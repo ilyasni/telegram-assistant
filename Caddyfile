@@ -1,0 +1,118 @@
+{
+    # Global options
+    log {
+        output file /var/log/caddy/access.log
+        format json
+    }
+}
+
+# Supabase Studio subdomain
+supabase.produman.studio {
+    # Security headers
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        X-XSS-Protection "1; mode=block"
+        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: https: blob:; font-src 'self' data: https://fonts.gstatic.com; connect-src 'self' wss: https: ws:; frame-src 'self' https:;"
+        -Server
+    }
+
+    # Supabase Studio через Kong
+    reverse_proxy kong:8000 {
+        header_up Host {http.request.host}
+        header_up X-Real-IP {http.request.remote}
+        header_up X-Forwarded-For {http.request.remote}
+        header_up X-Forwarded-Proto {http.request.scheme}
+        header_up X-Forwarded-Host {http.request.host}
+    }
+}
+
+# Main domain
+produman.studio {
+    # Security headers
+    header {
+        # Enable HSTS
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        # Prevent MIME type sniffing
+        X-Content-Type-Options "nosniff"
+        # Prevent clickjacking
+        X-Frame-Options "DENY"
+        # XSS Protection
+        X-XSS-Protection "1; mode=block"
+        # Content Security Policy
+        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: https: blob:; font-src 'self' data: https://fonts.gstatic.com; connect-src 'self' wss: https: ws:; frame-src 'self' https:;"
+        # Remove server info
+        -Server
+    }
+
+    # Health check endpoint
+    handle /health {
+        respond "OK" 200
+    }
+
+
+    # Supabase API endpoints через Kong
+    handle /rest/v1/* {
+        reverse_proxy kong:8000 {
+            header_up Host {http.request.host}
+            header_up X-Real-IP {http.request.remote}
+            header_up X-Forwarded-For {http.request.remote}
+            header_up X-Forwarded-Proto {http.request.scheme}
+        }
+    }
+
+    handle /auth/v1/* {
+        reverse_proxy kong:8000 {
+            header_up Host {http.request.host}
+            header_up X-Real-IP {http.request.remote}
+            header_up X-Forwarded-For {http.request.remote}
+            header_up X-Forwarded-Proto {http.request.scheme}
+        }
+    }
+
+    handle /realtime/v1/* {
+        reverse_proxy kong:8000 {
+            header_up Host {http.request.host}
+            header_up X-Real-IP {http.request.remote}
+            header_up X-Forwarded-For {http.request.remote}
+            header_up X-Forwarded-Proto {http.request.scheme}
+        }
+    }
+
+    handle /storage/v1/* {
+        reverse_proxy kong:8000 {
+            header_up Host {http.request.host}
+            header_up X-Real-IP {http.request.remote}
+            header_up X-Forwarded-For {http.request.remote}
+            header_up X-Forwarded-Proto {http.request.scheme}
+        }
+    }
+
+    # (Edge Functions disabled)
+
+    handle /pg/* {
+        reverse_proxy kong:8000 {
+            header_up Host {http.request.host}
+            header_up X-Real-IP {http.request.remote}
+            header_up X-Forwarded-For {http.request.remote}
+            header_up X-Forwarded-Proto {http.request.scheme}
+        }
+    }
+
+    # Grafana Dashboard
+    handle_path /grafana/* {
+        reverse_proxy grafana:3000 {
+            header_up Host {http.request.host}
+            header_up X-Real-IP {http.request.remote}
+            header_up X-Forwarded-For {http.request.remote}
+            header_up X-Forwarded-Proto {http.request.scheme}
+            header_up X-Forwarded-Host {http.request.host}
+        }
+    }
+
+    # Default route
+    handle {
+        respond "Telegram Assistant API" 200
+    }
+}
