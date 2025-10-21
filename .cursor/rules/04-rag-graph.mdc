@@ -1,0 +1,123 @@
+---
+# 04-rag-graph.mdc — Scope & Intent
+- Purpose: Правила RAG, GraphRAG, Qdrant, Neo4j, LangChain интеграция
+- Applies to: rag/, graph/, qdrant/, neo4j/, langchain/ папки
+- Non-goals: Нарушение SLA латентности, превышение токен-лимитов
+- Output expectations: Hybrid search, кэш эмбеддингов, GraphRAG, метрики качества
+- Checks: SLA латентности, токен-лимиты, качество RAG, fallback стратегии
+---
+
+# Правила RAG и Graph Intelligence
+
+## Qdrant векторное хранилище
+
+### Коллекции per-tenant
+- **Изоляция данных** — отдельная коллекция для каждого tenant_id
+- **Naming convention** — `posts_{tenant_id}` для постов
+- **Payload индексы** — для фильтрации по channel_id, created_at, status
+
+### Hybrid search
+- **Dense vectors** — GigaChat embeddings (1536 dim)
+- **Sparse vectors** — BM25 для точного поиска по тексту
+- **Fusion scoring** — комбинация dense + sparse результатов
+- **Reranking** — cross-encoder для финального ранжирования
+
+### Кэш эмбеддингов
+- **Redis кэш** — для часто запрашиваемых текстов
+- **TTL кэша** — 7 дней для постов, 30 дней для каналов
+- **Cache invalidation** — при обновлении контента
+- **Batch processing** — для массовой генерации эмбеддингов
+
+## GraphRAG и Neo4j
+
+### Когда включать GraphRAG
+- **Анализ связей** — между каналами, темами, сущностями
+- **Рекомендации** — на основе графа интересов
+- **Community detection** — выявление тематических сообществ
+- **Influence analysis** — кто на кого влияет
+
+### SLA на латентность
+- **Vector search** — <200ms для 95% запросов
+- **Graph queries** — <500ms для простых, <2s для сложных
+- **Hybrid search** — <300ms для комбинированных запросов
+- **RAG generation** — <5s для ответов до 1000 токенов
+
+### Токен-лимиты
+- **Input context** — максимум 32k токенов
+- **Output generation** — максимум 4k токенов
+- **Chunking strategy** — 512 токенов с overlap 50
+- **Context window** — 8k токенов для retrieval
+
+## LangChain интеграция
+
+### Retrieval pipeline
+```python
+# Базовый RAG pipeline
+retriever = QdrantRetriever(
+    collection_name=f"posts_{tenant_id}",
+    search_type="hybrid",  # dense + sparse
+    k=10,
+    score_threshold=0.7
+)
+
+chain = RetrievalQA.from_chain_type(
+    llm=GigaChatLLM(),
+    chain_type="stuff",
+    retriever=retriever,
+    return_source_documents=True
+)
+```
+
+### GraphRAG компоненты
+- **Entity extraction** — NER для выделения сущностей
+- **Relationship detection** — связи между сущностями
+- **Graph construction** — построение графа в Neo4j
+- **Graph traversal** — поиск путей и сообществ
+
+## Качество и мониторинг
+
+### Метрики качества
+- **Faithfulness** — соответствие ответа источникам
+- **Answer relevance** — релевантность ответа запросу
+- **Context precision** — точность контекста
+- **Retrieval accuracy** — качество поиска документов
+
+### A/B тестирование
+- **Конфигурации** — разные модели и параметры
+- **10% трафика** — на экспериментальные версии
+- **Метрики сравнения** — latency, quality, cost
+- **Rollback стратегия** — при деградации качества
+
+### Cost monitoring
+- **Token usage** — по провайдерам и моделям
+- **API calls** — частота и стоимость
+- **Storage costs** — Qdrant и Neo4j
+- **Budget alerts** — при превышении лимитов
+
+## Fallback стратегии
+
+### LLM провайдеры
+- **Primary** — GigaChat через gigachain
+- **Fallback** — OpenRouter для критичных случаев
+- **Local models** — для dev/test окружений
+- **Circuit breaker** — при недоступности провайдеров
+
+### Vector search
+- **Qdrant primary** — основное хранилище
+- **PostgreSQL fallback** — pgvector для критичных случаев
+- **Cache layer** — Redis для частых запросов
+- **Degradation** — упрощённый поиск при проблемах
+
+## Оптимизация производительности
+
+### Batch processing
+- **Embedding generation** — батчи по 100 текстов
+- **Graph updates** — транзакции по 1000 операций
+- **Index rebuilding** — в фоновом режиме
+- **Cache warming** — предзагрузка популярных запросов
+
+### Resource management
+- **Connection pooling** — для Qdrant и Neo4j
+- **Memory limits** — для больших графов
+- **CPU throttling** — для тяжёлых запросов
+- **Queue management** — приоритизация задач

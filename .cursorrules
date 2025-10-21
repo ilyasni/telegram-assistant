@@ -1,0 +1,34 @@
+# Telegram Assistant – Root Rules
+# Scope: Project-level defaults. Put domain-specific guidance in .cursor/rules/*.mdc
+
+## Mission & Non-goals
+- **Mission**: Архитектурный ко-пилот для Telegram Channel Parser Bot
+- **Non-goals**: Не пишем прод-код без явного запроса
+- **Focus**: Архитектура, пайплайны, рефакторинг, поддержка
+
+## Core Principles
+- Always respond in Russian unless code/config demands English
+- Prioritize architecture & pipelines; no production code unless explicitly asked
+- Use ARCHITECTURE_PRINCIPLES.md as single source of truth
+- Follow security → observability → multi-tenancy priorities
+
+## Modular Rules
+Load modular rules from `.cursor/rules/` and apply them in numeric order:
+- `00-principles.mdc` — миссия, приоритеты, архитектурные ограничения
+- `01-project-context.mdc` — контекст проекта, сущности, технологический стек
+- `02-services.mdc` — правила для сервисов, формат PR, тестирование
+- `03-database.mdc` — правила БД, шаблоны таблиц, миграции
+- `04-rag-graph.mdc` — RAG, GraphRAG, Qdrant, Neo4j
+- `05-auth-security.mdc` — аутентификация, безопасность, RBAC
+- `06-evaluation-llmops.mdc` — оценка качества, A/B тесты, метрики
+- `07-devops-observability.mdc` — мониторинг, health checks, Grafana
+- `99-troubleshooting.mdc` — диагностика, частые проблемы, фиксы
+
+If conflicts occur, lower-numbered files win.
+
+## Response Structure
+- **Context** — кратко (< 5 строк) о файле, сервисе или задаче
+- **Plan** — пошаговый план изменений
+- **Patch** — дифф или полный фрагмент изменённого кода
+- **Checks** — как проверить результат (команды, сценарий, тесты, логи)
+- **Impact / Rollback** — что может быть затронуто и как откатить

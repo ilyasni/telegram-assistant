@@ -1,0 +1,97 @@
+---
+# 02-services.mdc — Scope & Intent
+- Purpose: Правила для сервисов telethon-ingest/, api/, worker/
+- Applies to: telethon-ingest/, api/, worker/, Docker конфигурации
+- Non-goals: Смешивание изменений разных сервисов в одном PR
+- Output expectations: One file at a time, small diffs, тест-шаги
+- Checks: Формат PR, тестирование, обработка ошибок, конфигурация
+---
+
+# Правила для сервисов
+
+## Структура сервисов
+
+### telethon-ingest/
+- **Назначение**: подписка на Telegram каналы, запись событий в event bus
+- **Технологии**: Telethon, FastStream/Celery, Redis
+- **Принципы**: stateless, worker-per-user, изоляция сессий
+
+### api/
+- **Назначение**: FastAPI Gateway, REST/WebSocket API, авторизация
+- **Технологии**: FastAPI, SQLAlchemy, Pydantic, JWT
+- **Принципы**: RBAC, rate limiting, версионирование API
+
+### worker/
+- **Назначение**: LangChain orchestrator, асинхронная обработка
+- **Технологии**: LangChain, gigachain, Celery/FastStream
+- **Принципы**: event-driven, идемпотентность, retry с backoff
+
+## Формат PR-изменений
+
+### Принцип "one file at a time"
+- **Один файл за раз** — не смешивать изменения разных сервисов
+- **Small diffs** — изменения до 50-100 строк
+- **Чёткие причины** — объяснение зачем нужны изменения
+- **Тест-шаги** — как проверить работоспособность
+
+### Структура PR
+```markdown
+## Context
+Краткое описание проблемы/задачи
+
+## Plan
+1. Изменить X в файле Y
+2. Добавить Z в конфигурацию
+3. Обновить тесты
+
+## Changes
+- `path/to/file.py`: добавил функцию X
+- `config/settings.py`: обновил параметр Y
+
+## Testing
+1. Запустить `pytest tests/test_service.py`
+2. Проверить логи: `docker logs service_name`
+3. Тест API: `curl -X GET /healthz`
+
+## Impact
+- Влияние на другие сервисы: нет
+- Требует миграции: нет
+- Rollback: `git revert <commit>`
+```
+
+## Правила кодирования
+
+### Общие принципы
+- **Идентификаторы на английском** — функции, переменные, классы
+- **Комментарии на русском** — кратко и по делу
+- **Type hints обязательны** — для всех публичных функций
+- **Pydantic модели** — для всех API endpoints и событий
+
+### Обработка ошибок
+- **Structured logging** — JSON формат с trace_id
+- **Graceful degradation** — fallback на альтернативные провайдеры
+- **Circuit breaker** — для внешних API (GigaChat, Telegram)
+- **Dead letter queue** — для необработанных событий
+
+### Конфигурация
+- **BaseSettings** — Pydantic для всех настроек
+- **Environment variables** — с валидацией и дефолтами
+- **Secrets management** — через Vault/1Password
+- **Feature flags** — для A/B тестирования
+
+## Тестирование
+
+### Unit тесты
+- **Покрытие ключевой логики** — минимум 80%
+- **Изоляция зависимостей** — моки для внешних сервисов
+- **Параметризованные тесты** — для edge cases
+
+### Integration тесты
+- **Docker Compose профиль `test`** — с in-memory брокером
+- **Тестовые данные** — синтезированные и анонимизированные
+- **Cleanup после тестов** — автоматическая очистка БД
+
+### Performance тесты
+- **k6/Locust** — для API endpoints
+- **Бенчмарки** — для критичных операций
+- **Load testing** — для event bus throughput

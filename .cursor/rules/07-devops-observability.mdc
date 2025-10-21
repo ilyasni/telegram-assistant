@@ -1,0 +1,158 @@
+---
+# 07-devops-observability.mdc — Scope & Intent
+- Purpose: Мониторинг, health checks, Prometheus, Grafana, логирование
+- Applies to: monitoring/, health/, metrics/, logs/, dashboards/
+- Non-goals: Отсутствие мониторинга, неструктурированные логи
+- Output expectations: Health checks матрица, Prometheus метрики, Grafana дашборды
+- Checks: Health checks, метрики, алерты, логирование, incident response
+---
+
+# Правила DevOps и наблюдаемости
+
+## Health checks матрица
+
+### Обязательные endpoints
+- **`/healthz`** — базовая проверка доступности сервиса
+- **`/readyz`** — готовность к обработке запросов
+- **`/livez`** — проверка жизнеспособности процесса
+- **`/metrics`** — Prometheus метрики
+
+### Зависимости для проверки
+- **PostgreSQL** — подключение и базовые запросы
+- **Redis** — ping и операции записи/чтения
+- **Qdrant** — подключение и поиск в коллекциях
+- **Neo4j** — подключение и простые Cypher запросы
+- **Telegram API** — доступность MTProto endpoints
+- **GigaChat API** — доступность LLM endpoints
+
+### Health check implementation
+```python
+@router.get("/healthz")
+async def health_check():
+    checks = {
+        "database": await check_postgres(),
+        "redis": await check_redis(),
+        "qdrant": await check_qdrant(),
+        "telegram": await check_telegram_api()
+    }
+    
+    all_healthy = all(checks.values())
+    status_code = 200 if all_healthy else 503
+    
+    return JSONResponse(
+        status_code=status_code,
+        content={"status": "healthy" if all_healthy else "unhealthy", "checks": checks}
+    )
+```
+
+## Prometheus метрики
+
+### Бизнес метрики
+- **`telegram_messages_processed_total`** — количество обработанных сообщений
+- **`rag_queries_total`** — количество RAG запросов
+- **`embedding_generation_duration_seconds`** — время генерации эмбеддингов
+- **`graph_queries_duration_seconds`** — время выполнения графовых запросов
+
+### Системные метрики
+- **`http_requests_total`** — HTTP запросы по endpoint и статусу
+- **`http_request_duration_seconds`** — время выполнения HTTP запросов
+- **`database_connections_active`** — активные соединения с БД
+- **`queue_size`** — размер очередей обработки
+
+### LLM метрики
+- **`llm_requests_total`** — запросы к LLM по провайдеру
+- **`llm_tokens_used_total`** — использованные токены
+- **`llm_request_duration_seconds`** — время ответа LLM
+- **`llm_errors_total`** — ошибки LLM по типу
+
+### Алерты
+- **High error rate** — >5% ошибок за 5 минут
+- **High latency** — >95 percentile >2 секунды
+- **Queue backlog** — >1000 задач в очереди
+- **Resource usage** — >80% CPU/Memory
+
+## Grafana дашборды
+
+### Service Overview
+- **Request rate** — RPS по сервисам
+- **Error rate** — процент ошибок
+- **Response time** — p50, p95, p99 латентность
+- **Active connections** — соединения с БД и внешними сервисами
+
+### LLM Operations
+- **Token usage** — по провайдерам и моделям
+- **Cost tracking** — расходы на API вызовы
+- **Quality metrics** — RAGAS scores
+- **Model performance** — latency и throughput
+
+### Infrastructure
+- **Database performance** — медленные запросы, блокировки
+- **Queue monitoring** — размер очередей, processing rate
+- **Storage usage** — размер данных в Qdrant, Neo4j, S3
+- **Network traffic** — входящий/исходящий трафик
+
+### Business Intelligence
+- **User activity** — активные пользователи, сессии
+- **Content processing** — обработанные посты, каналы
+- **RAG usage** — популярные запросы, качество ответов
+- **Cost analysis** — расходы по компонентам
+
+## Логирование
+
+### Structured logging
+- **JSON format** — для всех логов
+- **Trace ID** — для связывания запросов
+- **Log levels** — DEBUG, INFO, WARNING, ERROR, CRITICAL
+- **Context fields** — user_id, tenant_id, request_id
+
+### Лог-агрегация
+- **Loki** — для централизованного сбора логов
+- **Log retention** — 30 дней для INFO, 90 дней для ERROR
+- **Log rotation** — по размеру и времени
+- **Log shipping** — в Cloud.ru S3 для долгосрочного хранения
+
+### Аудит логи
+- **Authentication events** — входы, выходы, неудачные попытки
+- **Authorization events** — доступ к ресурсам
+- **Data access** — чтение/запись чувствительных данных
+- **Admin actions** — административные операции
+
+## Мониторинг производительности
+
+### APM (Application Performance Monitoring)
+- **OpenTelemetry** — для трассировки запросов
+- **Span correlation** — связывание операций
+- **Performance profiling** — профилирование CPU/Memory
+- **Database query analysis** — анализ медленных запросов
+
+### Resource monitoring
+- **CPU usage** — по контейнерам и сервисам
+- **Memory usage** — RSS, heap, stack
+- **Disk I/O** — read/write операции
+- **Network I/O** — входящий/исходящий трафик
+
+### Capacity planning
+- **Growth trends** — тренды роста нагрузки
+- **Resource utilization** — использование ресурсов
+- **Scaling triggers** — триггеры для масштабирования
+- **Cost projections** — прогнозы расходов
+
+## Incident response
+
+### Runbooks
+- **Service restart** — процедуры перезапуска сервисов
+- **Database recovery** — восстановление БД
+- **Queue processing** — обработка застрявших задач
+- **Rollback procedures** — откат изменений
+
+### Escalation matrix
+- **Level 1** — автоматические алерты
+- **Level 2** — уведомление команды
+- **Level 3** — эскалация руководству
+- **Level 4** — внешняя поддержка
+
+### Post-mortem process
+- **Incident timeline** — хронология событий
+- **Root cause analysis** — анализ причин
+- **Action items** — планы улучшений
+- **Knowledge sharing** — обмен опытом

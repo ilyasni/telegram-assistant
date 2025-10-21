@@ -1,0 +1,125 @@
+---
+# 01-project-context.mdc — Scope & Intent
+- Purpose: Контекст проекта Telegram Channel Parser Bot
+- Applies to: Все сервисы, архитектурные решения, документация
+- Non-goals: Изменение базовой архитектуры без обоснования
+- Output expectations: Соответствие технологическому стеку, доменной модели
+- Checks: Правильность сущностей, соответствие потоку данных, технологическому стеку
+---
+
+# Контекст проекта Telegram Channel Parser Bot
+
+## Состояние проекта
+
+### Текущий статус: Переходная фаза
+- **Старая версия**: Документирована в `docs/OLD_*` файлах
+  - Монолитная архитектура с n8n/Flowise
+  - Сложная система с множественными зависимостями
+  - Репозиторий: https://github.com/ilyasni/t-bot-for-channels/tree/test-cleanup-fresh
+- **Новая архитектура**: Описана в `ARCHITECTURE_PRINCIPLES.md`
+  - Event-driven микросервисная архитектура
+  - LangChain-ориентированная обработка
+  - Минимально достаточная инфраструктура
+- **Реализация**: В процессе (папки `api/`, `worker/`, `telethon-ingest/` пустые)
+
+### Приоритеты разработки
+1. **Новая архитектура** — основная для разработки
+2. **Старая документация** — только для справки и понимания эволюции
+3. **Не смешивать** — четко разделять контексты старого и нового
+
+### Roadmap реализации
+1. **Инициализация ядра** — Telethon + FastAPI + Postgres + Redis
+2. **Добавление orchestrator** — Redpanda/Redis Streams + LangChain
+3. **RAG модуль** — Qdrant + LangChain retrieval pipeline
+4. **Graph Intelligence** — Neo4j + GraphRAG
+5. **Quality Evaluation** — Ragas evaluator
+6. **Observability & Security** — OTel + RBAC + аудит
+
+## Архитектурный обзор
+**Поток данных**: Telethon Ingest → FastAPI Gateway → LangChain Workers → Postgres+Qdrant+Neo4j → RAG/Graph API
+
+**Event Bus**: Kafka/Redpanda (прод) или Redis Streams (dev/mid-size)
+
+**TTL постов**: 90 дней (настраивается per-tenant)
+
+**Аутентификация**: Mini App QR-логин через Telegram Login Widget
+
+## Ключевые сущности
+
+### User
+- `id`, `telegram_id`, `username`, `tenant_id`
+- `created_at`, `last_active_at`
+- `settings` (JSON), `subscription_tier`
+
+### Channel
+- `id`, `telegram_id`, `username`, `title`, `tenant_id`
+- `is_active`, `last_message_at`
+- `parsing_settings` (JSON), `digest_frequency`
+
+### Post
+- `id`, `channel_id`, `telegram_message_id`, `tenant_id`
+- `content`, `media_urls`, `created_at`
+- `is_processed`, `embedding_status`, `graph_status`
+
+### IndexingStatus
+- `post_id`, `embedding_status`, `graph_status`
+- `processing_started_at`, `processing_completed_at`
+- `error_message`, `retry_count`
+
+### DigestSettings
+- `user_id`, `channel_ids` (JSON array)
+- `frequency` (daily/weekly/monthly)
+- `delivery_method` (telegram/email/webhook)
+- `template_id`, `is_active`
+
+## Технологический стек
+
+### Backend
+- **Python 3.11+**, FastAPI, SQLAlchemy 2.x
+- **LangChain**, `gigachain` (GigaChat), Pydantic v2
+- **Celery/FastStream** для асинхронных задач
+
+### Базы данных
+- **Postgres** (Supabase) — основное хранилище
+- **Redis/Valkey** — кэш, сессии, очереди
+- **Qdrant** — векторное хранилище
+- **Neo4j** — граф знаний
+- **Cloud.ru S3** — файлы и медиа
+
+### Messaging
+- **Kafka/Redpanda** — event bus
+- **Schema Registry** — контракты событий
+
+## Доменные сервисы
+
+### Telegram Ingestion Service
+- Подписка на каналы через Telethon
+- Запись событий `MessageCreated` в event bus
+- Многопользовательский режим (worker-per-user)
+
+### LangChain Orchestrator
+- Обработка событий о новых постах
+- Запуск цепочек обогащения (embeddings, summarization)
+- Асинхронные воркеры для тяжёлых задач
+
+### FastAPI Gateway
+- REST и WebSocket API
+- JWT/Telegram Login Widget авторизация
+- Роли: user/admin/support
+
+### Graph Intelligence Service
+- Синхронизация Postgres/Qdrant → Neo4j
+- NER/NEL, построение отношений
+- API для графовых запросов и рекомендаций
+
+## Конфигурация окружений
+
+### Dev
+- Docker Compose с профилями `core`, `rag`, `analytics`
+- По умолчанию только `core` (ingestion + API + Postgres + Redis)
+
+### Stage/Prod
+- Kubernetes/Ansible
+- Каждый сервис в отдельном deployment
+- Caddy как reverse proxy
+- Supabase как управляемое окружение

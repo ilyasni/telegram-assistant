@@ -1,0 +1,120 @@
+---
+# 05-auth-security.mdc — Scope & Intent
+- Purpose: Аутентификация, безопасность, RBAC, QR-логин, шифрование
+- Applies to: auth/, security/, api/, middleware/, Redis сессии
+- Non-goals: Нарушение безопасности, утечка секретов, отсутствие rate limiting
+- Output expectations: QR-логин, Redis сессии, шифрование, RBAC, мониторинг
+- Checks: Валидация Telegram, шифрование данных, rate limiting, RBAC
+---
+
+# Правила аутентификации и безопасности
+
+## QR-логин через Mini App
+
+### Telegram Login Widget
+- **OAuth flow** — через Telegram Bot API
+- **QR код** — для авторизации в веб-интерфейсе
+- **Deep linking** — для мобильных приложений
+- **Session management** — JWT токены с refresh
+
+### Валидация данных
+- **Telegram signature** — проверка подписи от Telegram
+- **Timestamp validation** — защита от replay атак
+- **User data verification** — соответствие данных Telegram API
+- **Rate limiting** — защита от брутфорса
+
+## Redis сессии
+
+### Хранение сессий
+- **TTL сессий** — 7 дней для активных пользователей
+- **Refresh tokens** — 30 дней с автоматическим обновлением
+- **Session invalidation** — при logout или подозрительной активности
+- **Multi-device support** — отдельные сессии для каждого устройства
+
+### Безопасность сессий
+- **Secure cookies** — HttpOnly, Secure, SameSite
+- **CSRF protection** — токены для всех state-changing операций
+- **Session hijacking** — детекция смены IP/User-Agent
+- **Concurrent sessions** — лимит активных сессий per user
+
+## Шифрование чувствительных данных
+
+### Поля для шифрования
+- **API ключи** — Telegram Bot tokens, внешние API keys
+- **Personal data** — телефоны, email адреса
+- **Configuration** — настройки парсинга каналов
+- **Secrets** — пароли, токены доступа
+
+### Методы шифрования
+- **PGP/GPG** — для долгосрочного хранения
+- **AES-256** — для временных данных
+- **KMS integration** — для ключей шифрования
+- **Key rotation** — регулярная смена ключей
+
+## Rate limiting
+
+### API endpoints
+- **Authentication** — 5 попыток в минуту per IP
+- **RAG queries** — 100 запросов в час per user
+- **Channel management** — 10 операций в минуту per user
+- **Admin operations** — 50 операций в час per admin
+
+### Implementation
+- **Redis-based** — leaky bucket algorithm
+- **Per-endpoint limits** — разные лимиты для разных операций
+- **User-based limits** — дополнительно к IP-based
+- **Graceful degradation** — 429 responses с retry-after
+
+## Threat model
+
+### MTProto/Telethon угрозы
+- **Session hijacking** — перехват сессий Telegram
+- **API abuse** — превышение лимитов Telegram API
+- **Data leakage** — утечка сообщений каналов
+- **Account suspension** — блокировка аккаунтов
+
+### Mini App угрозы
+- **XSS attacks** — инъекция скриптов в веб-интерфейс
+- **CSRF attacks** — подделка запросов
+- **Clickjacking** — скрытие интерфейса
+- **Phishing** — подделка Telegram Login
+
+### Mitigation strategies
+- **Input validation** — строгая валидация всех входных данных
+- **Output encoding** — экранирование HTML/JS в ответах
+- **CSP headers** — Content Security Policy
+- **HSTS** — принудительное HTTPS
+
+## RBAC и авторизация
+
+### Роли пользователей
+- **user** — базовые права на свои данные
+- **admin** — управление пользователями и настройками
+- **support** — доступ к логам и диагностике
+- **system** — сервисные аккаунты
+
+### Права доступа
+- **Data isolation** — доступ только к своим данным
+- **API permissions** — по endpoint и методу
+- **Resource limits** — лимиты на операции
+- **Audit logging** — логирование всех действий
+
+## Мониторинг безопасности
+
+### Security events
+- **Failed logins** — неудачные попытки входа
+- **Suspicious activity** — необычные паттерны использования
+- **API abuse** — превышение лимитов
+- **Data access** — доступ к чувствительным данным
+
+### Алерты
+- **Brute force** — множественные неудачные попытки
+- **Anomaly detection** — необычная активность
+- **Rate limit exceeded** — превышение лимитов
+- **Security violations** — нарушения политик
+
+### Incident response
+- **Automatic blocking** — временная блокировка подозрительных IP
+- **Session invalidation** — принудительный logout
+- **Admin notification** — уведомление администраторов
+- **Forensic logging** — детальные логи для анализа

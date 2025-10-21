@@ -1,0 +1,126 @@
+---
+# 03-database.mdc — Scope & Intent
+- Purpose: Правила работы с PostgreSQL, миграции, мульти-тенантность
+- Applies to: migrations/, models/, database/, SQL файлы
+- Non-goals: Использование SQLite, нарушение мульти-тенантности
+- Output expectations: Шаблоны таблиц, индексы, RLS политики, миграции
+- Checks: tenant_id во всех таблицах, индексы, миграции, безопасность
+---
+
+# Правила работы с базой данных
+
+## Основные принципы
+
+### Только PostgreSQL
+- **Никакого SQLite** — даже для тестов используем PostgreSQL
+- **Supabase** — как управляемая платформа для dev/stage/prod
+- **Connection pooling** — через PgBouncer или встроенный пул SQLAlchemy
+
+### Мульти-тенантность
+- **tenant_id обязателен** — во всех таблицах с данными пользователей
+- **Row Level Security** — для Supabase-совместимости
+- **Изоляция данных** — на уровне схемы и политик доступа
+
+## Шаблон для новых таблиц
+
+```sql
+CREATE TABLE example_table (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    
+    -- Основные поля
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    status VARCHAR(50) NOT NULL DEFAULT 'active',
+    
+    -- Метаданные
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by UUID REFERENCES users(id),
+    
+    -- JSON поля для гибкости
+    metadata JSONB DEFAULT '{}',
+    settings JSONB DEFAULT '{}',
+    
+    -- Ограничения
+    CONSTRAINT example_table_name_check CHECK (length(name) >= 1),
+    CONSTRAINT example_table_status_check CHECK (status IN ('active', 'inactive', 'archived'))
+);
+
+-- Индексы
+CREATE INDEX idx_example_table_tenant_id ON example_table(tenant_id);
+CREATE INDEX idx_example_table_status ON example_table(status);
+CREATE INDEX idx_example_table_created_at ON example_table(created_at);
+CREATE INDEX idx_example_table_metadata_gin ON example_table USING GIN(metadata);
+
+-- RLS политика
+ALTER TABLE example_table ENABLE ROW LEVEL SECURITY;
+CREATE POLICY example_table_tenant_policy ON example_table
+    FOR ALL TO authenticated
+    USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+```
+
+## Индексы и производительность
+
+### Обязательные индексы
+- **tenant_id** — на всех таблицах с мульти-тенантностью
+- **created_at** — для временных запросов и партиционирования
+- **status** — для фильтрации активных записей
+- **JSONB поля** — GIN индексы для поиска
+
+### Специальные индексы
+- **Составные индексы** — для частых комбинаций фильтров
+- **Partial индексы** — для активных записей
+- **Expression индексы** — для вычисляемых полей
+
+## Миграции
+
+### Alembic
+- **Версионирование** — все изменения через миграции
+- **Автогенерация** — `alembic revision --autogenerate`
+- **Ручная проверка** — перед применением миграций
+- **Rollback план** — для каждой миграции
+
+### Безопасные миграции
+- **Добавление колонок** — с DEFAULT значениями
+- **Удаление колонок** — в два этапа (deprecate → remove)
+- **Изменение типов** — через промежуточные колонки
+- **Индексы** — CONCURRENTLY для больших таблиц
+
+## Таймзоны и время
+
+### UTC везде
+- **TIMESTAMPTZ** — для всех временных полей
+- **NOW()** — вместо CURRENT_TIMESTAMP
+- **Timezone conversion** — на уровне приложения
+
+### Retention политики
+- **TTL постов** — 90 дней (настраивается per-tenant)
+- **Архивирование** — старые данные в отдельные таблицы
+- **Партиционирование** — по дате для больших таблиц
+
+## Безопасность
+
+### Шифрование
+- **Чувствительные поля** — PGP шифрование
+- **API ключи** — в зашифрованном виде
+- **Пароли** — bcrypt с солью
+
+### Аудит
+- **Audit trail** — для критичных операций
+- **Change tracking** — кто и когда изменил данные
+- **Access logging** — через Supabase logs
+
+## Мониторинг
+
+### Метрики
+- **Connection pool** — активные/ожидающие соединения
+- **Query performance** — медленные запросы
+- **Lock contention** — блокировки и deadlocks
+- **Storage usage** — размер таблиц и индексов
+
+### Алерты
+- **High connection count** — >80% от лимита
+- **Slow queries** — >1 секунды
+- **Failed migrations** — ошибки применения
+- **Storage threshold** — >90% от лимита

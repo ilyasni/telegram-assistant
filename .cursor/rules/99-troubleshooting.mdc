@@ -1,0 +1,139 @@
+---
+# 99-troubleshooting.mdc — Scope & Intent
+- Purpose: Диагностика, частые проблемы, минимальные фиксы, rollback
+- Applies to: Все сервисы при проблемах, диагностика, фиксы
+- Non-goals: Большие изменения без тестирования, отсутствие rollback плана
+- Output expectations: Пошаговые проверки, минимальные диффы, rollback стратегия
+- Checks: Health checks, логи, метрики, минимальные изменения, тестирование
+---
+
+# Troubleshooting и диагностика
+
+## Частые проблемы
+
+### Telegram Ingestion
+**Проблема**: Каналы не парсятся
+**Диагностика**:
+1. Проверить логи: `docker logs telethon-ingest`
+2. Проверить статус сессий: `SELECT * FROM telegram_sessions WHERE is_active = true`
+3. Проверить API лимиты: `curl -X GET /api/telegram/status`
+4. Проверить подключение к Telegram: `ping api.telegram.org`
+
+**Решение**: Перезапуск воркера, обновление сессий, проверка лимитов API
+
+### RAG качество
+**Проблема**: Плохие ответы RAG
+**Диагностика**:
+1. Проверить RAGAS метрики: `SELECT * FROM quality_metrics WHERE date >= NOW() - INTERVAL '1 day'`
+2. Проверить эмбеддинги: `curl -X GET /api/rag/embeddings/status`
+3. Проверить Qdrant: `curl -X GET /api/qdrant/collections`
+4. Проверить контекст: `curl -X POST /api/rag/debug -d '{"query": "test"}'`
+
+**Решение**: Переиндексация, обновление промптов, проверка источников
+
+### База данных
+**Проблема**: Медленные запросы
+**Диагностика**:
+1. Проверить активные запросы: `SELECT * FROM pg_stat_activity WHERE state = 'active'`
+2. Проверить блокировки: `SELECT * FROM pg_locks WHERE NOT granted`
+3. Проверить индексы: `SELECT * FROM pg_stat_user_indexes WHERE idx_scan = 0`
+4. Проверить размер таблиц: `SELECT schemaname, tablename, pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) FROM pg_tables`
+
+**Решение**: Добавление индексов, оптимизация запросов, очистка старых данных
+
+## Пошаговые проверки
+
+### Health check последовательность
+1. **Базовые сервисы**: `curl -X GET /healthz`
+2. **База данных**: `curl -X GET /healthz/database`
+3. **Redis**: `curl -X GET /healthz/redis`
+4. **Qdrant**: `curl -X GET /healthz/qdrant`
+5. **Neo4j**: `curl -X GET /healthz/neo4j`
+6. **Telegram API**: `curl -X GET /healthz/telegram`
+
+### Логирование диагностики
+```bash
+# Проверка логов сервиса
+docker logs -f --tail=100 telethon-ingest
+
+# Поиск ошибок
+docker logs telethon-ingest 2>&1 | grep -i error
+
+# Проверка метрик
+curl -X GET http://localhost:8000/metrics | grep -E "(error|latency|queue)"
+
+# Проверка очередей
+redis-cli LLEN celery:default
+```
+
+### База данных диагностика
+```sql
+-- Проверка подключений
+SELECT count(*) as active_connections FROM pg_stat_activity;
+
+-- Проверка медленных запросов
+SELECT query, mean_time, calls FROM pg_stat_statements ORDER BY mean_time DESC LIMIT 10;
+
+-- Проверка блокировок
+SELECT blocked_locks.pid AS blocked_pid, blocked_activity.usename AS blocked_user,
+       blocking_locks.pid AS blocking_pid, blocking_activity.usename AS blocking_user,
+       blocked_activity.query AS blocked_statement
+FROM pg_catalog.pg_locks blocked_locks
+JOIN pg_catalog.pg_stat_activity blocked_activity ON blocked_activity.pid = blocked_locks.pid
+JOIN pg_catalog.pg_locks blocking_locks ON blocking_locks.locktype = blocked_locks.locktype
+JOIN pg_catalog.pg_stat_activity blocking_activity ON blocking_activity.pid = blocking_locks.pid
+WHERE NOT blocked_locks.granted;
+```
+
+## "Минимальный дифф" при фиксе
+
+### Принципы
+- **Один файл за раз** — не смешивать изменения
+- **Минимальные изменения** — только необходимые правки
+- **Обратная совместимость** — не ломать существующий функционал
+- **Тестирование** — проверка после каждого изменения
+
+### Примеры минимальных фиксов
+```python
+# Было
+def process_message(message):
+    result = expensive_operation(message)
+    return result
+
+# Стало (добавили кэширование)
+def process_message(message):
+    cache_key = f"msg_{hash(message)}"
+    cached = redis.get(cache_key)
+    if cached:
+        return json.loads(cached)
+    
+    result = expensive_operation(message)
+    redis.setex(cache_key, 3600, json.dumps(result))
+    return result
+```
+
+### Rollback стратегия
+- **Git revert** — для отката коммитов
+- **Database rollback** — для миграций
+- **Config rollback** — для изменений конфигурации
+- **Service restart** — для изменений кода
+
+## Best practices
+
+### Мониторинг
+- **Proactive monitoring** — предупреждение проблем
+- **Alert fatigue** — избегать избыточных алертов
+- **Runbook automation** — автоматизация рутинных задач
+- **Knowledge base** — документирование решений
+
+### Документация
+- **Incident reports** — отчёты об инцидентах
+- **Root cause analysis** — анализ причин
+- **Prevention measures** — меры предотвращения
+- **Lessons learned** — извлечённые уроки
+
+### Команда
+- **On-call rotation** — дежурство по инцидентам
+- **Escalation procedures** — процедуры эскалации
+- **Communication channels** — каналы связи
+- **Post-mortem meetings** — разборы инцидентов

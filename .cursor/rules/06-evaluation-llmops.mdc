@@ -1,0 +1,130 @@
+---
+# 06-evaluation-llmops.mdc — Scope & Intent
+- Purpose: Оценка качества RAG, A/B тесты, метрики, LLMOps
+- Applies to: evaluation/, metrics/, llm/, ragas/, A/B тесты
+- Non-goals: Отсутствие метрик качества, нарушение статистической значимости
+- Output expectations: RAGAS метрики, A/B тесты, 10% семплирование, structured outputs
+- Checks: Качество RAG, метрики стоимости, A/B тесты, валидация
+---
+
+# Правила оценки качества и LLMOps
+
+## RAGAS авто-оценки
+
+### Метрики качества
+- **Faithfulness** — соответствие ответа источникам (0-1)
+- **Answer relevance** — релевантность ответа запросу (0-1)
+- **Context precision** — точность контекста (0-1)
+- **Context recall** — полнота контекста (0-1)
+
+### Автоматическая оценка
+- **Batch evaluation** — ежедневно для 10% запросов
+- **Real-time sampling** — случайная выборка 5% запросов
+- **Threshold alerts** — при падении метрик ниже 0.7
+- **Trend analysis** — отслеживание деградации качества
+
+### Контрольные датасеты
+- **Golden dataset** — 100 эталонных Q&A пар
+- **Edge cases** — сложные запросы и edge cases
+- **Domain-specific** — специфичные для Telegram каналов
+- **Regular updates** — еженедельное обновление датасета
+
+## A/B тестирование конфигураций
+
+### Экспериментальные версии
+- **10% трафика** — на новые конфигурации
+- **Feature flags** — для переключения между версиями
+- **Gradual rollout** — постепенное увеличение трафика
+- **Rollback strategy** — быстрый откат при проблемах
+
+### Метрики сравнения
+- **Quality metrics** — RAGAS scores
+- **Performance metrics** — latency, throughput
+- **Cost metrics** — token usage, API costs
+- **User satisfaction** — feedback и ratings
+
+### Статистическая значимость
+- **Minimum sample size** — 1000 запросов per variant
+- **Confidence interval** — 95% для метрик качества
+- **P-value threshold** — <0.05 для статистической значимости
+- **Multiple testing correction** — Bonferroni correction
+
+## 10% семплирование
+
+### Стратегия семплирования
+- **Random sampling** — равномерное распределение
+- **Stratified sampling** — по типам запросов
+- **Time-based sampling** — равномерно по времени
+- **User-based sampling** — по пользователям
+
+### Сбор данных
+- **Request/response pairs** — полные пары запрос-ответ
+- **Metadata** — timestamp, user_id, model_version
+- **Performance data** — latency, token counts
+- **Quality scores** — RAGAS метрики
+
+### Хранение и анализ
+- **Anonymized data** — без персональных данных
+- **Retention policy** — 90 дней для анализа
+- **Aggregated metrics** — ежедневные/еженедельные сводки
+- **Trend dashboards** — визуализация трендов
+
+## Метрики качества и стоимости
+
+### Quality KPIs
+- **Overall RAGAS score** — средневзвешенная метрика
+- **User satisfaction** — рейтинги и feedback
+- **Error rate** — доля неудачных запросов
+- **Response completeness** — полнота ответов
+
+### Cost KPIs
+- **Token usage** — по провайдерам и моделям
+- **API costs** — стоимость вызовов
+- **Storage costs** — Qdrant, Neo4j, S3
+- **Compute costs** — CPU/GPU utilization
+
+### ROI метрики
+- **Cost per query** — средняя стоимость запроса
+- **Quality per cost** — качество на рубль
+- **User engagement** — активность пользователей
+- **Retention rate** — удержание пользователей
+
+## Structured outputs и валидация
+
+### Pydantic схемы
+- **Response validation** — строгая валидация ответов LLM
+- **Error handling** — graceful degradation при ошибках
+- **Type safety** — типизированные ответы
+- **Documentation** — автогенерация схем
+
+### Output formats
+- **JSON responses** — структурированные данные
+- **Markdown formatting** — для текстовых ответов
+- **Citation format** — стандартизированные ссылки
+- **Error codes** — коды ошибок и описания
+
+### Quality gates
+- **Schema validation** — соответствие Pydantic схемам
+- **Content filtering** — фильтрация нежелательного контента
+- **Length limits** — ограничения на размер ответов
+- **Language detection** — проверка языка ответа
+
+## Мониторинг и алерты
+
+### Real-time мониторинг
+- **Quality degradation** — падение RAGAS scores
+- **Cost spikes** — резкое увеличение расходов
+- **Error rate increase** — рост ошибок
+- **Latency degradation** — увеличение времени ответа
+
+### Алерты
+- **Critical alerts** — немедленные уведомления
+- **Warning alerts** — предупреждения о трендах
+- **Info alerts** — информационные уведомления
+- **Escalation** — эскалация при отсутствии реакции
+
+### Dashboards
+- **Quality trends** — тренды качества по времени
+- **Cost analysis** — анализ расходов по компонентам
+- **Performance metrics** — метрики производительности
+- **User behavior** — поведение пользователей
