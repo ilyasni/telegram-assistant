@@ -1,16 +1,7 @@
 _format_version: "3.0"
 
-consumers:
-  - username: supabase
-    keyauth_credentials:
-      - key: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9.CRXP1A7WOeoJeXxjNni43kdQwgnWNReilDMblYTn_I0
-    basicauth_credentials:
-      - username: supabase
-        password: this_password_is_insecure_and_should_be_updated
-
-acls:
-  - consumer: supabase
-    group: admin
+consumers: []
+acls: []
 
 services:
   # Direct platform pg-meta proxy (Studio -> Meta)

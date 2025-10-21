@@ -89,14 +89,7 @@ produman.studio {
         }
     }
 
-    handle /functions/v1/* {
-        reverse_proxy kong:8000 {
-            header_up Host {http.request.host}
-            header_up X-Real-IP {http.request.remote}
-            header_up X-Forwarded-For {http.request.remote}
-            header_up X-Forwarded-Proto {http.request.scheme}
-        }
-    }
+    # (Edge Functions disabled)
 
     handle /pg/* {
         reverse_proxy kong:8000 {
