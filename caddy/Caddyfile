@@ -1,23 +1,47 @@
 {
-    # Глобальные настройки
+    # Глобальные настройки для продакшена
     log {
         output stdout
         format json
     }
-    # Отключаем автоматический HTTPS для разработки
-    auto_https off
+    # Включаем автоматический HTTPS для продакшена
+    # auto_https включен по умолчанию
 }
 
-# Единый домен с path-based маршрутизацией (Production)
-:80 {
-    # Supabase Studio (внешний доступ)
-    handle_path /supabase/* {
-        reverse_proxy supabase-studio:3000
+# Основной домен с HTTPS (Production)
+produman.studio {
+    # Security headers
+    header {
+        # HSTS
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        # XSS Protection
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        X-XSS-Protection "1; mode=block"
+        # Content Security Policy
+        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self' wss: https:;"
+        # Remove server info
+        -Server
     }
 
-    # Grafana Dashboard (внешний доступ)
+    # Supabase Studio (внешний доступ через подпуть)
+    handle_path /supabase/* {
+        reverse_proxy supabase-studio:3000 {
+            header_up Host {http.request.host}
+            header_up X-Real-IP {http.request.remote}
+            header_up X-Forwarded-For {http.request.remote}
+            header_up X-Forwarded-Proto {http.request.scheme}
+        }
+    }
+
+    # Grafana Dashboard (внешний доступ через подпуть)
     handle_path /grafana/* {
-        reverse_proxy grafana:3000
+        reverse_proxy grafana:3000 {
+            header_up Host {http.request.host}
+            header_up X-Real-IP {http.request.remote}
+            header_up X-Forwarded-For {http.request.remote}
+            header_up X-Forwarded-Proto {http.request.scheme}
+        }
     }
 
     # Health check
@@ -30,6 +54,25 @@
         respond "Telegram Assistant API Gateway" 200
     }
 }
+
+# Альтернативная конфигурация с отдельными поддоменами (опционально)
+# supabase.produman.studio {
+#     reverse_proxy supabase-studio:3000 {
+#         header_up Host {http.request.host}
+#         header_up X-Real-IP {http.request.remote}
+#         header_up X-Forwarded-For {http.request.remote}
+#         header_up X-Forwarded-Proto {http.request.scheme}
+#     }
+# }
+
+# grafana.produman.studio {
+#     reverse_proxy grafana:3000 {
+#         header_up Host {http.request.host}
+#         header_up X-Real-IP {http.request.remote}
+#         header_up X-Forwarded-For {http.request.remote}
+#         header_up X-Forwarded-Proto {http.request.scheme}
+#     }
+# }
 
 # Внутренние сервисы (только для Docker сети)
 # API Gateway

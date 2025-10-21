@@ -101,8 +101,11 @@ services:
   supabase-studio:
     image: supabase/studio:latest
     environment:
-      - SUPABASE_URL=https://supabase.produman.studio
+      # Обновляем URL на ваш реальный домен
+      - SUPABASE_URL=https://produman.studio
       - SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9.CRXP1A7WOeoJeXxjNni43kdQwgnWNReilDMblYTn_I0
+      # Настройки для работы за reverse proxy
+      - SUPABASE_STUDIO_URL=https://produman.studio/supabase
     # Порт убираем, так как доступ через Caddy
     networks:
       - telegram-network
@@ -152,11 +155,24 @@ services:
     image: grafana/grafana:latest
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
+      # Настройки для работы за reverse proxy с подпутем
+      - GF_SERVER_ROOT_URL=https://produman.studio/grafana
+      - GF_SERVER_SERVE_FROM_SUB_PATH=true
+      # Security настройки
+      - GF_SECURITY_COOKIE_SECURE=true
+      - GF_SECURITY_COOKIE_SAMESITE=strict
+      - GF_SECURITY_STRICT_TRANSPORT_SECURITY=true
+      - GF_SECURITY_STRICT_TRANSPORT_SECURITY_MAX_AGE_SECONDS=31536000
+      - GF_SECURITY_STRICT_TRANSPORT_SECURITY_PRELOAD=true
+      - GF_SECURITY_STRICT_TRANSPORT_SECURITY_SUBDOMAINS=true
+      # Отключаем прямой доступ (только через Caddy)
+      - GF_SERVER_DISABLE_GRAVATAR=true
     volumes:
       - grafana_data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning
-    ports:
-      - "3000:3000"
+    # Убираем прямой доступ к порту 3000 для безопасности
+    # ports:
+    #   - "3000:3000"
     networks:
       - telegram-network
     profiles:
