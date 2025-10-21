@@ -1,0 +1,278 @@
+_format_version: "3.0"
+
+consumers:
+  - username: supabase
+    keyauth_credentials:
+      - key: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9.CRXP1A7WOeoJeXxjNni43kdQwgnWNReilDMblYTn_I0
+    basicauth_credentials:
+      - username: supabase
+        password: this_password_is_insecure_and_should_be_updated
+
+acls:
+  - consumer: supabase
+    group: admin
+
+services:
+  # Direct platform pg-meta proxy (Studio -> Meta)
+  - name: supabase-meta-platform
+    url: http://meta:8080/
+    routes:
+      - name: supabase-meta-platform
+        hosts:
+          - supabase.produman.studio
+        paths:
+          - ~/api/platform/pg-meta/[^/]+
+        strip_path: true
+        preserve_host: false
+    plugins:
+      - name: cors
+        config:
+          origins:
+            - https://produman.studio
+            - https://supabase.produman.studio
+          methods:
+            - GET
+            - POST
+            - PUT
+            - DELETE
+            - OPTIONS
+          headers:
+            - Accept
+            - Accept-Version
+            - Content-Length
+            - Content-MD5
+            - Content-Type
+            - Date
+            - X-Auth-Token
+            - Authorization
+          exposed_headers:
+            - X-Auth-Token
+          credentials: true
+          max_age: 3600
+  # Supabase Studio
+  - name: supabase-studio
+    url: http://supabase-studio:3000/
+    routes:
+      - name: supabase-studio
+        hosts:
+          - supabase.produman.studio
+        paths:
+          - /
+        strip_path: false
+        preserve_host: false
+      - name: studio-run-lints
+        hosts:
+          - supabase.produman.studio
+        paths:
+          - ~/api/platform/projects/[^/]+/run-lints$
+        strip_path: false
+        plugins:
+          - name: request-termination
+            config:
+              status_code: 200
+              content_type: application/json
+              body: "[]"
+    plugins:
+      - name: cors
+        config:
+          origins:
+            - https://produman.studio
+            - https://supabase.produman.studio
+          methods:
+            - GET
+            - POST
+            - PUT
+            - DELETE
+            - OPTIONS
+          headers:
+            - Accept
+            - Accept-Version
+            - Content-Length
+            - Content-MD5
+            - Content-Type
+            - Date
+            - X-Auth-Token
+            - Authorization
+          exposed_headers:
+            - X-Auth-Token
+          credentials: true
+          max_age: 3600
+
+  # PostgREST API
+  - name: supabase-rest
+    url: http://rest:3000/
+    routes:
+      - name: supabase-rest
+        hosts:
+          - produman.studio
+          - supabase.produman.studio
+        strip_path: true
+        paths:
+          - /rest/v1
+    plugins:
+      - name: cors
+        config:
+          origins:
+            - https://produman.studio
+            - https://supabase.produman.studio
+          methods:
+            - GET
+            - POST
+            - PUT
+            - DELETE
+            - OPTIONS
+          headers:
+            - Accept
+            - Accept-Version
+            - Content-Length
+            - Content-MD5
+            - Content-Type
+            - Date
+            - X-Auth-Token
+            - Authorization
+          exposed_headers:
+            - X-Auth-Token
+          credentials: true
+          max_age: 3600
+
+  # GoTrue Auth
+  - name: supabase-auth
+    url: http://auth:9999/
+    routes:
+      - name: supabase-auth
+        strip_path: true
+        paths:
+          - /auth/v1
+    plugins:
+      - name: cors
+        config:
+          origins:
+            - https://produman.studio
+            - https://supabase.produman.studio
+          methods:
+            - GET
+            - POST
+            - PUT
+            - DELETE
+            - OPTIONS
+          headers:
+            - Accept
+            - Accept-Version
+            - Content-Length
+            - Content-MD5
+            - Content-Type
+            - Date
+            - X-Auth-Token
+            - Authorization
+          exposed_headers:
+            - X-Auth-Token
+          credentials: true
+          max_age: 3600
+
+  # Postgres Meta (критичен для Studio)
+  - name: supabase-meta
+    url: http://meta:8080/
+    routes:
+      - name: supabase-meta
+        hosts:
+          - produman.studio
+          - supabase.produman.studio
+        strip_path: true
+        paths:
+          - /pg
+          - /pg/
+    plugins:
+      - name: cors
+        config:
+          origins:
+            - https://produman.studio
+            - https://supabase.produman.studio
+          methods:
+            - GET
+            - POST
+            - PUT
+            - DELETE
+            - OPTIONS
+          headers:
+            - Accept
+            - Accept-Version
+            - Content-Length
+            - Content-MD5
+            - Content-Type
+            - Date
+            - X-Auth-Token
+            - Authorization
+          exposed_headers:
+            - X-Auth-Token
+          credentials: true
+          max_age: 3600
+
+  # Realtime
+  - name: supabase-realtime
+    url: http://realtime:4000/
+    routes:
+      - name: supabase-realtime
+        strip_path: true
+        paths:
+          - /realtime/v1
+    plugins:
+      - name: cors
+        config:
+          origins:
+            - https://produman.studio
+            - https://supabase.produman.studio
+          methods:
+            - GET
+            - POST
+            - PUT
+            - DELETE
+            - OPTIONS
+          headers:
+            - Accept
+            - Accept-Version
+            - Content-Length
+            - Content-MD5
+            - Content-Type
+            - Date
+            - X-Auth-Token
+            - Authorization
+          exposed_headers:
+            - X-Auth-Token
+          credentials: true
+          max_age: 3600
+
+  # Storage
+  - name: supabase-storage
+    url: http://storage:5000/
+    routes:
+      - name: supabase-storage
+        strip_path: true
+        paths:
+          - /storage/v1
+    plugins:
+      - name: cors
+        config:
+          origins:
+            - https://produman.studio
+            - https://supabase.produman.studio
+          methods:
+            - GET
+            - POST
+            - PUT
+            - DELETE
+            - OPTIONS
+          headers:
+            - Accept
+            - Accept-Version
+            - Content-Length
+            - Content-MD5
+            - Content-Type
+            - Date
+            - X-Auth-Token
+            - Authorization
+          exposed_headers:
+            - X-Auth-Token
+          credentials: true
+          max_age: 3600
+
+  # (Edge Functions disabled)

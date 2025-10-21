@@ -1,32 +1,60 @@
 {
-    # Глобальные настройки для продакшена
+    # Global options
     log {
-        output stdout
+        output file /var/log/caddy/access.log
         format json
     }
-    # Включаем автоматический HTTPS для продакшена
-    # auto_https включен по умолчанию
 }
 
-# Основной домен с HTTPS (Production)
+# Supabase Studio subdomain
+supabase.produman.studio {
+    # Security headers
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        X-XSS-Protection "1; mode=block"
+        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: https: blob:; font-src 'self' data: https://fonts.gstatic.com; connect-src 'self' wss: https: ws:; frame-src 'self' https:;"
+        -Server
+    }
+
+    # Supabase Studio через Kong
+    reverse_proxy kong:8000 {
+        header_up Host {http.request.host}
+        header_up X-Real-IP {http.request.remote}
+        header_up X-Forwarded-For {http.request.remote}
+        header_up X-Forwarded-Proto {http.request.scheme}
+        header_up X-Forwarded-Host {http.request.host}
+    }
+}
+
+# Main domain
 produman.studio {
     # Security headers
     header {
-        # HSTS
+        # Enable HSTS
         Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
-        # XSS Protection
+        # Prevent MIME type sniffing
         X-Content-Type-Options "nosniff"
+        # Prevent clickjacking
         X-Frame-Options "DENY"
+        # XSS Protection
         X-XSS-Protection "1; mode=block"
         # Content Security Policy
-        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self' wss: https:;"
+        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: https: blob:; font-src 'self' data: https://fonts.gstatic.com; connect-src 'self' wss: https: ws:; frame-src 'self' https:;"
         # Remove server info
         -Server
     }
 
-    # Supabase Studio (внешний доступ через подпуть)
-    handle_path /supabase/* {
-        reverse_proxy supabase-studio:3000 {
+    # Health check endpoint
+    handle /health {
+        respond "OK" 200
+    }
+
+
+    # Supabase API endpoints через Kong
+    handle /rest/v1/* {
+        reverse_proxy kong:8000 {
             header_up Host {http.request.host}
             header_up X-Real-IP {http.request.remote}
             header_up X-Forwarded-For {http.request.remote}
@@ -34,63 +62,64 @@ produman.studio {
         }
     }
 
-    # Grafana Dashboard (внешний доступ через подпуть)
+    handle /auth/v1/* {
+        reverse_proxy kong:8000 {
+            header_up Host {http.request.host}
+            header_up X-Real-IP {http.request.remote}
+            header_up X-Forwarded-For {http.request.remote}
+            header_up X-Forwarded-Proto {http.request.scheme}
+        }
+    }
+
+    handle /realtime/v1/* {
+        reverse_proxy kong:8000 {
+            header_up Host {http.request.host}
+            header_up X-Real-IP {http.request.remote}
+            header_up X-Forwarded-For {http.request.remote}
+            header_up X-Forwarded-Proto {http.request.scheme}
+        }
+    }
+
+    handle /storage/v1/* {
+        reverse_proxy kong:8000 {
+            header_up Host {http.request.host}
+            header_up X-Real-IP {http.request.remote}
+            header_up X-Forwarded-For {http.request.remote}
+            header_up X-Forwarded-Proto {http.request.scheme}
+        }
+    }
+
+    handle /functions/v1/* {
+        reverse_proxy kong:8000 {
+            header_up Host {http.request.host}
+            header_up X-Real-IP {http.request.remote}
+            header_up X-Forwarded-For {http.request.remote}
+            header_up X-Forwarded-Proto {http.request.scheme}
+        }
+    }
+
+    handle /pg/* {
+        reverse_proxy kong:8000 {
+            header_up Host {http.request.host}
+            header_up X-Real-IP {http.request.remote}
+            header_up X-Forwarded-For {http.request.remote}
+            header_up X-Forwarded-Proto {http.request.scheme}
+        }
+    }
+
+    # Grafana Dashboard
     handle_path /grafana/* {
         reverse_proxy grafana:3000 {
             header_up Host {http.request.host}
             header_up X-Real-IP {http.request.remote}
             header_up X-Forwarded-For {http.request.remote}
             header_up X-Forwarded-Proto {http.request.scheme}
+            header_up X-Forwarded-Host {http.request.host}
         }
     }
 
-    # Health check
-    handle /health {
-        respond "OK" 200
+    # Default route
+    handle {
+        respond "Telegram Assistant API" 200
     }
-
-    # Root endpoint
-    handle / {
-        respond "Telegram Assistant API Gateway" 200
-    }
-}
-
-# Альтернативная конфигурация с отдельными поддоменами (опционально)
-# supabase.produman.studio {
-#     reverse_proxy supabase-studio:3000 {
-#         header_up Host {http.request.host}
-#         header_up X-Real-IP {http.request.remote}
-#         header_up X-Forwarded-For {http.request.remote}
-#         header_up X-Forwarded-Proto {http.request.scheme}
-#     }
-# }
-
-# grafana.produman.studio {
-#     reverse_proxy grafana:3000 {
-#         header_up Host {http.request.host}
-#         header_up X-Real-IP {http.request.remote}
-#         header_up X-Forwarded-For {http.request.remote}
-#         header_up X-Forwarded-Proto {http.request.scheme}
-#     }
-# }
-
-# Внутренние сервисы (только для Docker сети)
-# API Gateway
-api:8000 {
-    reverse_proxy api:8000
-}
-
-# Neo4j Browser
-neo4j:7474 {
-    reverse_proxy neo4j:7474
-}
-
-# Qdrant Dashboard
-qdrant:6333 {
-    reverse_proxy qdrant:6333
-}
-
-# RAG Service
-rag:8000 {
-    reverse_proxy api:8000
 }

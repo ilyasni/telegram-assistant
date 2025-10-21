@@ -1,97 +1,94 @@
 version: '3.8'
 
 services:
-  # Caddy Reverse Proxy
-  caddy:
-    image: caddy:2-alpine
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
-    depends_on:
-      - api
-      - supabase-studio
-    networks:
-      - telegram-network
-    profiles:
-      - core
-
-  # API Service
-  api:
-    build: ./api
-    environment:
-      - DATABASE_URL=postgresql://postgres:postgres@supabase-db:5432/postgres
-      - REDIS_URL=redis://redis:6379
-      - JWT_SECRET=your-super-secret-jwt-key-change-this-in-production
-      - JWT_ALGORITHM=HS256
-      - ENVIRONMENT=development
-      - LOG_LEVEL=INFO
-    depends_on:
-      - supabase-db
-      - redis
-    volumes:
-      - ./api:/app
-    networks:
-      - telegram-network
-    profiles:
-      - core
-
-  # Worker Service
-  worker:
-    build: ./worker
-    environment:
-      - DATABASE_URL=postgresql://postgres:postgres@supabase-db:5432/postgres
-      - REDIS_URL=redis://redis:6379
-      - QDRANT_URL=http://qdrant:6333
-      - ENVIRONMENT=development
-      - LOG_LEVEL=INFO
-    depends_on:
-      - supabase-db
-      - redis
-      - qdrant
-    volumes:
-      - ./worker:/app
-    networks:
-      - telegram-network
-    profiles:
-      - core
-
-  # Telegram Ingest Service
-  telethon-ingest:
-    build: ./telethon-ingest
-    environment:
-      - MASTER_API_ID=9602513
-      - MASTER_API_HASH=d72f161ad90794db968e19cc24e77efa
-      - DATABASE_URL=postgresql://postgres:postgres@supabase-db:5432/postgres
-      - REDIS_URL=redis://redis:6379
-      - ENVIRONMENT=development
-      - LOG_LEVEL=INFO
-    depends_on:
-      - supabase-db
-      - redis
-    volumes:
-      - ./telethon-ingest:/app
-      - ./telethon-sessions:/app/sessions
-    networks:
-      - telegram-network
-    profiles:
-      - core
-
-  # Supabase Database
+  # PostgreSQL Database
   supabase-db:
-    image: postgres:15
+    image: supabase/postgres:15.1.1.78
     environment:
-      - POSTGRES_DB=postgres
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     volumes:
       - supabase_data:/var/lib/postgresql/data
-      - ./supabase/init:/docker-entrypoint-initdb.d
-    # Порт убираем, так как доступ через Caddy
+      - ./supabase/volumes/db/init:/docker-entrypoint-initdb.d
+    networks:
+      - telegram-network
+    profiles:
+      - core
+
+  # Kong API Gateway
+  kong:
+    image: kong:3.4
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /var/lib/kong/kong.yml
+      KONG_DNS_ORDER: LAST,A,CNAME
+      KONG_PLUGINS: request-transformer,cors,key-auth,acl,basic-auth,request-termination
+      KONG_DNS_VALID_TTL: 1
+      KONG_DNS_STALE_TTL: 0
+      KONG_DNS_NOT_FOUND_TTL: 0
+      KONG_DNS_ERROR_TTL: 1
+      KONG_NGINX_PROXY_PROXY_BUFFER_SIZE: 160k
+      KONG_NGINX_PROXY_PROXY_BUFFERS: 64 160k
+    volumes:
+      - ./supabase/volumes/api/kong.yml:/var/lib/kong/kong.yml:ro
+    networks:
+      - telegram-network
+    profiles:
+      - core
+
+  # PostgREST API
+  rest:
+    image: postgrest/postgrest:v12.0.2
+    environment:
+      PGRST_DB_URI: postgresql://postgres:${POSTGRES_PASSWORD}@supabase-db:5432/${POSTGRES_DB}
+      PGRST_DB_SCHEMAS: public,storage,graphql_public,telegram_bot
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_JWT_SECRET: ${JWT_SECRET}
+      PGRST_DB_USE_LEGACY_GUCS: "false"
+    depends_on:
+      - supabase-db
+    networks:
+      - telegram-network
+    profiles:
+      - core
+
+  # Postgres Meta (критичен для Studio)
+  meta:
+    image: supabase/postgres-meta:v0.80.0
+    environment:
+      PG_META_PORT: 8080
+      PG_META_DB_HOST: supabase-db
+      PG_META_DB_PASSWORD: postgres
+      PG_META_DB_NAME: postgres
+      PG_META_DB_USER: postgres
+    depends_on:
+      - supabase-db
+    networks:
+      - telegram-network
+    profiles:
+      - core
+
+  # GoTrue Auth
+  auth:
+    image: supabase/gotrue:v2.143.0
+    environment:
+      GOTRUE_API_HOST: 0.0.0.0
+      GOTRUE_API_PORT: 9999
+      API_EXTERNAL_URL: https://${DOMAIN}
+      GOTRUE_DB_DRIVER: postgres
+      GOTRUE_DB_DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@supabase-db:5432/${POSTGRES_DB}
+      GOTRUE_SITE_URL: https://${DOMAIN}
+      GOTRUE_URI_ALLOW_LIST: "*"
+      GOTRUE_DISABLE_SIGNUP: "false"
+      GOTRUE_JWT_ADMIN_ROLES: service_role
+      GOTRUE_JWT_AUD: authenticated
+      GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
+      GOTRUE_JWT_EXP: 3600
+      GOTRUE_JWT_SECRET: ${JWT_SECRET}
+      GOTRUE_EXTERNAL_EMAIL_ENABLED: "true"
+      GOTRUE_MAILER_AUTOCONFIRM: "true"
+    depends_on:
+      - supabase-db
     networks:
       - telegram-network
     profiles:
@@ -101,88 +98,138 @@ services:
   supabase-studio:
     image: supabase/studio:latest
     environment:
-      # Обновляем URL на ваш реальный домен
-      - SUPABASE_URL=https://produman.studio
-      - SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9.CRXP1A7WOeoJeXxjNni43kdQwgnWNReilDMblYTn_I0
-      # Настройки для работы за reverse proxy
-      - SUPABASE_STUDIO_URL=https://produman.studio/supabase
-    # Порт убираем, так как доступ через Caddy
+      # Basic configuration
+      SUPABASE_URL: http://kong:8000
+      SUPABASE_API_URL: http://kong:8000
+      # Explicit Studio URLs to avoid localhost fallbacks
+      STUDIO_SUPABASE_URL: http://kong:8000
+      STUDIO_PG_META_URL: http://meta:8080
+      KONG_URL: http://kong:8000
+      # Disable lints in self-hosted
+      STUDIO_DISABLE_LINTS: "true"
+      DISABLE_LINTS: "true"
+      POSTGRES_META_URL: http://meta:8080
+      # Direct connection to meta
+      POSTGRES_META_HOST: meta
+      POSTGRES_META_PORT: 8080
+      # (no direct DB connections; Studio uses Kong and pg-meta)
+      # API Keys
+      SUPABASE_ANON_KEY: ${ANON_KEY}
+      SUPABASE_SERVICE_KEY: ${SERVICE_KEY}
+      # Public URLs
+      NEXT_PUBLIC_SUPABASE_URL: https://${SUPABASE_HOST}
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: ${ANON_KEY}
+      SUPABASE_STUDIO_URL: https://${SUPABASE_HOST}
+      NEXT_PUBLIC_SUPABASE_STUDIO_URL: https://${SUPABASE_HOST}
+      # Project settings
+      SUPABASE_PROJECT_REF: default
+      SUPABASE_PROJECT_ID: default
+      # JWT Secret
+      SUPABASE_JWT_SECRET: ${JWT_SECRET}
+      # API URLs
+      SUPABASE_REST_URL: http://kong:8000/rest/v1
+      SUPABASE_AUTH_URL: http://kong:8000/auth/v1
+      SUPABASE_REALTIME_URL: http://kong:8000/realtime/v1
+      SUPABASE_STORAGE_URL: http://kong:8000/storage/v1
+      SUPABASE_FUNCTIONS_URL: http://kong:8000/functions/v1
+      SUPABASE_GRAPHQL_URL: http://kong:8000/graphql/v1
+    depends_on:
+      - supabase-db
+      - rest
+      - auth
+      - meta
     networks:
       - telegram-network
     profiles:
       - core
+
+  # Realtime
+  realtime:
+    image: supabase/realtime:v2.25.50
+    environment:
+      DB_HOST: supabase-db
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_NAME: ${POSTGRES_DB}
+      DB_USER: postgres
+      JWT_SECRET: ${JWT_SECRET}
+      API_JWT_SECRET: ${JWT_SECRET}
+      PORT: 4000
+    depends_on:
+      - supabase-db
+    networks:
+      - telegram-network
+    profiles:
+      - core
+
+  # Storage
+  storage:
+    image: supabase/storage-api:v0.46.4
+    environment:
+      POSTGREST_URL: http://rest:3000
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@supabase-db:5432/${POSTGRES_DB}
+      FILE_SIZE_LIMIT: 52428800
+      STORAGE_BACKEND: file
+      GLOBAL_S3_BUCKET: telegram-assistant-storage
+      ANON_KEY: ${ANON_KEY}
+      SERVICE_KEY: ${SERVICE_KEY}
+      JWT_SECRET: ${JWT_SECRET}
+    depends_on:
+      - supabase-db
+      - rest
+    networks:
+      - telegram-network
+    profiles:
+      - core
+
 
   # Redis Cache
   redis:
     image: redis:7-alpine
     volumes:
       - redis_data:/data
-    # Порт убираем, так как доступ через Caddy
     networks:
       - telegram-network
     profiles:
       - core
 
-  # Qdrant Vector Database
-  qdrant:
-    image: qdrant/qdrant:latest
-    volumes:
-      - qdrant_data:/qdrant/storage
-    # Порты убираем, так как доступ через Caddy
-    networks:
-      - telegram-network
-    profiles:
-      - core
-
-  # Neo4j Graph Database
-  neo4j:
-    image: neo4j:5
-    environment:
-      - NEO4J_AUTH=neo4j/password
-      - NEO4J_PLUGINS=["apoc"]
-    volumes:
-      - neo4j_data:/data
-    ports:
-      - "7474:7474"
-      - "7687:7687"
-    networks:
-      - telegram-network
-    profiles:
-      - analytics
-
-  # Grafana Monitoring
+  # Grafana Dashboard
   grafana:
     image: grafana/grafana:latest
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-      # Настройки для работы за reverse proxy с подпутем
-      - GF_SERVER_ROOT_URL=https://produman.studio/grafana
-      - GF_SERVER_SERVE_FROM_SUB_PATH=true
-      # Security настройки
-      - GF_SECURITY_COOKIE_SECURE=true
-      - GF_SECURITY_COOKIE_SAMESITE=strict
-      - GF_SECURITY_STRICT_TRANSPORT_SECURITY=true
-      - GF_SECURITY_STRICT_TRANSPORT_SECURITY_MAX_AGE_SECONDS=31536000
-      - GF_SECURITY_STRICT_TRANSPORT_SECURITY_PRELOAD=true
-      - GF_SECURITY_STRICT_TRANSPORT_SECURITY_SUBDOMAINS=true
-      # Отключаем прямой доступ (только через Caddy)
-      - GF_SERVER_DISABLE_GRAVATAR=true
+      GF_SECURITY_ADMIN_PASSWORD: ${GF_SECURITY_ADMIN_PASSWORD}
+      GF_SERVER_ROOT_URL: https://${DOMAIN}/grafana
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+      GF_SECURITY_COOKIE_SECURE: "true"
+      GF_SECURITY_COOKIE_SAMESITE: "strict"
+      GF_SECURITY_STRICT_TRANSPORT_SECURITY: "true"
+      GF_SECURITY_STRICT_TRANSPORT_SECURITY_MAX_AGE_SECONDS: 31536000
+      GF_SECURITY_STRICT_TRANSPORT_SECURITY_PRELOAD: "true"
+      GF_SECURITY_STRICT_TRANSPORT_SECURITY_SUBDOMAINS: "true"
     volumes:
       - grafana_data:/var/lib/grafana
-      - ./grafana/provisioning:/etc/grafana/provisioning
-    # Убираем прямой доступ к порту 3000 для безопасности
-    # ports:
-    #   - "3000:3000"
     networks:
       - telegram-network
     profiles:
-      - analytics
+      - core
+
+  # Caddy Reverse Proxy
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - telegram-network
+    profiles:
+      - core
 
 volumes:
   supabase_data:
   redis_data:
-  qdrant_data:
-  neo4j_data:
   grafana_data:
   caddy_data:
   caddy_config:
