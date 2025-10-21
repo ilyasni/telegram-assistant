@@ -1,95 +1,135 @@
 version: '3.8'
 
 services:
+  # Caddy Reverse Proxy
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - api
+      - supabase-studio
+    networks:
+      - telegram-network
+    profiles:
+      - core
+
   # API Service
   api:
     build: ./api
-    ports:
-      - "8000:8000"
     environment:
-      - DATABASE_URL=postgresql://postgres:password@postgres:5432/telegram_assistant
+      - DATABASE_URL=postgresql://postgres:postgres@supabase-db:5432/postgres
       - REDIS_URL=redis://redis:6379
-      - QDRANT_URL=http://qdrant:6333
-      - NEO4J_URL=bolt://neo4j:7687
+      - JWT_SECRET=your-super-secret-jwt-key-change-this-in-production
+      - JWT_ALGORITHM=HS256
+      - ENVIRONMENT=development
+      - LOG_LEVEL=INFO
     depends_on:
-      - postgres
+      - supabase-db
       - redis
-      - qdrant
-      - neo4j
     volumes:
       - ./api:/app
     networks:
       - telegram-network
+    profiles:
+      - core
 
   # Worker Service
   worker:
     build: ./worker
     environment:
-      - DATABASE_URL=postgresql://postgres:password@postgres:5432/telegram_assistant
+      - DATABASE_URL=postgresql://postgres:postgres@supabase-db:5432/postgres
       - REDIS_URL=redis://redis:6379
       - QDRANT_URL=http://qdrant:6333
-      - NEO4J_URL=bolt://neo4j:7687
+      - ENVIRONMENT=development
+      - LOG_LEVEL=INFO
     depends_on:
-      - postgres
+      - supabase-db
       - redis
       - qdrant
-      - neo4j
     volumes:
       - ./worker:/app
     networks:
       - telegram-network
+    profiles:
+      - core
 
   # Telegram Ingest Service
   telethon-ingest:
     build: ./telethon-ingest
     environment:
-      - DATABASE_URL=postgresql://postgres:password@postgres:5432/telegram_assistant
+      - MASTER_API_ID=9602513
+      - MASTER_API_HASH=d72f161ad90794db968e19cc24e77efa
+      - DATABASE_URL=postgresql://postgres:postgres@supabase-db:5432/postgres
       - REDIS_URL=redis://redis:6379
-      - QDRANT_URL=http://qdrant:6333
+      - ENVIRONMENT=development
+      - LOG_LEVEL=INFO
     depends_on:
-      - postgres
+      - supabase-db
       - redis
-      - qdrant
     volumes:
       - ./telethon-ingest:/app
-      - ./telethon/sessions:/app/sessions
+      - ./telethon-sessions:/app/sessions
     networks:
       - telegram-network
+    profiles:
+      - core
 
-  # PostgreSQL Database
-  postgres:
+  # Supabase Database
+  supabase-db:
     image: postgres:15
     environment:
-      - POSTGRES_DB=telegram_assistant
+      - POSTGRES_DB=postgres
       - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=password
+      - POSTGRES_PASSWORD=postgres
     volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./postgres:/docker-entrypoint-initdb.d
-    ports:
-      - "5432:5432"
+      - supabase_data:/var/lib/postgresql/data
+      - ./supabase/init:/docker-entrypoint-initdb.d
+    # Порт убираем, так как доступ через Caddy
     networks:
       - telegram-network
+    profiles:
+      - core
+
+  # Supabase Studio
+  supabase-studio:
+    image: supabase/studio:latest
+    environment:
+      - SUPABASE_URL=https://supabase.produman.studio
+      - SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9.CRXP1A7WOeoJeXxjNni43kdQwgnWNReilDMblYTn_I0
+    # Порт убираем, так как доступ через Caddy
+    networks:
+      - telegram-network
+    profiles:
+      - core
 
   # Redis Cache
   redis:
     image: redis:7-alpine
     volumes:
       - redis_data:/data
-    ports:
-      - "6379:6379"
+    # Порт убираем, так как доступ через Caddy
     networks:
       - telegram-network
+    profiles:
+      - core
 
   # Qdrant Vector Database
   qdrant:
     image: qdrant/qdrant:latest
     volumes:
       - qdrant_data:/qdrant/storage
-    ports:
-      - "6333:6333"
+    # Порты убираем, так как доступ через Caddy
     networks:
       - telegram-network
+    profiles:
+      - core
 
   # Neo4j Graph Database
   neo4j:
@@ -104,6 +144,8 @@ services:
       - "7687:7687"
     networks:
       - telegram-network
+    profiles:
+      - analytics
 
   # Grafana Monitoring
   grafana:
@@ -117,13 +159,17 @@ services:
       - "3000:3000"
     networks:
       - telegram-network
+    profiles:
+      - analytics
 
 volumes:
-  postgres_data:
+  supabase_data:
   redis_data:
   qdrant_data:
   neo4j_data:
   grafana_data:
+  caddy_data:
+  caddy_config:
 
 networks:
   telegram-network:

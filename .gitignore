@@ -198,6 +198,7 @@ Thumbs.db
 
 # Telegram sessions
 sessions/
+telethon-sessions/
 *.session
 *.session-journal
 
