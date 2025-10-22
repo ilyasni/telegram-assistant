@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Telegram Assistant - QR Login</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { 
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
+      margin: 0; padding: 16px; background: #f8f9fa; 
+    }
+    .container { 
+      max-width: 400px; margin: 0 auto; 
+    }
+    .card { 
+      background: white; border-radius: 12px; padding: 24px; 
+      box-shadow: 0 2px 8px rgba(0,0,0,0.1); 
+      text-align: center;
+    }
+    .header {
+      margin-bottom: 24px;
+    }
+    .title {
+      font-size: 24px; font-weight: 600; color: #1a1a1a;
+      margin: 0 0 8px 0;
+    }
+    .subtitle {
+      color: #6b7280; font-size: 14px; margin: 0;
+    }
+    .status {
+      padding: 12px 16px; border-radius: 8px; margin: 16px 0;
+      font-weight: 500; font-size: 14px;
+    }
+    .status.loading { background: #fef3c7; color: #92400e; }
+    .status.pending { background: #dbeafe; color: #1e40af; }
+    .status.success { background: #d1fae5; color: #065f46; }
+    .status.error { background: #fee2e2; color: #dc2626; }
+    .qr-container {
+      margin: 20px 0; padding: 20px; background: #f9fafb; border-radius: 8px;
+    }
+    #qr {
+      display: flex; justify-content: center; align-items: center;
+      min-height: 200px;
+    }
+    .timer {
+      margin-top: 12px; font-size: 14px; color: #6b7280;
+    }
+    .timer.warning { color: #dc2626; font-weight: 500; }
+    .instructions {
+      margin-top: 20px; padding: 16px; background: #f3f4f6; border-radius: 8px;
+      font-size: 14px; color: #374151; line-height: 1.5;
+    }
+    .btn {
+      background: #3b82f6; color: white; border: none; border-radius: 8px;
+      padding: 12px 24px; font-size: 14px; font-weight: 500;
+      cursor: pointer; transition: background 0.2s;
+    }
+    .btn:hover { background: #2563eb; }
+    .btn:disabled { background: #9ca3af; cursor: not-allowed; }
+    .spinner {
+      display: inline-block; width: 16px; height: 16px; border: 2px solid #f3f3f3;
+      border-top: 2px solid #3b82f6; border-radius: 50%; animation: spin 1s linear infinite;
+    }
+    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    .hidden { display: none; }
+    .error-details {
+      margin-top: 12px; padding: 12px; background: #fef2f2; border: 1px solid #fecaca;
+      border-radius: 6px; font-size: 12px; color: #dc2626; text-align: left;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="card">
+      <div class="header">
+        <h1 class="title">🔐 Авторизация</h1>
+        <p class="subtitle">Отсканируйте QR-код в Telegram для входа</p>
+      </div>
+      
+      <div id="status" class="status loading">
+        <span class="spinner"></span> Инициализация...
+      </div>
+      
+      <div id="qr-container" class="qr-container hidden">
+        <div id="qr"></div>
+        <div id="timer" class="timer"></div>
+      </div>
+      
+      <div class="instructions">
+        <strong>Как войти:</strong><br>
+        1. Откройте Telegram на другом устройстве<br>
+        2. Перейдите в Настройки → Устройства<br>
+        3. Нажмите "Привязать устройство"<br>
+        4. Отсканируйте QR-код
+      </div>
+      
+      <button id="btn-retry" class="btn hidden">Повторить</button>
+    </div>
+  </div>
+
+  <script>
+    // DOM elements
+    const statusEl = document.getElementById('status');
+    const qrContainerEl = document.getElementById('qr-container');
+    const qrEl = document.getElementById('qr');
+    const timerEl = document.getElementById('timer');
+    const btnRetryEl = document.getElementById('btn-retry');
+
+    // State
+    let sessionToken = null;
+    let eventSource = null;
+    let qrCode = null;
+    let expiresAt = null;
+    let countdownInterval = null;
+
+    // API helper
+    async function callApi(path, method = 'GET', body) {
+      const headers = { 'Content-Type': 'application/json' };
+      const options = { method, headers };
+      if (body) options.body = JSON.stringify(body);
+      const res = await fetch(path, options);
+      if (!res.ok) throw new Error(await res.text());
+      return await res.json();
+    }
+
+    // Update status display
+    function updateStatus(text, type = 'loading') {
+      statusEl.textContent = text;
+      statusEl.className = `status ${type}`;
+    }
+
+    // Update timer
+    function updateTimer() {
+      if (!expiresAt) return;
+      const now = Math.floor(Date.now() / 1000);
+      const timeLeft = expiresAt - now;
+      
+      if (timeLeft <= 0) {
+        timerEl.textContent = 'QR-код истёк';
+        timerEl.className = 'timer warning';
+        clearInterval(countdownInterval);
+        if (eventSource) eventSource.close();
+        updateStatus('QR-код истёк. Нажмите "Повторить"', 'error');
+        btnRetryEl.classList.remove('hidden');
+        return;
+      }
+      
+      const minutes = Math.floor(timeLeft / 60);
+      const seconds = timeLeft % 60;
+      const timeStr = `${minutes}:${seconds.toString().padStart(2, '0')}`;
+      
+      timerEl.textContent = `Действителен ещё: ${timeStr}`;
+      timerEl.className = timeLeft <= 60 ? 'timer warning' : 'timer';
+    }
+
+    // Start SSE connection
+    function startSSE(token) {
+      if (eventSource) {
+        eventSource.close();
+      }
+      
+      eventSource = new EventSource(`/tg/qr/sse?token=${encodeURIComponent(token)}`);
+      
+      eventSource.onmessage = function(event) {
+        try {
+          const data = JSON.parse(event.data);
+          handleSSEMessage(data);
+        } catch (e) {
+          console.error('SSE parse error:', e);
+        }
+      };
+      
+      eventSource.onerror = function(err) {
+        console.error('SSE error:', err);
+        updateStatus('Ошибка соединения. Попробуйте ещё раз', 'error');
+        btnRetryEl.classList.remove('hidden');
+        if (eventSource) eventSource.close();
+      };
+    }
+
+    // Handle SSE messages
+    function handleSSEMessage(data) {
+      console.log('SSE message:', data);
+      
+      if (data.qr_url && !qrCode) {
+        // Show QR code
+        qrContainerEl.classList.remove('hidden');
+        qrEl.innerHTML = '';
+        qrCode = new QRCode(qrEl, {
+          text: data.qr_url,
+          width: 200,
+          height: 200,
+          colorDark: '#000000',
+          colorLight: '#ffffff',
+          correctLevel: QRCode.CorrectLevel.H
+        });
+        updateStatus('Отсканируйте QR-код в Telegram', 'pending');
+      }
+      
+      if (data.status === 'authorized') {
+        updateStatus('✅ Успешная авторизация!', 'success');
+        qrContainerEl.classList.add('hidden');
+        if (eventSource) eventSource.close();
+        if (countdownInterval) clearInterval(countdownInterval);
+        
+        // Close Mini App after success
+        setTimeout(() => {
+          if (window.Telegram?.WebApp?.close) {
+            window.Telegram.WebApp.close();
+          }
+        }, 2000);
+      } else if (data.status === 'failed') {
+        updateStatus('❌ Ошибка авторизации', 'error');
+        btnRetryEl.classList.remove('hidden');
+        if (eventSource) eventSource.close();
+        if (countdownInterval) clearInterval(countdownInterval);
+      }
+    }
+
+    // Start QR login process
+    async function startQRLogin() {
+      try {
+        updateStatus('Инициализация...', 'loading');
+        btnRetryEl.classList.add('hidden');
+        
+        // Get initData from Telegram WebApp
+        const initData = window.Telegram?.WebApp?.initData || '';
+        console.log('initData length:', initData.length);
+        
+        // Initialize Mini App
+        const initResponse = await callApi('/tg/miniapp/init', 'POST', { init_data: initData });
+        console.log('init response:', initResponse);
+        
+        // Get tenant_id from initData or use default
+        const tenantId = '550e8400-e29b-41d4-a716-446655440000'; // TODO: extract from initData
+        
+        // Link Mini App
+        const linkResponse = await callApi('/tg/miniapp/link', 'POST', { 
+          start_param: 'qr_login', 
+          tenant_id: tenantId 
+        });
+        sessionToken = linkResponse.session_token;
+        console.log('session_token:', sessionToken.substring(0, 24) + '...');
+        
+        // Start QR session
+        const startResponse = await callApi('/tg/qr/start', 'POST', { 
+          tenant_id: tenantId,
+          invite_code: 'DEMO123' // TODO: get from URL params or initData
+        });
+        console.log('qr start response:', startResponse);
+        
+        // Parse expiration time
+        if (startResponse.expires_at) {
+          expiresAt = Math.floor(new Date(startResponse.expires_at).getTime() / 1000);
+          countdownInterval = setInterval(updateTimer, 1000);
+          updateTimer();
+        }
+        
+        // Start SSE for real-time updates
+        startSSE(sessionToken);
+        
+      } catch (error) {
+        console.error('QR login error:', error);
+        updateStatus('Ошибка: ' + error.message, 'error');
+        btnRetryEl.classList.remove('hidden');
+      }
+    }
+
+    // Retry button handler
+    btnRetryEl.addEventListener('click', () => {
+      startQRLogin();
+    });
+
+    // Initialize on page load
+    document.addEventListener('DOMContentLoaded', () => {
+      startQRLogin();
+    });
+
+    // Cleanup on page unload
+    window.addEventListener('beforeunload', () => {
+      if (eventSource) eventSource.close();
+      if (countdownInterval) clearInterval(countdownInterval);
+    });
+  </script>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
+</body>
+</html>

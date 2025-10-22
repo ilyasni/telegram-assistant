@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     
     # Telethon settings
     session_name: str = "telegram_assistant"
+    master_session_string: Optional[str] = None
     flood_sleep_threshold: int = 60
     retry_delay: int = 1
     max_retries: int = 3

@@ -14,7 +14,7 @@ supabase.produman.studio {
         X-Content-Type-Options nosniff
         X-Frame-Options DENY
         X-XSS-Protection "1; mode=block"
-        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: https: blob:; font-src 'self' data: https://fonts.gstatic.com; connect-src 'self' wss: https: ws:; frame-src 'self' https:;"
+        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net https://telegram.org; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: https: blob:; font-src 'self' data: https://fonts.gstatic.com; connect-src 'self' wss: https: ws:; frame-src 'self' https:;"
         -Server
     }
 
@@ -41,7 +41,7 @@ produman.studio {
         # XSS Protection
         X-XSS-Protection "1; mode=block"
         # Content Security Policy
-        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: https: blob:; font-src 'self' data: https://fonts.gstatic.com; connect-src 'self' wss: https: ws:; frame-src 'self' https:;"
+        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net https://telegram.org; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: https: blob:; font-src 'self' data: https://fonts.gstatic.com; connect-src 'self' wss: https: ws:; frame-src 'self' https:;"
         # Remove server info
         -Server
     }
@@ -98,6 +98,66 @@ produman.studio {
             header_up X-Forwarded-For {http.request.remote}
             header_up X-Forwarded-Proto {http.request.scheme}
         }
+    }
+
+    # Mini App - статические файлы
+    handle /tg/miniapp* {
+        root * /var/www/webapp
+        try_files {path} /index.html
+        file_server
+    }
+
+    # API endpoints
+    handle /health* {
+        reverse_proxy api:8000 {
+            header_up Host {http.request.host}
+            header_up X-Real-IP {http.request.remote}
+            header_up X-Forwarded-For {http.request.remote}
+            header_up X-Forwarded-Proto {http.request.scheme}
+        }
+    }
+
+    handle /api/* {
+        reverse_proxy api:8000 {
+            header_up Host {http.request.host}
+            header_up X-Real-IP {http.request.remote}
+            header_up X-Forwarded-For {http.request.remote}
+            header_up X-Forwarded-Proto {http.request.scheme}
+        }
+    }
+
+    # Telegram bot webhook - точное правило без переписывания пути
+    handle /tg/bot/* {
+        reverse_proxy api:8000 {
+            header_up Host {http.request.host}
+            header_up X-Real-IP {http.request.remote}
+            header_up X-Forwarded-For {http.request.remote}
+            header_up X-Forwarded-Proto {http.request.scheme}
+        }
+    }
+
+    # Telegram QR auth endpoints
+    handle /tg/qr/* {
+        reverse_proxy api:8000 {
+            header_up Host {http.request.host}
+            header_up X-Real-IP {http.request.remote}
+            header_up X-Forwarded-For {http.request.remote}
+            header_up X-Forwarded-Proto {http.request.scheme}
+        }
+    }
+
+    # Telegram Mini App
+    handle /tg/app/* {
+        reverse_proxy api:8000 {
+            header_up Host {http.request.host}
+            header_up X-Real-IP {http.request.remote}
+            header_up X-Forwarded-For {http.request.remote}
+            header_up X-Forwarded-Proto {http.request.scheme}
+        }
+        # Context7 best practice: cache-busting для Mini App
+        header Cache-Control "no-cache, no-store, must-revalidate"
+        header Pragma "no-cache"
+        header Expires "0"
     }
 
     # Default route

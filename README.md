@@ -1,117 +1,298 @@
-# 🤖 Telegram Assistant
+# Telegram Assistant
 
-Архитектурный ко-пилот для Telegram Channel Parser Bot с event-driven микросервисной архитектурой.
+Telegram bot с QR-авторизацией для управления каналами и контентом.
 
 ## 🚀 Быстрый старт
 
-```bash
-# Запуск системы
-docker compose up -d
+### Требования
+- Docker & Docker Compose
+- Telegram Bot Token
+- PostgreSQL
+- Redis
 
-# Проверка статуса
-curl http://localhost:80/health
+### Установка
+```bash
+git clone <repository>
+cd telegram-assistant
+cp .env.example .env
+# Настройте переменные в .env
+docker compose up -d
 ```
 
-## 📚 Документация
+### Переменные окружения
+```bash
+# Telegram Bot
+BOT_TOKEN=your_bot_token
+BOT_WEBHOOK_SECRET=your_webhook_secret
+BOT_PUBLIC_URL=https://your-domain.com
 
-### 🛠️ Настройка
-- [**Быстрый старт**](docs/setup/QUICKSTART.md) — основные команды для запуска
-- [**Полная настройка**](docs/setup/SETUP.md) — детальная инструкция
-- [**DNS настройка**](docs/setup/DNS_SETUP.md) — настройка доменов
-- [**Локальная DNS**](docs/setup/LOCAL_DNS_SETUP.md) — для разработки
+# Database
+DATABASE_URL=postgresql://user:password@localhost:5432/telegram_assistant
 
-### 🚀 Развертывание
-- [**Продакшн настройка**](docs/deployment/PRODUCTION_SETUP.md) — полная настройка для production
-- [**Внешний доступ**](docs/deployment/EXTERNAL_ACCESS_SETUP.md) — настройка внешнего доступа
-- [**Subdomain маршрутизация**](docs/deployment/SUBDOMAIN_SETUP.md) — настройка поддоменов
-- [**Простая доменная настройка**](docs/deployment/SIMPLE_DOMAIN_SETUP.md) — единый домен
-- [**Безопасный доступ**](docs/deployment/SECURE_ACCESS.md) — настройка безопасности
-- [**Supabase доступ**](docs/deployment/SUPABASE_ACCESS.md) — настройка Supabase
+# Redis
+REDIS_URL=redis://localhost:6379
 
-### 🔧 Устранение неполадок
-- [**DNS проблемы**](docs/troubleshooting/TROUBLESHOOTING_DNS.md) — решение проблем с DNS
-- [**Альтернативная DNS**](docs/troubleshooting/ALTERNATIVE_DNS.md) — альтернативные решения
-- [**Финальное решение DNS**](docs/troubleshooting/FINAL_DNS_SOLUTION.md) — итоговое решение
-
-### 📊 Статус системы
-- [**Система готова**](docs/status/SYSTEM_READY.md) — текущий статус
-- [**Порты исправлены**](docs/status/PORTS_FIXED.md) — решение проблем с портами
-- [**Caddy готов**](docs/status/CADDY_READY.md) — статус Caddy
-- [**DNS готов**](docs/status/DNS_READY.md) — статус DNS
-
-## 🌐 Доступные сервисы
-
-- **API Gateway:** http://localhost:80/api/
-- **Supabase Studio:** http://localhost:80/supabase/
-- **Grafana Dashboard:** http://localhost:80/grafana/
-- **Neo4j Browser:** http://localhost:80/neo4j/
-- **Qdrant Dashboard:** http://localhost:80/qdrant/
-- **RAG Service:** http://localhost:80/rag/
+# JWT
+JWT_SECRET=your_jwt_secret
+```
 
 ## 🏗️ Архитектура
 
+### Сервисы
+- **api** - FastAPI приложение с ботом и API
+- **telethon-ingest** - QR-авторизация через Telethon
+- **redis** - Кеширование и сессии
+- **postgres** - Основная база данных
+- **caddy** - Reverse proxy
+
+### Компоненты
+- **Telegram Bot** - обработка команд и webhook
+- **Mini App** - QR-авторизация в Telegram
+- **QR Auth Service** - Telethon интеграция
+- **API Endpoints** - REST API для фронтенда
+
+## 📱 Mini App
+
+### Функциональность
+- ✅ **QR-авторизация** - вход через QR-код
+- ✅ **Theme support** - темная/светлая тема
+- ✅ **Responsive design** - адаптивный дизайн
+- ✅ **Error handling** - обработка ошибок
+- ✅ **Session management** - управление сессиями
+
+### Технологии
+- **HTML5** - семантическая разметка
+- **CSS3** - современные стили и анимации
+- **Vanilla JS** - без фреймворков
+- **Telegram WebApp SDK** - интеграция с Telegram
+
+## 🔐 QR Authentication
+
+### Flow
+1. **Пользователь** нажимает /start в боте
+2. **Бот** открывает Mini App
+3. **Mini App** создает QR-сессию
+4. **Пользователь** сканирует QR-код
+5. **Telethon** обрабатывает авторизацию
+6. **Система** сохраняет сессию
+
+### Безопасность
+- **JWT токены** для сессий
+- **Шифрование** StringSession
+- **Ownership check** - проверка владельца
+- **Rate limiting** - защита от спама
+
+## 🛠️ Разработка
+
+### Структура проекта
 ```
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   Caddy Proxy   │    │   API Gateway   │    │   Worker        │
-│   (Port 80/443) │────│   (FastAPI)     │────│   (Redis)       │
-└─────────────────┘    └─────────────────┘    └─────────────────┘
-         │                       │                       │
-         │                       │                       │
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│  Supabase DB    │    │   Redis Streams  │    │   Qdrant        │
-│  (PostgreSQL)   │    │   (Event Bus)    │    │   (Vector DB)   │
-└─────────────────┘    └─────────────────┘    └─────────────────┘
+telegram-assistant/
+├── api/                    # FastAPI приложение
+│   ├── routers/           # API endpoints
+│   ├── bot/               # Telegram bot
+│   ├── models/            # Database models
+│   └── main.py            # FastAPI app
+├── telethon-ingest/       # QR auth service
+│   ├── services/          # Business logic
+│   └── main.py            # Service entry point
+├── webapp/                # Mini App
+│   └── index.html         # Mini App UI
+├── docs/                  # Документация
+├── docker-compose.yml     # Docker services
+└── Caddyfile             # Reverse proxy config
 ```
 
-## 🛠️ Технологический стек
-
-- **Caddy** — reverse proxy с автоматическим HTTPS
-- **FastAPI** — API Gateway
-- **PostgreSQL** — основная база данных (Supabase)
-- **Redis** — кэш и event bus
-- **Qdrant** — векторная база данных
-- **Neo4j** — графовая база данных
-- **Grafana** — мониторинг и дашборды
-
-## 📋 Основные команды
-
+### Команды разработки
 ```bash
-# Запуск всех сервисов
+# Запуск в dev режиме
 docker compose up -d
 
-# Запуск только core сервисов
-docker compose --profile core up -d
+# Просмотр логов
+docker compose logs -f api
+docker compose logs -f telethon-ingest
 
-# Запуск с аналитикой
-docker compose --profile analytics up -d
-
-# Проверка логов
-docker compose logs -f
+# Пересборка сервиса
+docker compose build api
+docker compose up -d api
 
 # Остановка
 docker compose down
 ```
 
-## 🔧 Разработка
+## 📊 Мониторинг
 
-```bash
-# Пересборка сервисов
-docker compose build
+### Health Checks
+- `/health` - общее состояние API
+- `/health/auth` - состояние QR-авторизации
+- `/health/bot` - состояние Telegram бота
 
-# Перезапуск конкретного сервиса
-docker compose restart api
+### Метрики
+- **Prometheus** - сбор метрик
+- **Grafana** - визуализация
+- **Redis** - кеш и сессии
+- **PostgreSQL** - база данных
 
-# Просмотр статуса
-docker compose ps
+### Логирование
+- **Structured logs** - JSON формат
+- **Log levels** - DEBUG, INFO, WARNING, ERROR
+- **Correlation IDs** - трассировка запросов
+- **Performance metrics** - время выполнения
+
+## 🔧 Конфигурация
+
+### Docker Compose
+```yaml
+services:
+  api:
+    build: ./api
+    ports: ["8000:8000"]
+    environment:
+      - DATABASE_URL=postgresql://...
+      - REDIS_URL=redis://...
+  
+  telethon-ingest:
+    build: ./telethon-ingest
+    volumes:
+      - ./telethon-ingest/sessions:/app/sessions
+    environment:
+      - DATABASE_URL=postgresql://...
+      - REDIS_URL=redis://...
 ```
 
-## 📞 Поддержка
+### Caddy Reverse Proxy
+```caddyfile
+produman.studio {
+    handle /tg/bot/* {
+        reverse_proxy api:8000
+    }
+    
+    handle /tg/app/* {
+        root * /app/webapp
+        file_server
+    }
+    
+    handle /tg/qr/* {
+        reverse_proxy api:8000
+    }
+}
+```
 
-При возникновении проблем:
-1. Проверьте [документацию по устранению неполадок](docs/troubleshooting/)
-2. Посмотрите [статус системы](docs/status/)
-3. Обратитесь к [настройке](docs/setup/)
+## 🚀 Деплой
 
----
+### Production
+```bash
+# Настройка production переменных
+export BOT_PUBLIC_URL=https://produman.studio
+export DATABASE_URL=postgresql://user:pass@db:5432/telegram_assistant
 
-**Система готова к работе!** 🚀
+# Запуск production
+docker compose -f docker-compose.yml up -d
+```
+
+### SSL/TLS
+- **Let's Encrypt** - автоматические сертификаты
+- **Caddy** - автоматическое обновление
+- **HSTS** - безопасные заголовки
+- **CSP** - защита от XSS
+
+## 🧪 Тестирование
+
+### Unit Tests
+```bash
+# Запуск тестов
+pytest tests/
+
+# Покрытие кода
+pytest --cov=api tests/
+```
+
+### Integration Tests
+```bash
+# Тестирование API
+curl -X POST https://produman.studio/tg/qr/start \
+  -H "Content-Type: application/json" \
+  -d '{"tenant_id": "123456789"}'
+
+# Тестирование Mini App
+open https://produman.studio/tg/app/
+```
+
+### Load Testing
+```bash
+# Нагрузочное тестирование
+wrk -t12 -c400 -d30s https://produman.studio/health
+```
+
+## 📚 Документация
+
+### API Documentation
+- **OpenAPI/Swagger** - `/docs` endpoint
+- **Postman Collection** - экспорт API
+- **cURL Examples** - примеры запросов
+- **Error Codes** - коды ошибок
+
+### Architecture Docs
+- **Mini App Architecture** - `docs/MINIAPP_ARCHITECTURE.md`
+- **QR Auth Flow** - `docs/QR_AUTH_FLOW.md`
+- **Troubleshooting** - `docs/TROUBLESHOOTING.md`
+- **Deployment Guide** - `docs/DEPLOYMENT.md`
+
+## 🤝 Contributing
+
+### Development Workflow
+1. **Fork** репозиторий
+2. **Create** feature branch
+3. **Commit** изменения
+4. **Push** в fork
+5. **Create** Pull Request
+
+### Code Style
+- **Black** для Python форматирования
+- **ESLint** для JavaScript
+- **Prettier** для HTML/CSS
+- **TypeScript** для типизации
+
+### Git Hooks
+```bash
+# Pre-commit hooks
+pre-commit install
+
+# Pre-push hooks
+pre-push install
+```
+
+## 📄 Лицензия
+
+MIT License - см. [LICENSE](LICENSE) файл.
+
+## 🆘 Поддержка
+
+### Issues
+- **Bug Reports** - GitHub Issues
+- **Feature Requests** - GitHub Discussions
+- **Security Issues** - приватные сообщения
+
+### Community
+- **Telegram** - @telegram_assistant
+- **Discord** - сервер сообщества
+- **Email** - support@produman.studio
+
+## 🎯 Roadmap
+
+### v1.1.0
+- [ ] **Multi-language** поддержка
+- [ ] **Push notifications** для статуса
+- [ ] **Biometric auth** для быстрого входа
+- [ ] **Offline support** для базовой функциональности
+
+### v1.2.0
+- [ ] **Admin panel** для управления
+- [ ] **Analytics dashboard** для метрик
+- [ ] **A/B testing** для экспериментов
+- [ ] **Feature flags** для постепенного внедрения
+
+### v2.0.0
+- [ ] **Microservices** архитектура
+- [ ] **Kubernetes** деплой
+- [ ] **GraphQL** API
+- [ ] **Real-time** уведомления

@@ -26,6 +26,12 @@ class Settings(BaseSettings):
     
     # CORS
     cors_origins: list = ["*"]
+
+    # Bot/Webhook
+    telegram_bot_token: str | None = None
+    bot_webhook_secret: str | None = None
+    bot_public_url: str | None = None
+    default_tenant_id: str | None = None
     
     class Config:
         env_file = ".env"

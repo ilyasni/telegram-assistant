@@ -4,6 +4,7 @@ import asyncio
 import logging
 from typing import List, Optional
 from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, AuthKeyError
 import structlog
 import redis
@@ -30,18 +31,38 @@ class TelegramIngestionService:
     async def start(self):
         """Запуск сервиса."""
         try:
-            # Подключение к БД
-            self.db_connection = psycopg2.connect(settings.database_url)
-            
-            # Инициализация Telegram клиента
-            self.client = TelegramClient(
-                settings.session_name,
-                settings.master_api_id,
-                settings.master_api_hash
+            # Context7 best practice: асинхронное подключение к БД через ThreadPoolExecutor
+            logger.info("Connecting to database...")
+            import asyncio
+            loop = asyncio.get_event_loop()
+            self.db_connection = await loop.run_in_executor(
+                None, 
+                lambda: psycopg2.connect(
+                    settings.database_url,
+                    connect_timeout=10  # таймаут 10 секунд
+                )
             )
+            logger.info("Database connected")
             
+            # Если нет заранее выданной сессии, не запускаем парсинг
+            if not getattr(settings, "master_session_string", None):
+                logger.info("No session_string provided — waiting for QR authorization to complete")
+                return
+
+            # Инициализация Telegram клиента (StringSession)
+            session = StringSession(settings.master_session_string)
+            self.client = TelegramClient(
+                session,
+                settings.master_api_id,
+                settings.master_api_hash,
+                device_model="TelegramAssistant",
+                system_version="Linux",
+                app_version="1.0",
+            )
+
             await self.client.start()
-            logger.info("Telegram client started", user_id=self.client.get_me().id)
+            me = await self.client.get_me()
+            logger.info("Telegram client started", user_id=getattr(me, 'id', None))
             
             # Регистрация обработчиков событий
             self._register_handlers()

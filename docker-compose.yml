@@ -189,6 +189,13 @@ services:
       - redis_data:/data
     networks:
       - telegram-network
+    # Context7 best practice: health check для Redis
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     profiles:
       - core
 
@@ -222,6 +229,7 @@ services:
       - "443:443"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile
+      - ./webapp:/var/www/webapp:ro
       - caddy_data:/data
       - caddy_config:/config
     networks:
@@ -248,8 +256,19 @@ services:
       REDIS_URL: redis://redis:6379
       QDRANT_URL: http://qdrant:6333
       JWT_SECRET: ${JWT_SECRET}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      BOT_WEBHOOK_SECRET: ${BOT_WEBHOOK_SECRET}
+      BOT_PUBLIC_URL: ${BOT_PUBLIC_URL}
+      DEFAULT_TENANT_ID: ${DEFAULT_TENANT_ID}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       ENVIRONMENT: ${ENVIRONMENT:-production}
+      # Context7 best practice: timezone для корректной работы с временем
+      TZ: Europe/Moscow
+    volumes:
+      - ./webapp:/app/webapp:ro
+      # Context7 best practice: монтируем timezone данные хоста
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     depends_on:
       - supabase-db
       - redis
@@ -295,16 +314,41 @@ services:
     environment:
       MASTER_API_ID: ${MASTER_API_ID}
       MASTER_API_HASH: ${MASTER_API_HASH}
-      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@supabase-db:5432/${POSTGRES_DB}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@supabase-db:5432/${POSTGRES_DB}?connect_timeout=5&application_name=telethon-ingest&keepalives=1&keepalives_idle=30&keepalives_interval=10&keepalives_count=3
       REDIS_URL: redis://redis:6379
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       ENVIRONMENT: ${ENVIRONMENT:-production}
+      INGEST_HEALTH_PORT: 8011
+      # Context7 best practice: отладка и логи
+      PYTHONUNBUFFERED: 1
+      PYTHONASYNCIODEBUG: 1
+      # Context7 best practice: timezone для корректной работы с временем
+      TZ: Europe/Moscow
+      # Отключаем прокси на время диагностики
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      ALL_PROXY: ""
+    volumes:
+      - ./telethon-ingest/sessions:/app/sessions  # персистентность сессий
+      # Context7 best practice: монтируем timezone данные хоста
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     depends_on:
-      - supabase-db
-      - redis
+      supabase-db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     networks:
       - telegram-network
-    # Telethon не поднимает HTTP — пока без healthcheck
+    restart: unless-stopped  # автоматический рестарт
+    # Context7 best practice: health check для telethon-ingest на порту 8011
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8011/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
     profiles:
       - core
 

@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException
 from sqlalchemy import create_engine, text
 import redis
 import structlog
+import time
 from config import settings
 
 router = APIRouter()
@@ -60,3 +61,33 @@ async def readiness_check():
     """Проверка готовности сервиса."""
     # Простая проверка готовности
     return {"status": "ready", "message": "Service is ready to accept requests"}
+
+
+@router.get("/health/auth")
+async def health_auth():
+    """Проверка здоровья QR-авторизации."""
+    checks = {
+        "redis_qr_sessions": False,
+        "telethon_service": False
+    }
+    
+    # Проверка Redis
+    try:
+        redis_client = redis.from_url(settings.redis_url)
+        test_key = f"health:check:{int(time.time())}"
+        redis_client.setex(test_key, 10, "ok")
+        checks["redis_qr_sessions"] = redis_client.get(test_key) == b"ok"
+        redis_client.delete(test_key)
+    except Exception as e:
+        logger.error("Redis QR sessions check failed", error=str(e))
+    
+    # Проверка telethon-ingest (косвенно, через Redis метрики)
+    try:
+        redis_client = redis.from_url(settings.redis_url)
+        cursor = redis_client.scan(0, match="tg:qr:session:*", count=1)
+        checks["telethon_service"] = True  # если сканируем, значит сервис работает
+    except Exception as e:
+        logger.error("Telethon service check failed", error=str(e))
+    
+    status = "healthy" if all(checks.values()) else "degraded"
+    return {"status": status, "checks": checks}

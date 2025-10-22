@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>QR Login</title>
+  <style>
+    body { font-family: sans-serif; margin: 24px; }
+    .card { max-width: 520px; margin: 0 auto; padding: 16px; border: 1px solid #ddd; border-radius: 8px; }
+    #qr { display: flex; justify-content: center; margin: 16px 0; }
+    pre { background: #f6f8fa; padding: 8px; border-radius: 6px; overflow-x: auto; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>QR Login</h2>
+    <div id="status">Pending...</div>
+    <div id="qr"></div>
+    <pre id="log"></pre>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
+  <script>
+    const params = new URLSearchParams(location.search);
+    const token = params.get('token');
+    const statusEl = document.getElementById('status');
+    const logEl = document.getElementById('log');
+    const qrEl = document.getElementById('qr');
+    function log(m){ logEl.textContent += m + "\n"; }
+
+    if (!token) {
+      statusEl.textContent = 'Missing token';
+    } else {
+      const sse = new EventSource('/tg/qr/sse?token=' + encodeURIComponent(token));
+      sse.onmessage = (evt) => {
+        try {
+          const data = JSON.parse(evt.data);
+          statusEl.textContent = data.status;
+          if (data.qr_url) {
+            qrEl.innerHTML = '';
+            new QRCode(qrEl, { text: data.qr_url, width: 220, height: 220 });
+          }
+          if (data.status === 'authorized' || data.status === 'failed' || data.status === 'expired') {
+            sse.close();
+          }
+        } catch(e) { log('parse error: ' + e.message); }
+      };
+      sse.onerror = () => { log('sse error'); };
+    }
+  </script>
+</body>
+</html>
+

@@ -5,7 +5,12 @@ WORKDIR /app
 # Установка системных зависимостей
 RUN apt-get update && apt-get install -y \
     gcc \
+    tzdata \
     && rm -rf /var/lib/apt/lists/*
+
+# Context7 best practice: настройка timezone
+ENV TZ=Europe/Moscow
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
 # Копирование requirements и установка зависимостей
 COPY requirements.txt .

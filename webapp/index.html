@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Telegram Assistant</title>
+    
+    <!-- Telegram WebApp SDK -->
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    
+    <!-- Cache-busting для Mini App -->
+    <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    
+    <style>
+        /* CSS переменные для темной/светлой темы */
+        :root {
+            --tg-bg-color: #ffffff;
+            --tg-text-color: #000000;
+            --tg-button-color: #2481cc;
+            --tg-button-text-color: #ffffff;
+            --tg-hint-color: #999999;
+            --tg-link-color: #2481cc;
+            --tg-section-bg-color: #f8f8f8;
+            --tg-header-bg-color: #ffffff;
+            --tg-destructive-color: #ff3b30;
+            --tg-accent-color: #2481cc;
+        }
+        
+        /* Темная тема */
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --tg-bg-color: #17212b;
+                --tg-text-color: #f5f5f5;
+                --tg-button-color: #5288c1;
+                --tg-button-text-color: #ffffff;
+                --tg-hint-color: #708499;
+                --tg-link-color: #6ab3f3;
+                --tg-section-bg-color: #232e3c;
+                --tg-header-bg-color: #17212b;
+                --tg-destructive-color: #ec3942;
+                --tg-accent-color: #6ab2f2;
+            }
+        }
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background-color: var(--tg-bg-color);
+            color: var(--tg-text-color);
+            line-height: 1.4;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .container {
+            max-width: 400px;
+            margin: 0 auto;
+            padding: 20px;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            overflow: hidden;
+        }
+        
+        .header {
+            text-align: center;
+            margin-bottom: 32px;
+        }
+        
+        .header h1 {
+            font-size: 24px;
+            font-weight: 600;
+            margin-bottom: 8px;
+            color: var(--tg-text-color);
+        }
+        
+        .header p {
+            font-size: 16px;
+            color: var(--tg-hint-color);
+        }
+        
+        .status {
+            text-align: center;
+            padding: 16px;
+            border-radius: 12px;
+            margin-bottom: 24px;
+            font-weight: 500;
+            transition: all 0.3s ease;
+            min-height: 60px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        .status.loading {
+            background-color: var(--tg-section-bg-color);
+            color: var(--tg-text-color);
+        }
+        
+        .status.success {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        
+        .status.error {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        
+        .qr-container {
+            text-align: center;
+            margin-bottom: 24px;
+            min-height: 300px;
+            opacity: 0;
+            visibility: hidden;
+            transition: opacity 0.3s ease, visibility 0.3s ease;
+        }
+        
+        .qr-container.show {
+            opacity: 1;
+            visibility: visible;
+        }
+        
+        .qr-code {
+            background-color: var(--tg-section-bg-color);
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 16px;
+            width: 300px;
+            height: 300px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 16px auto;
+        }
+        
+        .qr-code img {
+            width: 260px;
+            height: 260px;
+            border-radius: 8px;
+            object-fit: contain;
+        }
+        
+        .qr-code canvas {
+            width: 260px;
+            height: 260px;
+            border-radius: 8px;
+        }
+        
+        .qr-instructions {
+            color: var(--tg-hint-color);
+            font-size: 14px;
+            margin-top: 12px;
+        }
+        
+        .button {
+            background-color: var(--tg-button-color);
+            color: var(--tg-button-text-color);
+            border: none;
+            border-radius: 12px;
+            padding: 16px 24px;
+            font-size: 16px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            width: 100%;
+            margin-top: 16px;
+            min-height: 56px;
+            opacity: 0;
+            visibility: hidden;
+            transition: opacity 0.3s ease, visibility 0.3s ease;
+        }
+        
+        .button.show {
+            opacity: 1;
+            visibility: visible;
+        }
+        
+        .button:hover {
+            opacity: 0.9;
+            transform: translateY(-1px);
+        }
+        
+        .button:active {
+            transform: translateY(0);
+        }
+        
+        .button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .error-message {
+            color: var(--tg-destructive-color);
+            font-size: 14px;
+            margin-top: 8px;
+        }
+        
+        /* Адаптивность для разных размеров экрана */
+        @media (max-width: 480px) {
+            .container {
+                padding: 16px;
+            }
+            
+            .header h1 {
+                font-size: 20px;
+            }
+            
+            .qr-code {
+                padding: 16px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🔐 Авторизация</h1>
+            <p>Войдите в систему через QR-код</p>
+        </div>
+
+        <div id="status" class="status loading">
+            Инициализация...
+        </div>
+
+        <div id="qr-container" class="qr-container">
+            <div class="qr-code" id="qr-code">
+                <div style="color: var(--tg-hint-color); font-size: 16px;">Загрузка QR-кода...</div>
+            </div>
+            <div class="qr-instructions">
+                Отсканируйте QR-код в Telegram
+            </div>
+        </div>
+
+        <button id="cancel-btn" class="button" onclick="cancelAuth()">
+            Отменить
+        </button>
+    </div>
+
+    <script>
+        (function() {
+            'use strict';
+            
+            const API_BASE = 'https://produman.studio';
+            let sessionToken = null;
+            let statusCheckInterval = null;
+            let isInitialized = false;
+            
+            // Получение theme parameters от Telegram
+            function getThemeColors() {
+                if (window.Telegram && window.Telegram.WebApp && window.Telegram.WebApp.themeParams) {
+                    const theme = window.Telegram.WebApp.themeParams;
+                    return {
+                        bgColor: theme.bg_color || '#ffffff',
+                        textColor: theme.text_color || '#000000',
+                        buttonColor: theme.button_color || '#2481cc',
+                        buttonTextColor: theme.button_text_color || '#ffffff',
+                        hintColor: theme.hint_color || '#999999',
+                        linkColor: theme.link_color || '#2481cc',
+                        sectionBgColor: theme.section_bg_color || '#f8f8f8',
+                        headerBgColor: theme.header_bg_color || '#ffffff',
+                        destructiveColor: theme.destructive_text_color || '#ff3b30',
+                        accentColor: theme.accent_text_color || '#2481cc'
+                    };
+                }
+                return null;
+            }
+            
+            // Применение theme colors
+            function applyTheme() {
+                const theme = getThemeColors();
+                if (theme) {
+                    const root = document.documentElement;
+                    root.style.setProperty('--tg-bg-color', theme.bgColor);
+                    root.style.setProperty('--tg-text-color', theme.textColor);
+                    root.style.setProperty('--tg-button-color', theme.buttonColor);
+                    root.style.setProperty('--tg-button-text-color', theme.buttonTextColor);
+                    root.style.setProperty('--tg-hint-color', theme.hintColor);
+                    root.style.setProperty('--tg-link-color', theme.linkColor);
+                    root.style.setProperty('--tg-section-bg-color', theme.sectionBgColor);
+                    root.style.setProperty('--tg-header-bg-color', theme.headerBgColor);
+                    root.style.setProperty('--tg-destructive-color', theme.destructiveColor);
+                    root.style.setProperty('--tg-accent-color', theme.accentColor);
+                }
+            }
+            
+            // Инициализация Telegram WebApp
+            function initTelegramWebApp() {
+                if (window.Telegram && window.Telegram.WebApp) {
+                    window.Telegram.WebApp.ready();
+                    window.Telegram.WebApp.expand();
+                    
+                    // Настройка header и background
+                    window.Telegram.WebApp.setHeaderColor('bg_color');
+                    window.Telegram.WebApp.setBackgroundColor('bg_color');
+                    
+                    // Применение темы
+                    applyTheme();
+                    
+                    // Слушатель изменений темы
+                    if (window.Telegram.WebApp.onEvent) {
+                        window.Telegram.WebApp.onEvent('themeChanged', applyTheme);
+                    }
+                }
+            }
+            
+            // Обновление статуса
+            function updateStatus(message, type = 'loading') {
+                const statusEl = document.getElementById('status');
+                statusEl.textContent = message;
+                statusEl.className = `status ${type}`;
+            }
+            
+            // Показ/скрытие QR
+            function showQR() {
+                document.getElementById('qr-container').classList.add('show');
+                document.getElementById('cancel-btn').classList.add('show');
+            }
+            
+            function hideQR() {
+                document.getElementById('qr-container').classList.remove('show');
+                document.getElementById('cancel-btn').classList.remove('show');
+            }
+            
+            // Создание сессии
+            async function createSession() {
+                try {
+                    updateStatus('Создание сессии...', 'loading');
+                    
+                    const response = await fetch(`${API_BASE}/tg/qr/start`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Cache-Control': 'no-cache, no-store, must-revalidate',
+                            'Pragma': 'no-cache'
+                        },
+                        body: JSON.stringify({ tenant_id: '139883458' })
+                    });
+                    
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                    }
+                    
+                    const data = await response.json();
+                    sessionToken = data.session_token;
+                    
+                    // Обновление URL без перезагрузки
+                    const url = new URL(location.href);
+                    url.searchParams.set('session_id', sessionToken);
+                    history.replaceState(null, '', url.toString());
+                    
+                    // Показ QR сразу если доступен
+                    if (data.qr_url) {
+                        showQR();
+                        renderQR(data.qr_url);
+                        updateStatus('Отсканируйте QR-код в Telegram', 'loading');
+                    } else {
+                        updateStatus('Ожидание QR-кода...', 'loading');
+                    }
+                    
+                    return data;
+                } catch (error) {
+                    console.error('Create session error:', error);
+                    updateStatus(`Ошибка: ${error.message}`, 'error');
+                    throw error;
+                }
+            }
+            
+            // Рендеринг QR-кода
+            function renderQR(qrUrl) {
+                const qrCodeDiv = document.getElementById('qr-code');
+                
+                const img = document.createElement('img');
+                img.style.width = '260px';
+                img.style.height = '260px';
+                img.style.borderRadius = '8px';
+                img.style.objectFit = 'contain';
+                
+                img.onload = () => {
+                    console.log('✅ QR Code loaded successfully');
+                    qrCodeDiv.innerHTML = '';
+                    qrCodeDiv.appendChild(img);
+                };
+                
+                img.onerror = () => {
+                    console.error('❌ QR Code load failed');
+                    qrCodeDiv.innerHTML = '<div style="color: var(--tg-destructive-color); font-size: 16px;">Ошибка загрузки QR-кода</div>';
+                };
+                
+                img.src = `${API_BASE}/tg/qr/png/${sessionToken}?t=${Date.now()}`;
+            }
+            
+            // Проверка статуса
+            async function checkStatus() {
+                if (!sessionToken) return;
+                
+                try {
+                    const response = await fetch(`${API_BASE}/tg/qr/status`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Cache-Control': 'no-cache, no-store, must-revalidate',
+                            'Pragma': 'no-cache'
+                        },
+                        body: JSON.stringify({ session_token: sessionToken })
+                    });
+                    
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                    }
+                    
+                    const data = await response.json();
+                    
+                    if (data.status === 'authorized') {
+                        updateStatus('✅ Авторизация успешна!', 'success');
+                        hideQR();
+                        clearInterval(statusCheckInterval);
+                        
+                        setTimeout(() => {
+                            if (window.Telegram && window.Telegram.WebApp) {
+                                window.Telegram.WebApp.close();
+                            }
+                        }, 2000);
+                        
+                    } else if (data.status === 'failed') {
+                        updateStatus(`❌ Ошибка: ${data.reason || 'Неизвестная ошибка'}`, 'error');
+                        hideQR();
+                        clearInterval(statusCheckInterval);
+                        
+                    } else if (data.status === 'expired') {
+                        updateStatus('⏰ Сессия истекла', 'error');
+                        hideQR();
+                        clearInterval(statusCheckInterval);
+                        
+                    } else if (data.qr_url) {
+                        showQR();
+                        renderQR(data.qr_url);
+                        
+                        if (data.status === 'awaiting_scan') {
+                            updateStatus('Отсканируйте QR-код в Telegram', 'loading');
+                        } else if (data.status === 'in_progress') {
+                            updateStatus('Подключение к Telegram...', 'loading');
+                        } else {
+                            updateStatus('Готово к сканированию', 'loading');
+                        }
+                    } else if (data.status === 'pending') {
+                        updateStatus('Ожидание QR-кода...', 'loading');
+                    } else if (data.status === 'in_progress') {
+                        updateStatus('Подключение к Telegram...', 'loading');
+                    }
+                    
+                } catch (error) {
+                    console.error('Status check error:', error);
+                    updateStatus(`Ошибка проверки статуса: ${error.message}`, 'error');
+                    clearInterval(statusCheckInterval);
+                }
+            }
+            
+            // Отмена авторизации
+            async function cancelAuth() {
+                if (sessionToken) {
+                    try {
+                        await fetch(`${API_BASE}/tg/qr/cancel`, {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                            },
+                            body: JSON.stringify({ session_token: sessionToken })
+                        });
+                    } catch (error) {
+                        console.error('Cancel auth error:', error);
+                    }
+                }
+                
+                hideQR();
+                updateStatus('Авторизация отменена', 'loading');
+                clearInterval(statusCheckInterval);
+            }
+            
+            // Инициализация при загрузке
+            document.addEventListener('DOMContentLoaded', async () => {
+                if (isInitialized) return;
+                isInitialized = true;
+                
+                initTelegramWebApp();
+                
+                const urlParams = new URLSearchParams(location.search);
+                const existingSessionId = urlParams.get('session_id');
+                
+                if (existingSessionId) {
+                    sessionToken = existingSessionId;
+                    updateStatus('Проверка сессии...', 'loading');
+                    showQR();
+                    statusCheckInterval = setInterval(checkStatus, 2000);
+                } else {
+                    try {
+                        await createSession();
+                        statusCheckInterval = setInterval(checkStatus, 2000);
+                    } catch (error) {
+                        console.error('Initialization error:', error);
+                    }
+                }
+            });
+            
+            // Глобальные функции для кнопок
+            window.cancelAuth = cancelAuth;
+            
+        })();
+    </script>
+</body>
+</html>
