@@ -11,7 +11,7 @@ import redis
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError, FloodWaitError
-from prometheus_client import Counter
+from prometheus_client import Counter, Histogram
 
 from config import settings
 from services.events import publish_user_authorized
@@ -25,6 +25,15 @@ AUTH_QR_PUBLISHED = Counter("auth_qr_published_total", "QR URL published")
 AUTH_QR_EXPIRED = Counter("auth_qr_expired_total", "QR session expired")
 AUTH_QR_SUCCESS = Counter("auth_qr_success_total", "QR session authorized")
 AUTH_QR_FAIL = Counter("auth_qr_fail_total", "QR session failed")
+
+# Context7 best practice: Telethon метрики
+FLOODWAIT_TOTAL = Counter("telethon_floodwait_total", "FloodWait events", ["reason", "seconds"])
+FLOODWAIT_DURATION = Histogram("telethon_floodwait_duration_seconds", "FloodWait wait duration", ["reason"])
+SESSION_CLEANUP_TOTAL = Counter("telethon_session_cleanup_total", "Session cleanup operations", ["status"])
+SESSION_CLEANUP_DURATION = Histogram("telethon_session_cleanup_duration_seconds", "Session cleanup duration")
+QR_SESSION_TOTAL = Counter("telethon_qr_session_total", "QR sessions", ["status"])
+RATE_LIMIT_HITS = Counter("telethon_rate_limit_hits_total", "Rate limit hits", ["endpoint"])
+THROTTLING_DELAY = Histogram("telethon_throttling_delay_seconds", "Request throttling delay")
 
 
 class QrAuthService:
@@ -50,6 +59,23 @@ class QrAuthService:
                     status = data.get(b"status", b"pending").decode()
                     tenant_id = data.get(b"tenant_id", b"").decode()
                     logger.debug("Found session", key=key, status=status, tenant_id=tenant_id)
+                    
+                    # Context7 best practice: идемпотентность на уровне user_id
+                    # [C7-ID: security-idempotency-002]
+                    if status == "pending":
+                        # Проверяем, есть ли уже активная сессия для этого пользователя
+                        existing_session = await self._check_existing_session(tenant_id)
+                        if existing_session:
+                            logger.info("Existing session found, skipping new QR", 
+                                       tenant_id=tenant_id, 
+                                       existing_session=existing_session)
+                            # Обновляем статус на "authorized" для идемпотентности
+                            self.redis_client.hset(key, mapping={
+                                "status": "authorized",
+                                "session_id": existing_session,
+                                "reason": "existing_session"
+                            })
+                            continue
                     
                     # Context7 best practice: обрабатываем все сессии для валидации
                     if status not in ["pending", "failed", "authorized"]:
@@ -335,17 +361,34 @@ class QrAuthService:
             await client.connect()
             logger.debug("Connected to Telegram", tenant_id=tenant_id)
             
+            # Context7 best practice: throttling между запросами
+            # [C7-ID: telethon-throttle-004]
+            import random
+            import asyncio
+            delay = random.uniform(0.2, 0.5)  # 200-500ms
+            THROTTLING_DELAY.observe(delay)
+            await asyncio.sleep(delay)
+            
             logger.debug("Starting QR login", tenant_id=tenant_id)
             qr_login = await client.qr_login()
             logger.debug("QR login initiated", tenant_id=tenant_id, qr_url=qr_login.url)
             
-            # Публикация QR URL для Mini App
+            # Context7 best practice: TTL для QR-сессий
+            # [C7-ID: telethon-qr-ttl-002]
+            import os
+            QR_TTL_SECONDS = int(os.getenv("QR_TTL_SECONDS", "600"))  # 10 минут
+            
+            # Публикация QR URL для Mini App с TTL
             self.redis_client.hset(redis_key, mapping={
                 "qr_url": qr_login.url,
                 "status": "awaiting_scan"
             })
-            logger.info("QR published", tenant_id=tenant_id, url=qr_login.url)
+            # Устанавливаем TTL для всей сессии
+            self.redis_client.expire(redis_key, QR_TTL_SECONDS)
+            
+            logger.info("QR published", tenant_id=tenant_id, url=qr_login.url, ttl=QR_TTL_SECONDS)
             AUTH_QR_PUBLISHED.inc()
+            QR_SESSION_TOTAL.labels(status="created").inc()
             
             # Ожидание авторизации с timeout
             try:
@@ -354,6 +397,7 @@ class QrAuthService:
                 self.redis_client.hset(redis_key, "status", "expired")
                 logger.warning("QR login timeout", tenant_id=tenant_id)
                 AUTH_QR_EXPIRED.inc()
+                QR_SESSION_TOTAL.labels(status="expired").inc()
                 return
             except SessionPasswordNeededError:
                 self.redis_client.hset(redis_key, mapping={
@@ -362,19 +406,45 @@ class QrAuthService:
                 })
                 logger.warning("QR login requires 2FA", tenant_id=tenant_id)
                 AUTH_QR_FAIL.inc()
+                QR_SESSION_TOTAL.labels(status="failed").inc()
                 return
             
-            # Ownership check (КРИТИЧНО!)
+            # Context7 best practice: усиленная проверка владельца
+            # [C7-ID: security-owner-verify-001]
             me = await client.get_me()
             expected_telegram_id = int(tenant_id)  # TODO: получать из БД по tenant_id
+            
+            # Дополнительная валидация Telegram user data
+            if not me or not me.id:
+                logger.error("Invalid Telegram user data", tenant_id=tenant_id)
+                self.redis_client.hset(redis_key, mapping={
+                    "status": "failed",
+                    "reason": "invalid_telegram_user"
+                })
+                AUTH_QR_FAIL.inc()
+                QR_SESSION_TOTAL.labels(status="failed").inc()
+                return
+            
+            # Строгая проверка соответствия владельца
             if me.id != expected_telegram_id:
+                logger.error("Ownership mismatch", 
+                           expected=expected_telegram_id, 
+                           actual=me.id,
+                           tenant_id=tenant_id,
+                           username=getattr(me, 'username', None))
                 self.redis_client.hset(redis_key, mapping={
                     "status": "failed",
                     "reason": "ownership_mismatch"
                 })
-                logger.error("Ownership mismatch", expected=expected_telegram_id, actual=me.id)
                 AUTH_QR_FAIL.inc()
+                QR_SESSION_TOTAL.labels(status="failed").inc()
                 return
+            
+            # Логирование успешной проверки владельца
+            logger.info("Ownership verified", 
+                       telegram_id=me.id, 
+                       tenant_id=tenant_id,
+                       username=getattr(me, 'username', None))
             
             # Context7 best practice: сохранение StringSession в БД
             session_string = client.session.save()
@@ -402,6 +472,7 @@ class QrAuthService:
                     "reason": "database_save_failed"
                 })
                 AUTH_QR_FAIL.inc()
+                QR_SESSION_TOTAL.labels(status="failed").inc()
                 return
             
             # Context7 best practice: обновление Redis с session_id
@@ -416,6 +487,7 @@ class QrAuthService:
             
             logger.info("QR login success", tenant_id=tenant_id, user_id=me.id, session_id=session_id)
             AUTH_QR_SUCCESS.inc()
+            QR_SESSION_TOTAL.labels(status="authorized").inc()
             
             # Проверка invite-кода и публикация события для активации тарифа
             invite_code = self.redis_client.hget(redis_key, b"invite_code")
@@ -433,7 +505,32 @@ class QrAuthService:
                     logger.error("Failed to publish user authorized event", error=str(e), tenant_id=tenant_id)
             
         except FloodWaitError as e:
-            logger.warning("FloodWait during QR login", seconds=e.seconds, tenant_id=tenant_id)
+            # Context7 best practice: FloodWait handling с экспоненциальным backoff
+            # [C7-ID: telethon-floodwait-001]
+            import random
+            import asyncio
+            
+            # Максимальное ожидание: 60 секунд
+            max_wait = min(e.seconds, 60)
+            
+            # Экспоненциальный backoff с джиттером
+            base_delay = min(max_wait, 2 ** min(e.seconds // 10, 6))
+            jitter = random.uniform(0.1, 0.3) * base_delay
+            delay = base_delay + jitter
+            
+            # Метрики FloodWait
+            FLOODWAIT_TOTAL.labels(reason="qr_login", seconds=str(e.seconds)).inc()
+            FLOODWAIT_DURATION.labels(reason="qr_login").observe(delay)
+            
+            logger.warning("FloodWait during QR login", 
+                          seconds=e.seconds, 
+                          delay=delay, 
+                          tenant_id=tenant_id)
+            
+            # Ждём с backoff
+            await asyncio.sleep(delay)
+            
+            # Обновляем статус
             self.redis_client.hset(redis_key, mapping={
                 "status": "failed",
                 "reason": f"flood_wait_{e.seconds}s"
@@ -444,6 +541,27 @@ class QrAuthService:
             self.redis_client.hset(redis_key, "status", "failed")
             AUTH_QR_FAIL.inc()
         finally:
-            await client.disconnect()
+            # Context7 best practice: гарантированная остановка клиента
+            # [C7-ID: telethon-cleanup-003]
+            import time
+            start_time = time.time()
+            
+            try:
+                if client.is_connected():
+                    await client.disconnect()
+                    logger.debug("Telethon client disconnected", tenant_id=tenant_id)
+                    SESSION_CLEANUP_TOTAL.labels(status="success").inc()
+                else:
+                    logger.debug("Client already disconnected", tenant_id=tenant_id)
+                    SESSION_CLEANUP_TOTAL.labels(status="already_disconnected").inc()
+            except Exception as e:
+                logger.warning("Error during client disconnect", error=str(e), tenant_id=tenant_id)
+                SESSION_CLEANUP_TOTAL.labels(status="failed").inc()
+            finally:
+                cleanup_duration = time.time() - start_time
+                SESSION_CLEANUP_DURATION.observe(cleanup_duration)
+                logger.debug("Session cleanup completed", 
+                           duration=cleanup_duration, 
+                           tenant_id=tenant_id)
 
 

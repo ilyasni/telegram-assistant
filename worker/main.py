@@ -1,29 +1,20 @@
-"""Основной модуль Worker сервиса."""
+"""Worker для обработки событий Telegram Assistant.
 
-print("=== WORKER MAIN.PY: TOP OF FILE ===", flush=True)
+Реализует event-driven архитектуру с использованием Redis Streams.
+"""
 
 import asyncio
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+import os
 import signal
-import sys
-
-print("=== WORKER MAIN.PY: BASIC IMPORTS DONE ===", flush=True)
-
 import structlog
-print("=== WORKER MAIN.PY: STRUCTLOG IMPORTED ===", flush=True)
+from typing import Dict, Any
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
-from tasks.indexing import IndexingService
-print("=== WORKER MAIN.PY: INDEXING SERVICE IMPORTED ===", flush=True)
-
+from event_bus import init_event_bus, get_event_publisher
 from config import settings
-print("=== WORKER MAIN.PY: CONFIG IMPORTED ===", flush=True)
 
 # Настройка логирования
-import logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-
 structlog.configure(
     processors=[
         structlog.stdlib.filter_by_level,
@@ -31,9 +22,6 @@ structlog.configure(
         structlog.stdlib.add_log_level,
         structlog.stdlib.PositionalArgumentsFormatter(),
         structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.StackInfoRenderer(),
-        structlog.processors.format_exc_info,
-        structlog.processors.UnicodeDecoder(),
         structlog.processors.JSONRenderer()
     ],
     context_class=dict,
@@ -43,111 +31,241 @@ structlog.configure(
 )
 
 logger = structlog.get_logger()
-print("=== WORKER MAIN.PY: LOGGING CONFIGURED ===", flush=True)
 
 
-class WorkerApp:
-    """Основное приложение Worker."""
+class EventWorker:
+    """Worker для обработки событий."""
     
     def __init__(self):
-        self.indexing_service = IndexingService()
-        self.is_running = False
+        self.running = False
+        self.db_connection = None
+        self.event_bus = None
     
     async def start(self):
-        """Запуск приложения."""
+        """Запуск worker'а."""
+        self.running = True
+        logger.info("Event worker starting...")
+        
         try:
-            print("Starting Worker service...", flush=True)
-            logger.info("Starting Worker service", 
-                       environment=settings.environment,
-                       log_level=settings.log_level)
+            # Инициализация БД подключения
+            await self._init_db()
             
-            print("Initializing indexing service...", flush=True)
-            await self.indexing_service.initialize()
-            print("Indexing service initialized", flush=True)
+            # Инициализация event bus
+            await init_event_bus(settings.redis_url, self.db_connection)
+            self.event_bus = await get_event_publisher()
             
-            self.is_running = True
+            # Регистрация consumer'ов
+            self._register_consumers()
             
-            # Запуск легкого HTTP-сервера для health/metrics
-            print("Starting HTTP server...", flush=True)
-            self._start_http_server()
-            print("HTTP server started", flush=True)
-
-            # Запуск обработки событий
-            print("Starting event processing...", flush=True)
-            await self.indexing_service.start_processing()
+            logger.info("Event worker started successfully")
             
-        except KeyboardInterrupt:
-            logger.info("Received shutdown signal")
+            # Основной цикл
+            while self.running:
+                await asyncio.sleep(1)
+                
         except Exception as e:
-            logger.error("Fatal error", error=str(e))
-            print(f"Fatal error: {e}", flush=True)
-            sys.exit(1)
+            logger.error("Failed to start event worker", error=str(e))
+            raise
         finally:
             await self.stop()
     
     async def stop(self):
-        """Остановка приложения."""
-        if self.is_running:
-            logger.info("Stopping Worker service")
-            await self.indexing_service.stop()
-            self.is_running = False
-
-    # --- Встроенный HTTP-сервер ---
-    def _start_http_server(self):
-        request_count = Counter('worker_http_requests_total', 'Total HTTP requests', ['path'])
-        request_latency = Histogram('worker_http_request_duration_seconds', 'HTTP request duration seconds', ['path'])
-
-        class Handler(BaseHTTPRequestHandler):
-            def do_GET(self_inner):
-                path = self_inner.path
-                with request_latency.labels(path).time():
-                    if path == '/health':
-                        self_inner.send_response(200)
-                        self_inner.send_header('Content-Type', 'application/json')
-                        self_inner.end_headers()
-                        self_inner.wfile.write(b'{"status":"healthy"}')
-                    elif path == '/metrics':
-                        data = generate_latest()
-                        self_inner.send_response(200)
-                        self_inner.send_header('Content-Type', CONTENT_TYPE_LATEST)
-                        self_inner.end_headers()
-                        self_inner.wfile.write(data)
-                    else:
-                        self_inner.send_response(404)
-                        self_inner.end_headers()
-                request_count.labels(path).inc()
-
-            def log_message(self_inner, format, *args):  # noqa: N802
-                return
-
-        def run_server():
-            httpd = HTTPServer(('0.0.0.0', 8000), Handler)
-            httpd.serve_forever()
-
-        thread = threading.Thread(target=run_server, daemon=True)
-        thread.start()
+        """Остановка worker'а."""
+        self.running = False
+        logger.info("Event worker stopping...")
+        
+        if self.db_connection:
+            self.db_connection.close()
+        
+        logger.info("Event worker stopped")
     
-    async def _wait_for_shutdown(self):
-        """Ожидание сигналов завершения."""
-        def signal_handler(signum, frame):
-            logger.info("Received signal", signal=signum)
-            asyncio.create_task(self.stop())
+    async def _init_db(self):
+        """Инициализация подключения к БД."""
+        try:
+            self.db_connection = psycopg2.connect(settings.database_url)
+            logger.info("Database connection established")
+        except Exception as e:
+            logger.error("Failed to connect to database", error=str(e))
+            raise
+    
+    def _register_consumers(self):
+        """Регистрация consumer'ов для обработки событий."""
+        # Consumer для RAG индексации
+        self.event_bus.register_consumer("rag-indexer", self._handle_rag_indexing)
         
-        # Регистрация обработчиков сигналов
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
+        # Consumer для webhook уведомлений
+        self.event_bus.register_consumer("webhook-notifier", self._handle_webhook_notifications)
         
-        # Ожидание завершения
-        while self.is_running:
-            await asyncio.sleep(1)
+        # Consumer для тегирования
+        self.event_bus.register_consumer("tagging", self._handle_tagging)
+        
+        # Consumer для аналитики
+        self.event_bus.register_consumer("analytics", self._handle_analytics)
+        
+        logger.info("Event consumers registered")
+    
+    async def _handle_rag_indexing(self, event: Dict[str, Any]):
+        """Обработка событий для RAG индексации."""
+        try:
+            event_type = event["event_type"]
+            
+            if event_type == "channel.parsing.completed":
+                await self._index_channel_posts(event)
+            elif event_type == "rag.query.completed":
+                await self._update_query_analytics(event)
+            else:
+                logger.debug("Unhandled event type for RAG indexing", event_type=event_type)
+                
+        except Exception as e:
+            logger.error("Failed to handle RAG indexing event", 
+                        event_id=event.get("event_id"),
+                        error=str(e))
+            raise
+    
+    async def _handle_webhook_notifications(self, event: Dict[str, Any]):
+        """Обработка событий для webhook уведомлений."""
+        try:
+            event_type = event["event_type"]
+            
+            if event_type == "auth.login.authorized":
+                await self._notify_user_authorized(event)
+            elif event_type == "channel.parsing.completed":
+                await self._notify_parsing_completed(event)
+            else:
+                logger.debug("Unhandled event type for webhook notifications", event_type=event_type)
+                
+        except Exception as e:
+            logger.error("Failed to handle webhook notification event", 
+                        event_id=event.get("event_id"),
+                        error=str(e))
+            raise
+    
+    async def _handle_tagging(self, event: Dict[str, Any]):
+        """Обработка событий для тегирования."""
+        try:
+            event_type = event["event_type"]
+            
+            if event_type == "channel.parsing.completed":
+                await self._tag_channel_posts(event)
+            else:
+                logger.debug("Unhandled event type for tagging", event_type=event_type)
+                
+        except Exception as e:
+            logger.error("Failed to handle tagging event", 
+                        event_id=event.get("event_id"),
+                        error=str(e))
+            raise
+    
+    async def _handle_analytics(self, event: Dict[str, Any]):
+        """Обработка событий для аналитики."""
+        try:
+            # Логирование события для аналитики
+            logger.info("Analytics event", 
+                       event_type=event["event_type"],
+                       tenant_id=event.get("tenant_id"),
+                       user_id=event.get("user_id"),
+                       correlation_id=event.get("correlation_id"))
+            
+            # TODO: Реализовать сохранение в аналитическую БД
+            
+        except Exception as e:
+            logger.error("Failed to handle analytics event", 
+                        event_id=event.get("event_id"),
+                        error=str(e))
+            raise
+    
+    async def _index_channel_posts(self, event: Dict[str, Any]):
+        """Индексация постов канала в RAG."""
+        payload = event["payload"]
+        channel_id = payload["channel_id"]
+        posts_parsed = payload["posts_parsed"]
+        
+        logger.info("Indexing channel posts", 
+                   channel_id=channel_id,
+                   posts_parsed=posts_parsed)
+        
+        # TODO: Реализовать индексацию в Qdrant
+        # 1. Получить посты из БД
+        # 2. Создать embeddings
+        # 3. Сохранить в Qdrant
+        
+        logger.info("Channel posts indexed successfully", channel_id=channel_id)
+    
+    async def _update_query_analytics(self, event: Dict[str, Any]):
+        """Обновление аналитики запросов."""
+        payload = event["payload"]
+        query_id = payload["query_id"]
+        processing_time = payload["processing_time_ms"]
+        
+        logger.info("Updating query analytics", 
+                   query_id=query_id,
+                   processing_time=processing_time)
+        
+        # TODO: Реализовать сохранение аналитики запросов
+    
+    async def _notify_user_authorized(self, event: Dict[str, Any]):
+        """Уведомление о авторизации пользователя."""
+        payload = event["payload"]
+        user_id = payload.get("user_id")
+        tenant_id = event["tenant_id"]
+        
+        logger.info("Notifying user authorized", 
+                   user_id=user_id,
+                   tenant_id=tenant_id)
+        
+        # TODO: Реализовать отправку webhook уведомления
+        # 1. Получить webhook URL из настроек tenant
+        # 2. Отправить POST запрос с данными события
+    
+    async def _notify_parsing_completed(self, event: Dict[str, Any]):
+        """Уведомление о завершении парсинга."""
+        payload = event["payload"]
+        channel_id = payload["channel_id"]
+        posts_parsed = payload["posts_parsed"]
+        
+        logger.info("Notifying parsing completed", 
+                   channel_id=channel_id,
+                   posts_parsed=posts_parsed)
+        
+        # TODO: Реализовать отправку webhook уведомления
+    
+    async def _tag_channel_posts(self, event: Dict[str, Any]):
+        """Тегирование постов канала."""
+        payload = event["payload"]
+        channel_id = payload["channel_id"]
+        posts_parsed = payload["posts_parsed"]
+        
+        logger.info("Tagging channel posts", 
+                   channel_id=channel_id,
+                   posts_parsed=posts_parsed)
+        
+        # TODO: Реализовать автоматическое тегирование
+        # 1. Получить посты из БД
+        # 2. Применить ML модели для тегирования
+        # 3. Сохранить теги в БД
 
 
 async def main():
-    """Точка входа в приложение."""
-    print("Worker starting...", flush=True)
-    app = WorkerApp()
-    print("Worker app created", flush=True)
-    await app.start()
+    """Главная функция worker'а."""
+    worker = EventWorker()
+    
+    # Обработка сигналов для graceful shutdown
+    def signal_handler(signum, frame):
+        logger.info("Received signal, shutting down...", signal=signum)
+        asyncio.create_task(worker.stop())
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    try:
+        await worker.start()
+    except KeyboardInterrupt:
+        logger.info("Received keyboard interrupt")
+    except Exception as e:
+        logger.error("Worker failed", error=str(e))
+        raise
+    finally:
+        await worker.stop()
 
 
 if __name__ == "__main__":

@@ -98,25 +98,93 @@ telegram-assistant/
 ├── webapp/                # Mini App
 │   └── index.html         # Mini App UI
 ├── docs/                  # Документация
+│   ├── ENV_CHECKLIST.md   # Контрольный список окружения
+│   ├── API_CONTRACTS.md   # API контракты
+│   └── TESTING_GUIDE.md   # Руководство по тестированию
+├── scripts/               # Утилиты
+│   ├── diagnostic.sh      # Диагностика системы
+│   ├── monitor.sh         # Мониторинг логов
+│   └── invites_cli.py     # CLI для инвайт-кодов
 ├── docker-compose.yml     # Docker services
+├── Makefile              # Автоматизация задач
 └── Caddyfile             # Reverse proxy config
 ```
 
 ### Команды разработки
 ```bash
-# Запуск в dev режиме
-docker compose up -d
+# Диагностика системы
+make diag
+# или
+bash scripts/diagnostic.sh
 
-# Просмотр логов
-docker compose logs -f api
-docker compose logs -f telethon-ingest
+# Мониторинг логов
+make monitor
+# или
+bash scripts/monitor.sh
+
+# Запуск в dev режиме
+make dev
+# или
+docker compose --profile core up -d
+
+# Просмотр логов конкретного сервиса
+make logs-api
+make logs-telethon
+make logs-redis
 
 # Пересборка сервиса
 docker compose build api
 docker compose up -d api
 
 # Остановка
+make down
+# или
 docker compose down
+```
+
+### Управление инвайт-кодами
+```bash
+# Создание инвайта
+python scripts/invites_cli.py create --tenant <uuid> --role user --limit 10 --expires 2025-12-31T23:59:59Z
+
+# Отзыв инвайта
+python scripts/invites_cli.py revoke --code ABC123XYZ456
+
+# Список инвайтов
+python scripts/invites_cli.py list --tenant <uuid> --status active
+
+# Информация об инвайте
+python scripts/invites_cli.py get --code ABC123XYZ456
+```
+
+## 🔌 API
+
+### Документация
+- **Swagger UI**: `https://your-domain.com/docs`
+- **ReDoc**: `https://your-domain.com/redoc`
+- **API Контракты**: [docs/API_CONTRACTS.md](docs/API_CONTRACTS.md)
+
+### Основные endpoints
+- **QR Авторизация**: `/tg/qr/*` (алиасы `/qr-auth/*`)
+- **Пользователи**: `/api/users/*`
+- **Каналы**: `/api/channels/*`
+- **RAG Поиск**: `/api/rag/query`
+- **Администрирование**: `/api/admin/*`
+
+### Примеры использования
+```bash
+# Создание QR-сессии
+curl -X POST "https://your-domain.com/api/tg/qr/start" \
+  -H "Content-Type: application/json" \
+  -d '{"telegram_user_id": "123456789", "invite_code": "ABC123XYZ456"}'
+
+# Проверка статуса QR
+curl "https://your-domain.com/api/tg/qr/status/550e8400-e29b-41d4-a716-446655440000"
+
+# RAG-поиск
+curl -X POST "https://your-domain.com/api/rag/query" \
+  -H "Authorization: Bearer <jwt_token>" \
+  -d '{"query": "Что нового в ИИ?", "user_id": "uuid"}'
 ```
 
 ## 📊 Мониторинг

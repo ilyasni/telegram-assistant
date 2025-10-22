@@ -1,0 +1,126 @@
+# Grafana алёрты для QR Auth Funnel
+# Импорт в Grafana: Alerting > Alert Rules > Import
+
+groups:
+  - name: qr_auth_funnel
+    rules:
+      - alert: QRSuccessRateLow
+        expr: sum(rate(auth_qr_success_total[5m])) / sum(rate(auth_qr_start_total[5m])) * 100 < 10
+        for: 5m
+        labels:
+          severity: critical
+          service: qr_auth
+        annotations:
+          summary: "QR Auth success rate is critically low"
+          description: "QR authorization success rate is {{ $value }}%, which is below the 10% threshold"
+          runbook_url: "https://docs.telegram-assistant.com/runbooks/qr-auth-low-success-rate"
+
+      - alert: HighFloodWaitRate
+        expr: rate(telethon_floodwait_total[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+          service: telethon
+        annotations:
+          summary: "High FloodWait rate detected"
+          description: "Telethon FloodWait rate is {{ $value }} events/sec, indicating potential API rate limiting issues"
+          runbook_url: "https://docs.telegram-assistant.com/runbooks/telethon-floodwait"
+
+      - alert: SlowSessionCleanup
+        expr: histogram_quantile(0.95, rate(telethon_session_cleanup_duration_seconds_bucket[5m])) > 5
+        for: 1m
+        labels:
+          severity: critical
+          service: telethon
+        annotations:
+          summary: "Session cleanup is taking too long"
+          description: "P95 session cleanup time is {{ $value }}s, which exceeds the 5s threshold"
+          runbook_url: "https://docs.telegram-assistant.com/runbooks/telethon-session-cleanup"
+
+      - alert: HighRateLimitBlocks
+        expr: rate(rate_limit_hits_total[5m]) > 10
+        for: 3m
+        labels:
+          severity: warning
+          service: api
+        annotations:
+          summary: "High rate limit blocks detected"
+          description: "Rate limit blocks are {{ $value }} hits/sec, indicating potential abuse or misconfiguration"
+          runbook_url: "https://docs.telegram-assistant.com/runbooks/api-rate-limiting"
+
+      - alert: QRTimeoutRateHigh
+        expr: rate(auth_qr_expired_total[5m]) > 0.2
+        for: 3m
+        labels:
+          severity: warning
+          service: qr_auth
+        annotations:
+          summary: "High QR timeout rate"
+          description: "QR session timeout rate is {{ $value }} timeouts/sec, indicating potential UX issues"
+          runbook_url: "https://docs.telegram-assistant.com/runbooks/qr-timeout-rate"
+
+      - alert: APIResponseTimeHigh
+        expr: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m])) > 1
+        for: 2m
+        labels:
+          severity: warning
+          service: api
+        annotations:
+          summary: "API response time is high"
+          description: "P95 API response time is {{ $value }}s, which exceeds the 1s threshold"
+          runbook_url: "https://docs.telegram-assistant.com/runbooks/api-performance"
+
+      - alert: QRErrorsHigh
+        expr: rate(auth_qr_fail_total[5m]) > 5
+        for: 2m
+        labels:
+          severity: warning
+          service: qr_auth
+        annotations:
+          summary: "High QR error rate"
+          description: "QR authentication error rate is {{ $value }} errors/sec"
+          runbook_url: "https://docs.telegram-assistant.com/runbooks/qr-errors"
+
+      - alert: SecurityViolations
+        expr: rate(security_header_violations_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+          service: security
+        annotations:
+          summary: "Security header violations detected"
+          description: "Security header violations are {{ $value }} violations/sec"
+          runbook_url: "https://docs.telegram-assistant.com/runbooks/security-violations"
+
+      - alert: CORSViolations
+        expr: rate(security_cors_violations_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+          service: security
+        annotations:
+          summary: "CORS violations detected"
+          description: "CORS violations are {{ $value }} violations/sec"
+          runbook_url: "https://docs.telegram-assistant.com/runbooks/cors-violations"
+
+      - alert: JWTValidationFailures
+        expr: rate(jwt_validation_failures_total[5m]) > 1
+        for: 2m
+        labels:
+          severity: warning
+          service: auth
+        annotations:
+          summary: "High JWT validation failure rate"
+          description: "JWT validation failures are {{ $value }} failures/sec"
+          runbook_url: "https://docs.telegram-assistant.com/runbooks/jwt-validation"
+
+      - alert: OwnerVerificationFailures
+        expr: rate(security_owner_verification_failures_total[5m]) > 0.5
+        for: 2m
+        labels:
+          severity: critical
+          service: security
+        annotations:
+          summary: "Owner verification failures detected"
+          description: "Owner verification failures are {{ $value }} failures/sec"
+          runbook_url: "https://docs.telegram-assistant.com/runbooks/owner-verification"

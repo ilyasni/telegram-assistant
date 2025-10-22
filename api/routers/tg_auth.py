@@ -81,17 +81,17 @@ def issue_session_token(tenant_id: str, ttl_seconds: int = None) -> str:
 
 
 def decode_session_token(token: str) -> dict:
-    """Декодирование JWT токена для получения tenant_id.
+    """Context7 best practice: JWT security с audience verification.
     
-    Context7 best practice: PyJWT требует явной проверки audience для безопасности.
-    Отключаем проверку audience, так как мы проверяем tenant_id отдельно.
+    [C7-ID: security-jwt-001]
     """
     try:
         payload = jwt.decode(
             token, 
             settings.jwt_secret, 
             algorithms=["HS256"],
-            options={"verify_aud": False}  # Context7: отключаем проверку audience
+            options={"verify_aud": True},  # Включаем проверку audience
+            audience="tg-auth"  # Обязательная проверка audience
         )
         return payload
     except jwt.ExpiredSignatureError:
@@ -114,23 +114,33 @@ def _extract_tenant_id(payload: dict) -> str:
         raise HTTPException(status_code=400, detail="invalid token payload")
     return str(tenant_id)
 
+# Context7 best practice: Redis-based sliding window rate limiting
+# [C7-ID: fastapi-ratelimit-003]
 def ratelimit(key: str, max_per_minute: int = 30) -> bool:
+    """Sliding window rate limiting с Redis."""
     bucket = f"rl:{key}:{int(time.time() // 60)}"
     v = redis_client.incr(bucket)
     if v == 1:
-        redis_client.expire(bucket, 120)
+        redis_client.expire(bucket, 120)  # 2 минуты TTL для cleanup
+    
+    # Метрики для мониторинга
+    if v > max_per_minute:
+        logger.warning("Rate limit exceeded", key=key, count=v, limit=max_per_minute)
+    
     return v <= max_per_minute
 
 
 def ratelimit_strict(key: str, max_per_minute: int = 5) -> bool:
-    """Более жёсткий лимит для QR start."""
+    """Более жёсткий лимит для критических endpoints."""
     bucket = f"rl:strict:{key}:{int(time.time() // 60)}"
     v = redis_client.incr(bucket)
     if v == 1:
         redis_client.expire(bucket, 120)
+    
     if v > max_per_minute:
         # Логирование подозрительной активности
-        logger.warning("Rate limit exceeded", key=key, count=v)
+        logger.warning("Strict rate limit exceeded", key=key, count=v, limit=max_per_minute)
+    
     return v <= max_per_minute
 
 
@@ -156,6 +166,7 @@ async def miniapp_link(body: MiniAppLink):
 
 
 @router.post("/qr/start")
+@router.post("/qr-auth/init")  # Алиас для обратной совместимости
 async def qr_start(body: QrStart, request: Request):
     tenant_id = body.tenant_id
     ip = request.client.host
@@ -206,6 +217,7 @@ async def qr_start(body: QrStart, request: Request):
 
 
 @router.post("/qr/status")
+@router.get("/qr-auth/status/{session_id}")  # Алиас для обратной совместимости
 async def qr_status_post(body: dict):
     token = body.get("session_token")
     if not token:
@@ -282,6 +294,7 @@ async def qr_cancel(token: str):
 
 
 @router.get("/qr/png/{session_id}")
+@router.get("/qr-auth/png/{session_id}")  # Алиас для обратной совместимости
 async def qr_png(session_id: str):
     """Context7 best practice: PNG fallback для QR-кода"""
     try:

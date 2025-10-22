@@ -9,7 +9,7 @@ import time
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 from config import settings
 from fastapi.staticfiles import StaticFiles
-from routers import health, channels, posts, tg_auth, users, rag, sessions
+from routers import health, channels, posts, tg_auth, users, rag, sessions, admin_invites
 from bot.webhook import router as bot_router, init_bot, ensure_webhook
 from bot.handlers import router as bot_handlers
 
@@ -70,26 +70,69 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS middleware
+# Context7 best practice: CORS whitelist из ENV
+# [C7-ID: fastapi-cors-001]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins,
+    allow_origins=settings.cors_origins,  # Строгий whitelist из ENV
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],  # Ограниченный список методов
+    allow_headers=["Authorization", "Content-Type", "X-Requested-With"],  # Ограниченный список заголовков
 )
+
+
+# Context7 best practice: Security headers middleware
+# [C7-ID: security-headers-002]
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    """Middleware для добавления security headers."""
+    response = await call_next(request)
+    
+    # Security headers
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains; preload"
+    response.headers["Content-Security-Policy"] = "default-src 'self'; img-src 'self' data: blob:; connect-src 'self' https://api.telegram.org; frame-ancestors 'none'"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    
+    return response
+
+
+# Context7 best practice: маскирование чувствительных данных в логах
+# [C7-ID: security-logs-mask-001]
+def mask_sensitive_data(data: dict) -> dict:
+    """Маскирование чувствительных данных в логах."""
+    sensitive_keys = ['token', 'password', 'secret', 'key', 'session', 'auth', 'jwt']
+    masked_data = data.copy()
+    
+    for key, value in masked_data.items():
+        if any(sensitive_key in key.lower() for sensitive_key in sensitive_keys):
+            if isinstance(value, str) and len(value) > 8:
+                masked_data[key] = value[:4] + "***" + value[-4:]
+            else:
+                masked_data[key] = "***MASKED***"
+    
+    return masked_data
 
 
 @app.middleware("http")
 async def logging_middleware(request: Request, call_next):
-    """Middleware для логирования запросов."""
+    """Middleware для логирования запросов с маскированием секретов."""
     start_time = time.time()
     
+    # Подготовка данных для логирования
+    log_data = {
+        "method": request.method,
+        "url": str(request.url),
+        "client_ip": request.client.host
+    }
+    
+    # Маскирование чувствительных данных
+    safe_log_data = mask_sensitive_data(log_data)
+    
     # Логирование входящего запроса
-    logger.info("Request started", 
-                method=request.method,
-                url=str(request.url),
-                client_ip=request.client.host)
+    logger.info("Request started", **safe_log_data)
     
     # Обработка запроса
     response = await call_next(request)
@@ -137,6 +180,7 @@ app.include_router(posts.router, prefix="/api")
 app.include_router(users.router, prefix="/api")
 app.include_router(rag.router, prefix="/api")
 app.include_router(sessions.router, prefix="/api")
+app.include_router(admin_invites.router)
 app.include_router(tg_auth.router)
 app.include_router(bot_router, prefix="/tg")
 

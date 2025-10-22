@@ -24,6 +24,13 @@ def _kb_login():
     ])
 
 
+def _kb_login_with_invite(invite_code: str):
+    """Клавиатура для авторизации с инвайт-кодом."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Открыть Mini App (QR)", web_app={"url": f"https://produman.studio/tg/app/?invite={invite_code}"})]
+    ])
+
+
 def _kb_main_menu():
     """Главное меню бота."""
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -101,12 +108,82 @@ async def cmd_start(msg: Message):
 
 @router.message(Command("login"))
 async def cmd_login(msg: Message):
-    """Обработчик команды /login."""
-    # Всегда возвращаем единое сообщение и кнопку Mini App (QR)
-    await msg.answer(
-        "Вход через Mini App.",
-        reply_markup=_kb_login()
-    )
+    """Обработчик команды /login с поддержкой инвайт-кодов."""
+    args = msg.text.split()
+    
+    # Если передан инвайт-код, валидируем его
+    if len(args) > 1:
+        invite_code = args[1]
+        logger.info("Login with invite code", user_id=msg.from_user.id, invite_code=invite_code)
+        
+        # Валидация инвайт-кода
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                # Проверяем инвайт-код через API
+                response = await client.get(f"{API_BASE}/api/admin/invites/{invite_code}")
+                
+                if response.status_code == 200:
+                    invite_data = response.json()
+                    logger.info("Valid invite code", invite_code=invite_code, tenant_id=invite_data.get('tenant_id'))
+                    
+                    # Открываем Mini App с валидным инвайтом
+                    await msg.answer(
+                        f"✅ <b>Инвайт-код принят</b>\n\n"
+                        f"Открываем Mini App для авторизации...",
+                        reply_markup=_kb_login_with_invite(invite_code)
+                    )
+                elif response.status_code == 404:
+                    await msg.answer(
+                        "❌ <b>Неверный инвайт-код</b>\n\n"
+                        "Проверьте правильность кода и попробуйте снова.",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data="login:retry")]
+                        ])
+                    )
+                elif response.status_code == 410:
+                    await msg.answer(
+                        "❌ <b>Инвайт-код истёк</b>\n\n"
+                        "Срок действия кода истёк. Обратитесь к администратору.",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data="login:retry")]
+                        ])
+                    )
+                else:
+                    await msg.answer(
+                        "❌ <b>Ошибка проверки инвайт-кода</b>\n\n"
+                        "Попробуйте позже или обратитесь к поддержке.",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data="login:retry")]
+                        ])
+                    )
+                    
+        except httpx.TimeoutException:
+            logger.warning("Timeout checking invite code", user_id=msg.from_user.id, invite_code=invite_code)
+            await msg.answer(
+                "⏱️ <b>Таймаут проверки</b>\n\n"
+                "Сервер не отвечает. Попробуйте позже.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data="login:retry")]
+                ])
+            )
+        except Exception as e:
+            logger.error("Error checking invite code", user_id=msg.from_user.id, invite_code=invite_code, error=str(e))
+            await msg.answer(
+                "❌ <b>Ошибка системы</b>\n\n"
+                "Попробуйте позже или обратитесь к поддержке.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data="login:retry")]
+                ])
+            )
+    else:
+        # Обычный логин без инвайт-кода
+        await msg.answer(
+            "🔐 <b>Вход в систему</b>\n\n"
+            "Для входа используйте команду:\n"
+            "<code>/login INVITE_CODE</code>\n\n"
+            "Или нажмите кнопку ниже для входа через Mini App:",
+            reply_markup=_kb_login()
+        )
 
 
 @router.message(Command("add_channel"))
@@ -195,6 +272,19 @@ async def on_qr_start(cb: CallbackQuery):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Открыть Mini App (QR)", web_app={"url": "https://produman.studio/tg/app/"})]
         ])
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data == "login:retry")
+async def on_login_retry(cb: CallbackQuery):
+    """Фолбэк: повторная попытка входа."""
+    await cb.message.edit_text(
+        "🔐 <b>Вход в систему</b>\n\n"
+        "Для входа используйте команду:\n"
+        "<code>/login INVITE_CODE</code>\n\n"
+        "Или нажмите кнопку ниже для входа через Mini App:",
+        reply_markup=_kb_login()
     )
     await cb.answer()
 
