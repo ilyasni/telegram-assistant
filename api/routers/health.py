@@ -11,6 +11,12 @@ logger = structlog.get_logger()
 
 
 @router.get("/")
+async def health_check_root():
+    """Поддержка старого пути /api/."""
+    return await health_check()
+
+
+@router.get("/health")
 async def health_check():
     """Проверка здоровья сервиса."""
     health_status = {

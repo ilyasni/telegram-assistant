@@ -1,7 +1,5 @@
 _format_version: "3.0"
 
-consumers: []
-acls: []
 
 services:
   # Direct platform pg-meta proxy (Studio -> Meta)

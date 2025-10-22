@@ -13,6 +13,7 @@ import json
 from datetime import datetime
 
 from config import settings
+from services.events import publish_post_created
 
 logger = structlog.get_logger()
 
@@ -119,11 +120,11 @@ class TelegramIngestionService:
             # Сохранение в БД
             post_id = await self._save_message(message_data)
             
-            # Публикация события в Redis Streams
-            await self._publish_event('post.created', {
+            # Публикация события в Redis Streams по контракту
+            publish_post_created(self.redis_client, {
                 'post_id': post_id,
-                'tenant_id': channel_info['tenant_id'],
-                'channel_id': channel_info['id'],
+                'tenant_id': str(channel_info['tenant_id']),
+                'channel_id': str(channel_info['id']),
                 'content': message_data['content'],
                 'created_at': message_data['created_at']
             })
@@ -180,14 +181,7 @@ class TelegramIngestionService:
             media_urls.append(f"document:{message.document.id}")
         return media_urls
     
-    async def _publish_event(self, event_type: str, data: dict):
-        """Публикация события в Redis Streams."""
-        try:
-            stream_name = f"events:{event_type}"
-            self.redis_client.xadd(stream_name, data)
-            logger.debug("Event published", event_type=event_type, stream=stream_name)
-        except Exception as e:
-            logger.error("Failed to publish event", error=str(e))
+    # Публикация перенесена в services.events
     
     async def stop(self):
         """Остановка сервиса."""

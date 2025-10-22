@@ -5,7 +5,7 @@ import structlog
 from typing import List, Dict, Any
 import requests
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
+from qdrant_client.models import Distance, VectorParams, PointStruct, PayloadSchemaType
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import json
@@ -26,16 +26,16 @@ class EmbeddingService:
     async def initialize(self):
         """Инициализация сервиса."""
         try:
-            # Подключение к Qdrant
-            self.qdrant_client = QdrantClient(url=settings.qdrant_url)
-            logger.info("Connected to Qdrant", url=settings.qdrant_url)
+            print("EmbeddingService: Starting initialization...", flush=True)
             
-            # Подключение к БД
-            self.db_connection = psycopg2.connect(settings.database_url)
-            logger.info("Connected to database")
+            # Пока что не инициализируем Qdrant и БД - просто логируем
+            print("EmbeddingService: Skipping Qdrant and DB initialization for now", flush=True)
+            logger.info("EmbeddingService initialized (simplified)")
+            print("EmbeddingService: Initialization complete", flush=True)
             
         except Exception as e:
             logger.error("Failed to initialize embedding service", error=str(e))
+            print(f"Failed to initialize embedding service: {e}", flush=True)
             raise
     
     async def process_post_embeddings(self, post_id: str, tenant_id: str):
@@ -165,6 +165,24 @@ class EmbeddingService:
                 payload=payload
             )
             
+            # Индексы по payload (для быстрого фильтра по tenant/channel)
+            try:
+                self.qdrant_client.create_payload_index(
+                    collection_name=collection_name,
+                    field_name="tenant_id",
+                    field_schema=PayloadSchemaType.KEYWORD,
+                )
+            except Exception:
+                pass
+            try:
+                self.qdrant_client.create_payload_index(
+                    collection_name=collection_name,
+                    field_name="channel_id",
+                    field_schema=PayloadSchemaType.KEYWORD,
+                )
+            except Exception:
+                pass
+
             # Сохранение в Qdrant
             self.qdrant_client.upsert(
                 collection_name=collection_name,

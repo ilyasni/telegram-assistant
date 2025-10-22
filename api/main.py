@@ -124,6 +124,15 @@ async def metrics():
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
+# Единый health-эндпоинт на корне сервиса
+from routers.health import health_check as api_health_check  # noqa: E402
+
+
+@app.get("/health")
+async def health():
+    return await api_health_check()
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

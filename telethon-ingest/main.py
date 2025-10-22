@@ -1,6 +1,9 @@
 """Основной модуль telethon-ingest сервиса."""
 
 import asyncio
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 import signal
 import sys
 import structlog
@@ -45,6 +48,9 @@ class TelegramIngestionApp:
             
             await self.service.start()
             self.is_running = True
+
+            # HTTP-сервер для health/metrics
+            self._start_http_server()
             
             # Ожидание сигналов завершения
             await self._wait_for_shutdown()
@@ -63,6 +69,40 @@ class TelegramIngestionApp:
             logger.info("Stopping Telegram ingestion service")
             await self.service.stop()
             self.is_running = False
+
+    def _start_http_server(self):
+        request_count = Counter('ingest_http_requests_total', 'Total HTTP requests', ['path'])
+        request_latency = Histogram('ingest_http_request_duration_seconds', 'HTTP request duration seconds', ['path'])
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self_inner):
+                path = self_inner.path
+                with request_latency.labels(path).time():
+                    if path == '/health':
+                        self_inner.send_response(200)
+                        self_inner.send_header('Content-Type', 'application/json')
+                        self_inner.end_headers()
+                        self_inner.wfile.write(b'{"status":"healthy"}')
+                    elif path == '/metrics':
+                        data = generate_latest()
+                        self_inner.send_response(200)
+                        self_inner.send_header('Content-Type', CONTENT_TYPE_LATEST)
+                        self_inner.end_headers()
+                        self_inner.wfile.write(data)
+                    else:
+                        self_inner.send_response(404)
+                        self_inner.end_headers()
+                request_count.labels(path).inc()
+
+            def log_message(self_inner, format, *args):  # noqa: N802
+                return
+
+        def run_server():
+            httpd = HTTPServer(('0.0.0.0', 8000), Handler)
+            httpd.serve_forever()
+
+        thread = threading.Thread(target=run_server, daemon=True)
+        thread.start()
     
     async def _wait_for_shutdown(self):
         """Ожидание сигналов завершения."""

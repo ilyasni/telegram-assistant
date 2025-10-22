@@ -8,6 +8,16 @@ from datetime import datetime
 
 from config import settings
 from tasks.embeddings import EmbeddingService
+from tasks.events import (
+    read_post_created,
+    ensure_stream_group,
+    read_post_created_group,
+    ack_post_created,
+    publish_post_tagged,
+    publish_post_indexed,
+    read_post_tagged_group,
+    ack_post_tagged,
+)
 
 logger = structlog.get_logger()
 
@@ -23,18 +33,34 @@ class IndexingService:
     async def initialize(self):
         """Инициализация сервиса."""
         try:
+            print("Connecting to Redis...", flush=True)
             # Подключение к Redis
             self.redis_client = redis.from_url(settings.redis_url)
             logger.info("Connected to Redis", url=settings.redis_url)
+            print("Redis connected", flush=True)
             
+            print("Initializing embedding service...", flush=True)
             # Инициализация сервиса embeddings
             self.embedding_service = EmbeddingService()
             await self.embedding_service.initialize()
+            print("Embedding service initialized", flush=True)
+
+            print("Setting up consumer groups...", flush=True)
+            # Обеспечим Consumer Group для надежного чтения по обоим потокам
+            ensure_stream_group(self.redis_client, "events:post.created", "worker")
+            ensure_stream_group(self.redis_client, "events:post.tagged", "worker")
+            # зарегистрируем консюмера
+            from tasks.events import ensure_consumer
+            ensure_consumer(self.redis_client, "events:post.created", "worker", "worker-1")
+            ensure_consumer(self.redis_client, "events:post.tagged", "worker", "worker-1")
+            print("Consumer groups set up", flush=True)
             
             logger.info("Indexing service initialized")
+            print("Indexing service initialized", flush=True)
             
         except Exception as e:
             logger.error("Failed to initialize indexing service", error=str(e))
+            print(f"Failed to initialize indexing service: {e}", flush=True)
             raise
     
     async def start_processing(self):
@@ -63,46 +89,44 @@ class IndexingService:
     async def _process_post_created_events(self):
         """Обработка событий создания постов."""
         try:
-            # Чтение событий из Redis Stream
-            stream_name = "events:post.created"
-            messages = self.redis_client.xread({stream_name: "$"}, count=settings.batch_size, block=1000)
+            logger.info("Checking for post.created events...")
+            # Чтение событий из Redis Stream с коротким таймаутом для диагностики
+            items = read_post_created_group(self.redis_client, "worker", consumer="worker-1", count=settings.batch_size, block_ms=500)
+            logger.info("Read items from stream", count=len(items) if items else 0)
             
-            for stream, msgs in messages:
-                for msg_id, fields in msgs:
-                    try:
-                        # Парсинг данных события
-                        event_data = {
-                            'post_id': fields.get(b'post_id', b'').decode(),
-                            'tenant_id': fields.get(b'tenant_id', b'').decode(),
-                            'channel_id': fields.get(b'channel_id', b'').decode(),
-                            'content': fields.get(b'content', b'').decode(),
-                            'created_at': fields.get(b'created_at', b'').decode()
-                        }
-                        
-                        logger.info("Processing post.created event", 
-                                   post_id=event_data['post_id'],
-                                   tenant_id=event_data['tenant_id'])
-                        
-                        # Создание записи в indexing_status
-                        await self._create_indexing_status(event_data['post_id'], event_data['tenant_id'])
-                        
-                        # Обработка embeddings
-                        await self.embedding_service.process_post_embeddings(
-                            event_data['post_id'], 
-                            event_data['tenant_id']
-                        )
-                        
-                        # Публикация события post.tagged
-                        await self._publish_event('post.tagged', {
-                            'post_id': event_data['post_id'],
-                            'tenant_id': event_data['tenant_id'],
-                            'status': 'completed'
-                        })
-                        
-                    except Exception as e:
-                        logger.error("Failed to process post.created event", 
-                                   msg_id=msg_id, 
-                                   error=str(e))
+            if not items:
+                logger.debug("No post.created events found")
+                return
+
+            for msg_id, event_data in items:
+                try:
+                    logger.info("Processing post.created event",
+                               post_id=event_data['post_id'],
+                               tenant_id=event_data['tenant_id'])
+
+                    # Создание записи в indexing_status
+                    await self._create_indexing_status(event_data['post_id'], event_data['tenant_id'])
+
+                    # Обработка embeddings
+                    await self.embedding_service.process_post_embeddings(
+                        event_data['post_id'],
+                        event_data['tenant_id']
+                    )
+
+                    # Публикация события post.tagged
+                    publish_post_tagged(self.redis_client, {
+                        'post_id': event_data['post_id'],
+                        'tenant_id': event_data['tenant_id'],
+                        'status': 'completed'
+                    })
+
+                    # ACK сообщения
+                    ack_post_created(self.redis_client, "worker", msg_id)
+
+                except Exception as e:
+                    logger.error("Failed to process post.created event",
+                               msg_id=msg_id,
+                               error=str(e))
                         
         except Exception as e:
             logger.error("Failed to process post.created events", error=str(e))
@@ -110,33 +134,30 @@ class IndexingService:
     async def _process_post_tagged_events(self):
         """Обработка событий тегирования постов."""
         try:
-            stream_name = "events:post.tagged"
-            messages = self.redis_client.xread({stream_name: "$"}, count=settings.batch_size, block=1000)
-            
-            for stream, msgs in messages:
-                for msg_id, fields in msgs:
-                    try:
-                        event_data = {
-                            'post_id': fields.get(b'post_id', b'').decode(),
-                            'tenant_id': fields.get(b'tenant_id', b'').decode(),
-                            'status': fields.get(b'status', b'').decode()
-                        }
-                        
-                        logger.info("Processing post.tagged event", 
-                                   post_id=event_data['post_id'],
-                                   status=event_data['status'])
-                        
-                        # Публикация события post.indexed
-                        await self._publish_event('post.indexed', {
-                            'post_id': event_data['post_id'],
-                            'tenant_id': event_data['tenant_id'],
-                            'status': 'completed'
-                        })
-                        
-                    except Exception as e:
-                        logger.error("Failed to process post.tagged event", 
-                                   msg_id=msg_id, 
-                                   error=str(e))
+            items = read_post_tagged_group(self.redis_client, "worker", consumer="worker-1", count=settings.batch_size, block_ms=500)
+            if not items:
+                return
+
+            for msg_id, event_data in items:
+                try:
+                    logger.info("Processing post.tagged event", 
+                               post_id=event_data.get('post_id'),
+                               status=event_data.get('status'))
+
+                    # Публикация события post.indexed
+                    publish_post_indexed(self.redis_client, {
+                        'post_id': event_data.get('post_id'),
+                        'tenant_id': event_data.get('tenant_id'),
+                        'status': 'completed'
+                    })
+
+                    # ACK сообщения
+                    ack_post_tagged(self.redis_client, "worker", msg_id)
+
+                except Exception as e:
+                    logger.error("Failed to process post.tagged event", 
+                               msg_id=msg_id, 
+                               error=str(e))
                         
         except Exception as e:
             logger.error("Failed to process post.tagged events", error=str(e))
