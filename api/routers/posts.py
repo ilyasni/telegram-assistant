@@ -26,6 +26,7 @@ class PostResponse(BaseModel):
     media_urls: List[str]
     created_at: str
     is_processed: bool
+    telegram_post_url: Optional[str]
 
 
 def get_db():
@@ -48,15 +49,14 @@ async def get_posts(
     """Получение списка постов."""
     try:
         query = """
-            SELECT p.id, p.tenant_id, p.channel_id, p.telegram_message_id, 
-                   p.content, p.media_urls, p.created_at, p.is_processed
+            SELECT p.id, p.channel_id, p.telegram_message_id, 
+                   p.content, p.media_urls, p.created_at, p.is_processed, p.telegram_post_url
             FROM posts p
-            WHERE p.tenant_id = :tenant_id
         """
-        params = {"tenant_id": tenant_id}
+        params = {}
         
         if channel_id:
-            query += " AND p.channel_id = :channel_id"
+            query += " WHERE p.channel_id = :channel_id"
             params["channel_id"] = channel_id
         
         query += " ORDER BY p.created_at DESC LIMIT :limit OFFSET :offset"
@@ -68,13 +68,14 @@ async def get_posts(
         for row in result:
             posts.append(PostResponse(
                 id=str(row.id),
-                tenant_id=str(row.tenant_id),
+                tenant_id=tenant_id,  # Use the parameter since posts are now global
                 channel_id=str(row.channel_id),
                 telegram_message_id=row.telegram_message_id,
                 content=row.content,
                 media_urls=row.media_urls or [],
                 created_at=row.created_at.isoformat(),
-                is_processed=row.is_processed
+                is_processed=row.is_processed,
+                telegram_post_url=row.telegram_post_url
             ))
         
         return posts
@@ -93,13 +94,12 @@ async def get_post(
     """Получение поста по ID."""
     try:
         result = db.execute(text("""
-            SELECT id, tenant_id, channel_id, telegram_message_id, 
-                   content, media_urls, created_at, is_processed
+            SELECT id, channel_id, telegram_message_id, 
+                   content, media_urls, created_at, is_processed, telegram_post_url
             FROM posts 
-            WHERE id = :post_id AND tenant_id = :tenant_id
+            WHERE id = :post_id
         """), {
-            "post_id": post_id,
-            "tenant_id": tenant_id
+            "post_id": post_id
         })
         
         row = result.fetchone()
@@ -108,13 +108,14 @@ async def get_post(
         
         return PostResponse(
             id=str(row.id),
-            tenant_id=str(row.tenant_id),
+            tenant_id=tenant_id,  # Use the parameter since posts are now global
             channel_id=str(row.channel_id),
             telegram_message_id=row.telegram_message_id,
             content=row.content,
             media_urls=row.media_urls or [],
             created_at=row.created_at.isoformat(),
-            is_processed=row.is_processed
+            is_processed=row.is_processed,
+            telegram_post_url=row.telegram_post_url
         )
         
     except HTTPException:

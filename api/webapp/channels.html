@@ -1,0 +1,870 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Управление каналами - Telegram Assistant</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <style>
+        /* Context7 Best Practices: Modern CSS with CSS Grid and Flexbox */
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--tg-theme-bg-color, #ffffff);
+            color: var(--tg-theme-text-color, #000000);
+            line-height: 1.6;
+            padding: 16px;
+        }
+
+        .container {
+            max-width: 600px;
+            margin: 0 auto;
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 24px;
+        }
+
+        .header h1 {
+            font-size: 24px;
+            font-weight: 600;
+            margin-bottom: 8px;
+        }
+
+        .header p {
+            color: var(--tg-theme-hint-color, #999999);
+            font-size: 14px;
+        }
+
+        .stats-card {
+            background: var(--tg-theme-secondary-bg-color, #f8f9fa);
+            border-radius: 12px;
+            padding: 16px;
+            margin-bottom: 20px;
+            border: 1px solid var(--tg-theme-section-separator-color, #e1e3e6);
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            gap: 16px;
+        }
+
+        .stat-item {
+            text-align: center;
+        }
+
+        .stat-value {
+            font-size: 20px;
+            font-weight: 600;
+            color: var(--tg-theme-accent-text-color, #007aff);
+        }
+
+        .stat-label {
+            font-size: 12px;
+            color: var(--tg-theme-hint-color, #999999);
+            margin-top: 4px;
+        }
+
+        .section {
+            margin-bottom: 24px;
+        }
+
+        .section-title {
+            font-size: 18px;
+            font-weight: 600;
+            margin-bottom: 12px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .add-channel-form {
+            background: var(--tg-theme-secondary-bg-color, #f8f9fa);
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 20px;
+            border: 1px solid var(--tg-theme-section-separator-color, #e1e3e6);
+        }
+
+        .form-group {
+            margin-bottom: 16px;
+        }
+
+        .form-label {
+            display: block;
+            font-size: 14px;
+            font-weight: 500;
+            margin-bottom: 8px;
+            color: var(--tg-theme-text-color, #000000);
+        }
+
+        .form-input {
+            width: 100%;
+            padding: 12px 16px;
+            border: 1px solid var(--tg-theme-section-separator-color, #e1e3e6);
+            border-radius: 8px;
+            font-size: 16px;
+            background: var(--tg-theme-bg-color, #ffffff);
+            color: var(--tg-theme-text-color, #000000);
+            transition: border-color 0.2s ease;
+        }
+
+        .form-input:focus {
+            outline: none;
+            border-color: var(--tg-theme-accent-text-color, #007aff);
+        }
+
+        .form-select {
+            width: 100%;
+            padding: 12px 16px;
+            border: 1px solid var(--tg-theme-section-separator-color, #e1e3e6);
+            border-radius: 8px;
+            font-size: 16px;
+            background: var(--tg-theme-bg-color, #ffffff);
+            color: var(--tg-theme-text-color, #000000);
+        }
+
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            padding: 12px 20px;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            text-decoration: none;
+            min-height: 44px;
+        }
+
+        .btn-primary {
+            background: var(--tg-theme-button-color, #007aff);
+            color: var(--tg-theme-button-text-color, #ffffff);
+        }
+
+        .btn-primary:hover {
+            opacity: 0.9;
+        }
+
+        .btn-secondary {
+            background: var(--tg-theme-secondary-bg-color, #f8f9fa);
+            color: var(--tg-theme-text-color, #000000);
+            border: 1px solid var(--tg-theme-section-separator-color, #e1e3e6);
+        }
+
+        .btn-danger {
+            background: #ff3b30;
+            color: #ffffff;
+        }
+
+        .btn-danger:hover {
+            opacity: 0.9;
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .channels-list {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .channel-card {
+            background: var(--tg-theme-secondary-bg-color, #f8f9fa);
+            border-radius: 12px;
+            padding: 16px;
+            border: 1px solid var(--tg-theme-section-separator-color, #e1e3e6);
+            transition: transform 0.2s ease;
+        }
+
+        .channel-card:hover {
+            transform: translateY(-2px);
+        }
+
+        .channel-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 8px;
+        }
+
+        .channel-title {
+            font-size: 16px;
+            font-weight: 600;
+            color: var(--tg-theme-text-color, #000000);
+        }
+
+        .channel-status {
+            padding: 4px 8px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+
+        .status-active {
+            background: #34c759;
+            color: #ffffff;
+        }
+
+        .status-inactive {
+            background: #ff9500;
+            color: #ffffff;
+        }
+
+        .channel-info {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+            gap: 12px;
+            margin-top: 12px;
+        }
+
+        .info-item {
+            text-align: center;
+        }
+
+        .info-value {
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--tg-theme-text-color, #000000);
+        }
+
+        .info-label {
+            font-size: 12px;
+            color: var(--tg-theme-hint-color, #999999);
+            margin-top: 2px;
+        }
+
+        .channel-actions {
+            display: flex;
+            gap: 8px;
+            margin-top: 12px;
+        }
+
+        .btn-small {
+            padding: 8px 12px;
+            font-size: 14px;
+            min-height: 36px;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 40px 20px;
+            color: var(--tg-theme-hint-color, #999999);
+        }
+
+        .empty-state-icon {
+            font-size: 48px;
+            margin-bottom: 16px;
+        }
+
+        .loading {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            padding: 20px;
+            color: var(--tg-theme-hint-color, #999999);
+        }
+
+        .spinner {
+            width: 20px;
+            height: 20px;
+            border: 2px solid var(--tg-theme-section-separator-color, #e1e3e6);
+            border-top: 2px solid var(--tg-theme-accent-text-color, #007aff);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .error-message {
+            background: #ff3b30;
+            color: #ffffff;
+            padding: 12px 16px;
+            border-radius: 8px;
+            margin-bottom: 16px;
+            font-size: 14px;
+        }
+
+        .success-message {
+            background: #34c759;
+            color: #ffffff;
+            padding: 12px 16px;
+            border-radius: 8px;
+            margin-bottom: 16px;
+            font-size: 14px;
+        }
+
+        .modal {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.5);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+            padding: 20px;
+        }
+
+        .modal-content {
+            background: var(--tg-theme-bg-color, #ffffff);
+            border-radius: 12px;
+            padding: 24px;
+            max-width: 400px;
+            width: 100%;
+            max-height: 80vh;
+            overflow-y: auto;
+        }
+
+        .modal-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 16px;
+        }
+
+        .modal-title {
+            font-size: 18px;
+            font-weight: 600;
+        }
+
+        .modal-close {
+            background: none;
+            border: none;
+            font-size: 24px;
+            cursor: pointer;
+            color: var(--tg-theme-hint-color, #999999);
+        }
+
+        .modal-actions {
+            display: flex;
+            gap: 12px;
+            margin-top: 20px;
+        }
+
+        .hidden {
+            display: none !important;
+        }
+
+        /* Responsive design */
+        @media (max-width: 480px) {
+            .container {
+                padding: 0;
+            }
+            
+            .stats-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+            
+            .channel-info {
+                grid-template-columns: repeat(2, 1fr);
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <div class="header">
+            <h1>📢 Управление каналами</h1>
+            <p>Добавляйте и управляйте подписками на Telegram каналы</p>
+        </div>
+
+        <!-- Statistics -->
+        <div class="stats-card">
+            <div class="stats-grid" id="statsGrid">
+                <div class="stat-item">
+                    <div class="stat-value" id="totalChannels">-</div>
+                    <div class="stat-label">Каналов</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-value" id="activeChannels">-</div>
+                    <div class="stat-label">Активных</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-value" id="totalPosts">-</div>
+                    <div class="stat-label">Постов</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-value" id="postsToday">-</div>
+                    <div class="stat-label">Сегодня</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Add Channel Form -->
+        <div class="section">
+            <div class="section-title">
+                <span>➕</span>
+                <span>Добавить канал</span>
+            </div>
+            
+            <div class="add-channel-form">
+                <div class="form-group">
+                    <label class="form-label" for="addMethod">Способ добавления</label>
+                    <select class="form-select" id="addMethod" onchange="toggleAddMethod()">
+                        <option value="username">По username (@channel_name)</option>
+                        <option value="telegram_id">По Telegram ID</option>
+                    </select>
+                </div>
+                
+                <div class="form-group" id="usernameGroup">
+                    <label class="form-label" for="channelUsername">Username канала</label>
+                    <input 
+                        type="text" 
+                        class="form-input" 
+                        id="channelUsername" 
+                        placeholder="@channel_name или channel_name"
+                        maxlength="32"
+                    >
+                </div>
+                
+                <div class="form-group hidden" id="telegramIdGroup">
+                    <label class="form-label" for="channelTelegramId">Telegram ID канала</label>
+                    <input 
+                        type="number" 
+                        class="form-input" 
+                        id="channelTelegramId" 
+                        placeholder="-1001234567890"
+                    >
+                </div>
+                
+                <div class="form-group">
+                    <label class="form-label" for="channelTitle">Название канала (опционально)</label>
+                    <input 
+                        type="text" 
+                        class="form-input" 
+                        id="channelTitle" 
+                        placeholder="Название канала"
+                        maxlength="100"
+                    >
+                </div>
+                
+                <button class="btn btn-primary" onclick="addChannel()" id="addChannelBtn">
+                    <span>➕</span>
+                    <span>Добавить канал</span>
+                </button>
+            </div>
+        </div>
+
+        <!-- Channels List -->
+        <div class="section">
+            <div class="section-title">
+                <span>📢</span>
+                <span>Мои каналы</span>
+                <button class="btn btn-secondary btn-small" onclick="refreshChannels()" style="margin-left: auto;">
+                    <span>🔄</span>
+                    <span>Обновить</span>
+                </button>
+            </div>
+            
+            <div id="channelsList" class="channels-list">
+                <div class="loading">
+                    <div class="spinner"></div>
+                    <span>Загрузка каналов...</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Confirmation Modal -->
+    <div id="confirmModal" class="modal hidden">
+        <div class="modal-content">
+            <div class="modal-header">
+                <div class="modal-title">Подтверждение</div>
+                <button class="modal-close" onclick="closeModal()">&times;</button>
+            </div>
+            <div id="confirmMessage"></div>
+            <div class="modal-actions">
+                <button class="btn btn-secondary" onclick="closeModal()">Отмена</button>
+                <button class="btn btn-danger" id="confirmBtn" onclick="confirmAction()">Подтвердить</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Context7 Best Practices: Modern JavaScript with async/await and error handling
+        
+        // Global state
+        let channels = [];
+        let stats = {};
+        let currentUserId = null;
+        let pendingAction = null;
+
+        // API Configuration
+        const API_BASE_URL = window.location.origin + '/api';
+        const API_TIMEOUT = 30000;
+
+        // Initialize Telegram WebApp
+        function initTelegramWebApp() {
+            if (window.Telegram && window.Telegram.WebApp) {
+                window.Telegram.WebApp.ready();
+                window.Telegram.WebApp.expand();
+                
+                // Get user ID from Telegram WebApp
+                currentUserId = window.Telegram.WebApp.initDataUnsafe?.user?.id;
+                
+                if (!currentUserId) {
+                    showError('Не удалось получить ID пользователя');
+                    return;
+                }
+                
+                // Set theme colors
+                document.documentElement.style.setProperty('--tg-theme-bg-color', window.Telegram.WebApp.themeParams.bg_color);
+                document.documentElement.style.setProperty('--tg-theme-text-color', window.Telegram.WebApp.themeParams.text_color);
+                document.documentElement.style.setProperty('--tg-theme-hint-color', window.Telegram.WebApp.themeParams.hint_color);
+                document.documentElement.style.setProperty('--tg-theme-button-color', window.Telegram.WebApp.themeParams.button_color);
+                document.documentElement.style.setProperty('--tg-theme-button-text-color', window.Telegram.WebApp.themeParams.button_text_color);
+                
+                // Load initial data
+                loadStats();
+                loadChannels();
+            } else {
+                // Fallback for development
+                currentUserId = '12345';
+                loadStats();
+                loadChannels();
+            }
+        }
+
+        // API Helper Functions
+        async function apiCall(endpoint, options = {}) {
+            const url = `${API_BASE_URL}${endpoint}`;
+            const defaultOptions = {
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                timeout: API_TIMEOUT
+            };
+            
+            const mergedOptions = { ...defaultOptions, ...options };
+            
+            try {
+                const response = await fetch(url, mergedOptions);
+                
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    throw new Error(`HTTP ${response.status}: ${errorText}`);
+                }
+                
+                return await response.json();
+            } catch (error) {
+                console.error('API call failed:', error);
+                throw error;
+            }
+        }
+
+        // Load Statistics
+        async function loadStats() {
+            try {
+                const data = await apiCall(`/channels/users/${currentUserId}/stats`);
+                stats = data;
+                updateStatsDisplay();
+            } catch (error) {
+                console.error('Failed to load stats:', error);
+                showError('Ошибка загрузки статистики');
+            }
+        }
+
+        // Load Channels
+        async function loadChannels() {
+            try {
+                const data = await apiCall(`/channels/users/${currentUserId}/list`);
+                channels = data.channels || [];
+                updateChannelsDisplay();
+            } catch (error) {
+                console.error('Failed to load channels:', error);
+                showError('Ошибка загрузки каналов');
+            }
+        }
+
+        // Update Statistics Display
+        function updateStatsDisplay() {
+            document.getElementById('totalChannels').textContent = stats.total_channels || 0;
+            document.getElementById('activeChannels').textContent = stats.active_channels || 0;
+            document.getElementById('totalPosts').textContent = stats.total_posts || 0;
+            document.getElementById('postsToday').textContent = stats.posts_today || 0;
+        }
+
+        // Update Channels Display
+        function updateChannelsDisplay() {
+            const container = document.getElementById('channelsList');
+            
+            if (channels.length === 0) {
+                container.innerHTML = `
+                    <div class="empty-state">
+                        <div class="empty-state-icon">📭</div>
+                        <div>У вас пока нет подписок</div>
+                        <div style="margin-top: 8px; font-size: 14px; color: var(--tg-theme-hint-color, #999999);">
+                            Добавьте канал выше
+                        </div>
+                    </div>
+                `;
+                return;
+            }
+            
+            container.innerHTML = channels.map(channel => `
+                <div class="channel-card">
+                    <div class="channel-header">
+                        <div class="channel-title">${channel.title || 'Без названия'}</div>
+                        <div class="channel-status ${channel.is_active ? 'status-active' : 'status-inactive'}">
+                            ${channel.is_active ? 'Активен' : 'Неактивен'}
+                        </div>
+                    </div>
+                    
+                    <div style="margin-bottom: 8px; color: var(--tg-theme-hint-color, #999999); font-size: 14px;">
+                        @${channel.username || 'N/A'}
+                    </div>
+                    
+                    <div class="channel-info">
+                        <div class="info-item">
+                            <div class="info-value">${channel.posts_count || 0}</div>
+                            <div class="info-label">Постов</div>
+                        </div>
+                        <div class="info-item">
+                            <div class="info-value">${channel.subscribers_count || 0}</div>
+                            <div class="info-label">Подписчиков</div>
+                        </div>
+                        <div class="info-item">
+                            <div class="info-value">${formatDate(channel.last_message_at)}</div>
+                            <div class="info-label">Последнее сообщение</div>
+                        </div>
+                    </div>
+                    
+                    <div class="channel-actions">
+                        <button class="btn btn-secondary btn-small" onclick="triggerParsing('${channel.id}')">
+                            <span>🔄</span>
+                            <span>Парсинг</span>
+                        </button>
+                        <button class="btn btn-danger btn-small" onclick="unsubscribeChannel('${channel.id}', '${channel.title || channel.username}')">
+                            <span>❌</span>
+                            <span>Отписаться</span>
+                        </button>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        // Toggle Add Method
+        function toggleAddMethod() {
+            const method = document.getElementById('addMethod').value;
+            const usernameGroup = document.getElementById('usernameGroup');
+            const telegramIdGroup = document.getElementById('telegramIdGroup');
+            
+            if (method === 'username') {
+                usernameGroup.classList.remove('hidden');
+                telegramIdGroup.classList.add('hidden');
+            } else {
+                usernameGroup.classList.add('hidden');
+                telegramIdGroup.classList.remove('hidden');
+            }
+        }
+
+        // Add Channel
+        async function addChannel() {
+            const method = document.getElementById('addMethod').value;
+            const title = document.getElementById('channelTitle').value.trim();
+            const addBtn = document.getElementById('addChannelBtn');
+            
+            // Validate input
+            let channelData = {};
+            
+            if (method === 'username') {
+                const username = document.getElementById('channelUsername').value.trim();
+                if (!username) {
+                    showError('Введите username канала');
+                    return;
+                }
+                channelData.username = username.replace('@', '');
+            } else {
+                const telegramId = document.getElementById('channelTelegramId').value.trim();
+                if (!telegramId) {
+                    showError('Введите Telegram ID канала');
+                    return;
+                }
+                channelData.telegram_id = parseInt(telegramId);
+            }
+            
+            if (title) {
+                channelData.title = title;
+            }
+            
+            // Disable button and show loading
+            addBtn.disabled = true;
+            addBtn.innerHTML = '<div class="spinner"></div><span>Добавление...</span>';
+            
+            try {
+                const result = await apiCall(`/channels/users/${currentUserId}/subscribe`, {
+                    method: 'POST',
+                    body: JSON.stringify(channelData)
+                });
+                
+                showSuccess('Канал успешно добавлен!');
+                
+                // Clear form
+                document.getElementById('channelUsername').value = '';
+                document.getElementById('channelTelegramId').value = '';
+                document.getElementById('channelTitle').value = '';
+                
+                // Refresh data
+                await Promise.all([loadStats(), loadChannels()]);
+                
+            } catch (error) {
+                showError(`Ошибка добавления канала: ${error.message}`);
+            } finally {
+                // Re-enable button
+                addBtn.disabled = false;
+                addBtn.innerHTML = '<span>➕</span><span>Добавить канал</span>';
+            }
+        }
+
+        // Unsubscribe Channel
+        async function unsubscribeChannel(channelId, channelName) {
+            pendingAction = {
+                type: 'unsubscribe',
+                channelId: channelId,
+                channelName: channelName
+            };
+            
+            document.getElementById('confirmMessage').innerHTML = `
+                <p>Вы уверены, что хотите отписаться от канала <strong>${channelName}</strong>?</p>
+                <p style="margin-top: 8px; color: var(--tg-theme-hint-color, #999999); font-size: 14px;">
+                    Это действие можно отменить, добавив канал заново.
+                </p>
+            `;
+            
+            document.getElementById('confirmModal').classList.remove('hidden');
+        }
+
+        // Trigger Parsing
+        async function triggerParsing(channelId) {
+            try {
+                await apiCall(`/channels/${channelId}/trigger-parsing`, {
+                    method: 'POST',
+                    body: JSON.stringify({ user_id: currentUserId })
+                });
+                
+                showSuccess('Парсинг канала запущен!');
+            } catch (error) {
+                showError(`Ошибка запуска парсинга: ${error.message}`);
+            }
+        }
+
+        // Refresh Channels
+        async function refreshChannels() {
+            try {
+                await loadChannels();
+                showSuccess('Список каналов обновлён');
+            } catch (error) {
+                showError('Ошибка обновления каналов');
+            }
+        }
+
+        // Confirm Action
+        async function confirmAction() {
+            if (!pendingAction) return;
+            
+            const { type, channelId, channelName } = pendingAction;
+            
+            try {
+                if (type === 'unsubscribe') {
+                    await apiCall(`/channels/users/${currentUserId}/unsubscribe/${channelId}`, {
+                        method: 'DELETE'
+                    });
+                    
+                    showSuccess(`Отписка от канала ${channelName} выполнена`);
+                    await Promise.all([loadStats(), loadChannels()]);
+                }
+            } catch (error) {
+                showError(`Ошибка выполнения действия: ${error.message}`);
+            } finally {
+                closeModal();
+                pendingAction = null;
+            }
+        }
+
+        // Close Modal
+        function closeModal() {
+            document.getElementById('confirmModal').classList.add('hidden');
+            pendingAction = null;
+        }
+
+        // Utility Functions
+        function formatDate(dateString) {
+            if (!dateString) return 'N/A';
+            
+            const date = new Date(dateString);
+            const now = new Date();
+            const diffMs = now - date;
+            const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+            
+            if (diffDays === 0) {
+                return 'Сегодня';
+            } else if (diffDays === 1) {
+                return 'Вчера';
+            } else if (diffDays < 7) {
+                return `${diffDays} дн. назад`;
+            } else {
+                return date.toLocaleDateString('ru-RU');
+            }
+        }
+
+        function showError(message) {
+            // Remove existing messages
+            document.querySelectorAll('.error-message, .success-message').forEach(el => el.remove());
+            
+            const errorDiv = document.createElement('div');
+            errorDiv.className = 'error-message';
+            errorDiv.textContent = message;
+            
+            document.querySelector('.container').insertBefore(errorDiv, document.querySelector('.stats-card'));
+            
+            // Auto-hide after 5 seconds
+            setTimeout(() => errorDiv.remove(), 5000);
+        }
+
+        function showSuccess(message) {
+            // Remove existing messages
+            document.querySelectorAll('.error-message, .success-message').forEach(el => el.remove());
+            
+            const successDiv = document.createElement('div');
+            successDiv.className = 'success-message';
+            successDiv.textContent = message;
+            
+            document.querySelector('.container').insertBefore(successDiv, document.querySelector('.stats-card'));
+            
+            // Auto-hide after 3 seconds
+            setTimeout(() => successDiv.remove(), 3000);
+        }
+
+        // Initialize on page load
+        document.addEventListener('DOMContentLoaded', initTelegramWebApp);
+        
+        // Handle Telegram WebApp events
+        if (window.Telegram && window.Telegram.WebApp) {
+            window.Telegram.WebApp.onEvent('viewportChanged', () => {
+                // Handle viewport changes if needed
+            });
+        }
+    </script>
+</body>
+</html>

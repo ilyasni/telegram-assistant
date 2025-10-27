@@ -30,9 +30,23 @@ class Settings:
     webhook_timeout: int = int(os.getenv("WEBHOOK_TIMEOUT", "30"))
     webhook_retry_count: int = int(os.getenv("WEBHOOK_RETRY_COUNT", "3"))
     
+    # Embeddings Configuration
+    EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "gigachat-embeddings")
+    EMBED_DIM: int = int(os.getenv("EMBED_DIM", "1536"))
+    INDEXER_EMBED_IF_MISSING: bool = os.getenv("INDEXER_EMBED_IF_MISSING", "true").lower() == "true"
+    
+    # GigaChat
+    GIGACHAT_BASE_URL: str = os.getenv("GIGACHAT_BASE_URL", "https://gigachat.devices.sberbank.ru/api/v1")
+    GIGACHAT_EMBEDDINGS_MODEL: str = os.getenv("GIGACHAT_EMBEDDINGS_MODEL", "Embeddings")
+    
     # RAG settings
     qdrant_url: str = os.getenv("QDRANT_URL", "http://qdrant:6333")
     qdrant_collection: str = os.getenv("QDRANT_COLLECTION", "telegram_posts")
+    
+    # Neo4j settings
+    neo4j_url: str = os.getenv("NEO4J_URI", "neo4j://neo4j:7687")
+    neo4j_username: str = os.getenv("NEO4J_USER", "neo4j")
+    neo4j_password: str = os.getenv("NEO4J_PASSWORD", "neo4j123")
     
     # Analytics settings
     analytics_enabled: bool = os.getenv("ANALYTICS_ENABLED", "true").lower() == "true"

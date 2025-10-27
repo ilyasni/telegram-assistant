@@ -22,4 +22,4 @@ USER worker
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD python -c "import urllib.request as u; u.urlopen('http://localhost:8000/health')" || exit 1
 
-CMD ["python", "-u", "main.py"]
+CMD ["python", "-u", "run_all_tasks.py"]

@@ -4,10 +4,13 @@ from aiogram import Router, F
 from aiogram.filters import Command
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 import httpx
 import structlog
 import re
 from typing import Optional
+from datetime import datetime
 from config import settings
 
 logger = structlog.get_logger()
@@ -186,24 +189,7 @@ async def cmd_login(msg: Message):
         )
 
 
-@router.message(Command("add_channel"))
-async def cmd_add_channel(msg: Message):
-    """Обработчик команды /add_channel."""
-    args = msg.text.split()
-    if len(args) < 2:
-        await msg.answer(
-            "❌ <b>Неверный формат</b>\n\n"
-            "Использование: <code>/add_channel @channel_name</code>\n"
-            "Пример: <code>/add_channel @durov</code>"
-        )
-        return
-    
-    channel_name = args[1]
-    if not channel_name.startswith('@'):
-        await msg.answer("❌ Имя канала должно начинаться с @")
-        return
-    
-    await _add_channel(msg, channel_name)
+# Удалена дублированная функция - используется версия ниже
 
 
 @router.message(Command("my_channels"))
@@ -385,7 +371,7 @@ async def _add_channel(msg: Message, channel_name: str):
         }
         
         async with httpx.AsyncClient() as client:
-            r = await client.post(f"{API_BASE}/api/channels/users/{user['id']}/channels", json=channel_data)
+            r = await client.post(f"{API_BASE}/api/channels/users/{user['id']}/subscribe", json=channel_data)
             r.raise_for_status()
             channel = r.json()
         
@@ -419,10 +405,14 @@ async def _show_channels(msg: Message):
             user = r.json()
         
         # Получить каналы
+        url = f"{API_BASE}/api/channels/users/{user['id']}/list"
+        logger.info(f"[BOT] CALL {url}")
         async with httpx.AsyncClient() as client:
-            r = await client.get(f"{API_BASE}/api/channels/users/{user['id']}/channels")
+            r = await client.get(url)
+            logger.info(f"[BOT] RESPONSE {r.status_code} for {url}")
             r.raise_for_status()
-            channels = r.json()
+            channels_data = r.json()
+            channels = channels_data.get('channels', [])
         
         if not channels:
             await msg.answer(
@@ -465,9 +455,10 @@ async def _show_channels_callback(cb: CallbackQuery):
         
         # Получить каналы
         async with httpx.AsyncClient() as client:
-            r = await client.get(f"{API_BASE}/api/channels/users/{user['id']}/channels")
+            r = await client.get(f"{API_BASE}/api/channels/users/{user['id']}/list")
             r.raise_for_status()
-            channels = r.json()
+            channels_data = r.json()
+            channels = channels_data.get('channels', [])
         
         if not channels:
             await cb.message.edit_text(
@@ -519,7 +510,7 @@ async def _delete_channel_callback(cb: CallbackQuery, channel_id: str):
         
         # Удалить канал
         async with httpx.AsyncClient() as client:
-            r = await client.delete(f"{API_BASE}/api/channels/users/{user['id']}/channels/{channel_id}")
+            r = await client.delete(f"{API_BASE}/api/channels/users/{user['id']}/unsubscribe/{channel_id}")
             r.raise_for_status()
         
         await cb.message.edit_text("✅ Канал удален")
@@ -638,3 +629,150 @@ async def _show_subscription_callback(cb: CallbackQuery):
     except Exception as e:
         logger.error("Error showing subscription callback", error=str(e))
         await cb.message.edit_text("❌ Произошла ошибка")
+
+# ============================================================================
+# НОВЫЕ КОМАНДЫ ДЛЯ УПРАВЛЕНИЯ КАНАЛАМИ
+# ============================================================================
+
+@router.message(Command("add_channel"))
+async def cmd_add_channel(msg: Message):
+    """Команда добавления канала."""
+    try:
+        # Извлекаем аргументы из текста сообщения
+        command_text = msg.text or ""
+        args = command_text.replace("/add_channel", "").strip()
+        
+        if not args:
+            await msg.answer(
+                "Использование: /add_channel @channel_name\n\n"
+                "Пример: /add_channel @durov"
+            )
+            return
+        
+        username = args
+        
+        # Валидация username
+        if not re.match(r'^@?[a-zA-Z0-9_]{5,32}$', username):
+            await msg.answer("❌ Неверный формат канала. Используйте @channel_name")
+            return
+        
+        # Добавление @ если отсутствует
+        if not username.startswith('@'):
+            username = '@' + username
+        
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(
+                    f"{API_BASE}/api/channels/users/{msg.from_user.id}/subscribe",
+                    json={"username": username}
+                )
+                
+                if resp.status_code == 201:
+                    data = resp.json()
+                    
+                    # Получаем статистику пользователя для показа лимитов
+                    try:
+                        stats_resp = await client.get(
+                            f"{API_BASE}/api/channels/users/{msg.from_user.id}/stats"
+                        )
+                        if stats_resp.status_code == 200:
+                            stats = stats_resp.json()
+                            await msg.answer(
+                                f"✅ Канал {username} добавлен!\n\n"
+                                f"📊 Статистика:\n"
+                                f"• Каналов: {stats['total']}/{stats['max_allowed']}\n"
+                                f"• Тариф: {stats['tier'].upper()}\n"
+                                f"• Осталось слотов: {stats['remaining']}"
+                            )
+                        else:
+                            await msg.answer(f"✅ Канал {username} добавлен!")
+                    except Exception:
+                        await msg.answer(f"✅ Канал {username} добавлен!")
+                elif resp.status_code == 409:
+                    await msg.answer("⚠️ Вы уже подписаны на этот канал")
+                elif resp.status_code == 429:
+                    data = resp.json()
+                    reset_time = datetime.fromtimestamp(data['reset'])
+                    await msg.answer(
+                        f"⏳ Превышен лимит запросов\n"
+                        f"Попробуйте после {reset_time.strftime('%H:%M:%S')}"
+                    )
+                elif resp.status_code == 403:
+                    data = resp.json()
+                    detail = data.get('detail', {})
+                    await msg.answer(
+                        f"🚫 <b>Достигнут лимит каналов</b>\n\n"
+                        f"📊 Текущее использование: {detail.get('current', '?')}/{detail.get('max', '?')}\n"
+                        f"💎 Тариф: FREE\n\n"
+                        f"Для добавления новых каналов:\n"
+                        f"• Удалите один из существующих каналов\n"
+                        f"• Или улучшите тариф в Mini App"
+                    )
+                elif resp.status_code == 422:
+                    await msg.answer("❌ Неверный формат канала. Используйте @channel_name")
+                elif resp.status_code == 500:
+                    # Попробуем получить детали ошибки из API
+                    try:
+                        error_data = resp.json()
+                        if error_data.get('detail', {}).get('error') == 'tier_limit_exceeded':
+                            await msg.answer(
+                                f"🚫 <b>Достигнут лимит каналов</b>\n\n"
+                                f"📊 Текущее использование: {error_data['detail'].get('current', '?')}/{error_data['detail'].get('max', '?')}\n"
+                                f"💎 Тариф: FREE\n\n"
+                                f"Для добавления новых каналов:\n"
+                                f"• Удалите один из существующих каналов\n"
+                                f"• Или улучшите тариф в Mini App"
+                            )
+                        else:
+                            await msg.answer("❌ Внутренняя ошибка сервера. Попробуйте позже")
+                    except:
+                        await msg.answer("❌ Внутренняя ошибка сервера. Попробуйте позже")
+                else:
+                    await msg.answer(f"❌ Ошибка: {resp.status_code}")
+        
+        except httpx.TimeoutException:
+            await msg.answer("⏱️ Превышено время ожидания. Попробуйте позже")
+        except Exception as e:
+            logger.error("Error in /add_channel", error=str(e))
+            await msg.answer("❌ Произошла ошибка")
+    
+    except Exception as e:
+        logger.error("Error in /add_channel command", error=str(e))
+        await msg.answer("❌ Произошла ошибка")
+
+@router.message(Command("my_channels"))
+async def cmd_my_channels(msg: Message):
+    """Команда просмотра каналов пользователя."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{API_BASE}/api/channels/users/{msg.from_user.id}/list"
+            )
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                channels = data['channels']
+                
+                if not channels:
+                    await msg.answer("📺 У вас нет подписанных каналов")
+                    return
+                
+                # Inline кнопки для каждого канала
+                builder = InlineKeyboardBuilder()
+                for ch in channels[:10]:  # Первые 10
+                    builder.button(
+                        text=f"📺 {ch['title']}",
+                        callback_data=f"channel:view:{ch['id']}"
+                    )
+                builder.adjust(1)
+                
+                await msg.answer(
+                    f"📋 Ваши каналы ({data['total']}):",
+                    reply_markup=builder.as_markup()
+                )
+            else:
+                await msg.answer("❌ Не удалось загрузить список каналов")
+    
+    except Exception as e:
+        logger.error("Error in /my_channels", error=str(e))
+        await msg.answer("❌ Произошла ошибка")

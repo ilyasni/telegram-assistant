@@ -1,416 +1,972 @@
-"""Redis Streams Event Bus для Telegram Assistant.
-
-Реализует event-driven архитектуру с использованием Redis Streams и outbox-паттерна.
+"""
+Event Bus для надёжной доставки событий через Redis Streams
+Поддерживает consumer groups, DLQ, retries и идемпотентность
 """
 
 import asyncio
 import json
+import logging
+import time
 import uuid
+from typing import Dict, List, Optional, Any, AsyncGenerator
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional, List
+from dataclasses import dataclass
+import os
+
 import redis.asyncio as redis
-import structlog
-from prometheus_client import Counter, Histogram, Gauge
+from pydantic import BaseModel, Field
+from prometheus_client import Counter, Gauge, Histogram
 
-logger = structlog.get_logger()
+logger = logging.getLogger(__name__)
 
-# Prometheus метрики
-EVENTS_PUBLISHED = Counter("events_published_total", "Published events", ["event_type", "source"])
-EVENTS_CONSUMED = Counter("events_consumed_total", "Consumed events", ["event_type", "consumer"])
-EVENTS_PROCESSING_DURATION = Histogram("events_processing_duration_seconds", "Event processing duration", ["event_type", "consumer"])
-EVENTS_FAILED = Counter("events_failed_total", "Failed events", ["event_type", "consumer", "error_type"])
-OUTBOX_EVENTS_PENDING = Gauge("outbox_events_pending", "Pending outbox events")
-OUTBOX_EVENTS_PROCESSED = Counter("outbox_events_processed_total", "Processed outbox events", ["status"])
+# Context7: Метрики для мониторинга пайплайна
+stream_messages_total = Counter(
+    'stream_messages_total',
+    'Total messages processed by stream',
+    ['stream', 'phase', 'status']
+)
 
+redis_xack_total = Counter(
+    'redis_xack_total',
+    'Total XACK operations',
+    ['stream']
+)
 
-class EventBus:
-    """Redis Streams Event Bus с outbox-паттерном."""
+consumer_loop_iterations_total = Counter(
+    'consumer_loop_iterations_total',
+    'Total consumer loop iterations',
+    ['task']
+)
+
+consumer_handle_latency_seconds = Histogram(
+    'consumer_handle_latency_seconds',
+    'Message handling latency',
+    ['task']
+)
+
+redis_claim_batch_size = Histogram(
+    'redis_claim_batch_size',
+    'Batch size for XAUTOCLAIM operations',
+    ['stream']
+)
+
+stream_pending_size = Gauge(
+    'stream_pending_size',
+    'Number of pending messages in stream',
+    ['stream']
+)
+
+posts_in_queue_total = Gauge(
+    'posts_in_queue_total',
+    'Current posts in queue',
+    ['queue', 'status']
+)
+
+# ============================================================================
+# КОНФИГУРАЦИЯ СТРИМОВ
+# ============================================================================
+
+# [C7-ID: EVENTS-DLQ-ALIAS-001] DLQ алиасы добавлены в STREAMS
+STREAMS = {
+    'posts.parsed': 'stream:posts:parsed',
+    'posts.tagged': 'stream:posts:tagged', 
+    'posts.enriched': 'stream:posts:enriched',
+    'posts.indexed': 'stream:posts:indexed',
+    'posts.crawl': 'stream:posts:crawl',  # Новый stream для crawling задач
+    'posts.deleted': 'stream:posts:deleted',
+    # DLQ алиасы
+    'posts.parsed.dlq': 'stream:posts:parsed:dlq',
+    'posts.tagged.dlq': 'stream:posts:tagged:dlq',
+    'posts.enriched.dlq': 'stream:posts:enriched:dlq',
+    'posts.indexed.dlq': 'stream:posts:indexed:dlq',
+    'posts.crawl.dlq': 'stream:posts:crawl:dlq',
+    'posts.deleted.dlq': 'stream:posts:deleted:dlq',
+}
+
+# DLQ стримы (legacy, для обратной совместимости)
+DLQ_STREAMS = {
+    'posts.parsed': 'stream:posts:parsed:dlq',
+    'posts.tagged': 'stream:posts:tagged:dlq',
+    'posts.enriched': 'stream:posts:enriched:dlq', 
+    'posts.indexed': 'stream:posts:indexed:dlq',
+    'posts.deleted': 'stream:posts:deleted:dlq'
+}
+
+# ============================================================================
+# СХЕМЫ СОБЫТИЙ (Pydantic)
+# ============================================================================
+
+class BaseEvent(BaseModel):
+    """Базовый класс для всех событий."""
+    schema_version: str = Field(default="v1", description="Версия схемы события")
+    trace_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    occurred_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    idempotency_key: str = Field(..., description="Ключ идемпотентности")
+
+class PostParsedEvent(BaseEvent):
+    """Событие: пост распарсен."""
+    user_id: str
+    channel_id: str
+    post_id: str
+    tenant_id: str
+    text: str
+    urls: List[str] = Field(default_factory=list)
+    posted_at: datetime
+    content_hash: Optional[str] = None
+    link_count: int = 0
+
+class PostTaggedEvent(BaseEvent):
+    """Событие: пост протегирован."""
+    post_id: str
+    tags: List[Dict[str, Any]] = Field(default_factory=list)
+    provider: str  # gigachat | openrouter
+    model: Optional[str] = None
+    latency_ms: int
+    token_count: Optional[int] = None
+
+class PostEnrichedEvent(BaseEvent):
+    """Событие: пост обогащён."""
+    post_id: str
+    enrichment_data: Dict[str, Any] = Field(default_factory=dict)
+    source_urls: List[str] = Field(default_factory=list)
+    word_count: Optional[int] = None
+    skipped: bool = False
+    skip_reason: Optional[str] = None
+
+class PostIndexedEvent(BaseEvent):
+    """Событие: пост проиндексирован."""
+    post_id: str
+    vector_id: str
+    embedding_provider: str
+    embedding_dim: int
+    qdrant_collection: str
+    neo4j_nodes_created: int = 0
+
+class PostDeletedEvent(BaseEvent):
+    """Событие: пост удалён."""
+    post_id: str
+    tenant_id: str
+    channel_id: str
+    reason: str  # ttl | user | admin
+    qdrant_cleaned: bool = False
+    neo4j_cleaned: bool = False
+
+# ============================================================================
+# REDIS STREAMS CLIENT
+# ============================================================================
+
+class RedisStreamsClient:
+    """Клиент для работы с Redis Streams."""
     
-    def __init__(self, redis_url: str, db_connection=None):
-        self.redis_client = redis.from_url(redis_url)
-        self.db_connection = db_connection
-        self.running = False
-        self.consumers = {}
-    
-    async def start(self):
-        """Запуск event bus."""
-        self.running = True
-        logger.info("Event bus started")
+    def __init__(self, redis_url: str = "redis://redis:6379"):
+        self.redis_url = redis_url
+        self.client: Optional[redis.Redis] = None
         
-        # Запуск outbox processor
-        asyncio.create_task(self._outbox_processor())
+    async def connect(self):
+        """Подключение к Redis."""
+        if not self.client:
+            self.client = redis.from_url(self.redis_url, decode_responses=True)
+            # redis.from_url() уже создает подключенный клиент
+            # Проверяем подключение через ping
+            try:
+                await self.client.ping()
+                logger.info("Connected to Redis")
+            except Exception as e:
+                logger.error("Failed to ping Redis", error=str(e))
+                raise
+    
+    async def disconnect(self):
+        """Отключение от Redis."""
+        if self.client:
+            await self.client.close()
+            self.client = None
+            logger.info("Disconnected from Redis")
+
+# ============================================================================
+# EVENT PUBLISHER
+# ============================================================================
+
+class EventPublisher:
+    """Публикатор событий в Redis Streams."""
+    
+    def __init__(self, client: RedisStreamsClient):
+        self.client = client
+    
+    # [C7-ID: EVENTBUS-PUB-UNIFY-001]
+    @staticmethod
+    def _to_payload_dict(event: Any) -> Any:
+        """Унифицировать событие к dict/list для сериализации."""
+        # pydantic v2
+        if hasattr(event, "model_dump"):
+            try:
+                return event.model_dump()
+            except Exception:
+                pass
+        # pydantic v1
+        if hasattr(event, "dict"):
+            try:
+                return event.dict()
+            except Exception:
+                pass
+        # уже dict/list
+        if isinstance(event, (dict, list)):
+            return event
+        raise TypeError(f"Unsupported event type: {type(event)}")
+
+    @staticmethod
+    def _to_json_bytes(obj: Any) -> bytes:
+        import uuid as _uuid
+        import datetime as _dt
+        def norm(o):
+            if o is None:
+                return None
+            if isinstance(o, (str, int, float, bool)):
+                return o
+            if isinstance(o, _uuid.UUID):
+                return str(o)
+            if isinstance(o, (_dt.datetime, _dt.date)):
+                return o.isoformat()
+            if isinstance(o, dict):
+                out = {}
+                for k, v in o.items():
+                    nv = norm(v)
+                    if nv is not None:
+                        out[k] = nv
+                return out
+            if isinstance(o, (list, tuple, set)):
+                out = [norm(v) for v in o]
+                return [x for x in out if x is not None]
+            return str(o)
+        cleaned = norm(obj)
+        if not cleaned:
+            raise ValueError("normalized payload is empty")
+        return json.dumps(cleaned, ensure_ascii=False).encode("utf-8")
+    
+    async def publish_event(self, stream_name: str, event: Any) -> str:
+        """
+        Публикация события в стрим.
         
-        # Запуск consumer groups
-        for consumer_name, handler in self.consumers.items():
-            asyncio.create_task(self._consumer_loop(consumer_name, handler))
-    
-    async def stop(self):
-        """Остановка event bus."""
-        self.running = False
-        await self.redis_client.close()
-        logger.info("Event bus stopped")
-    
-    def register_consumer(self, consumer_name: str, handler):
-        """Регистрация consumer'а для обработки событий."""
-        self.consumers[consumer_name] = handler
-        logger.info("Consumer registered", consumer=consumer_name)
-    
-    async def publish_event(self, event: Dict[str, Any], stream_key: str = None) -> str:
-        """Публикация события через outbox-паттерн."""
-        try:
-            # Генерация event_id если не указан
-            if "event_id" not in event:
-                event["event_id"] = str(uuid.uuid4())
+        Args:
+            stream_name: Имя стрима (например, 'posts.parsed')
+            event: Событие для публикации
             
-            # Установка occurred_at если не указано
-            if "occurred_at" not in event:
-                event["occurred_at"] = datetime.now(timezone.utc).isoformat()
-            
-            # Определение stream_key
-            if not stream_key:
-                tenant_id = event.get("tenant_id", "system")
-                stream_key = f"events:{tenant_id}"
-            
-            # Сохранение в outbox
-            outbox_id = await self._save_to_outbox(event, stream_key)
-            
-            logger.info("Event saved to outbox", 
-                       event_id=event["event_id"], 
-                       event_type=event["event_type"],
-                       outbox_id=outbox_id)
-            
-            return event["event_id"]
-            
-        except Exception as e:
-            logger.error("Failed to publish event", 
-                        event_id=event.get("event_id"), 
-                        error=str(e))
-            raise
-    
-    async def _save_to_outbox(self, event: Dict[str, Any], stream_key: str) -> str:
-        """Сохранение события в outbox таблицу."""
-        if not self.db_connection:
-            # Если нет БД подключения, публикуем напрямую в Redis
-            return await self._publish_to_redis(event, stream_key)
+        Returns:
+            Message ID в стриме
+        """
+        # [C7-ID: EVENTBUS-PUB-TRACE-001] Логирование в EventPublisher
+        logger.info("event_pub_enter", extra={"stream": stream_name, "type": str(type(event))})
         
-        outbox_id = str(uuid.uuid4())
+        # Проверка, что stream_name - это короткое имя, а не полное
+        if stream_name.startswith("stream:"):
+            logger.error(f"Invalid stream_name: {stream_name}. Expected short name like 'posts.tagged', got full name.")
+            raise ValueError(f"Invalid stream_name: {stream_name}")
         
-        # Сохранение в outbox_events таблицу
-        async with self.db_connection.cursor() as cursor:
-            await cursor.execute(
-                """
-                INSERT INTO outbox_events 
-                (id, event_id, event_type, tenant_id, stream_key, event_data, status, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    outbox_id,
-                    event["event_id"],
-                    event["event_type"],
-                    event.get("tenant_id"),
-                    stream_key,
-                    json.dumps(event),
-                    "pending",
-                    datetime.now(timezone.utc)
-                )
-            )
-            await self.db_connection.commit()
+        if isinstance(event, dict):
+            # покажи, что именно мы кладём в Redis
+            sample = {k: (f"bytes[{len(v)}]" if isinstance(v, (bytes, bytearray)) else str(type(v)))
+                      for k, v in list(event.items())[:5]}
+            logger.info("event_pub_payload_shape", extra={"stream": stream_name, "shape": sample})
         
-        OUTBOX_EVENTS_PENDING.inc()
-        return outbox_id
-    
-    async def _publish_to_redis(self, event: Dict[str, Any], stream_key: str) -> str:
-        """Прямая публикация в Redis Stream."""
-        event_id = await self.redis_client.xadd(
+        stream_key = STREAMS[stream_name]
+        
+        # Унифицированная публикация: событие → dict/list → json bytes → {"data": bytes}
+        payload = self._to_payload_dict(event)
+        data = self._to_json_bytes(payload)
+        event_data = {"data": data}
+        logger.info("event_pub_xadd", extra={"stream": stream_name, "has_data": True, "data_type": "bytes"})
+        
+        # Context7: [C7-ID: debug-redis-client-001] - Отладка типа self.client
+        logger.info("event_pub_debug_client", extra={
+            "client_type": str(type(self.client)),
+            "client_value": str(self.client)[:100],
+            "has_client_attr": hasattr(self.client, 'client') if self.client else False
+        })
+        
+        message_id = await self.client.client.xadd(
             stream_key,
-            {
-                "event_id": event["event_id"],
-                "event_type": event["event_type"],
-                "tenant_id": event.get("tenant_id", ""),
-                "user_id": event.get("user_id", ""),
-                "correlation_id": event.get("correlation_id", ""),
-                "occurred_at": event["occurred_at"],
-                "version": event.get("version", "1.0"),
-                "source": event.get("source", ""),
-                "payload": json.dumps(event.get("payload", {}))
+            event_data,
+            maxlen=10000
+        )
+        logger.info(f"Published event {stream_name} with ID {message_id}")
+        return message_id
+
+    async def publish_json(self, stream_name: str, payload: Any) -> str:
+        stream_key = STREAMS[stream_name]
+        data = self._to_json_bytes(payload)
+        maxlen = int(os.getenv("REDIS_STREAM_MAXLEN", "100000"))
+        return await self.client.client.xadd(stream_key, {"data": data}, maxlen=maxlen)
+
+    async def publish_bytes(self, stream_name: str, data: bytes) -> str:
+        stream_key = STREAMS[stream_name]
+        maxlen = int(os.getenv("REDIS_STREAM_MAXLEN", "100000"))
+        return await self.client.client.xadd(stream_key, {"data": data}, maxlen=maxlen)
+    
+    async def publish_batch(self, events: List[tuple[str, BaseEvent]]) -> List[str]:
+        """
+        Батчевая публикация событий.
+        
+        Args:
+            events: Список кортежей (stream_name, event)
+            
+        Returns:
+            Список Message ID
+        """
+        message_ids = []
+        
+        # Группировка по стримам для оптимизации
+        streams_data = {}
+        for stream_name, event in events:
+            if stream_name not in streams_data:
+                streams_data[stream_name] = []
+            
+            try:
+                model_dump = event.model_dump(mode='json')
+            except Exception:
+                model_dump = event.dict()
+                if isinstance(model_dump.get('occurred_at'), datetime):
+                    model_dump['occurred_at'] = model_dump['occurred_at'].isoformat()
+                if isinstance(model_dump.get('posted_at'), datetime):
+                    model_dump['posted_at'] = model_dump['posted_at'].isoformat()
+
+            raw = {
+                'schema_version': model_dump.get('schema_version', 'v1'),
+                'trace_id': model_dump.get('trace_id', str(uuid.uuid4())),
+                'occurred_at': model_dump.get('occurred_at', datetime.now(timezone.utc).isoformat()),
+                'idempotency_key': model_dump['idempotency_key'],
+                **{k: v for k, v in model_dump.items() if k not in ['schema_version', 'trace_id', 'occurred_at', 'idempotency_key']}
+            }
+            # Сериализация сложных типов
+            serialized: Dict[str, Any] = {}
+            for k, v in raw.items():
+                if isinstance(v, (list, dict)):
+                    serialized[k] = json.dumps(v, ensure_ascii=False)
+                elif isinstance(v, bool):
+                    serialized[k] = 'true' if v else 'false'
+                else:
+                    serialized[k] = v
+            streams_data[stream_name].append(serialized)
+        
+        # Публикация по стримам
+        for stream_name, events_data in streams_data.items():
+            stream_key = STREAMS[stream_name]
+            for event_data in events_data:
+                message_id = await self.client.client.xadd(
+                    stream_key,
+                    event_data,
+                    maxlen=10000
+                )
+                message_ids.append(message_id)
+        
+        logger.info(f"Published {len(message_ids)} events in batch")
+        return message_ids
+
+    async def to_dlq(
+        self, 
+        base_event_name: str, 
+        payload: dict, 
+        reason: str, 
+        details: str = "", 
+        retry_count: int = 0
+    ) -> str:
+        """
+        [C7-ID: EVENTBUS-DLQ-001] Публикация в DLQ stream с метаданными и legacy-fallback.
+        
+        Args:
+            base_event_name: Базовое имя события (например, 'posts.enriched' или 'posts.enriched.dlq')
+            payload: Данные события
+            reason: Код причины из DLQReason enum
+            details: Детали ошибки (усекаются по DLQ_MAX_REASON_DETAILS)
+            retry_count: Количество попыток обработки
+            
+        Returns:
+            Message ID в DLQ stream
+        """
+        from datetime import datetime, timezone
+        import os
+        
+        # Защита от случайной передачи .dlq суффикса
+        base = base_event_name.removesuffix(".dlq")
+        dlq_event = f"{base}.dlq"
+        
+        # Обогащение payload метаданными DLQ с корреляцией
+        dlq_payload = {
+            **payload,
+            "dlq_reason": reason,
+            "dlq_reason_details": (details or "")[:int(os.getenv("DLQ_MAX_REASON_DETAILS", "500"))],
+            "dlq_timestamp": datetime.now(timezone.utc).isoformat(),
+            "retry_count": int(retry_count),
+            "origin_stream": STREAMS.get(base),
+            "origin_msg_id": payload.get("_msg_id"),  # Корреляция с исходным сообщением
+            "correlation_id": payload.get("correlation_id"),  # Сквозная трассировка
+        }
+        
+        # Определение DLQ stream: основной путь → STREAMS, fallback → legacy DLQ_STREAMS
+        stream_key = STREAMS.get(dlq_event) or DLQ_STREAMS.get(base)
+        
+        if not stream_key:
+            raise ValueError(f"No DLQ stream configured for {base_event_name}")
+        
+        # Единый путь публикации через publish_json (сохраняет формат и middlewares)
+        msg_id = await self.publish_json(dlq_event, dlq_payload)
+        
+        logger.warning(
+            "event_published_to_dlq",
+            extra={
+                "dlq_event": dlq_event,
+                "msg_id": msg_id,
+                "reason": reason,
+                "retry_count": retry_count
             }
         )
-        
-        EVENTS_PUBLISHED.labels(
-            event_type=event["event_type"],
-            source=event.get("source", "unknown")
-        ).inc()
-        
-        return event_id
+        return msg_id
+
+# ============================================================================
+# EVENT CONSUMER
+# ============================================================================
+
+@dataclass
+class ConsumerConfig:
+    """Конфигурация consumer."""
+    group_name: str
+    consumer_name: str
+    batch_size: int = 10
+    block_time: int = 1000  # мс
+    max_retries: int = 3
+    retry_delay: int = 5  # секунд
+    idle_timeout: int = 300  # секунд
+
+class EventConsumer:
+    """Consumer событий из Redis Streams с поддержкой групп и DLQ."""
     
-    async def _outbox_processor(self):
-        """Процессор outbox событий."""
-        logger.info("Outbox processor started")
-        
-        while self.running:
-            try:
-                if not self.db_connection:
-                    await asyncio.sleep(1)
-                    continue
-                
-                # Получение pending событий из outbox
-                async with self.db_connection.cursor() as cursor:
-                    await cursor.execute(
-                        """
-                        SELECT id, event_id, event_type, tenant_id, stream_key, event_data
-                        FROM outbox_events 
-                        WHERE status = 'pending' 
-                        ORDER BY created_at ASC 
-                        LIMIT 100
-                        """
-                    )
-                    events = await cursor.fetchall()
-                
-                for event_row in events:
-                    outbox_id, event_id, event_type, tenant_id, stream_key, event_data = event_row
-                    
-                    try:
-                        # Публикация в Redis Stream
-                        event = json.loads(event_data)
-                        await self._publish_to_redis(event, stream_key)
-                        
-                        # Обновление статуса в outbox
-                        async with self.db_connection.cursor() as cursor:
-                            await cursor.execute(
-                                "UPDATE outbox_events SET status = 'sent', sent_at = %s WHERE id = %s",
-                                (datetime.now(timezone.utc), outbox_id)
-                            )
-                            await self.db_connection.commit()
-                        
-                        OUTBOX_EVENTS_PROCESSED.labels(status="sent").inc()
-                        OUTBOX_EVENTS_PENDING.dec()
-                        
-                        logger.debug("Outbox event processed", 
-                                   outbox_id=outbox_id, 
-                                   event_id=event_id)
-                        
-                    except Exception as e:
-                        # Обновление статуса на failed
-                        async with self.db_connection.cursor() as cursor:
-                            await cursor.execute(
-                                """
-                                UPDATE outbox_events 
-                                SET status = 'failed', 
-                                    retry_count = retry_count + 1,
-                                    last_error = %s,
-                                    next_retry_at = %s
-                                WHERE id = %s
-                                """,
-                                (
-                                    str(e),
-                                    datetime.now(timezone.utc).replace(second=0, microsecond=0),
-                                    outbox_id
-                                )
-                            )
-                            await self.db_connection.commit()
-                        
-                        OUTBOX_EVENTS_PROCESSED.labels(status="failed").inc()
-                        
-                        logger.error("Failed to process outbox event", 
-                                   outbox_id=outbox_id, 
-                                   event_id=event_id,
-                                   error=str(e))
-                
-                await asyncio.sleep(1)
-                
-            except Exception as e:
-                logger.error("Outbox processor error", error=str(e))
-                await asyncio.sleep(5)
+    def __init__(self, client: RedisStreamsClient, config: ConsumerConfig):
+        self.client = client
+        self.config = config
+        self.running = False
+        self.last_activity = time.time()
     
-    async def _consumer_loop(self, consumer_name: str, handler):
-        """Цикл обработки событий для consumer'а."""
-        logger.info("Consumer loop started", consumer=consumer_name)
+    async def _ensure_consumer_group(self, stream_name: str):
+        """Создание consumer group и DLQ (идемпотентно)."""
+        stream_key = STREAMS[stream_name]
+        dlq_key = DLQ_STREAMS[stream_name]
         
-        # Создание consumer group если не существует
+        # Создание consumer group (идемпотентно)
         try:
-            await self.redis_client.xgroup_create(
-                "events:system", 
-                consumer_name, 
-                id="0", 
+            await self.client.client.xgroup_create(
+                stream_key, 
+                self.config.group_name, 
+                id='0', 
+                mkstream=True
+            )
+            logger.info(f"Created consumer group {self.config.group_name} for {stream_name}")
+        except redis.ResponseError as e:
+            if "BUSYGROUP" in str(e):
+                logger.info(f"Consumer group {self.config.group_name} already exists")
+            else:
+                raise
+        
+        # Создание DLQ группы
+        try:
+            await self.client.client.xgroup_create(
+                dlq_key,
+                f"{self.config.group_name}-dlq",
+                id='0',
                 mkstream=True
             )
         except redis.ResponseError:
-            # Consumer group уже существует
-            pass
+            pass  # DLQ группа уже существует
+
+    async def consume_batch(self, stream_name: str, handler_func) -> int:
+        """
+        Обработать один батч сообщений. Возвращает количество обработанных.
+        
+        Args:
+            stream_name: Имя стрима для потребления
+            handler_func: Функция-обработчик события
+            
+        Returns:
+            int: Количество обработанных сообщений
+        """
+        stream_key = STREAMS[stream_name]
+        dlq_key = DLQ_STREAMS[stream_name]
+        
+        try:
+            processed = 0
+            
+            # Context7: Фаза 1: Обработка pending сообщений (reclaim зависших)
+            pending_processed = await self.claim_pending(stream_name, handler_func)
+            processed += pending_processed
+            
+            # Context7: Фаза 2: Чтение новых сообщений
+            new_processed = await self.read_new(stream_name, handler_func)
+            processed += new_processed
+            
+            if processed > 0:
+                self.last_activity = time.time()
+            
+            return processed
+                
+        except Exception as e:
+            logger.error(f"Error in consumer {self.config.consumer_name}: {e}")
+            raise
+
+    async def claim_pending(self, stream_name: str, handler_func) -> int:
+        """
+        Context7: Обработка pending сообщений с XAUTOCLAIM.
+        
+        Args:
+            stream_name: Имя стрима для потребления
+            handler_func: Функция-обработчик события
+            
+        Returns:
+            int: Количество обработанных pending сообщений
+        """
+        stream_key = STREAMS[stream_name]
+        dlq_key = DLQ_STREAMS[stream_name]
+        
+        try:
+            # XAUTOCLAIM для получения зависших сообщений
+            result = await self.client.client.xautoclaim(
+                stream_key,
+                self.config.group_name,
+                self.config.consumer_name,
+                min_idle_time=60000,  # 60 секунд
+                count=self.config.batch_size
+            )
+            
+            if result and len(result) > 1:
+                messages = result[1]  # Список сообщений
+                if messages:
+                    logger.debug(f"Claimed {len(messages)} pending messages from {stream_name}")
+                    # Context7: Метрики для pending сообщений
+                    stream_messages_total.labels(stream=stream_name, phase='pending', status='ok').inc(len(messages))
+                    redis_claim_batch_size.labels(stream=stream_name).observe(len(messages))
+                    posts_in_queue_total.labels(queue=stream_name, status='pending').set(len(messages))
+                    await self._process_messages(stream_key, dlq_key, [(stream_key, messages)], handler_func)
+                    return len(messages)
+            
+            return 0
+            
+        except Exception as e:
+            logger.error(f"Error claiming pending messages from {stream_name}: {e}")
+            return 0
+
+    async def read_new(self, stream_name: str, handler_func) -> int:
+        """
+        Context7: Чтение новых сообщений с XREADGROUP.
+        
+        Args:
+            stream_name: Имя стрима для потребления
+            handler_func: Функция-обработчик события
+            
+        Returns:
+            int: Количество обработанных новых сообщений
+        """
+        stream_key = STREAMS[stream_name]
+        dlq_key = DLQ_STREAMS[stream_name]
+        
+        try:
+            # XREADGROUP для новых сообщений
+            messages = await self.client.client.xreadgroup(
+                self.config.group_name,
+                self.config.consumer_name,
+                {stream_key: '>'},
+                count=self.config.batch_size,
+                block=self.config.block_time
+            )
+            
+            if messages:
+                # Context7: Метрики для новых сообщений
+                message_count = len(messages[0][1]) if messages else 0
+                stream_messages_total.labels(stream=stream_name, phase='new', status='ok').inc(message_count)
+                redis_claim_batch_size.labels(stream=stream_name).observe(message_count)
+                posts_in_queue_total.labels(queue=stream_name, status='new').set(message_count)
+                await self._process_messages(stream_key, dlq_key, messages, handler_func)
+                return message_count
+            
+            return 0
+            
+        except Exception as e:
+            logger.error(f"Error reading new messages from {stream_name}: {e}")
+            return 0
+
+    async def consume_forever(self, stream_name: str, handler_func):
+        """
+        Context7: Бесконечный цикл потребления с правильным паттерном pending → новые.
+        
+        Args:
+            stream_name: Имя стрима для потребления
+            handler_func: Функция-обработчик события
+        """
+        self.running = True
+        
+        # Создание consumer group
+        await self._ensure_consumer_group(stream_name)
+        
+        logger.info(f"Started consuming {stream_name} with group {self.config.group_name}")
         
         while self.running:
             try:
-                # Чтение событий из stream
-                messages = await self.redis_client.xreadgroup(
-                    consumer_name,
-                    f"{consumer_name}-worker",
-                    {"events:system": ">"},
-                    count=10,
-                    block=1000
-                )
+                processed = 0
                 
-                for stream, msgs in messages:
-                    for msg_id, fields in msgs:
+                # Context7: Фаза 1: pending (reclaim зависших)
+                processed += await self.claim_pending(stream_name, handler_func)
+                
+                # Context7: Фаза 2: новые (>)
+                processed += await self.read_new(stream_name, handler_func)
+                
+                # Context7: Метрики для итераций цикла
+                consumer_loop_iterations_total.labels(task=self.config.consumer_name).inc()
+                
+                if processed == 0:
+                    await asyncio.sleep(0.2)  # Короткий backoff, чтобы не жечь CPU
+                    
+            except asyncio.CancelledError:
+                logger.info(f"Consumer {self.config.consumer_name} cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Error in consumer {self.config.consumer_name}: {e}")
+                await asyncio.sleep(self.config.retry_delay)
+
+    async def start_consuming(self, stream_name: str, handler_func):
+        """
+        Запуск потребления событий (обратная совместимость).
+        
+        Args:
+            stream_name: Имя стрима для потребления
+            handler_func: Функция-обработчик события
+        """
+        await self.consume_forever(stream_name, handler_func)
+    
+    async def _process_messages(self, stream_key: str, dlq_key: str, messages: List, handler_func):
+        """Обработка батча сообщений."""
+        for stream, stream_messages in messages:
+            try:
+                print("dispatch_enter", stream, "msg_count", len(stream_messages), flush=True)
+            except Exception:
+                pass
+            for message_id, fields in stream_messages:
                         try:
                             # Парсинг события
-                            event = {
-                                "event_id": fields[b"event_id"].decode(),
-                                "event_type": fields[b"event_type"].decode(),
-                                "tenant_id": fields[b"tenant_id"].decode(),
-                                "user_id": fields[b"user_id"].decode() if fields[b"user_id"] else None,
-                                "correlation_id": fields[b"correlation_id"].decode(),
-                                "occurred_at": fields[b"occurred_at"].decode(),
-                                "version": fields[b"version"].decode(),
-                                "source": fields[b"source"].decode(),
-                                "payload": json.loads(fields[b"payload"].decode())
-                            }
+                            event_data = self._parse_event_data(fields)
+                            
+                            # [C7:DISPATCH-SMOKE-001] — дым на уровне диспетчера
+                            try:
+                                if os.getenv("DISPATCH_SMOKE", "false").lower() == "true" and stream == STREAMS.get("posts.enriched"):
+                                    from event_bus import EventPublisher
+                                    publisher = EventPublisher(self.client)
+                                    mid = await publisher.publish_event("posts.indexed", {
+                                        "post_id": "dispatch-smoke",
+                                        "indexed_at": datetime.now(timezone.utc).isoformat(),
+                                        "note": "dispatch_before_routing"
+                                    })
+                                    print("dispatch_smoke_published", mid, stream, flush=True)
+                            except Exception as _e:
+                                print("dispatch_smoke_failed", str(_e), flush=True)
+
+                            try:
+                                print("dispatch_call", stream, getattr(handler_func, "__name__", str(handler_func)), flush=True)
+                            except Exception:
+                                pass
+
+                            # [GUARD-ENTRY] Диагностика входа в хендлер
+                            logger.info("dispatch_enter", extra={"stream_key": stream_key, "msg_id": message_id})
                             
                             # Обработка события
-                            start_time = datetime.now()
-                            await handler(event)
-                            processing_time = (datetime.now() - start_time).total_seconds()
+                            await handler_func(event_data)
+                            logger.info("dispatch_ok", extra={"stream_key": stream_key, "msg_id": message_id})
                             
                             # Подтверждение обработки
-                            await self.redis_client.xack("events:system", consumer_name, msg_id)
+                            await self.client.client.xack(
+                                stream_key,
+                                self.config.group_name,
+                                message_id
+                            )
                             
-                            # Метрики
-                            EVENTS_CONSUMED.labels(
-                                event_type=event["event_type"],
-                                consumer=consumer_name
-                            ).inc()
+                            # Context7: Метрики для XACK
+                            redis_xack_total.labels(stream=stream_key).inc()
                             
-                            EVENTS_PROCESSING_DURATION.labels(
-                                event_type=event["event_type"],
-                                consumer=consumer_name
-                            ).observe(processing_time)
-                            
-                            logger.debug("Event processed", 
-                                       event_id=event["event_id"],
-                                       event_type=event["event_type"],
-                                       consumer=consumer_name,
-                                       processing_time=processing_time)
+                            logger.debug(f"Processed message {message_id}")
                             
                         except Exception as e:
-                            EVENTS_FAILED.labels(
-                                event_type=fields[b"event_type"].decode(),
-                                consumer=consumer_name,
-                                error_type=type(e).__name__
-                            ).inc()
-                            
-                            logger.error("Failed to process event", 
-                                       msg_id=msg_id,
-                                       consumer=consumer_name,
-                                       error=str(e))
+                            import traceback as _tb
+                            logger.error(f"dispatch_fail stream={stream_key} msg_id={message_id} err={e}")
+                            print("dispatch_traceback:\n" + _tb.format_exc(), flush=True)
+                            await self._handle_failed_message(stream_key, dlq_key, message_id, fields, str(e))
+    
+    async def _handle_failed_message(self, stream_key: str, dlq_key: str, message_id: str, fields: Dict, error: str):
+        """Обработка неудачных сообщений (retry → DLQ)."""
+        # Получить информацию о сообщении
+        message_info = await self.client.client.xpending_range(
+            stream_key,
+            self.config.group_name,
+            min=message_id,
+            max=message_id,
+            count=1
+        )
+        
+        if message_info:
+            retry_count = message_info[0].get('times_delivered', 0)
+            
+            if retry_count < self.config.max_retries:
+                # Повторная попытка через некоторое время
+                logger.warning(f"Retrying message {message_id} (attempt {retry_count + 1})")
+                await asyncio.sleep(self.config.retry_delay)
+            else:
+                # Отправка в DLQ
+                logger.error(f"Moving message {message_id} to DLQ after {retry_count} retries")
+                await self.client.client.xadd(
+                    dlq_key,
+                    {
+                        'original_stream': stream_key,
+                        'original_message_id': message_id,
+                        'error': error,
+                        'retry_count': retry_count,
+                        'failed_at': datetime.now(timezone.utc).isoformat(),
+                        **fields
+                    }
+                )
                 
-            except Exception as e:
-                logger.error("Consumer loop error", 
-                           consumer=consumer_name,
-                           error=str(e))
-                await asyncio.sleep(5)
-
-
-class EventPublisher:
-    """Публикатор событий."""
+                # Подтверждение для удаления из основного стрима
+                await self.client.client.xack(stream_key, self.config.group_name, message_id)
     
-    def __init__(self, event_bus: EventBus):
-        self.event_bus = event_bus
-    
-    async def publish_auth_login_started(self, tenant_id: str, correlation_id: str, 
-                                       qr_session_id: str, telegram_user_id: str, 
-                                       invite_code: str = None, ip_address: str = None,
-                                       user_agent: str = None):
-        """Публикация события начала авторизации."""
-        event = {
-            "event_type": "auth.login.started",
-            "tenant_id": tenant_id,
-            "user_id": None,
-            "correlation_id": correlation_id,
-            "version": "1.0",
-            "source": "qr-auth-service",
-            "payload": {
-                "qr_session_id": qr_session_id,
-                "telegram_user_id": telegram_user_id,
-                "invite_code": invite_code,
-                "ip_address": ip_address,
-                "user_agent": user_agent,
-                "client_meta": {
-                    "locale": "ru-RU",
-                    "timezone": "Europe/Moscow"
-                }
-            }
-        }
+    async def _reclaim_pending_messages(self, stream_key: str):
+        """Пере-claim зависших сообщений."""
+        # Получить зависшие сообщения старше 5 минут
+        pending = await self.client.client.xpending_range(
+            stream_key,
+            self.config.group_name,
+            min='-',
+            max='+',
+            count=100,
+            idle=5000  # 5 секунд в мс (ускоренный ребаланс для dev/worker)
+        )
         
-        return await self.event_bus.publish_event(event)
+        if pending:
+            logger.info(f"Reclaiming {len(pending)} stuck messages")
+            for message in pending:
+                await self.client.client.xclaim(
+                    stream_key,
+                    self.config.group_name,
+                    self.config.consumer_name,
+                    min_idle_time=300000,
+                    message_ids=[message['message_id']]
+                )
     
-    async def publish_auth_login_authorized(self, tenant_id: str, user_id: str, 
-                                          correlation_id: str, qr_session_id: str,
-                                          session_id: str, telegram_user_id: str,
-                                          invite_code: str = None):
-        """Публикация события успешной авторизации."""
-        event = {
-            "event_type": "auth.login.authorized",
-            "tenant_id": tenant_id,
-            "user_id": user_id,
-            "correlation_id": correlation_id,
-            "version": "1.0",
-            "source": "qr-auth-service",
-            "payload": {
-                "qr_session_id": qr_session_id,
-                "session_id": session_id,
-                "telegram_user_id": telegram_user_id,
-                "invite_code": invite_code,
-                "user_data": {
-                    "username": "user",  # TODO: получить из БД
-                    "first_name": "User",
-                    "last_name": "Name"
-                }
-            }
-        }
+    def _parse_event_data(self, fields: Dict[str, Any]) -> Dict[str, Any]:
+        """Парсинг данных события из Redis Streams.
+        Нормализация enriched: {"data": bytes(JSON)} → payload: dict.
+        """
+        # [C7-ID: EVENTBUS-NORM-ENRICHED] Унификация payload
+        # 1) Попытка извлечь из поля data/payload «сырое» тело
+        raw = fields.get('data') or fields.get('payload')
+        if isinstance(raw, (bytes, bytearray)):
+            try:
+                raw = raw.decode('utf-8', 'replace')
+            except Exception:
+                pass
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                # оставим строкой; ниже сформируем event_data
+                pass
         
-        return await self.event_bus.publish_event(event)
-    
-    async def publish_channel_parsing_completed(self, tenant_id: str, user_id: str,
-                                               channel_id: str, telegram_channel_id: str,
-                                               posts_parsed: int, posts_indexed: int,
-                                               parsing_duration_ms: int):
-        """Публикация события завершения парсинга канала."""
-        event = {
-            "event_type": "channel.parsing.completed",
-            "tenant_id": tenant_id,
-            "user_id": user_id,
-            "correlation_id": str(uuid.uuid4()),
-            "version": "1.0",
-            "source": "telethon-ingest",
-            "payload": {
-                "channel_id": channel_id,
-                "telegram_channel_id": telegram_channel_id,
-                "posts_parsed": posts_parsed,
-                "posts_indexed": posts_indexed,
-                "parsing_duration_ms": parsing_duration_ms
-            }
-        }
+        event_data: Dict[str, Any] = {}
+        # Если raw уже dict — это наш payload
+        if isinstance(raw, dict):
+            event_data['payload'] = raw
+            # Остальные поля (заголовки) сохраним для отладки
+            event_data['headers'] = {k: v for k, v in fields.items() if k not in ('data', 'payload')}
+            return event_data
         
-        return await self.event_bus.publish_event(event)
-
-
-# Глобальный экземпляр event bus
-event_bus = None
-event_publisher = None
-
-
-async def init_event_bus(redis_url: str, db_connection=None):
-    """Инициализация event bus."""
-    global event_bus, event_publisher
+        # Иначе — старый формат: разворачиваем поля как раньше
+        for key, value in fields.items():
+            if key in ['tags', 'enrichment_data', 'source_urls', 'urls']:
+                try:
+                    event_data[key] = json.loads(value)
+                except Exception:
+                    event_data[key] = value
+            elif key in ['occurred_at', 'posted_at']:
+                try:
+                    event_data[key] = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+                except Exception:
+                    event_data[key] = value
+            else:
+                event_data[key] = value
+        return event_data
     
-    event_bus = EventBus(redis_url, db_connection)
-    event_publisher = EventPublisher(event_bus)
+    async def stop(self):
+        """Остановка consumer."""
+        self.running = False
+        logger.info(f"Stopping consumer {self.config.consumer_name}")
+
+# ============================================================================
+# FACTORY FUNCTIONS
+# ============================================================================
+
+async def create_publisher(redis_url: str = "redis://redis:6379") -> EventPublisher:
+    """Создание publisher для событий."""
+    client = RedisStreamsClient(redis_url)
+    await client.connect()
+    return EventPublisher(client)
+
+async def create_consumer(
+    stream_name: str,
+    group_name: str,
+    consumer_name: str,
+    redis_url: str = "redis://redis:6379"
+) -> EventConsumer:
+    """Создание consumer для событий."""
+    client = RedisStreamsClient(redis_url)
+    await client.connect()
     
-    await event_bus.start()
-    logger.info("Event bus initialized")
+    config = ConsumerConfig(
+        group_name=group_name,
+        consumer_name=consumer_name
+    )
+    
+    return EventConsumer(client, config)
 
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
 
-async def get_event_publisher() -> EventPublisher:
-    """Получение event publisher."""
-    if not event_publisher:
-        raise RuntimeError("Event bus not initialized")
-    return event_publisher
+async def get_stream_info(stream_name: str, redis_url: str = "redis://redis:6379") -> Dict[str, Any]:
+    """Получение информации о стриме."""
+    client = RedisStreamsClient(redis_url)
+    await client.connect()
+    
+    stream_key = STREAMS[stream_name]
+    info = await client.client.xinfo_stream(stream_key)
+    
+    await client.disconnect()
+    return info
+
+async def get_consumer_group_info(stream_name: str, group_name: str, redis_url: str = "redis://redis:6379") -> Dict[str, Any]:
+    """Получение информации о consumer group."""
+    client = RedisStreamsClient(redis_url)
+    await client.connect()
+    
+    stream_key = STREAMS[stream_name]
+    groups = await client.client.xinfo_groups(stream_key)
+    
+    group_info = next((g for g in groups if g['name'] == group_name), None)
+    
+    await client.disconnect()
+    return group_info
+
+# ============================================================================
+# EXAMPLE USAGE
+# ============================================================================
+
+async def example_publisher():
+    """Пример использования publisher."""
+    publisher = await create_publisher()
+    
+    # Создание события
+    event = PostParsedEvent(
+        idempotency_key="tenant123:channel456:msg789",
+        user_id="user123",
+        channel_id="channel456", 
+        post_id="post789",
+        tenant_id="tenant123",
+        text="Пример поста",
+        urls=["https://example.com"],
+        posted_at=datetime.now(timezone.utc)
+    )
+    
+    # Публикация
+    message_id = await publisher.publish_event('posts.parsed', event)
+    print(f"Published event with ID: {message_id}")
+
+async def example_consumer():
+    """Пример использования consumer."""
+    consumer = await create_consumer(
+        stream_name='posts.parsed',
+        group_name='tagging-group',
+        consumer_name='worker-1'
+    )
+    
+    async def handle_post_parsed(event_data):
+        """Обработчик события post.parsed."""
+        print(f"Processing post: {event_data['post_id']}")
+        # Здесь логика тегирования
+    
+    # Запуск потребления
+    await consumer.start_consuming('posts.parsed', handle_post_parsed)
+
+# ============================================================================
+# EVENT BUS CONFIG
+# ============================================================================
+
+@dataclass
+class EventBusConfig:
+    """Конфигурация EventBus."""
+    group_name: str = "telegram-assistant"
+    consumer_name: str = "worker"
+    batch_size: int = 10
+    block_time: int = 1000
+    max_retries: int = 3
+    retry_delay: int = 5
+    idle_timeout: int = 30000
+
+# ============================================================================
+# EVENT BUS
+# ============================================================================
+
+class EventBus:
+    """Основной класс для управления событиями."""
+    
+    def __init__(self, redis_url: str, config: Optional['EventBusConfig'] = None):
+        self.redis_url = redis_url
+        self.config = config or EventBusConfig()
+        self.client = None
+        self.publisher = None
+        self.consumer = None
+    
+    async def initialize(self):
+        """Инициализация EventBus."""
+        self.client = RedisStreamsClient(self.redis_url)
+        await self.client.connect()
+        self.publisher = EventPublisher(self.client)
+        self.consumer = EventConsumer(self.client, self.config)
+    
+    def get_publisher(self) -> 'EventPublisher':
+        """Получение EventPublisher."""
+        if self.publisher is None:
+            raise RuntimeError("EventBus not initialized. Call initialize() first.")
+        return self.publisher
+    
+    def get_consumer(self) -> 'EventConsumer':
+        """Получение EventConsumer."""
+        if self.consumer is None:
+            raise RuntimeError("EventBus not initialized. Call initialize() first.")
+        return self.consumer
+
+# ============================================================================
+# Глобальные экземпляры для инициализации
+# ============================================================================
+
+_event_bus: Optional['EventBus'] = None
+_event_publisher: Optional['EventPublisher'] = None
+
+async def init_event_bus(redis_url: str, config: Optional['EventBusConfig'] = None) -> 'EventBus':
+    """Инициализация глобального EventBus."""
+    global _event_bus
+    if _event_bus is None:
+        _event_bus = EventBus(redis_url, config)
+        await _event_bus.initialize()
+    return _event_bus
+
+def get_event_publisher() -> 'EventPublisher':
+    """Получение глобального EventPublisher."""
+    global _event_publisher
+    if _event_publisher is None:
+        if _event_bus is None:
+            raise RuntimeError("EventBus not initialized. Call init_event_bus() first.")
+        _event_publisher = _event_bus.get_publisher()
+    return _event_publisher
+
+if __name__ == "__main__":
+    # Пример запуска
+    asyncio.run(example_publisher())

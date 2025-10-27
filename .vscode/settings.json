@@ -1,0 +1,21 @@
+{
+  "files.watcherExclude": {
+    "**/.env": true
+  },
+  "files.readonlyInclude": [
+    "**/.env",
+    "**/docker-compose.yml"
+  ],
+  "editor.codeActionsOnSave": {
+    "source.organizeImports": "explicit"
+  },
+  "files.associations": {
+    "*.yml": "yaml"
+  },
+  "search.exclude": {
+    "**/.env": true,
+    "**/docker-compose.yml": true,
+    "**/Caddyfile": true,
+    "**/supabase/volumes/api/kong.yml": true
+  }
+}

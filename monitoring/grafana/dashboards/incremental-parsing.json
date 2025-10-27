@@ -1,0 +1,115 @@
+{
+  "dashboard": {
+    "title": "Incremental Parsing Dashboard",
+    "tags": ["telegram-assistant", "parser"],
+    "schemaVersion": 27,
+    "panels": [
+      {
+        "id": 1,
+        "title": "Parsing Rate",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(posts_parsed_total[5m])",
+            "legendFormat": "{{mode}}"
+          }
+        ],
+        "yaxes": [
+          {
+            "label": "Posts/sec"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}
+      },
+      {
+        "id": 2,
+        "title": "Parsing Latency p95",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, sum(rate(parsing_duration_seconds_bucket[5m])) by (le, mode))",
+            "legendFormat": "{{mode}}"
+          }
+        ],
+        "yaxes": [
+          {
+            "label": "Seconds"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}
+      },
+      {
+        "id": 3,
+        "title": "Empty Ticks Detection",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "increase(parser_runs_total{status=\"ok\"}[1h]) - increase(posts_parsed_total{status=\"success\"}[1h])",
+            "legendFormat": "Empty ticks"
+          }
+        ],
+        "yaxes": [
+          {
+            "label": "Count"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}
+      },
+      {
+        "id": 4,
+        "title": "HWM Age Max",
+        "type": "singlestat",
+        "targets": [
+          {
+            "expr": "max(parser_hwm_age_seconds)"
+          }
+        ],
+        "valueName": "current",
+        "thresholds": "20000,21600",
+        "colorBackground": true,
+        "format": "s",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8}
+      },
+      {
+        "id": 5,
+        "title": "Forced Historical Count",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "increase(parser_mode_forced_total{reason=\"stale_lpa\"}[24h])",
+            "legendFormat": "Forced historical"
+          }
+        ],
+        "yaxes": [
+          {
+            "label": "Count"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16}
+      },
+      {
+        "id": 6,
+        "title": "Scheduler Freshness",
+        "type": "singlestat",
+        "targets": [
+          {
+            "expr": "time() - scheduler_last_tick_ts_seconds"
+          }
+        ],
+        "valueName": "current",
+        "thresholds": "600,1200",
+        "colorBackground": true,
+        "format": "s",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16}
+      }
+    ],
+    "refresh": "10s",
+    "time": {
+      "from": "now-1h",
+      "to": "now"
+    },
+    "timepicker": {
+      "refresh_intervals": ["10s", "30s", "1m", "5m"]
+    }
+  }
+}

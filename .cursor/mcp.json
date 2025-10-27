@@ -8,6 +8,9 @@
           "TG_API_HASH": "d72f161ad90794db968e19cc24e77efa",
           "HOME": "/home/ilyasni"
         }
+      },
+      "supabase": {
+        "url": "https://mcp.supabase.com/mcp"
       }
     }
   }

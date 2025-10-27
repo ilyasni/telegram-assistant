@@ -39,7 +39,7 @@ class SessionRevokeRequest(BaseModel):
 
 
 @router.get("/", response_model=SessionListResponse)
-async def list_sessions(
+def list_sessions(
     tenant_id: Optional[str] = Query(None, description="Фильтр по tenant_id"),
     status: Optional[str] = Query(None, description="Фильтр по статусу"),
     page: int = Query(1, ge=1, description="Номер страницы"),
@@ -85,7 +85,7 @@ async def list_sessions(
 
 
 @router.get("/{session_id}", response_model=SessionResponse)
-async def get_session(session_id: str, db: Session = Depends(get_db)):
+def get_session(session_id: str, db: Session = Depends(get_db)):
     """Context7 best practice: получение конкретной сессии."""
     try:
         session = db.query(TelegramSession).filter(TelegramSession.id == session_id).first()
@@ -109,7 +109,7 @@ async def get_session(session_id: str, db: Session = Depends(get_db)):
 
 
 @router.post("/{session_id}/revoke")
-async def revoke_session(
+def revoke_session(
     session_id: str,
     request: SessionRevokeRequest,
     db: Session = Depends(get_db)
@@ -148,7 +148,7 @@ async def revoke_session(
 
 
 @router.get("/{session_id}/logs")
-async def get_session_logs(
+def get_session_logs(
     session_id: str,
     limit: int = Query(50, ge=1, le=100, description="Количество записей"),
     db: Session = Depends(get_db)
@@ -191,7 +191,7 @@ async def get_session_logs(
 
 
 @router.post("/cleanup")
-async def cleanup_expired_sessions(
+def cleanup_expired_sessions(
     days: int = Query(30, ge=1, le=365, description="Количество дней для хранения"),
     db: Session = Depends(get_db)
 ):
@@ -227,7 +227,7 @@ async def cleanup_expired_sessions(
 
 
 @router.get("/stats/summary")
-async def get_session_stats(db: Session = Depends(get_db)):
+def get_session_stats(db: Session = Depends(get_db)):
     """Context7 best practice: статистика по сессиям."""
     try:
         # Context7 best practice: агрегированная статистика

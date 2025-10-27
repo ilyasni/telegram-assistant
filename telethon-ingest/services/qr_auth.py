@@ -68,12 +68,21 @@ class QrAuthService:
                         if existing_session:
                             logger.info("Existing session found, skipping new QR", 
                                        tenant_id=tenant_id, 
-                                       existing_session=existing_session)
+                                       session_id=str(existing_session.get('id', '')))
+                            # Получаем session_string из БД для Redis
+                            session_string = None
+                            try:
+                                from crypto_utils import decrypt_session
+                                session_string = decrypt_session(existing_session.get('session_string_enc'), existing_session.get('key_id'))
+                            except Exception as e:
+                                logger.warning("Failed to decrypt session_string for Redis", error=str(e))
+                            
                             # Обновляем статус на "authorized" для идемпотентности
                             self.redis_client.hset(key, mapping={
                                 "status": "authorized",
-                                "session_id": existing_session,
-                                "reason": "existing_session"
+                                "session_id": str(existing_session.get('id', '')),
+                                "reason": "existing_session",
+                                "session_string": session_string or ""
                             })
                             continue
                     
@@ -183,7 +192,7 @@ class QrAuthService:
             
             # Расшифровываем сессию
             from crypto_utils import decrypt_session
-            session_string = decrypt_session(encrypted_session, key_id)
+            session_string = decrypt_session(encrypted_session)
             if not session_string:
                 logger.warning("Failed to decrypt session for validation")
                 return False
@@ -283,10 +292,24 @@ class QrAuthService:
                 telegram_user_id = me.id
                 await temp_client.disconnect()
             
+            # Context7 best practice: получаем правильный tenant_id из БД
+            if not self.session_storage.db_connection:
+                await self.session_storage.init_db()
+            
+            # Получаем tenant_id из БД по telegram_user_id
+            with self.session_storage.db_connection.cursor() as cursor:
+                cursor.execute("SELECT tenant_id FROM users WHERE telegram_id = %s", (telegram_user_id,))
+                result = cursor.fetchone()
+                if result:
+                    db_tenant_id = str(result[0])
+                else:
+                    # Если пользователь не найден, используем переданный tenant_id как fallback
+                    db_tenant_id = tenant_id
+            
             # Сохраняем сессию в БД
             session_id = await self.session_storage.save_telegram_session(
-                tenant_id=tenant_id,
-                user_id=tenant_id,  # TODO: получать user_id из БД по tenant_id
+                tenant_id=db_tenant_id,
+                user_id=db_tenant_id,
                 session_string=session_string,
                 telegram_user_id=telegram_user_id,
                 invite_code=None
@@ -317,12 +340,22 @@ class QrAuthService:
         # Context7 best practice: проверка существующей активной сессии
         existing_session = await self._check_existing_session(tenant_id)
         if existing_session:
-            logger.info("User already has active session", tenant_id=tenant_id, session_id=existing_session.get('id'))
+            logger.info("User already has active session", tenant_id=tenant_id, session_id=str(existing_session.get('id', '')))
+            
+            # Получаем session_string из БД для Redis
+            session_string = None
+            try:
+                from crypto_utils import decrypt_session
+                session_string = decrypt_session(existing_session.get('session_string_enc'), existing_session.get('key_id'))
+            except Exception as e:
+                logger.warning("Failed to decrypt session_string for Redis", error=str(e))
+            
             self.redis_client.hset(redis_key, mapping={
                 "status": "authorized",
-                "session_id": existing_session.get('id'),
+                "session_id": str(existing_session.get('id', '')),
                 "telegram_user_id": str(existing_session.get('telegram_user_id', '')),
-                "reason": "existing_session"
+                "reason": "existing_session",
+                "session_string": session_string or ""
             })
             self.redis_client.expire(redis_key, 3600)
             AUTH_QR_SUCCESS.inc()
@@ -453,10 +486,21 @@ class QrAuthService:
             if not self.session_storage.db_connection:
                 await self.session_storage.init_db()
             
+            # Context7 best practice: получаем правильный tenant_id из БД
+            with self.session_storage.db_connection.cursor() as cursor:
+                cursor.execute("SELECT tenant_id FROM users WHERE telegram_id = %s", (me.id,))
+                result = cursor.fetchone()
+                if result:
+                    db_tenant_id = str(result[0])
+                else:
+                    # Если пользователь не найден, используем переданный tenant_id как fallback
+                    db_tenant_id = tenant_id
+            
             # Context7 best practice: сохранение сессии в БД с данными пользователя
-            session_id = await self.session_storage.save_telegram_session(
-                tenant_id=tenant_id,
-                user_id=tenant_id,  # TODO: получать user_id из БД по tenant_id
+            # Детектор правды: детальная диагностика ошибок
+            success, session_id, error_code, error_details = await self.session_storage.save_telegram_session(
+                tenant_id=db_tenant_id,
+                user_id=db_tenant_id,
                 session_string=session_string,
                 telegram_user_id=me.id,
                 first_name=getattr(me, 'first_name', None),
@@ -465,11 +509,34 @@ class QrAuthService:
                 invite_code=None  # TODO: получать invite_code из запроса
             )
             
-            if not session_id:
-                logger.error("Failed to save session to database", tenant_id=tenant_id)
+            if not success:
+                # Детектор правды: разделение ошибок по типам
+                if error_code == "db_integrity":
+                    failure_reason = "session_store_integrity_failed"
+                elif error_code == "db_operational":
+                    failure_reason = "session_store_operational_failed"
+                elif error_code == "db_generic":
+                    failure_reason = "session_store_database_failed"
+                elif error_code == "session_saver_failed":
+                    failure_reason = "session_saver_failed"
+                else:
+                    failure_reason = "session_store_unexpected_failed"
+                
+                logger.error(
+                    "Failed to save session to database", 
+                    tenant_id=tenant_id,
+                    error_code=error_code,
+                    error_details=error_details,
+                    failure_reason=failure_reason,
+                    session_length=len(session_string),
+                    telegram_user_id=me.id
+                )
+                
                 self.redis_client.hset(redis_key, mapping={
                     "status": "failed",
-                    "reason": "database_save_failed"
+                    "reason": failure_reason,
+                    "error_code": error_code,
+                    "error_details": error_details or "Unknown error"
                 })
                 AUTH_QR_FAIL.inc()
                 QR_SESSION_TOTAL.labels(status="failed").inc()
@@ -480,7 +547,8 @@ class QrAuthService:
             self.redis_client.hset(redis_key, mapping={
                 "status": "authorized",
                 "session_id": session_id,
-                "telegram_user_id": str(me.id)
+                "telegram_user_id": str(me.id),
+                "session_string": session_string
             })
             self.redis_client.hdel(redis_key, "reason")
             self.redis_client.expire(redis_key, 3600)  # продление для интеграции с инвайтами

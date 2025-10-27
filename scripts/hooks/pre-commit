@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -e
+if git diff --cached --name-only | grep -E "(^|/)\.env$" >/dev/null; then
+  echo "ERROR: попытка закоммитить .env"; exit 1
+fi
+if git diff --cached --name-only | grep -E "(^|/)docker-compose\.yml$" >/dev/null; then
+  echo "WARN: меняется docker-compose.yml"
+  echo " - убедись, что изменения согласованы и проходят scripts/compose-guard.sh"
+  ./scripts/compose-guard.sh || exit 1
+fi
+exit 0

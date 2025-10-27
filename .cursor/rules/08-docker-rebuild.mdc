@@ -1,0 +1,206 @@
+---
+# 08-docker-rebuild.mdc — Scope & Intent
+- Purpose: Предотвращение проблем с пересборкой контейнеров, диагностика "неизменности" файлов
+- Applies to: Dockerfile, docker-compose.yml, сборка образов, пересоздание контейнеров
+- Non-goals: Отсутствие диагностики, игнорирование кэширования, смешивание путей артефактов и томов
+- Output expectations: Корректная пересборка, обновление файлов, предсказуемое поведение
+- Checks: Маунты, образы, файлы в контейнере, контекст сборки, версионирование
+---
+
+# Docker Rebuild Rules
+
+## Топ-7 причин "неизменности" файлов
+
+### 1. Named/anonymous volume перекрывает файлы образа
+**Проблема**: Если у сервиса смонтирован том в ту же директорию, куда вы COPYнули артефакты сборки, Docker возьмёт содержимое тома, а не то, что в образе.
+
+**Диагностика**:
+```bash
+# Посмотреть маунты у бегущего контейнера
+docker inspect <service> --format '{{json .Mounts}}' | jq
+
+# Проверить, что файл внутри контейнера «тот самый»
+docker exec -it <service> sh -c 'ls -l /путь && sha256sum /путь/файл'
+```
+
+**Решение**: Никогда не монтируйте том в директорию с артефактами сборки. Разделите: `/app` — код из образа; `/data`, `/sessions`, `/logs` — только для volume.
+
+### 2. Контейнер перезапустили, а не пересоздали
+**Проблема**: `docker compose restart` поднимает старый контейнер со старым слоем файловой системы.
+
+**Решение**: Используйте `docker compose up --build` или `docker compose up --force-recreate`.
+
+### 3. Не подтянули свежий base-image
+**Проблема**: `--no-cache` отключает локальный кэш слоёв сборки, но не заставляет тянуть обновлённый FROM.
+
+**Решение**: Используйте `--pull`:
+```bash
+docker compose build --pull
+# или
+docker build --pull .
+```
+
+### 4. Bind-mount «маскирует» изменения кода
+**Проблема**: Если монтируете `.:/app`, внутри увидите файлы хоста. Вы могли поменять их в другом каталоге/ветке.
+
+**Решение**: Для dev используйте bind-mount, для prod — образ. В `docker-compose.override.yml` держите `.:/app` только локально.
+
+### 5. .dockerignore режет контекст
+**Проблема**: Часто игнорят `**/*.py/dist/build` и потом удивляются, что в образ ничего не попало.
+
+**Диагностика**:
+```bash
+# Посмотреть, какие файлы реально попали в контекст
+docker build . -o type=docker,dest=/dev/null --no-cache
+```
+
+**Решение**: Проверяйте `.dockerignore`. Явно включите нужные каталоги/файлы, которые должны попасть в образ.
+
+### 6. Мультистейдж копирует «не тот» артефакт
+**Проблема**: Опечатка в `COPY --from=builder`/не тот путь — вы уверенно пересобираете, а в runtime-слое остаётся старое.
+
+**Решение**: Проверяйте пути в `COPY --from=` и убедитесь, что копируете из правильного стейджа.
+
+### 7. Compose берёт кэшированный тег из локального кеша/реестра
+**Проблема**: Если вы пушите тот же тег без latest-антипаттерновой дисциплины, другой хост/агент может тянуть старый манифест.
+
+**Решение**: Версионируйте образы тегом «по коду». Добавьте `ARG APP_VERSION` и пробрасывайте `--build-arg APP_VERSION=$(git rev-parse --short HEAD)`.
+
+## Чек-лист диагностики (быстро)
+
+### Проверка маунтов
+```bash
+# Посмотреть маунты у бегущего контейнера
+docker inspect <service> --format '{{json .Mounts}}' | jq
+
+# Проверить, что файл внутри контейнера «тот самый»
+docker exec -it <service> sh -c 'ls -l /путь && sha256sum /путь/файл'
+```
+
+### Проверка образов
+```bash
+# Убедиться, что образ реально обновился
+docker image ls | grep <service>
+docker history <image:tag>
+
+# Проверить, что файл внутри контейнера «тот самый»
+docker exec -it <service> sh -c 'ls -l /путь && sha256sum /путь/файл'
+```
+
+### Проверка контекста сборки
+```bash
+# Посмотреть, какие файлы реально попали в контекст
+docker build . -o type=docker,dest=/dev/null --no-cache + следить за выводом COPY
+```
+
+## Паттерны предотвращения
+
+### Разделение путей
+- **Никогда не монтируйте том в директорию с артефактами сборки**
+- **Фиксируйте пути**: В Dockerfile копируйте в папку, куда вы не монтируете тома:
+  ```dockerfile
+  COPY . /srv/app
+  # том — в /var/<service>-data
+  ```
+
+### Версионирование образов
+```dockerfile
+# В Dockerfile
+ARG APP_VERSION
+ENV APP_VERSION=${APP_VERSION}
+
+# При сборке
+docker build --build-arg APP_VERSION=$(git rev-parse --short HEAD) .
+```
+
+### Всегда --pull при «подозрениях»
+```bash
+docker compose build --pull
+# В CI включите DOCKER_BUILDKIT=1 и inline-cache
+export DOCKER_BUILDKIT=1
+```
+
+### Проверка .dockerignore
+```dockerignore
+# Явно включите нужные каталоги/файлы
+!src/
+!requirements.txt
+!Dockerfile
+```
+
+### Dev vs Prod разделение
+- **Для dev**: используйте bind-mount в `docker-compose.override.yml`
+- **Для prod**: никаких bind-mount на код, только образ
+
+## Context7 Integration
+
+### При изменении Dockerfile или docker-compose
+**Обязательно использовать Context7 для проверки**:
+- Docker best practices
+- BuildKit patterns  
+- Multi-stage build optimization
+- Cache invalidation strategies
+
+### При диагностике проблем со сборкой
+**Запрашивать документацию через Context7**:
+- Docker/BuildKit troubleshooting
+- Volume mount best practices
+- Image layer optimization
+- Build context management
+
+### Команды для Context7
+```bash
+# При изменении Dockerfile
+mcp_context7_resolve-library-id --libraryName "docker"
+mcp_context7_get-library-docs --context7CompatibleLibraryID "/docker/docs" --topic "best practices"
+
+# При проблемах со сборкой
+mcp_context7_resolve-library-id --libraryName "docker buildkit"
+mcp_context7_get-library-docs --context7CompatibleLibraryID "/docker/buildkit" --topic "troubleshooting"
+```
+
+## Best Practices для проекта
+
+### Текущие проблемы (найдены при анализе)
+1. **Bind-mount конфигов**: `./worker/config:/app/config:ro` — может перекрыть файлы из образа
+2. **Latest теги**: `supabase/studio:latest`, `grafana/grafana:latest` — могут быть закэшированы
+3. **Отсутствие .dockerignore** — нужно создать
+
+### Рекомендации
+1. **Создать .dockerignore** в корне и в каждом сервисе
+2. **Версионировать собственные образы** через `ARG APP_VERSION` и git SHA
+3. **При использовании latest** всегда делать `docker compose pull` перед `up --build`
+4. **Разделить dev/prod compose** — `docker-compose.override.yml` для dev-bind-mount
+
+### Команды для проверки
+```bash
+# Проверка маунтов всех сервисов
+docker compose ps --format "table {{.Name}}\t{{.Image}}\t{{.Status}}"
+for service in $(docker compose ps --services); do
+  echo "=== $service ==="
+  docker inspect $service --format '{{json .Mounts}}' | jq
+done
+
+# Проверка образов
+docker image ls --format "table {{.Repository}}\t{{.Tag}}\t{{.CreatedAt}}"
+
+# Проверка контекста сборки
+docker build . --no-cache 2>&1 | grep -E "(COPY|ADD)"
+```
+
+## Rollback стратегия
+
+### При проблемах со сборкой
+1. **Откат к предыдущему образу**: `docker compose down && docker compose up -d`
+2. **Очистка кэша**: `docker system prune -a`
+3. **Пересборка с нуля**: `docker compose build --no-cache --pull`
+
+### При проблемах с маунтами
+1. **Проверить .dockerignore**: убедиться, что нужные файлы не игнорятся
+2. **Проверить пути**: убедиться, что тома не перекрывают артефакты сборки
+3. **Временное отключение маунтов**: закомментировать volumes в compose
+
+### При проблемах с версионированием
+1. **Принудительный pull**: `docker compose pull`
+2. **Очистка локального кэша**: `docker image rm <image:tag>`
+3. **Пересборка с новым тегом**: изменить тег в compose и пересобрать

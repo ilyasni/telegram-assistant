@@ -1,0 +1,62 @@
+groups:
+  # Recording rules для квантилей
+  - name: crawl_latency_quantiles
+    interval: 30s
+    rules:
+      - record: job:crawl_trigger_processing_latency_seconds:p95
+        expr: histogram_quantile(0.95, sum by (le) (rate(crawl_trigger_processing_latency_seconds_bucket[5m])))
+      
+      - record: job:crawl_processing_seconds:p95
+        expr: histogram_quantile(0.95, sum by (le) (rate(crawl_processing_seconds_bucket[5m])))
+
+  # Alerts
+  - name: crawl_pipeline
+    interval: 30s
+    rules:
+      # PEL backlog критичен
+      - alert: CrawlPELBacklogHigh
+        expr: crawl_pel_backlog_current > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Высокий PEL backlog ({{ $value }})"
+      
+      # Queue depth растёт
+      - alert: CrawlTriggerQueueDepthHigh
+        expr: crawl_trigger_queue_depth_current > 500
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Высокая глубина очереди триггера ({{ $value }})"
+      
+      # Error rate > 10%
+      - alert: CrawlErrorRateHigh
+        expr: |
+          rate(crawl_requests_total{status="failed"}[5m])
+          /
+          rate(crawl_requests_total[5m]) > 0.10
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Crawl error-rate > 10%"
+      
+      # p95 latency > 2s
+      - alert: CrawlP95LatencyHigh
+        expr: job:crawl_trigger_processing_latency_seconds:p95 > 2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 latency триггера > 2s ({{ $value }})"
+      
+      # TagPersistence PEL backlog
+      - alert: TagPersistPELBacklogHigh
+        expr: tags_persist_pel_backlog_current > 50
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TagPersist PEL backlog высокий ({{ $value }})"

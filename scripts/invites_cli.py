@@ -41,7 +41,7 @@ class InvitesCLI:
     """CLI для управления инвайт-кодами."""
     
     def __init__(self):
-        self.db_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/telegram_assistant")
+        self.db_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/postgres")
     
     def get_db_connection(self):
         """Получение подключения к БД."""

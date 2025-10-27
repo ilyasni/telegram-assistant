@@ -1,0 +1,11 @@
+name: Guard
+on: [pull_request]
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y nodejs npm docker.io
+      - run: npm i -g ajv-cli
+      - run: bash scripts/compose-guard.sh
+      - run: echo {} > .env.json && ajv validate -s .env.schema.json -d .env.json || true

@@ -24,9 +24,9 @@ class UserCreate(BaseModel):
 class UserResponse(BaseModel):
     id: UUID
     telegram_id: int
-    username: Optional[str]
-    first_name: Optional[str]
-    last_name: Optional[str]
+    username: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
     created_at: str
 
 
@@ -108,25 +108,33 @@ async def create_user(user_data: UserCreate, db: Session = Depends(get_db)):
 
 
 @router.get("/{user_id}/subscription", response_model=SubscriptionInfo)
-async def get_user_subscription(user_id: UUID, db: Session = Depends(get_db)):
+async def get_user_subscription(user_id: str, db: Session = Depends(get_db)):
     """Получить информацию о подписке пользователя."""
-    user = db.query(User).filter(User.id == user_id).first()
+    # Определяем, является ли user_id UUID или telegram_id
+    try:
+        # Пытаемся преобразовать в int - если получилось, это telegram_id
+        telegram_id = int(user_id)
+        user = db.query(User).filter(User.telegram_id == telegram_id).first()
+    except ValueError:
+        # Если не получилось преобразовать в int, считаем что это UUID
+        user = db.query(User).filter(User.id == user_id).first()
+    
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     
     # Лимиты по типу подписки
     limits = {
-        "trial": {"channels": 3, "posts": 100, "rag_queries": 10},
+        "free": {"channels": 3, "posts": 100, "rag_queries": 10},
         "basic": {"channels": 10, "posts": 1000, "rag_queries": 100},
         "premium": {"channels": 50, "posts": 10000, "rag_queries": 1000}
     }
     
-    user_limits = limits.get(user.subscription_type or "trial", limits["trial"])
+    user_limits = limits.get(user.tier or "free", limits["free"])
     
     return SubscriptionInfo(
-        subscription_type=user.subscription_type or "trial",
-        subscription_expires_at=user.subscription_expires_at.isoformat() if user.subscription_expires_at else None,
-        is_active=user.is_active,
+        subscription_type=user.tier or "free",
+        subscription_expires_at=None,  # У нас нет поля expires_at
+        is_active=True,  # У нас нет поля is_active
         channels_limit=user_limits["channels"],
         posts_limit=user_limits["posts"],
         rag_queries_limit=user_limits["rag_queries"]

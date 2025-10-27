@@ -1,0 +1,5 @@
+- [ ] scripts/compose-guard.sh — OK
+- [ ] Базовые файлы (docker-compose.yml, Caddyfile, supabase/volumes/api/kong.yml) — изменения осознанные, локально пройдены проверки
+- [ ] .env/секреты — вне PR
+- [ ] scripts/env-check.sh — OK локально
+- [ ] Smoke тест (`make smoke`) — OK

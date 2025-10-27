@@ -95,3 +95,34 @@
 - **k6/Locust** — для API endpoints
 - **Бенчмарки** — для критичных операций
 - **Load testing** — для event bus throughput
+
+## Compose Protection
+
+### Защита docker-compose.yml
+- **Базовый compose неизменен** — только через override-файлы
+- **make guard** — проверка compose конфигурации
+- **Readonly защита** — базовый файл в режиме только чтение
+- **Override для экспериментов** — docker-compose.dev.yml для разработки
+
+### Обязательные сервисы
+```bash
+supabase-db kong rest auth storage redis qdrant api worker telethon-ingest
+```
+
+### Development Workflow
+```bash
+# Использование override
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+
+# Через Makefile
+make up-core up-app
+
+# Проверка конфигурации
+make guard
+```
+
+### Security Measures
+- **Git skip-worktree** — для базового compose
+- **FS immutable флаги** — для критичных файлов
+- **Pre-commit hooks** — проверка изменений compose
+- **CI валидация** — автоматическая проверка в PR

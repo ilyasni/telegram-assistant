@@ -5,11 +5,14 @@ services:
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_MAX_CONNECTIONS: 200
     volumes:
       - supabase_data:/var/lib/postgresql/data
       - ./supabase/volumes/db/init:/docker-entrypoint-initdb.d
     networks:
-      - telegram-network
+      telegram-network:
+        aliases:
+          - db
     profiles:
       - core
 
@@ -55,36 +58,12 @@ services:
     image: supabase/postgres-meta:v0.80.0
     environment:
       PG_META_PORT: 8080
-      PG_META_DB_HOST: supabase-db
-      PG_META_DB_PASSWORD: postgres
-      PG_META_DB_NAME: postgres
-      PG_META_DB_USER: postgres
-    depends_on:
-      - supabase-db
-    networks:
-      - telegram-network
-    profiles:
-      - core
-
-  # GoTrue Auth
-  auth:
-    image: supabase/gotrue:v2.143.0
-    environment:
-      GOTRUE_API_HOST: 0.0.0.0
-      GOTRUE_API_PORT: 9999
-      API_EXTERNAL_URL: https://${DOMAIN}
-      GOTRUE_DB_DRIVER: postgres
-      GOTRUE_DB_DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@supabase-db:5432/${POSTGRES_DB}
-      GOTRUE_SITE_URL: https://${DOMAIN}
-      GOTRUE_URI_ALLOW_LIST: "*"
-      GOTRUE_DISABLE_SIGNUP: "false"
-      GOTRUE_JWT_ADMIN_ROLES: service_role
-      GOTRUE_JWT_AUD: authenticated
-      GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
-      GOTRUE_JWT_EXP: 3600
-      GOTRUE_JWT_SECRET: ${JWT_SECRET}
-      GOTRUE_EXTERNAL_EMAIL_ENABLED: "true"
-      GOTRUE_MAILER_AUTOCONFIRM: "true"
+      PG_META_DB_URL: postgresql://postgres:postgres@supabase-db:5432/postgres
+      PG_META_DB_HOST__db: supabase-db
+      PG_META_DB_PORT__db: "5432"
+      PG_META_DB_NAME__db: postgres
+      PG_META_DB_USER__db: postgres
+      PG_META_DB_PASSWORD__db: postgres
     depends_on:
       - supabase-db
     networks:
@@ -216,10 +195,33 @@ services:
       GF_SECURITY_STRICT_TRANSPORT_SECURITY_SUBDOMAINS: "true"
     volumes:
       - grafana_data:/var/lib/grafana
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+      - ./grafana/provisioning:/etc/grafana/provisioning
     networks:
       - telegram-network
     profiles:
       - analytics
+
+  # Prometheus Metrics
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    ports:
+      - "9090:9090"
+    networks:
+      - telegram-network
+    profiles:
+      - monitoring
 
   # Caddy Reverse Proxy
   caddy:
@@ -245,6 +247,94 @@ services:
     networks:
       - telegram-network
     # qdrant образ не содержит curl/wget — оставляем без healthcheck
+    profiles:
+      - core
+
+  # Neo4j Graph Database
+  neo4j:
+    image: neo4j:5.15-community
+    environment:
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-changeme}
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 2G
+      NEO4J_server_memory_pagecache_size: 512m
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    networks:
+      - telegram-network
+    healthcheck:
+      # Явно указываем протокол neo4j:// и адрес для избежания SSL ошибок
+      test: ["CMD", "cypher-shell", "-a", "neo4j://neo4j:7687", "-u", "neo4j", "-p", "${NEO4J_PASSWORD:-changeme}", "RETURN 1;"]
+      interval: 20s
+      timeout: 5s
+      retries: 15
+      start_period: 40s
+    profiles:
+      - core
+
+  # GigaChat Proxy (gpt2giga) - локальная сборка с официальным gpt2giga
+  gpt2giga-proxy:
+    build:
+      context: ./gpt2giga-proxy
+      dockerfile: Dockerfile
+    ports:
+      - "8090:8090"
+    environment:
+      # Базовые настройки (из документации)
+      PROXY_HOST: "0.0.0.0"
+      PROXY_PORT: "8090"
+      
+      # GigaChat API (обязательные)
+      GIGACHAT_CREDENTIALS: ${GIGACHAT_CREDENTIALS}
+      GIGACHAT_SCOPE: ${GIGACHAT_SCOPE:-GIGACHAT_API_PERS}
+      GIGACHAT_BASE_URL: "https://gigachat.devices.sberbank.ru/api/v1"
+      GIGACHAT_MODEL: "GigaChat"
+      
+      # Таймауты и retry (Context7 best practice)
+      GPT2GIGA_TIMEOUT: "600"
+      
+      # Verbose logging для диагностики
+      GPT2GIGA_VERBOSE: "True"
+      
+      # Передача модели (из документации)
+      GPT2GIGA_PASS_MODEL: "True"
+      
+      # SSL сертификаты (отключаем для dev/test)
+      GIGACHAT_VERIFY_SSL_CERTS: "False"
+      
+      # Embeddings модель
+      GPT2GIGA_EMBEDDINGS: "EmbeddingsGigaR"
+    networks:
+      - telegram-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8090/v1/models"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    profiles:
+      - core
+
+  # Neo4j Health Server
+  neo4j-health:
+    build: ./neo4j
+    environment:
+      NEO4J_URI: ${NEO4J_URI:-neo4j://neo4j:7687}
+      NEO4J_USER: ${NEO4J_USER:-neo4j}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD}
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    networks:
+      - telegram-network
+    ports:
+      - "7475:7475"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7475/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
     profiles:
       - core
 
@@ -290,14 +380,67 @@ services:
       DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@supabase-db:5432/${POSTGRES_DB}
       REDIS_URL: redis://redis:6379
       QDRANT_URL: http://qdrant:6333
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      NEO4J_URL: ${NEO4J_URL:-bolt://neo4j:7687}
+      NEO4J_URI: ${NEO4J_URI:-neo4j://neo4j:7687}
+      NEO4J_USER: ${NEO4J_USER:-neo4j}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-changeme}
+      # AI Provider Configuration with Fallback
+      # Primary: GigaChat через gpt2giga-proxy
+      OPENAI_API_BASE: ${OPENAI_API_BASE:-http://gpt2giga-proxy:8090/v1}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-dummy}
+      # Флаг для использования прокси GigaChat
+      USE_GIGACHAT_PROXY: ${USE_GIGACHAT_PROXY:-true}
+      GIGACHAT_PROXY_URL: ${GIGACHAT_PROXY_URL:-http://gpt2giga-proxy:8090}
+      # Убираем GIGACHAT_ACCESS_TOKEN - используем только прокси
+      # GIGACHAT_ACCESS_TOKEN: ${GIGACHAT_ACCESS_TOKEN}
+      # Fallback: OpenRouter
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      # DEV Feature Flags
+      FEATURE_ALLOW_NON_UUID_IDS: ${FEATURE_ALLOW_NON_UUID_IDS:-true}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-qwen/qwen-2.5-72b-instruct:free}
+      OPENROUTER_API_BASE: ${OPENROUTER_API_BASE:-https://openrouter.ai/api/v1}
+      ENRICHMENT_CONFIG_PATH: /app/config/enrichment_policy.yml
+      # Feature flags
+      FEATURE_NEO4J_ENABLED: ${FEATURE_NEO4J_ENABLED:-true}
+      FEATURE_GIGACHAT_ENABLED: ${FEATURE_GIGACHAT_ENABLED:-true}
+      FEATURE_OPENROUTER_ENABLED: ${FEATURE_OPENROUTER_ENABLED:-true}
+      FEATURE_CRAWL4AI_ENABLED: ${FEATURE_CRAWL4AI_ENABLED:-true}
+      LEGACY_REDIS_CONSUMER_ENABLED: ${LEGACY_REDIS_CONSUMER_ENABLED:-false}
+      # Enrichment limits bypass
+      ENRICHMENT_SKIP_LIMITS: ${ENRICHMENT_SKIP_LIMITS:-true}
+      ENRICHMENT_LIMITS_SAMPLING: ${ENRICHMENT_LIMITS_SAMPLING:-0}
+      # Indexing fallback
+      INDEXER_EMBED_IF_MISSING: ${INDEXER_EMBED_IF_MISSING:-true}
+      # Надёжность вызовов провайдеров
+      AI_HTTP_TIMEOUT_SEC: ${AI_HTTP_TIMEOUT_SEC:-30}
+      AI_MAX_RETRIES: ${AI_MAX_RETRIES:-3}
+      AI_RETRY_BACKOFF_SEC: ${AI_RETRY_BACKOFF_SEC:-5}
+      LOG_LEVEL: ${LOG_LEVEL:-DEBUG}
       ENVIRONMENT: ${ENVIRONMENT:-production}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-hash-based}
       EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-128}
+      # Dispatch smoke to validate routing before handler
+      DISPATCH_SMOKE: ${DISPATCH_SMOKE:-false}
+      # Force temporary handler for debugging
+      INDEXER_FORCE_TMP: ${INDEXER_FORCE_TMP:-false}
+      # Unbuffered stdout for immediate print visibility
+      PYTHONUNBUFFERED: 1
+      # Context7 best practice: timezone для корректной работы с временем
+      TZ: Europe/Moscow
+    volumes:
+      - ./worker/config:/app/config:ro
+      # Context7 best practice: монтируем timezone данные хоста
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     depends_on:
-      - supabase-db
-      - redis
-      - qdrant
+      supabase-db:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      neo4j:
+        condition: service_healthy
     networks:
       - telegram-network
     healthcheck:
@@ -320,6 +463,15 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       ENVIRONMENT: ${ENVIRONMENT:-production}
       INGEST_HEALTH_PORT: 8011
+      # Context7: Incremental parsing configuration
+      FEATURE_INCREMENTAL_PARSING_ENABLED: ${FEATURE_INCREMENTAL_PARSING_ENABLED:-true}
+      PARSER_MODE_OVERRIDE: ${PARSER_MODE_OVERRIDE:-auto}
+      PARSER_SCHEDULER_INTERVAL_SEC: ${PARSER_SCHEDULER_INTERVAL_SEC:-300}
+      PARSER_HISTORICAL_HOURS: ${PARSER_HISTORICAL_HOURS:-24}
+      PARSER_INCREMENTAL_MINUTES: ${PARSER_INCREMENTAL_MINUTES:-5}
+      PARSER_LPA_MAX_AGE_HOURS: ${PARSER_LPA_MAX_AGE_HOURS:-48}
+      PARSER_MAX_CONCURRENCY: ${PARSER_MAX_CONCURRENCY:-4}
+      PARSER_RETRY_MAX: ${PARSER_RETRY_MAX:-3}
       # Context7 best practice: отладка и логи
       PYTHONUNBUFFERED: 1
       PYTHONASYNCIODEBUG: 1
@@ -352,14 +504,67 @@ services:
     profiles:
       - core
 
+  # Crawl4AI Enrichment Service
+  crawl4ai:
+    build:
+      context: ./crawl4ai
+      dockerfile: Dockerfile
+    environment:
+      REDIS_URL: redis://redis:6379
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 0
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@supabase-db:5432/${POSTGRES_DB}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      ENRICHMENT_CONFIG_PATH: /app/config/enrichment_policy.yml
+      FEATURE_CRAWL4AI_ENABLED: ${FEATURE_CRAWL4AI_ENABLED:-true}
+      MAX_CONCURRENT_CRAWLS: 3
+      TMPDIR: /tmp/playwright
+      # Crawl4AI specific settings
+      CRAWL_USER_AGENT: "TelegramAssistant/1.0 (Crawl4AI Bot)"
+      CRAWL_RESPECT_ROBOTS: "true"
+      CRAWL_MAX_DEPTH: "3"
+      CRAWL_TIMEOUT_SEC: "30"
+      CRAWL_CACHE_TTL_SEC: "3600"
+      CRAWL_PER_DOMAIN_CONCURRENCY: "2"
+      # Consumer group
+      CRAWL_STREAM: stream:posts:crawl
+      CRAWL_GROUP: crawl4ai_workers
+    volumes:
+      - ./worker/config:/app/config:ro
+      - /tmp/playwright:/tmp/playwright
+    shm_size: "1gb"
+    ulimits:
+      nofile: 65535
+    depends_on:
+      - redis
+      - supabase-db
+    networks:
+      - telegram-network
+    # [C7-ID: DOCKER-CRAWL4AI-002] - Ресурсные ограничения для Playwright
+    mem_limit: 2G
+    cpus: 1.0
+    healthcheck:
+      test: ["CMD", "sh", "-c", "printf 'GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' | nc -w 1 localhost 8080 >/dev/null 2>&1 || echo 'OK'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    profiles:
+      - core
+
 volumes:
   supabase_data:
   redis_data:
   grafana_data:
+  prometheus_data:
   caddy_data:
   caddy_config:
   qdrant_data:
+  neo4j_data:
+  neo4j_logs:
 
 networks:
   telegram-network:
     driver: bridge
+

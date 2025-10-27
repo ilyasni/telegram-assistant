@@ -1,0 +1,120 @@
+groups:
+  - name: ssl_alerts
+    rules:
+      - alert: SSLExpirationSoon
+        expr: (ssl_cert_not_after{domain="api.produman.studio"} - time()) < 604800
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "SSL сертификат истекает менее чем через 7 дней"
+          description: "SSL сертификат для {{ $labels.domain }} истекает через {{ $value }} секунд"
+          
+      - alert: SSLCertExpired
+        expr: (ssl_cert_not_after{domain="api.produman.studio"} - time()) < 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "SSL сертификат истёк"
+          description: "SSL сертификат для {{ $labels.domain }} истёк"
+
+  - name: neo4j_alerts
+    rules:
+      - alert: Neo4jConnectionFailure
+        expr: neo4j_connections_active == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Neo4j connection is down"
+          description: "Neo4j connection has been down for more than 5 minutes"
+          
+      - alert: Neo4jQueryLatencyHigh
+        expr: histogram_quantile(0.95, rate(neo4j_query_duration_seconds_bucket[5m])) > 5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Neo4j query latency is high"
+          description: "Neo4j p95 query latency is {{ $value }}s (threshold: 5s)"
+
+  - name: worker_alerts
+    rules:
+      - alert: WorkerQueueBacklog
+        expr: worker_queue_size > 1000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Worker queue backlog exceeds 1000"
+          description: "Worker queue {{ $labels.queue_name }} has {{ $value }} pending tasks"
+          
+      - alert: WorkerTaskFailureRate
+        expr: rate(worker_tasks_processed_total{status="failed"}[5m]) / rate(worker_tasks_processed_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Worker task failure rate is high"
+          description: "Worker task failure rate is {{ $value | humanizePercentage }}"
+
+  - name: rag_alerts
+    rules:
+      - alert: RAGProcessingLatencyHigh
+        expr: histogram_quantile(0.95, rate(rag_processing_duration_seconds_bucket[5m])) > 30
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RAG processing latency is high"
+          description: "RAG p95 processing latency is {{ $value }}s (threshold: 30s)"
+          
+      - alert: RAGQueryFailureRate
+        expr: rate(rag_queries_total{status="failed"}[5m]) / rate(rag_queries_total[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RAG query failure rate is high"
+          description: "RAG query failure rate is {{ $value | humanizePercentage }}"
+
+  - name: ai_provider_alerts
+    rules:
+      - alert: AIProviderLatencyHigh
+        expr: histogram_quantile(0.95, rate(ai_request_duration_seconds_bucket[5m])) > 60
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "AI provider latency is high"
+          description: "AI provider {{ $labels.provider }} latency is {{ $value }}s (threshold: 60s)"
+          
+      - alert: AIProviderFailureRate
+        expr: rate(ai_requests_total{status="failed"}[5m]) / rate(ai_requests_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "AI provider failure rate is high"
+          description: "AI provider {{ $labels.provider }} failure rate is {{ $value | humanizePercentage }}"
+
+  - name: system_alerts
+    rules:
+      - alert: HighMemoryUsage
+        expr: worker_memory_usage_bytes > 1073741824  # 1GB
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Worker memory usage is high"
+          description: "Worker memory usage is {{ $value | humanizeBytes }}"
+          
+      - alert: HighCPUUsage
+        expr: worker_cpu_usage_percent > 80
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Worker CPU usage is high"
+          description: "Worker CPU usage is {{ $value }}%"

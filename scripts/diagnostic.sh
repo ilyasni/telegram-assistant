@@ -166,6 +166,29 @@ TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
 log "Проверка Qdrant..."
 check_http "Qdrant Health" "http://localhost:6333/health" "200"
 
+# Проверка retention-политик
+log "Проверка retention-политик..."
+echo "=== Retention Policy Status ==="
+if docker compose exec supabase-db psql -U postgres -d telegram_assistant -c "SELECT * FROM get_telegram_auth_events_stats();" 2>/dev/null; then
+    echo -e "  ${GREEN}✓${NC} Статистика telegram_auth_events получена"
+    PASSED_CHECKS=$((PASSED_CHECKS + 1))
+else
+    echo -e "  ${RED}✗${NC} Не удалось получить статистику telegram_auth_events"
+    FAILED_CHECKS=$((FAILED_CHECKS + 1))
+fi
+TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
+
+echo ""
+echo "=== pg_cron Jobs ==="
+if docker compose exec supabase-db psql -U postgres -d telegram_assistant -c "SELECT jobid, jobname, schedule, active, database FROM cron.job WHERE jobname LIKE '%telegram-auth%';" 2>/dev/null; then
+    echo -e "  ${GREEN}✓${NC} pg_cron задачи для telegram_auth_events найдены"
+    PASSED_CHECKS=$((PASSED_CHECKS + 1))
+else
+    echo -e "  ${RED}✗${NC} pg_cron задачи для telegram_auth_events не найдены"
+    FAILED_CHECKS=$((FAILED_CHECKS + 1))
+fi
+TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
+
 # Проверка DNS резолва (если настроен домен)
 if [ -n "$CADDY_DOMAINS" ]; then
     log "Проверка DNS резолва..."

@@ -3,7 +3,7 @@
 import asyncio
 import uuid
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Tuple
 import structlog
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
@@ -47,23 +47,26 @@ class SessionStorageService:
         last_name: Optional[str] = None,
         username: Optional[str] = None,
         invite_code: Optional[str] = None
-    ) -> Optional[str]:
+    ) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
         """
-        Context7 best practice: сохранение Telegram сессии в БД.
+        Context7 best practice: сохранение Telegram сессии в БД с улучшенной диагностикой.
         
         Args:
             tenant_id: ID арендатора
             user_id: ID пользователя в системе
             session_string: StringSession от Telethon
             telegram_user_id: ID пользователя в Telegram
+            first_name: Имя пользователя
+            last_name: Фамилия пользователя
+            username: Username пользователя
             invite_code: Код приглашения (опционально)
             
         Returns:
-            session_id: UUID сохраненной сессии или None при ошибке
+            (success, session_id, error_code, error_details)
         """
         if not self.db_connection:
             logger.error("DB connection not initialized")
-            return None
+            return False, None, "db_not_initialized", "Database connection not initialized"
         
         try:
             # Context7 best practice: шифрование сессии
@@ -73,7 +76,7 @@ class SessionStorageService:
             key_id = await self._get_active_encryption_key()
             if not key_id:
                 logger.error("No active encryption key found")
-                return None
+                return False, None, "no_encryption_key", "No active encryption key found"
             
             session_id = str(uuid.uuid4())
             
@@ -102,11 +105,42 @@ class SessionStorageService:
                 telegram_user_id=telegram_user_id
             )
             
-            return session_id
+            return True, session_id, None, None
             
         except Exception as e:
-            logger.error("Failed to save Telegram session", error=str(e))
-            return None
+            error_code = self._classify_error(e)
+            error_details = str(e)
+            
+            logger.error(
+                "Failed to save Telegram session", 
+                error=str(e),
+                error_code=error_code,
+                tenant_id=tenant_id,
+                user_id=user_id
+            )
+            
+            return False, None, error_code, error_details
+    
+    def _classify_error(self, error: Exception) -> str:
+        """Классификация ошибок для детальной диагностики."""
+        error_str = str(error).lower()
+        
+        if 'value too long' in error_str or 'character varying' in error_str:
+            return "session_too_long"
+        elif 'column does not exist' in error_str:
+            return "missing_column"
+        elif 'unique constraint' in error_str or 'duplicate key' in error_str:
+            return "duplicate_session"
+        elif 'foreign key constraint' in error_str:
+            return "invalid_tenant_or_user"
+        elif 'not null constraint' in error_str:
+            return "missing_required_field"
+        elif 'permission denied' in error_str or 'insufficient privilege' in error_str:
+            return "permission_denied"
+        elif 'connection' in error_str or 'timeout' in error_str:
+            return "connection_error"
+        else:
+            return "database_error"
     
     def _save_session_sync(
         self,
@@ -164,7 +198,7 @@ class SessionStorageService:
                     first_name = COALESCE(%s, first_name),
                     last_name = COALESCE(%s, last_name),
                     username = COALESCE(%s, username),
-                    tenant_id = COALESCE(%s::uuid, tenant_id),
+                    tenant_id = COALESCE(%s, tenant_id),
                     role = COALESCE(%s, role)
                 WHERE telegram_id = %s
             """, (encrypted_session, key_id, first_name, last_name, username, resolved_tenant_id, resolved_role, telegram_user_id))
@@ -178,7 +212,7 @@ class SessionStorageService:
                 )
             """, (
                 str(uuid.uuid4()),
-                tenant_id,
+                telegram_user_id,  # Используем telegram_user_id (bigint), а не tenant_id (uuid)
                 f"telegram_user_id={telegram_user_id}",
                 Json({"invite_code": invite_code} if invite_code else {})
             ))
@@ -186,28 +220,43 @@ class SessionStorageService:
             self.db_connection.commit()
     
     async def _get_active_encryption_key(self) -> Optional[str]:
-        """Получение активного ключа шифрования."""
-        try:
-            loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(
-                None,
-                self._get_active_key_sync
-            )
-        except Exception as e:
-            logger.error("Failed to get active encryption key", error=str(e))
-            return None
+        """Получение активного ключа шифрования с retry логикой."""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                loop = asyncio.get_event_loop()
+                return await loop.run_in_executor(
+                    None,
+                    self._get_active_key_sync
+                )
+            except Exception as e:
+                logger.warning(f"Failed to get active encryption key (attempt {attempt + 1}/{max_retries})", error=str(e))
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(0.5 * (attempt + 1))  # Exponential backoff
+                else:
+                    logger.error("Failed to get active encryption key after all retries", error=str(e))
+                    return None
     
     def _get_active_key_sync(self) -> Optional[str]:
-        """Синхронное получение активного ключа."""
-        with self.db_connection.cursor() as cursor:
-            cursor.execute("""
-                SELECT key_id FROM encryption_keys 
-                WHERE retired_at IS NULL 
-                ORDER BY created_at DESC 
-                LIMIT 1
-            """)
-            result = cursor.fetchone()
-            return result[0] if result else None
+        """Синхронное получение активного ключа с очисткой транзакции."""
+        try:
+            with self.db_connection.cursor() as cursor:
+                cursor.execute("""
+                    SELECT key_id FROM encryption_keys 
+                    WHERE retired_at IS NULL 
+                    ORDER BY created_at DESC 
+                    LIMIT 1
+                """)
+                result = cursor.fetchone()
+                return result[0] if result else None
+        except Exception as e:
+            # Очистка абортированной транзакции
+            try:
+                self.db_connection.rollback()
+                logger.info("Rolled back aborted transaction")
+            except:
+                pass
+            raise e
     
     async def get_telegram_session(self, tenant_id: str, user_id: str) -> Optional[dict]:
         """

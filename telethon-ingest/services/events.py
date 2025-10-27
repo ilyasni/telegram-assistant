@@ -3,9 +3,9 @@
 from typing import Dict
 
 # Имена потоков
-STREAM_POST_CREATED = "events:post.created"
-STREAM_POST_TAGGED = "events:post.tagged"
-STREAM_POST_INDEXED = "events:post.indexed"
+STREAM_POST_CREATED = "stream:posts:parsed"
+STREAM_POST_TAGGED = "stream:posts:tagged"
+STREAM_POST_INDEXED = "stream:posts:indexed"
 STREAM_USER_AUTHORIZED = "events:user.authorized"
 
 # Наборы обязательных полей

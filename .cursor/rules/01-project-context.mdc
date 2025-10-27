@@ -123,3 +123,27 @@
 - Каждый сервис в отдельном deployment
 - Caddy как reverse proxy
 - Supabase как управляемое окружение
+
+## Environment Security
+
+### Обязательные переменные
+```bash
+JWT_SECRET=your_jwt_secret_key_here          # Минимум 16 символов
+ANON_KEY=your_anon_key_here                  # Минимум 20 символов  
+SERVICE_KEY=your_service_key_here             # Минимум 20 символов
+DATABASE_URL=postgresql://...                # PostgreSQL connection
+REDIS_URL=redis://...                        # Redis connection
+QDRANT_URL=http://...                        # Qdrant connection
+SUPABASE_HOST=your-domain.com                # Внешний домен
+```
+
+### Защита секретов
+- **Никогда не коммить .env** — только .env.example и .env.schema.json
+- **Git skip-worktree** — для локального .env
+- **FS immutable флаги** — для критичных файлов
+- **Pre-commit hooks** — автоматическая проверка
+
+### Валидация
+- **JSON Schema** — .env.schema.json для валидации
+- **make env-check** — проверка переменных окружения
+- **CI проверки** — автоматическая валидация в PR

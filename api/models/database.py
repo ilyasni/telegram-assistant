@@ -52,6 +52,7 @@ class User(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     last_active_at = Column(DateTime)
     settings = Column(JSON, default={})
+    tier = Column(String(20), default="free")
     
     # Relationships
     tenant = relationship("Tenant", back_populates="users")
@@ -85,11 +86,12 @@ class Post(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     # tenant_id УДАЛЁН - посты теперь глобальные
     channel_id = Column(UUID(as_uuid=True), ForeignKey("channels.id"), nullable=False)
-    tg_message_id = Column(BigInteger, nullable=False)
+    telegram_message_id = Column(BigInteger, nullable=False)
     content = Column(Text)
     media_urls = Column(JSON, default=[])
     posted_at = Column(DateTime)
     url = Column(Text)
+    telegram_post_url = Column(Text)
     has_media = Column(Boolean, default=False)
     yyyymm = Column(Integer)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -121,11 +123,11 @@ class Post(Base):
     media = relationship("PostMedia", back_populates="post")
     reactions = relationship("PostReaction", back_populates="post")
     forwards = relationship("PostForward", back_populates="post")
-    replies = relationship("PostReply", back_populates="post")
+    replies = relationship("PostReply", back_populates="post", foreign_keys="PostReply.post_id")
     
     # Unique constraint для глобальной уникальности
     __table_args__ = (
-        UniqueConstraint('channel_id', 'tg_message_id', name='ux_posts_chan_msg'),
+        UniqueConstraint('channel_id', 'telegram_message_id', name='ux_posts_chan_msg'),
     )
 
 
@@ -225,7 +227,7 @@ class PostEnrichment(Base):
     enrichment_provider = Column(String(50))
     enriched_at = Column(DateTime, default=datetime.utcnow)
     enrichment_latency_ms = Column(Integer)
-    metadata = Column(JSONB, default={})
+    enrichment_metadata = Column(JSONB, default={})
     updated_at = Column(DateTime, default=datetime.utcnow)
     
     # Relationships
