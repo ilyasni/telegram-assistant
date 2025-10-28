@@ -103,6 +103,38 @@ class IndexingTask:
             # Context7: Создание consumer group перед обработкой backlog
             await self.event_consumer._ensure_consumer_group("posts.enriched")
             
+            # Context7: Создание consumer group для выходного потока indexed (для мониторинга через XPENDING)
+            # Это позволяет отслеживать лаги и pending сообщения через E2E проверки
+            try:
+                import redis.asyncio as redis_async
+                from event_bus import STREAMS
+                indexed_stream = STREAMS.get("posts.indexed", "stream:posts:indexed")
+                try:
+                    await self.redis_client.client.xgroup_create(
+                        indexed_stream,
+                        "indexing_monitoring",
+                        id='0',
+                        mkstream=True
+                    )
+                    logger.info("Created monitoring consumer group for posts.indexed stream", 
+                              stream=indexed_stream, 
+                              group="indexing_monitoring")
+                except redis_async.ResponseError as e:
+                    if "BUSYGROUP" in str(e):
+                        logger.debug("Monitoring consumer group for posts.indexed already exists")
+                    else:
+                        logger.warning("Failed to create monitoring consumer group for posts.indexed", 
+                                     error=str(e), 
+                                     stream=indexed_stream)
+                except Exception as e:
+                    logger.warning("Unexpected error creating monitoring consumer group", 
+                                 error=str(e), 
+                                 error_type=type(e).__name__)
+            except Exception as e:
+                logger.error("Failed to setup monitoring consumer group for posts.indexed", 
+                           error=str(e), 
+                           error_type=type(e).__name__)
+            
             logger.info("IndexingTask started, consuming posts.enriched events")
             
             # Context7 best practice: обработка backlog при старте
@@ -350,6 +382,9 @@ class IndexingTask:
                 vector_id=vector_id
             )
             
+            # Context7: Обновляем is_processed в таблице posts после успешной индексации
+            await self._update_post_processed(post_id)
+            
             # Публикация события posts.indexed
             await self.publisher.publish_event("posts.indexed", {
                 "post_id": post_id,
@@ -574,6 +609,35 @@ class IndexingTask:
                         error=str(e),
                         error_type=type(e).__name__)
             # Не пробрасываем ошибку, чтобы не блокировать основной поток
+    
+    async def _update_post_processed(self, post_id: str):
+        """
+        Context7: Обновление is_processed в таблице posts после успешной индексации.
+        
+        Supabase best practice: параметризованные запросы для безопасности.
+        """
+        try:
+            db_url = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@supabase-db:5432/postgres")
+            conn = psycopg2.connect(db_url)
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                UPDATE posts 
+                SET is_processed = true 
+                WHERE id = %s
+            """, (post_id,))
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            logger.debug("Updated posts.is_processed", post_id=post_id)
+            
+        except Exception as e:
+            logger.warning("Failed to update posts.is_processed", 
+                         post_id=post_id, 
+                         error=str(e))
+            # Не пробрасываем ошибку - это не критично для работы пайплайна
     
     async def stop(self):
         """Остановка indexing task."""

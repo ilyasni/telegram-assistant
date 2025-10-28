@@ -1,0 +1,12 @@
+<testsuite name="e2e-e2e" tests="4" failures="2">
+  <testcase name="streams.stream:posts:indexed.groups">
+    <failure message="No consumer groups found"/>
+  </testcase>
+  <testcase name="parsing.posts_last24h">
+  </testcase>
+  <testcase name="qdrant.telegram_posts.payload_coverage">
+  </testcase>
+  <testcase name="pipeline.flow_complete">
+    <failure message="Post not found in all stages"/>
+  </testcase>
+</testsuite>

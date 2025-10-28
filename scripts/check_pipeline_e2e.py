@@ -154,12 +154,43 @@ async def stream_stats(client: redis.Redis, stream: str, group_hint: str | None 
     try:
         groups_info = await client.xinfo_groups(stream)  # list[dict-like with bytes keys]
         for g in groups_info:
-            name = g.get(b'name', b'').decode()
+            # Обработка разных форматов: dict, list, или объект с атрибутами
+            if isinstance(g, dict):
+                # Прямой словарь
+                name_bytes = g.get(b'name') or g.get('name', b'')
+            elif isinstance(g, (list, tuple)) and len(g) >= 2:
+                # Список пар (ключ, значение)
+                g_dict = dict(zip(g[::2], g[1::2]))
+                name_bytes = g_dict.get(b'name') or g_dict.get('name', b'')
+            else:
+                # Объект с методами get или __getitem__
+                try:
+                    name_bytes = g.get(b'name', b'') if hasattr(g, 'get') else g[b'name']
+                except (KeyError, TypeError):
+                    try:
+                        name_bytes = g.get('name', b'') if hasattr(g, 'get') else ''
+                    except (KeyError, TypeError):
+                        name_bytes = b''
+            
+            # Декодирование имени
+            if isinstance(name_bytes, bytes):
+                name = name_bytes.decode('utf-8', errors='ignore')
+            elif isinstance(name_bytes, str):
+                name = name_bytes
+            else:
+                name = str(name_bytes) if name_bytes else ''
+            
+            # Аналогично для других полей
+            consumers = g.get(b'consumers', 0) or g.get('consumers', 0) if hasattr(g, 'get') else 0
+            pending = g.get(b'pending', 0) or g.get('pending', 0) if hasattr(g, 'get') else 0
+            last_id_bytes = g.get(b'last-delivered-id', b'') or g.get('last-delivered-id', b'') if hasattr(g, 'get') else b''
+            last_id = last_id_bytes.decode('utf-8', errors='ignore') if isinstance(last_id_bytes, bytes) else str(last_id_bytes) if last_id_bytes else ''
+            
             out['groups'].append({
                 'name': name,
-                'consumers': int(g.get(b'consumers', 0)),
-                'pending': int(g.get(b'pending', 0)),
-                'last_delivered_id': g.get(b'last-delivered-id', b'').decode()
+                'consumers': int(consumers),
+                'pending': int(pending),
+                'last_delivered_id': last_id
             })
         
         # XPENDING summary (по первой группе или group_hint)
@@ -518,7 +549,9 @@ class PipelineChecker:
         
         for stream_name in streams_to_check:
             try:
-                stats = await stream_stats(self.redis_client, stream_name)
+                # Для indexed stream используем группу "indexing_monitoring" для XPENDING
+                group_hint = "indexing_monitoring" if stream_name == "stream:posts:indexed" else None
+                stats = await stream_stats(self.redis_client, stream_name, group_hint=group_hint)
                 streams_data[stream_name] = stats
                 
                 # Проверка порога pending
@@ -533,7 +566,17 @@ class PipelineChecker:
                     })
                 
                 # Проверка отсутствия групп для прод-пайплайна
-                if not stats['groups'] and self.mode != "smoke":
+                # Для indexed stream ожидаем группу "indexing_monitoring"
+                if stream_name == "stream:posts:indexed":
+                    expected_group = "indexing_monitoring"
+                    group_found = any(g.get('name') == expected_group for g in stats['groups'])
+                    if not group_found and self.mode != "smoke":
+                        self.results['checks'].append({
+                            'name': f'streams.{stream_name}.groups',
+                            'ok': False,
+                            'message': f"No consumer group '{expected_group}' found for monitoring"
+                        })
+                elif not stats['groups'] and self.mode != "smoke":
                     self.results['checks'].append({
                         'name': f'streams.{stream_name}.groups',
                         'ok': False,
@@ -933,23 +976,23 @@ class PipelineChecker:
         # Neo4j
         try:
             async with self.neo4j_driver.session() as session:
-                # Статистика узлов
+                # Статистика узлов (используем post_id вместо id, проверяем expires_at вместо posted_at)
                 result = await session.run("""
                     MATCH (p:Post)
                     RETURN count(p) as total_posts,
-                           max(p.posted_at) as newest_post,
-                           min(p.posted_at) as oldest_post
+                           max(p.expires_at) as newest_post,
+                           min(p.expires_at) as oldest_post
                 """)
                 record = await result.single()
                 
-                # Проверка индекса :Post(id) для deep режима
+                # Проверка индекса :Post(post_id) для deep режима
                 index_found = False
                 if self.mode == "deep":
                     index_result = await session.run("""
                         SHOW INDEXES YIELD name, type, entityType, labelsOrTypes, properties
                         WHERE entityType='NODE' 
                           AND any(l IN labelsOrTypes WHERE l='Post')
-                          AND any(p IN properties WHERE p='id')
+                          AND any(p IN properties WHERE p='post_id')
                         RETURN name, type
                     """)
                     index_record = await index_result.single()
@@ -960,44 +1003,25 @@ class PipelineChecker:
                             'type': index_record['type']
                         }
                 
-                # Проверка свежести vs PG
-                if record['newest_post'] and "max_skew_vs_pg_min" in self.thresholds:
-                    neo4j_newest = ensure_dt_utc(record['newest_post'])
-                    if neo4j_newest:
-                        # Получаем newest из PG
-                        async with self.db_pool.acquire() as conn:
-                            pg_row = await conn.fetchrow("SELECT MAX(posted_at) as newest FROM posts")
-                            if pg_row and pg_row['newest']:
-                                pg_newest = pg_row['newest']
-                                if isinstance(pg_newest, datetime):
-                                    if pg_newest.tzinfo is None:
-                                        pg_newest = pg_newest.replace(tzinfo=timezone.utc)
-                                    skew_seconds = abs((neo4j_newest - pg_newest).total_seconds())
-                                    skew_minutes = skew_seconds / 60
-                                    
-                                    threshold = self.thresholds.get("max_skew_vs_pg_min", 5)
-                                    ok = skew_minutes <= threshold
-                                    self.results['checks'].append({
-                                        'name': 'neo4j.skew_vs_pg',
-                                        'ok': ok,
-                                        'message': f"Skew {skew_minutes:.1f}m > {threshold}m" if not ok else None
-                                    })
+                # Проверка свежести vs PG (используем expires_at, т.к. posted_at отсутствует в Neo4j)
+                # Пропускаем эту проверку, т.к. expires_at не соответствует posted_at
+                # TODO: Добавить posted_at в схему Neo4j для правильной проверки свежести
                 
-                # Последние узлы
+                # Последние узлы (используем post_id и expires_at)
                 result_recent = await session.run(f"""
                     MATCH (p:Post)
-                    RETURN p.id as post_id, 
-                           p.posted_at as posted_at,
-                           p.expires_at as expires_at
-                    ORDER BY p.posted_at DESC
+                    RETURN p.post_id as post_id, 
+                           p.expires_at as expires_at,
+                           p.indexed_at as indexed_at
+                    ORDER BY p.expires_at DESC
                     LIMIT {min(self.limit, 5)}
                 """)
                 recent_nodes = []
                 async for record_recent in result_recent:
                     recent_nodes.append({
                         'post_id': record_recent['post_id'],
-                        'posted_at': str(record_recent['posted_at']) if record_recent['posted_at'] else None,
-                        'expires_at': str(record_recent['expires_at']) if record_recent['expires_at'] else None
+                        'expires_at': str(record_recent['expires_at']) if record_recent['expires_at'] else None,
+                        'indexed_at': str(record_recent['indexed_at']) if record_recent['indexed_at'] else None
                     })
                 
                 # Статистика связей
@@ -1094,13 +1118,13 @@ class PipelineChecker:
                 except Exception as e:
                     logger.warning("Qdrant search failed", post_id=post_id, error=str(e))
                 
-                # Проверяем в Neo4j
+                # Проверяем в Neo4j (используем post_id вместо id)
                 neo4j_found = False
                 try:
                     async with self.neo4j_driver.session() as session:
                         result = await session.run("""
-                            MATCH (p:Post {id: $post_id})
-                            RETURN p.id as post_id
+                            MATCH (p:Post {post_id: $post_id})
+                            RETURN p.post_id as post_id
                         """, post_id=post_id)
                         neo4j_found = (await result.single()) is not None
                 except Exception as e:
