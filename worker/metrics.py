@@ -28,11 +28,7 @@ stream_depth = Gauge(
     ['stream']
 )
 
-posts_in_queue_total = Gauge(
-    'posts_in_queue_total',
-    'Current posts in queue',
-    ['queue', 'status']
-)
+# posts_in_queue_total определено в event_bus.py (используется там)
 
 worker_queue_size = Gauge(
     'worker_queue_size',

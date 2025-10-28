@@ -60,3 +60,85 @@ groups:
           severity: warning
         annotations:
           summary: "TagPersist PEL backlog высокий ({{ $value }})"
+
+  # Pipeline Coverage Alerts
+  - name: pipeline_coverage
+    interval: 30s
+    rules:
+      # Индексация: покрытие < 90%
+      # Используем rate успешной индексации / rate успешного тегирования (ближайший proxy к общему парсингу)
+      - alert: IndexingCoverageLow
+        expr: |
+          (
+            sum(rate(indexing_processed_total{status="success"}[10m]))
+            /
+            (sum(rate(tagging_processed_total[10m])) + 1e-6)
+          ) < 0.90
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Индексация < 90% (текущее: {{ $value | humanizePercentage }})"
+          description: "Целевое покрытие: 90%+. Проверить логи worker и Qdrant."
+      
+      # Тегирование: покрытие < 80%
+      # Используем rate успешного тегирования / rate успешного парсинга (stream_messages_total с phase=new)
+      - alert: TaggingCoverageLow
+        expr: |
+          (
+            sum(rate(tagging_processed_total{status="success"}[10m]))
+            /
+            (sum(rate(stream_messages_total{stream="posts.parsed", phase="new", status="ok"}[10m])) + 1e-6)
+          ) < 0.80
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Тегирование < 80% (текущее: {{ $value | humanizePercentage }})"
+          description: "Целевое покрытие: 80%+. Проверить AI провайдеры (GigaChat/OpenRouter)."
+      
+      # Redis Stream lag
+      - alert: RedisStreamLagHigh
+        expr: stream_pending_size{stream=~"posts\\.(parsed|tagged|enriched)"} > 1000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Redis Stream lag высокий: {{ $labels.stream }} ({{ $value }} сообщений)"
+          description: "Очередь растёт. Проверить производительность worker."
+      
+      # Worker задача упала
+      - alert: WorkerTaskDown
+        expr: up{job="worker"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Worker не отвечает на health check"
+          description: "Worker контейнер недоступен. Проверить docker logs worker."
+      
+      # Индексация не обрабатывает события
+      - alert: IndexingNoActivity
+        expr: |
+          sum(rate(indexing_processed_total[10m])) == 0
+          and 
+          sum(stream_pending_size{stream=~"posts\\.enriched"}) > 10
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Индексация не обрабатывает события (pending: {{ $value }})"
+          description: "Есть события в posts.enriched, но indexing не обрабатывает. Проверить worker."
+      
+      # Тегирование не обрабатывает события
+      - alert: TaggingNoActivity
+        expr: |
+          sum(rate(tagging_processed_total[10m])) == 0
+          and 
+          sum(stream_pending_size{stream=~"posts\\.parsed"}) > 10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Тегирование не обрабатывает события (pending: {{ $value }})"
+          description: "Есть события в posts.parsed, но tagging не обрабатывает. Проверить AI провайдеры."

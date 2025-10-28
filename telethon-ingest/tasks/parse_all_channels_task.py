@@ -12,6 +12,7 @@ import random
 import re
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime, timezone, timedelta
+from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
 
 import structlog
 import redis.asyncio as redis
@@ -20,6 +21,7 @@ from psycopg2.extras import RealDictCursor
 from prometheus_client import Counter, Histogram, Gauge
 
 from config import settings
+from utils.time_utils import ensure_dt_utc
 
 logger = structlog.get_logger()
 
@@ -116,7 +118,8 @@ class ParseAllChannelsTask:
         # Инициализация Redis, если не передан
         if self.redis is None:
             try:
-                self.redis = redis.from_url(settings.redis_url)
+                # Context7: Создаём async Redis клиент с decode_responses для совместимости с parser
+                self.redis = redis.from_url(settings.redis_url, decode_responses=True)
                 logger.info("Redis initialized for scheduler")
             except Exception as e:
                 logger.error(f"Failed to initialize Redis: {str(e)}")
@@ -144,8 +147,8 @@ class ParseAllChannelsTask:
                 self.redis = redis.from_url(settings.redis_url)
                 logger.info("Redis initialized for lock acquisition")
             
-            # Context7: set() - синхронная функция в redis-py
-            acquired = self.redis.set(
+            # Context7: async Redis - используем await для set()
+            acquired = await self.redis.set(
                 lock_key,
                 instance_id,
                 nx=True,
@@ -167,8 +170,8 @@ class ParseAllChannelsTask:
     async def _release_lock(self):
         """Release scheduler lock"""
         try:
-            # Context7: delete() - синхронная функция в redis-py
-            self.redis.delete("scheduler:lock")
+            # Context7: async Redis - используем await для delete()
+            await self.redis.delete("scheduler:lock")
             if self.app_state:
                 self.app_state["scheduler"]["lock_owner"] = None
         except Exception as e:
@@ -178,8 +181,8 @@ class ParseAllChannelsTask:
         """Update Redis HWM watermark"""
         try:
             hwm_key = f"parse_hwm:{channel_id}"
-            # Context7: set() - синхронная функция в redis-py
-            self.redis.set(
+            # Context7: async Redis - используем await для set()
+            await self.redis.set(
                 hwm_key,
                 max_message_date.isoformat(),
                 ex=86400  # TTL 24 hours
@@ -192,8 +195,8 @@ class ParseAllChannelsTask:
         """Clear Redis HWM after successful parsing"""
         try:
             hwm_key = f"parse_hwm:{channel_id}"
-            # Context7: delete() - синхронная функция в redis-py
-            self.redis.delete(hwm_key)
+            # Context7: async Redis - используем await для delete()
+            await self.redis.delete(hwm_key)
             logger.debug("Cleared HWM", extra={"channel_id": channel_id})
         except Exception as e:
             logger.error(f"Failed to clear HWM for channel {channel_id}: {str(e)}")
@@ -264,21 +267,38 @@ class ParseAllChannelsTask:
                     # Initialize parser if needed
                     if not self.parser:
                         logger.info(f"Initializing ChannelParser for channel {channel['id']}")
-                        # Initialize ChannelParser with required components
-                        from services.channel_parser import ChannelParser
-                        from services.atomic_db_saver import AtomicDBSaver
-                        from services.rate_limiter import RateLimiter
+                        # Initialize ChannelParser with correct signature
+                        from services.channel_parser import ChannelParser, ParserConfig
+                        from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
                         
-                        # Create required components
-                        atomic_db_saver = AtomicDBSaver(self.db_url)
-                        rate_limiter = RateLimiter()
+                        # Create config
+                        config = ParserConfig()
+                        config.db_url = self.db_url
+                        config.redis_url = os.getenv("REDIS_URL", "redis://redis:6379")
                         
-                        # Initialize parser
+                        # Create async engine and session
+                        import re
+                        from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
+                        db_url_async = self.db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+                        parsed = urlparse(db_url_async)
+                        qs = parse_qs(parsed.query)
+                        # Remove asyncpg-unsupported parameters
+                        for key in ['connect_timeout', 'application_name', 'keepalives', 'keepalives_idle', 'keepalives_interval', 'keepalives_count']:
+                            qs.pop(key, None)
+                        new_query = urlencode(qs, doseq=True)
+                        db_url_async = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
+                        
+                        engine = create_async_engine(db_url_async, pool_pre_ping=True, pool_size=5)
+                        async_session_factory = async_sessionmaker(engine, expire_on_commit=False)
+                        db_session = async_session_factory()
+                        
+                        # Initialize parser with correct parameters
                         self.parser = ChannelParser(
-                            telegram_client=telegram_client,
-                            atomic_db_saver=atomic_db_saver,
-                            rate_limiter=rate_limiter,
-                            redis_client=self.redis
+                            config=config,
+                            db_session=db_session,
+                            event_publisher=None,
+                            redis_client=self.redis,
+                            telegram_client_manager=self.telegram_client_manager
                         )
                     
                     # Call actual parser
@@ -291,8 +311,10 @@ class ParseAllChannelsTask:
                     
                     # Update HWM if we have max_message_date
                     if result.get("max_message_date"):
-                        max_date = datetime.fromisoformat(result["max_message_date"])
-                        await self._update_hwm(channel['id'], max_date)
+                        # Context7 best practice: безопасная обработка через ensure_dt_utc
+                        max_date = ensure_dt_utc(result["max_message_date"])
+                        if max_date:
+                            await self._update_hwm(channel['id'], max_date)
                     
                     # Clear HWM after successful parsing
                     await self._clear_hwm(channel['id'])
@@ -359,19 +381,22 @@ class ParseAllChannelsTask:
                 try:
                     # Get HWM from Redis
                     hwm_key = f"parse_hwm:{channel['id']}"
-                    # Context7: get() - синхронная функция в redis-py
-                    hwm_str = self.redis.get(hwm_key)
+                    # Context7: async Redis - используем await для get()
+                    hwm_raw = await self.redis.get(hwm_key)
                     
-                    if hwm_str:
-                        hwm_ts = datetime.fromisoformat(hwm_str)
+                    # Context7 best practice: безопасная обработка типов через ensure_dt_utc
+                    hwm_ts = ensure_dt_utc(hwm_raw)
+                    if hwm_ts:
                         age_seconds = (datetime.now(timezone.utc) - hwm_ts).total_seconds()
                         parser_hwm_age_seconds.labels(channel_id=channel['id']).set(age_seconds)
                     
                     # Определение режима
                     mode = self._decide_mode(channel)
                     
-                    # Логирование статуса
-                    logger.info(f"Channel {channel['id']} status: {channel.get('title')} ({channel.get('username')}) - mode={mode}, last_parsed_at={channel.get('last_parsed_at').isoformat() if channel.get('last_parsed_at') else 'null'}")
+                    # Логирование статуса с безопасной обработкой last_parsed_at
+                    lpa = channel.get('last_parsed_at')
+                    lpa_str = lpa.isoformat() if isinstance(lpa, datetime) else 'null'
+                    logger.info(f"Channel {channel['id']} status: {channel.get('title')} ({channel.get('username')}) - mode={mode}, last_parsed_at={lpa_str}")
                     
                     # Call actual parser if telegram_client_manager is available
                     if self.telegram_client_manager:
@@ -390,9 +415,10 @@ class ParseAllChannelsTask:
                         # Just monitor without parsing
                         parser_runs_total.labels(mode=mode, status='monitored').inc()
                     
-                    # Gauge для возраста watermark
-                    if channel.get('last_parsed_at'):
-                        age_seconds = (datetime.now(timezone.utc) - channel['last_parsed_at']).total_seconds()
+                    # Gauge для возраста watermark с безопасной обработкой типов
+                    lpa_dt = ensure_dt_utc(channel.get('last_parsed_at'))
+                    if lpa_dt:
+                        age_seconds = (datetime.now(timezone.utc) - lpa_dt).total_seconds()
                         incremental_watermark_age_seconds.labels(
                             channel_id=channel['id']
                         ).set(age_seconds)
@@ -447,13 +473,14 @@ class ParseAllChannelsTask:
         elif override == "incremental":
             return "incremental"
         elif override == "auto":
-            # Автоматический выбор: если есть last_parsed_at → incremental
-            if channel.get('last_parsed_at') is None:
+            # Context7 best practice: безопасная обработка last_parsed_at через ensure_dt_utc
+            lpa_dt = ensure_dt_utc(channel.get('last_parsed_at'))
+            if lpa_dt is None:
                 logger.info(f"No last_parsed_at for channel {channel['id']}, using historical mode")
                 return "historical"
             else:
                 # LPA safeguard: если last_parsed_at слишком старый, форсим historical
-                age_hours = (datetime.now(timezone.utc) - channel['last_parsed_at']).total_seconds() / 3600
+                age_hours = (datetime.now(timezone.utc) - lpa_dt).total_seconds() / 3600
                 if age_hours > self.config.lpa_max_age_hours:
                     parser_mode_forced_total.labels(reason="stale_lpa").inc()
                     logger.warning(f"LPA too old for channel {channel['id']} (age={age_hours:.1f}h), forcing historical mode")
@@ -461,4 +488,5 @@ class ParseAllChannelsTask:
                 return "incremental"
         else:
             logger.warning("Unknown mode_override, defaulting to auto", mode_override=override)
-            return "historical" if channel.get('last_parsed_at') is None else "incremental"
+            lpa_dt = ensure_dt_utc(channel.get('last_parsed_at'))
+            return "historical" if lpa_dt is None else "incremental"

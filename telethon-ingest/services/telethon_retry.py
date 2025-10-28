@@ -10,6 +10,7 @@ Retry только для retriable ошибок:
 """
 
 import asyncio
+import json
 import random
 import time
 from datetime import datetime, timezone
@@ -174,11 +175,11 @@ async def set_channel_cooldown(
         }
         
         # Устанавливаем TTL и данные
-        # Context7: setex() - синхронная функция в redis-py
-        redis_client.setex(
+        # Context7: setex() - асинхронная функция в redis.asyncio
+        await redis_client.setex(
             cooldown_key,
             seconds,
-            str(cooldown_data)
+            json.dumps(cooldown_data)
         )
         
         cooldown_channels_total.inc()
@@ -209,9 +210,23 @@ async def is_channel_in_cooldown(
     """
     try:
         cooldown_key = f"channel:cooldown:{channel_id}"
-        # Context7: exists() - синхронная функция в redis-py
-        exists = redis_client.exists(cooldown_key)
-        return bool(exists)
+        # Context7: exists() - асинхронная функция в redis.asyncio
+        exists = await redis_client.exists(cooldown_key)
+        result = bool(exists)
+        
+        # Context7: Детальное логирование для диагностики (INFO для видимости)
+        if result:
+            ttl = await redis_client.ttl(cooldown_key)
+            logger.info("Channel cooldown found", 
+                        channel_id=channel_id,
+                        cooldown_key=cooldown_key,
+                        ttl=ttl)
+        else:
+            logger.info("Channel cooldown NOT found (will parse)", 
+                        channel_id=channel_id,
+                        cooldown_key=cooldown_key)
+        
+        return result
         
     except Exception as e:
         logger.error("Failed to check channel cooldown", 
@@ -236,12 +251,11 @@ async def get_channel_cooldown_info(
     """
     try:
         cooldown_key = f"channel:cooldown:{channel_id}"
-        # Context7: get() - синхронная функция в redis-py
-        data = redis_client.get(cooldown_key)
+        # Context7: get() - асинхронная функция в redis.asyncio
+        data = await redis_client.get(cooldown_key)
         
         if data:
             # Парсим данные cooldown
-            import json
             return json.loads(data)
         return None
         
@@ -268,8 +282,8 @@ async def clear_channel_cooldown(
     """
     try:
         cooldown_key = f"channel:cooldown:{channel_id}"
-        # Context7: delete() - синхронная функция в redis-py
-        deleted = redis_client.delete(cooldown_key)
+        # Context7: delete() - асинхронная функция в redis.asyncio
+        deleted = await redis_client.delete(cooldown_key)
         
         if deleted:
             cooldown_channels_total.dec()
@@ -299,8 +313,8 @@ async def get_all_cooldown_channels(
     """
     try:
         pattern = "channel:cooldown:*"
-        # Context7: keys() - синхронная функция в redis-py
-        keys = redis_client.keys(pattern)
+        # Context7: keys() - асинхронная функция в redis.asyncio (scan_iter лучше, но keys тоже работает)
+        keys = await redis_client.keys(pattern)
         
         cooldown_channels = []
         for key in keys:
@@ -309,8 +323,8 @@ async def get_all_cooldown_channels(
                 channel_id = int(key.decode('utf-8').split(':')[-1])
                 
                 # Получаем данные cooldown
-                # Context7: get() - синхронная функция в redis-py
-                data = redis_client.get(key)
+                # Context7: get() - асинхронная функция в redis.asyncio
+                data = await redis_client.get(key)
                 if data:
                     cooldown_info = {
                         "channel_id": channel_id,

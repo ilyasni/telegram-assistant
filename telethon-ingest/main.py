@@ -452,11 +452,20 @@ async def run_scheduler_loop():
         # Создание AsyncSession для парсера
         db_session = AsyncSession(engine)
         
-        # Создание ChannelParser с DI
+        # Context7: Создаём общий Redis клиент для parser и scheduler
+        import redis.asyncio as redis
+        shared_redis_client = redis.from_url(
+            settings.redis_url,
+            decode_responses=True
+        )
+        logger.info("Shared Redis client created for parser and scheduler")
+        
+        # Создание ChannelParser с DI и общим Redis клиентом
         parser = ChannelParser(
             config=config,
             db_session=db_session,
             event_publisher=None,  # Temporarily disabled
+            redis_client=shared_redis_client,  # Context7: Передаём общий Redis клиент
             telegram_client_manager=client_manager  # Передаём TelegramClientManager
         )
         
@@ -468,11 +477,11 @@ async def run_scheduler_loop():
         
         logger.info("ChannelParser initialized successfully")
         
-        # Инициализация scheduler с передачей app_state и parser
+        # Инициализация scheduler с передачей app_state, parser и общего Redis клиента
         scheduler = ParseAllChannelsTask(
             config=config,
             db_url=settings.database_url,
-            redis_client=None,  # Будет инициализирован внутри scheduler
+            redis_client=shared_redis_client,  # Context7: Используем общий Redis клиент
             parser=parser,  # Передаём инициализированный parser
             app_state=app_state,  # Передаём app_state для обновления статуса
             telegram_client_manager=client_manager  # Передаём TelegramClientManager если доступен

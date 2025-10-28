@@ -25,6 +25,7 @@ import structlog
 from .telethon_retry import fetch_messages_with_retry, is_channel_in_cooldown
 from .atomic_db_saver import AtomicDBSaver
 from .rate_limiter import RateLimiter, check_parsing_rate_limit
+from utils.time_utils import ensure_dt_utc
 
 # WORKER IMPORT DISABLED - will be restored when worker module is available
 # from worker.event_bus import EventPublisher, PostParsedEvent
@@ -78,7 +79,7 @@ class ChannelParser:
         config: ParserConfig,
         db_session: AsyncSession,
         event_publisher: Any,  # EventPublisher - temporarily disabled
-        redis_client: Optional[redis.Redis] = None,
+        redis_client: Optional[Any] = None,
         atomic_saver: Optional[AtomicDBSaver] = None,
         rate_limiter: Optional[RateLimiter] = None,
         telegram_client_manager: Optional[Any] = None
@@ -88,7 +89,11 @@ class ChannelParser:
         self.event_publisher = event_publisher
         
         # Context7: Redis клиент (переданный или созданный)
-        self.redis_client = redis_client or redis.from_url(config.redis_url, decode_responses=True)
+        if redis_client:
+            self.redis_client = redis_client
+        else:
+            redis_url = getattr(config, 'redis_url', os.getenv("REDIS_URL", "redis://redis:6379"))
+            self.redis_client = redis.from_url(redis_url, decode_responses=True)
         
         # Context7: Новые компоненты
         self.atomic_saver = atomic_saver or AtomicDBSaver()
@@ -129,6 +134,11 @@ class ChannelParser:
         start_time = time.time()
         max_message_date = None
         
+        logger.info("parse_channel_messages started", 
+                   channel_id=channel_id,
+                   mode=mode,
+                   user_id=user_id)
+        
         try:
             # Context7: Получение Telegram клиента из менеджера
             if not self.telegram_client_manager:
@@ -153,13 +163,19 @@ class ChannelParser:
                 }
             
             # Context7: Получение tg_channel_id для проверки cooldown
+            logger.info("Fetching tg_channel_id from DB", channel_id=channel_id)
             result = await self.db_session.execute(
                 text("SELECT tg_channel_id FROM channels WHERE id = :channel_id"),
                 {"channel_id": channel_id}
             )
             row = result.fetchone()
+            logger.info("tg_channel_id query result", 
+                       channel_id=channel_id,
+                       has_row=row is not None,
+                       tg_channel_id=row[0] if row else None)
             
-            if not row or not row[0]:
+            # Context7: Безопасная проверка на None
+            if not row or row[0] is None:
                 logger.warning("Channel has no tg_channel_id, skipping cooldown check", 
                               channel_id=channel_id)
             else:
@@ -168,10 +184,23 @@ class ChannelParser:
                 # Безопасное преобразование в int
                 try:
                     tg_channel_id_int = int(tg_channel_id)
-                    if await is_channel_in_cooldown(self.redis_client, tg_channel_id_int):
+                    cooldown_result = await is_channel_in_cooldown(self.redis_client, tg_channel_id_int)
+                    logger.info("Cooldown check result", 
+                                channel_id=channel_id,
+                                tg_channel_id=tg_channel_id,
+                                in_cooldown=cooldown_result)
+                    if cooldown_result:
                         logger.info("Channel in cooldown, skipping", 
                                    channel_id=channel_id, tg_channel_id=tg_channel_id)
                         self.stats['cooldown_skipped'] += 1
+                        # Context7: Обновляем last_parsed_at даже при cooldown для отслеживания попыток
+                        try:
+                            logger.info("Updating last_parsed_at after cooldown skip", channel_id=channel_id)
+                            await self._update_last_parsed_at(channel_id, 0)
+                            logger.info("Successfully updated last_parsed_at after cooldown skip", channel_id=channel_id)
+                        except Exception as e:
+                            logger.error("Failed to update last_parsed_at after cooldown skip", 
+                                        channel_id=channel_id, error=str(e), exc_info=True)
                         return {
                             'processed': 0,
                             'skipped': 0,
@@ -194,7 +223,7 @@ class ChannelParser:
                     logger.warning("Rate limit exceeded", 
                                  channel_id=channel_id,
                                  user_id=user_id,
-                                        "blocked_by": rate_result.get('blocked_by', [])})
+                                 blocked_by=rate_result.get('blocked_by', []))
                     self.stats['rate_limited'] += 1
                     return {
                         'processed': 0,
@@ -288,28 +317,107 @@ class ChannelParser:
         client: TelegramClient, 
         channel_id: str
     ) -> Optional[tuple[Channel, int]]:
-        """Получение entity канала и tg_channel_id."""
+        """
+        Получение entity канала и tg_channel_id.
+        Context7 best practice: Автоматическое заполнение tg_channel_id при отсутствии.
+        """
         try:
             # Получение информации о канале из БД
             result = await self.db_session.execute(
-                text("SELECT tg_channel_id, username FROM channels WHERE id = :channel_id"),
+                text("SELECT tg_channel_id, username, title FROM channels WHERE id = :channel_id"),
                 {"channel_id": channel_id}
             )
             channel_info = result.fetchone()
             
             if not channel_info:
+                logger.error("Channel not found in database", channel_id=channel_id)
                 return None
             
-            # Получение entity через Telethon
-            if channel_info.username:
-                entity = await client.get_entity(channel_info.username)
-            else:
-                entity = await client.get_entity(int(channel_info.tg_channel_id))
+            tg_channel_id_db = channel_info.tg_channel_id
+            username = channel_info.username
+            title = channel_info.title
             
-            return entity, int(channel_info.tg_channel_id)
+            # Context7 best practice: Получаем entity по username или tg_channel_id
+            entity = None
+            tg_channel_id = None
+            
+            if username:
+                # Приоритет: username (более надёжный способ)
+                try:
+                    entity = await client.get_entity(username)
+                    # Context7: Для каналов (Channel) ID всегда отрицательный при сохранении в БД
+                    # entity.id может быть положительным для приватных каналов, используем utils.get_peer_id
+                    from telethon import utils
+                    from telethon.tl.types import PeerChannel
+                    if hasattr(entity, 'id') and entity.id is not None:
+                        # Для каналов создаём PeerChannel и получаем правильный ID
+                        if hasattr(entity, 'broadcast') or hasattr(entity, 'megagroup'):
+                            tg_channel_id = utils.get_peer_id(PeerChannel(entity.id))
+                        else:
+                            tg_channel_id = entity.id
+                    else:
+                        logger.error("Entity has no valid ID", 
+                                   channel_id=channel_id, username=username)
+                        raise ValueError("Entity has no valid ID")
+                except Exception as e:
+                    logger.warning("Failed to get entity by username, trying tg_channel_id", 
+                                 channel_id=channel_id, username=username, error=str(e))
+                    # Context7: Безопасная проверка tg_channel_id_db на None
+                    if tg_channel_id_db is not None:
+                        try:
+                            entity = await client.get_entity(int(tg_channel_id_db))
+                            tg_channel_id = int(tg_channel_id_db)
+                        except Exception as e2:
+                            logger.error("Failed to get entity by tg_channel_id", 
+                                       channel_id=channel_id, tg_channel_id=tg_channel_id_db, error=str(e2))
+                            return None
+                    else:
+                        logger.error("No username and no tg_channel_id", channel_id=channel_id, title=title)
+                        return None
+            elif tg_channel_id_db is not None:
+                # Fallback: используем tg_channel_id если username отсутствует
+                try:
+                    entity = await client.get_entity(int(tg_channel_id_db))
+                    tg_channel_id = int(tg_channel_id_db)
+                except Exception as e:
+                    logger.error("Failed to get entity by tg_channel_id", 
+                               channel_id=channel_id, tg_channel_id=tg_channel_id_db, error=str(e))
+                    return None
+            else:
+                logger.error("Channel has neither username nor tg_channel_id", 
+                           channel_id=channel_id, title=title)
+                return None
+            
+            # Context7 best practice: Автоматическое заполнение tg_channel_id в БД, если отсутствует
+            if entity and not tg_channel_id_db and tg_channel_id:
+                try:
+                    await self.db_session.execute(
+                        text("UPDATE channels SET tg_channel_id = :tg_id WHERE id = :channel_id"),
+                        {"tg_id": tg_channel_id, "channel_id": channel_id}
+                    )
+                    await self.db_session.commit()
+                    logger.info("Auto-populated tg_channel_id", 
+                              channel_id=channel_id, 
+                              username=username,
+                              tg_channel_id=tg_channel_id)
+                except Exception as e:
+                    logger.warning("Failed to update tg_channel_id in DB", 
+                                 channel_id=channel_id, error=str(e))
+                    try:
+                        await self.db_session.rollback()
+                    except Exception:
+                        pass
+            
+            if not entity or not tg_channel_id:
+                logger.error("Failed to resolve channel entity", 
+                           channel_id=channel_id, username=username)
+                return None
+            
+            return entity, tg_channel_id
             
         except Exception as e:
-            logger.error(f"Failed to get channel entity: {e}")
+            logger.error("Failed to get channel entity", 
+                       channel_id=channel_id, error=str(e))
             try:
                 await self.db_session.rollback()
             except Exception:
@@ -335,14 +443,9 @@ class ChannelParser:
         
         # Получение HWM из Redis (устойчивость к сбоям)
         hwm_key = f"parse_hwm:{channel['id']}"
-        # Context7: get() - синхронная функция в redis-py
-        hwm_str = self.redis_client.get(hwm_key)
-        redis_hwm = None
-        if hwm_str:
-            try:
-                redis_hwm = datetime.fromisoformat(hwm_str)
-            except Exception:
-                pass
+        # Context7: get() - асинхронная функция в redis.asyncio
+        hwm_raw = await self.redis_client.get(hwm_key)
+        redis_hwm = ensure_dt_utc(hwm_raw) if hwm_raw else None
         
         if mode == "incremental":
             # Опора на last_parsed_at или Redis HWM
@@ -519,8 +622,8 @@ class ChannelParser:
                 # HWM ТОЛЬКО после успешного commit
                 if processed > 0 and max_date:
                     hwm_key = f"parse_hwm:{channel_id}"
-                    # Context7: set() - синхронная функция в redis-py
-                    self.redis_client.set(
+                    # Context7: set() - асинхронная функция в redis.asyncio
+                    await self.redis_client.set(
                         hwm_key,
                         max_date.isoformat(),
                         ex=86400  # TTL 24 hours
@@ -555,8 +658,8 @@ class ChannelParser:
         cache_key = f"parsed:{channel_id}:{message.id}"
         
         # Проверка в Redis (быстрая проверка)
-        # Context7: exists() - синхронная функция в redis-py
-        if self.redis_client.exists(cache_key):
+        # Context7: exists() - асинхронная функция в redis.asyncio
+        if await self.redis_client.exists(cache_key):
             return True
         
         # Проверка в БД (Context7: используем существующий уникальный индекс)
@@ -571,8 +674,8 @@ class ChannelParser:
         
         if result.fetchone():
             # Кеширование результата
-            # Context7: setex() - синхронная функция в redis-py
-            self.redis_client.setex(cache_key, 3600, "1")  # TTL 1 час
+            # Context7: setex() - асинхронная функция в redis.asyncio
+            await self.redis_client.setex(cache_key, 3600, "1")  # TTL 1 час
             return True
         
         return False
@@ -825,32 +928,54 @@ class ChannelParser:
         """
         Context7 best practice: Обновление last_parsed_at после парсинга.
         Обновляем ВСЕГДА для отслеживания последней попытки парсинга.
+        
+        Supabase best practice: Используем параметризованные запросы для безопасности.
         """
         
         try:
             now = datetime.now(timezone.utc)
             
-            await self.db_session.execute(
+            # Context7: Supabase best practice - параметризованные запросы, атомарное обновление
+            result = await self.db_session.execute(
                 text("UPDATE channels SET last_parsed_at = :now WHERE id = :channel_id"),
                 {"now": now, "channel_id": channel_id}
             )
+            
+            # Context7: Проверяем, что обновление произошло
+            rows_affected = result.rowcount
+            if rows_affected == 0:
+                logger.warning("No rows updated for last_parsed_at", 
+                             channel_id=channel_id,
+                             parsed_count=parsed_count)
+            
             await self.db_session.commit()
             
             # Удаление HWM после успешного обновления
             hwm_key = f"parse_hwm:{channel_id}"
-            # Context7: delete() - синхронная функция в redis-py
-            self.redis_client.delete(hwm_key)
+            # Context7: delete() - асинхронная функция в redis.asyncio
+            await self.redis_client.delete(hwm_key)
             
             # Context7: stdlib logging syntax для совместимости
             logger.info("Updated last_parsed_at", 
                        channel_id=channel_id, 
                        timestamp=now.isoformat(), 
-                       parsed_count=parsed_count)
+                       parsed_count=parsed_count,
+                       rows_affected=rows_affected)
             
         except Exception as e:
-            # Context7: stdlib logging syntax для совместимости
+            # Context7: stdlib logging syntax для совместимости, полная информация об ошибке
             logger.error("Failed to update last_parsed_at", 
-                        channel_id=channel_id, error=str(e))
+                        channel_id=channel_id, 
+                        error=str(e),
+                        error_type=type(e).__name__,
+                        exc_info=True)
+            # Context7: Откатываем транзакцию при ошибке
+            try:
+                await self.db_session.rollback()
+            except Exception as rollback_error:
+                logger.error("Failed to rollback after last_parsed_at update error",
+                            channel_id=channel_id,
+                            error=str(rollback_error))
             raise
     
     async def _update_channel_stats(self, channel_id: str, messages_count: int):
@@ -886,8 +1011,8 @@ class ChannelParser:
     
     async def close(self):
         """Закрытие соединений."""
-        # Context7: close() - синхронная функция в redis-py
-        self.redis_client.close()
+        # Context7: aclose() - асинхронная функция в redis.asyncio
+        await self.redis_client.aclose()
         logger.info("Channel parser closed")
 
 # ============================================================================

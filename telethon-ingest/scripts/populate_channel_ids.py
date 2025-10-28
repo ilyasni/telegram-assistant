@@ -48,8 +48,8 @@ async def get_channel_id_from_telegram(client: TelegramClient, username: str) ->
         
         return channel_id
         
-    except UsernameNotFoundError:
-        logger.warning("Channel not found in Telegram", username=username)
+    except (UsernameNotOccupiedError, ValueError) as e:
+        logger.warning("Channel not found in Telegram", username=username, error=str(e))
         return None
     except FloodWaitError as e:
         logger.warning("Flood wait error", username=username, wait_seconds=e.seconds)

@@ -1,880 +1,556 @@
 """
 Indexing Task - Consumer для posts.enriched событий
-[C7-ID: WORKER-INDEXING-002]
+Context7 best practice: индексация в Qdrant и Neo4j с обновлением indexing_status
 
-Обрабатывает события posts.enriched → эмбеддинги → Qdrant + Neo4j → публикация posts.indexed
+Обрабатывает события posts.enriched → создание эмбеддингов → индексация → публикация posts.indexed
 """
 
 import asyncio
-import hashlib
-import json
-import logging
 import os
-import re
 import time
-import unicodedata
-from datetime import datetime, timezone
-from typing import Dict, Any, Optional, List
-
 import structlog
-from prometheus_client import Counter, Histogram, Gauge
+import psycopg2
+from typing import Dict, Any, Optional
+from datetime import datetime, timezone, timedelta
+from prometheus_client import Counter
 
-# Context7: Импорты для обработки ошибок и DLQ
-class DLQReason:
-    """Причины отправки в Dead Letter Queue."""
-    SCHEMA_INVALID = "schema_invalid"
-    NO_TEXT = "no_text"
-    EMBED_GEN_FAIL = "embed_gen_fail"
-    EMBED_DIM = "embed_dim_mismatch"
-    QDRANT_FAIL = "qdrant_fail"
-    NEO4J_FAIL = "neo4j_fail"
-    UNHANDLED = "unhandled"
-
-class PermanentError(Exception):
-    """Перманентная ошибка - сообщение отправляется в DLQ."""
-    def __init__(self, reason_code: str, details: str = ""):
-        self.reason_code = reason_code
-        self.details = details
-        super().__init__(f"Permanent error: {reason_code} - {details}")
-
-class TransientError(Exception):
-    """Транзиентная ошибка - сообщение будет повторно обработано."""
-    pass
-
-from ai_providers.gigachain_adapter import GigaChainAdapter, create_gigachain_adapter
-from ai_providers.embedding_service import create_embedding_service
-from event_bus import EventConsumer, RedisStreamsClient
-from events.schemas.posts_enriched_v1 import PostEnrichedEventV1
-from events.schemas.posts_indexed_v1 import PostIndexedEventV1
+from event_bus import EventConsumer, RedisStreamsClient, EventPublisher
 from integrations.qdrant_client import QdrantClient
 from integrations.neo4j_client import Neo4jClient
-from feature_flags import feature_flags
-from config import settings
+from ai_providers.embedding_service import EmbeddingService
 
 logger = structlog.get_logger()
 
-# Debug banner to confirm module load
-from datetime import datetime as _dt_banner, timezone as _tz_banner
-print("indexing_task_loaded:", __file__, _dt_banner.now(_tz_banner.utc).isoformat(), flush=True)
-
-# ============================================================================
-# МЕТРИКИ PROMETHEUS
-# ============================================================================
-
-# [C7-ID: WORKER-INDEXING-002] - Метрики индексации
+# Метрики Prometheus
 indexing_processed_total = Counter(
     'indexing_processed_total',
-    'Total posts processed for indexing',
+    'Total posts indexed',
     ['status']
 )
 
-indexing_latency_seconds = Histogram(
-    'indexing_latency_seconds',
-    'Indexing processing latency',
-    ['operation']
-)
-
-embedding_generation_seconds = Histogram(
-    'embedding_generation_seconds',
-    'Embedding generation latency',
-    ['provider']
-)
-
-qdrant_indexing_seconds = Histogram(
-    'qdrant_indexing_seconds',
-    'Qdrant indexing latency'
-)
-
-neo4j_indexing_seconds = Histogram(
-    'neo4j_indexing_seconds',
-    'Neo4j indexing latency'
-)
-
-# [C7-ID: WORKER-QDRANT-SWEEP-001] - Sweeper метрики
-qdrant_sweep_total = Counter(
-    'qdrant_sweep_total',
-    'Total Qdrant sweep operations',
-    ['status']
-)
-
-qdrant_expired_vectors_deleted = Counter(
-    'qdrant_expired_vectors_deleted',
-    'Total expired vectors deleted from Qdrant'
-)
-
-# [C7-ID: INDEXING-DLQ-REASONS-001] Фиксированные коды для метрик (не взрывная кардинальность)
-class DLQReason:
-    NO_TEXT = "NO_TEXT"
-    EMBED_DIM = "EMBED_DIM"
-    EMBED_GEN_FAIL = "EMBED_GEN_FAIL"
-    QDRANT_FAIL = "QDRANT_FAIL"
-    SCHEMA_INVALID = "SCHEMA_INVALID"
-    UNHANDLED = "UNHANDLED"
-
-# Метрики для DLQ с фиксированными лейблами
-indexing_dlq_total = Counter(
-    'indexing_dlq_total',
-    'Total messages sent to DLQ',
-    ['reason']  # только из DLQReason
-)
-
-# [C7-ID: INDEXING-ERROR-TYPES-001] Типизированные исключения
-class TransientError(Exception):
-    """Транзиентная ошибка — retry без DLQ."""
-    pass
-
-class PermanentError(Exception):
-    """Перманентная ошибка — DLQ с ACK."""
-    def __init__(self, reason_code: str, details: str):
-        self.reason_code = reason_code
-        self.details = details
-        super().__init__(f"{reason_code}: {details}")
-
-# [C7-ID: INDEXING-TEXT-NORM-001] Нормализация текста для эмбеддингов
-def normalize_text(s: str) -> str:
-    """Нормализация текста: NFC, удаление zero-width, схлопывание пробелов."""
-    s = unicodedata.normalize("NFC", s.replace("\u200b", ""))
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-# [C7-ID: INDEXING-TOKEN-LIMIT-001] Эвристическая оценка токенов
-def approx_tokens(s: str) -> int:
-    """Эвристика: 4 символа ≈ 1 токен (смешанный текст)."""
-    return max(1, len(s) // 4)
-
-def truncate_by_tokens(text: str, max_tokens: int = 8192) -> str:
-    """Обрезка текста по токен-лимиту (эвристика)."""
-    if approx_tokens(text) > max_tokens:
-        truncated = text[: max_tokens * 4]
-        logger.warning("embedding_text_truncated_tokens", 
-                      original_tokens=approx_tokens(text),
-                      truncated_tokens=max_tokens)
-        return truncated
-    return text
-
-# [C7-ID: INDEXING-IDEMPOTENCY-001] Идемпотентность по хешу текста
-def calc_text_hash(text: str) -> str:
-    """SHA256 хеш текста для идемпотентности."""
-    return hashlib.sha256(text.encode('utf-8')).hexdigest()
-
-EMBED_VERSION = "v1"  # Версия эмбеддинга для инвалидации кеша
-
-# ============================================================================
-# INDEXING TASK
-# ============================================================================
 
 class IndexingTask:
     """
     Consumer для обработки posts.enriched событий.
     
     Поддерживает:
-    - Генерацию эмбеддингов через AI провайдер
-    - Индексацию в Qdrant с expires_at в payload
-    - Индексацию в Neo4j с expires_at как property
-    - Сквозной TTL/retention до всех хранилищ
-    - Метрики и мониторинг
+    - Индексацию эмбеддингов в Qdrant
+    - Создание графа в Neo4j
+    - Обновление indexing_status в БД
+    - Публикацию posts.indexed событий
     """
     
     def __init__(
         self,
-        redis_url: str = "redis://redis:6379",
-        qdrant_url: str = "http://localhost:6333",
-        neo4j_url: str = "bolt://localhost:7687",
-        consumer_group: str = "indexing_workers",
-        consumer_name: str = "indexing_worker_1"
+        redis_url: str,
+        qdrant_url: str,
+        neo4j_url: str
     ):
         self.redis_url = redis_url
         self.qdrant_url = qdrant_url
         self.neo4j_url = neo4j_url
-        self.consumer_group = consumer_group
-        self.consumer_name = consumer_name
         
-        # Redis клиенты
+        # Клиенты
         self.redis_client: Optional[RedisStreamsClient] = None
         self.event_consumer: Optional[EventConsumer] = None
-        
-        # AI адаптер для эмбеддингов
-        self.ai_adapter: Optional[GigaChainAdapter] = None
-        
-        # Интеграции
         self.qdrant_client: Optional[QdrantClient] = None
         self.neo4j_client: Optional[Neo4jClient] = None
+        self.embedding_service: Optional[EmbeddingService] = None
+        self.publisher: Optional[EventPublisher] = None
         
-        logger.info("IndexingTask initialized", 
-                   consumer_group=consumer_group,
-                   consumer_name=consumer_name)
+        logger.info("IndexingTask initialized",
+                   redis_url=redis_url[:50],
+                   qdrant_url=qdrant_url,
+                   neo4j_url=neo4j_url)
     
-    async def _initialize(self):
-        """Инициализация компонентов task."""
-        # Подключение к Redis
-        self.redis_client = RedisStreamsClient(self.redis_url)
-        await self.redis_client.connect()
-        
-        # Инициализация EventConsumer
-        from event_bus import ConsumerConfig
-        consumer_config = ConsumerConfig(
-            group_name=self.consumer_group,
-            consumer_name=self.consumer_name,
-            batch_size=50,
-            block_time=1000,
-            retry_delay=5,
-            idle_timeout=300
-        )
-        self.event_consumer = EventConsumer(self.redis_client, consumer_config)
-        
-        # Инициализация AI адаптера
-        self.ai_adapter = await create_gigachain_adapter()
-        
-        # [C7-ID: AI-EMBEDDING-SERVICE-FACTORY-001] Инициализация EmbeddingService
-        self.embedding_service = await create_embedding_service(self.ai_adapter)
-        
-        # Инициализация Qdrant клиента
-        self.qdrant_client = QdrantClient(self.qdrant_url)
-        await self.qdrant_client.connect()
-        
-        # [C7-ID: INDEXING-QDRANT-DIM-CHECK-001] Читаем размерность из Qdrant (единый источник правды)
-        try:
-            collection_info = self.qdrant_client.client.get_collection(settings.qdrant_collection)
-            # Для single-vector коллекции
-            self.qdrant_vector_size = collection_info.config.params.vectors.size
-            
-            # Сверяем с конфигом и логируем расхождение
-            if self.qdrant_vector_size != settings.EMBED_DIM:
-                logger.warning("embed_dim_mismatch_config",
-                              qdrant=self.qdrant_vector_size,
-                              env=settings.EMBED_DIM,
-                              collection=settings.qdrant_collection)
-            else:
-                logger.info("embed_dim_synchronized",
-                           dimension=self.qdrant_vector_size,
-                           collection=settings.qdrant_collection)
-        except Exception as e:
-            logger.error("qdrant_collection_check_failed", error=str(e))
-            # Fallback на конфиг
-            self.qdrant_vector_size = settings.EMBED_DIM
-            logger.warning("using_config_embed_dim", dimension=self.qdrant_vector_size)
-        
-        # Инициализация EventPublisher для DLQ
-        from event_bus import EventPublisher
-        self.publisher = EventPublisher(self.redis_client)
-        
-        logger.info("indexing_embedding_service_initialized", 
-                   dimension=self.qdrant_vector_size)
-        
-        # Инициализация Neo4j клиента
-        if feature_flags.neo4j_enabled:
-            # Не передаем явные креды: Neo4jClient возьмет их из env (Context7 best practice)
-            self.neo4j_client = Neo4jClient(self.neo4j_url)
-            await self.neo4j_client.connect()
-        
-        logger.info("IndexingTask initialized successfully")
-
     async def start(self):
-        """Запуск indexing task с неблокирующей обработкой."""
+        """Запуск indexing task."""
         try:
-            # Инициализация
-            await self._initialize()
+            # Инициализация Redis
+            self.redis_client = RedisStreamsClient(self.redis_url)
+            await self.redis_client.connect()
             
-            # Создание consumer group
+            # Инициализация EventConsumer
+            from event_bus import ConsumerConfig
+            consumer_config = ConsumerConfig(
+                group_name="indexing_workers",
+                consumer_name="indexing_worker_1"
+            )
+            self.event_consumer = EventConsumer(self.redis_client, consumer_config)
+            
+            # Инициализация Qdrant
+            self.qdrant_client = QdrantClient(self.qdrant_url)
+            await self.qdrant_client.connect()
+            
+            # Инициализация Neo4j
+            from config import settings
+            self.neo4j_client = Neo4jClient(
+                uri=self.neo4j_url,
+                username=os.getenv("NEO4J_USER", settings.neo4j_username),
+                password=os.getenv("NEO4J_PASSWORD", settings.neo4j_password)
+            )
+            await self.neo4j_client.connect()
+            
+            # Инициализация EmbeddingService
+            from ai_providers.gigachain_adapter import create_gigachain_adapter
+            from ai_providers.embedding_service import create_embedding_service
+            ai_adapter = await create_gigachain_adapter()
+            self.embedding_service = await create_embedding_service(ai_adapter)
+            
+            # Инициализация Publisher
+            self.publisher = EventPublisher(self.redis_client)
+            
+            # Context7: Создание consumer group перед обработкой backlog
             await self.event_consumer._ensure_consumer_group("posts.enriched")
             
-            logger.info("IndexingTask started successfully", stream="posts.enriched", group=self.consumer_group, consumer=self.consumer_name)
-            print("indexing_worker_initialized stream=stream:posts:enriched group=indexing_workers output=stream:posts:indexed", flush=True)
+            logger.info("IndexingTask started, consuming posts.enriched events")
             
-            # Используем реальный обработчик
-            handler_func = self._process_single_message
-            print("INDEXER_REAL_HANDLER_REGISTERED", flush=True)
+            # Context7 best practice: обработка backlog при старте
+            # Перечитываем сообщения с начала stream для обработки необработанных событий
+            backlog_processed = await self._process_backlog_once("posts.enriched")
+            if backlog_processed > 0:
+                logger.info(f"Processed {backlog_processed} backlog messages from stream")
             
-            # Context7: Используем consume_forever для правильного паттерна pending → новые
-            await self.event_consumer.consume_forever(
-                "posts.enriched", 
-                handler_func
-            )
-                    
+            # Запуск потребления событий
+            await self.event_consumer.start_consuming("posts.enriched", self._process_single_message)
+            
         except Exception as e:
             logger.error("Failed to start IndexingTask", error=str(e))
             raise
     
-    def _extract_event_dict(self, msg: dict) -> dict:
-        """Robust event parsing for IndexingTask."""
-        # 1) Нормализуем источник payload
-        raw = None
-        if isinstance(msg, dict):
-            if 'payload' in msg:
-                raw = msg['payload']
-                # Context7: Если payload - это строка, декодируем
-                if isinstance(raw, (bytes, bytearray)):
-                    raw = raw.decode('utf-8', errors='replace')
-                if isinstance(raw, str):
-                    try:
-                        import json
-                        raw = json.loads(raw)
-                    except Exception as e:
-                        logger.error("indexing_parse_json_error", err=str(e), sample=str(raw)[:200])
-                        raise
-                return raw  # Возвращаем сразу после извлечения payload
-            elif 'data' in msg:                     # legacy
-                raw = msg['data']
-            elif 'value' in msg:                    # на случай другой обёртки
-                raw = msg['value']
-            else:
-                # возможно, msg уже есть готовый dict события
-                raw = msg
-
-        # 2) Декодируем по типу
-        if isinstance(raw, (bytes, bytearray)):
-            raw = raw.decode('utf-8', errors='replace')
-        if isinstance(raw, str):
+    async def _process_backlog_once(self, stream_name: str) -> int:
+        """
+        Context7 best practice: обработка backlog при старте.
+        
+        Перечитывает все сообщения из stream через XREADGROUP.
+        Работает только если consumer group был пересоздан или stream содержит
+        непрочитанные сообщения.
+        
+        Args:
+            stream_name: Имя стрима для обработки
+            
+        Returns:
+            int: Количество обработанных сообщений
+        """
+        try:
+            from event_bus import STREAMS
+            
+            stream_key = STREAMS[stream_name]
+            batch_size = 100
+            max_backlog_messages = 500  # Ограничение для безопасности
+            processed_count = 0
+            
+            logger.info(f"Processing backlog for {stream_name}...")
+            
+            # Context7 best practice: читаем все сообщения из stream через XREVRANGE
+            # Получаем последние сообщения и обрабатываем их в обратном порядке
+            # Это позволяет обработать все существующие сообщения независимо от consumer group
             try:
-                import json
-                raw = json.loads(raw)
+                # Используем XREVRANGE для получения последних сообщений
+                messages_data = await self.redis_client.client.xrevrange(
+                    stream_key,
+                    count=max_backlog_messages,
+                    max='+',
+                    min='-'
+                )
+                
+                if not messages_data:
+                    logger.info("No messages in stream for backlog processing")
+                    return 0
+                
+                logger.info(f"Found {len(messages_data)} messages in stream, processing...")
+                
+                # Обрабатываем сообщения в обратном порядке (от новых к старым)
+                for message_id, fields in reversed(messages_data):
+                    try:
+                        # Парсинг события
+                        event_data = self.event_consumer._parse_event_data(fields)
+                        
+                        # Проверяем post_id
+                        post_id = event_data.get('post_id') if isinstance(event_data, dict) else event_data.get('payload', {}).get('post_id')
+                        if not post_id:
+                            continue
+                        
+                        # Проверяем, не обработан ли уже этот пост
+                        db_url = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@supabase-db:5432/postgres")
+                        conn = psycopg2.connect(db_url)
+                        cursor = conn.cursor()
+                        cursor.execute("SELECT embedding_status FROM indexing_status WHERE post_id = %s", (post_id,))
+                        row = cursor.fetchone()
+                        cursor.close()
+                        conn.close()
+                        
+                        # Пропускаем уже обработанные
+                        if row and row[0] in ('completed', 'processing'):
+                            continue
+                        
+                        # Обработка сообщения
+                        await self._process_single_message(event_data)
+                        
+                        processed_count += 1
+                        
+                        # Логируем прогресс каждые 20 сообщений
+                        if processed_count % 20 == 0:
+                            logger.info(f"Backlog progress: {processed_count} messages processed")
+                        
+                        # Ограничение на количество обработанных сообщений за раз
+                        if processed_count >= max_backlog_messages:
+                            logger.info(f"Reached max backlog messages limit ({max_backlog_messages})")
+                            break
+                            
+                    except Exception as e:
+                        logger.error(f"Error processing backlog message {message_id}",
+                                   error=str(e),
+                                   message_id=message_id)
+                        continue
+                
             except Exception as e:
-                logger.error("indexing_parse_json_error", err=str(e), sample=str(raw)[:200])
-                raise
-
-        if not isinstance(raw, dict):
-            logger.error("indexing_unexpected_payload_type", type=str(type(raw)))
-            raise ValueError("Unexpected payload type for enriched event")
-
-        return raw
-
-    def _extract_vector(self, event_dict: dict) -> list[float] | None:
-        """
-        [C7-ID: INDEXING-VECTOR-EXTRACT-002] Извлечение и валидация вектора.
-        Строгая проверка размерности, dim mismatch → raise PermanentError.
-        """
-        # 1) плоское поле
-        v = event_dict.get('embedding') or event_dict.get('vector')
-        # 2) вложенные - Context7: поддержка enrichment и enrichment_data
-        if v is None:
-            enr = event_dict.get('enrichment') or event_dict.get('enrichment_data') or event_dict.get('enriched') or {}
-            v = enr.get('embedding') or enr.get('vector') or enr.get('qdrant', {}).get('vector')
-        # 3) финальная проверка типа
-        if isinstance(v, dict) and 'values' in v:  # onnx-style
-            v = v['values']
-        
-        # [C7-ID: INDEXING-EMBED-DIM-VALIDATE-001] Строгая валидация размерности
-        if v is not None and len(v) != self.qdrant_vector_size:
-            post_id = event_dict.get('post_id', 'unknown')
-            raise PermanentError(
-                reason_code=DLQReason.EMBED_DIM,
-                details=f"post_id={post_id}, got={len(v)}, expected={self.qdrant_vector_size}"
-            )
-        
-        return v
-
-
+                logger.error(f"Error reading backlog: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                return 0
+            
+            if processed_count > 0:
+                logger.info(f"Backlog processing completed: {processed_count} messages processed")
+            else:
+                logger.info("No backlog messages to process or all already processed")
+            
+            return processed_count
+            
+        except Exception as e:
+            logger.error(f"Error in backlog processing: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return 0
+    
     async def _process_single_message(self, message: Dict[str, Any]):
         """
-        [C7-ID: INDEXING-PROCESS-001] Обработка одного сообщения с typсированной обработкой ошибок.
-        TransientError → retry, PermanentError → DLQ + ACK.
+        Обработка одного posts.enriched события.
+        
+        Context7 best practice: обновление indexing_status на каждом этапе.
         """
-        post_id = None
+        # Парсинг события: EventConsumer передает структуру {'payload': {...}, 'headers': {}}
+        if 'payload' in message:
+            event_data = message['payload']
+        elif 'data' in message:
+            # Старый формат: {'data': json_bytes}
+            import json
+            event_data = json.loads(message['data']) if isinstance(message['data'], (bytes, str)) else message['data']
+        else:
+            # Прямой формат
+            event_data = message
+        
+        post_id = event_data.get('post_id')
+        if not post_id:
+            logger.warning("Message without post_id, skipping", message=message, event_data=event_data)
+            return
+        
         try:
-            # Hard entry prints for guaranteed visibility
-            try:
-                print("indexing_msg_in_raw", type(message).__name__, str(message)[:300], flush=True)
-            except Exception:
-                pass
-            logger.info("indexing_msg_in_marker")
-            # [C7-ID: WORKER-INDEXING-DBG-001] Детальная телеметрия входа
-            msg_keys = list(message.keys()) if isinstance(message, dict) else []
-            msg_type = str(type(message))
-            logger.info("indexing_msg_raw",
-                keys=msg_keys,
-                msg_type=msg_type,
-                preview=str(message)[:500])
+            # Context7: Устанавливаем статус processing в начале обработки
+            await self._update_indexing_status(
+                post_id=post_id,
+                embedding_status='processing',
+                graph_status='pending'
+            )
             
-            # Robust парсинг события
-            event_dict = self._extract_event_dict(message)
-            post_id = event_dict.get('post_id', 'unknown')
-            logger.info("indexing_msg_in",
-                        post_id=post_id,
-                        has_payload=isinstance(message, dict) and ('payload' in message),
-                        payload_type=(type(message.get('payload')).__name__ if isinstance(message, dict) and ('payload' in message) else None))
-            if not isinstance(event_dict, dict):
-                logger.error("indexing_bad_payload", post_id=post_id, type=str(type(event_dict)), sample=str(event_dict)[:200])
-                raise PermanentError(DLQReason.SCHEMA_INVALID, "Invalid payload type")
-            
-            # Снимок «схемы» полезной нагрузки
-            logger.info("indexing_payload_shape",
-                keys=list(event_dict.keys()),
-                types={k: type(event_dict[k]).__name__ for k in list(event_dict.keys())[:15]},
-                has_embedding=('embedding' in event_dict),
-                has_text=('text' in event_dict),
-                has_channel=('channel_id' in event_dict),
-                has_post=('post_id' in event_dict))
-
-            # Context7: Проверяем enrichment_data/enrichment в правильном месте
-            # Для обратной совместимости поддерживаем оба названия
-            if 'enrichment_data' not in event_dict and 'enrichment' not in event_dict:
-                logger.error("indexing_no_enrichment", keys=list(event_dict.keys()))
-                # ACK сообщение даже при ошибке, чтобы избежать накопления pending
-                raise ValueError("Missing enrichment_data or enrichment")
-            
-            # [C7-ID: WORKER-INDEXING-VAL-001] Строгая валидация + мягкое падение в DLQ
-            try:
-                enriched_event = PostEnrichedEventV1.model_validate(event_dict)
-            except Exception as e:
-                logger.error("indexing_schema_validation_error",
-                             err=str(e),
-                             pydantic_errors=getattr(e, 'errors', lambda: [])(),
-                             payload_keys=list(event_dict.keys()))
-                # DLQ или skip (если есть publisher)
-                if hasattr(self, 'publisher') and self.publisher:
-                    await self.publisher.to_dlq("posts.enriched", event_dict, reason=DLQReason.SCHEMA_INVALID, details=str(e))
-                # ACK сообщение даже при ошибке, чтобы избежать накопления pending
+            # Получение данных поста
+            post_data = await self._get_post_data(post_id)
+            if not post_data:
+                logger.warning("Post not found", post_id=post_id)
+                await self._update_indexing_status(
+                    post_id=post_id,
+                    embedding_status='failed',
+                    graph_status='failed',
+                    error_message='Post not found'
+                )
                 return
             
-            # [C7-ID: WORKER-INDEXING-MAP-001] Нормализация поля с эмбеддингом
-            vec = self._extract_vector(event_dict)  # Может выбросить PermanentError при dim mismatch
-            
-            # [C7-ID: INDEXING-EMBED-GEN-001] Генерация эмбеддинга, если отсутствует
-            if vec is None:
-                logger.info("indexing_no_vector_found", post_id=post_id)
-                
-                if settings.INDEXER_EMBED_IF_MISSING:
-                    text = event_dict.get("text") or ""
-                    
-                    if not text.strip():
-                        raise PermanentError(
-                            reason_code=DLQReason.NO_TEXT,
-                            details=f"post_id={post_id}, empty text"
-                        )
-                    
-                    try:
-                        # [C7-ID: INDEXING-EMBED-SERVICE-001] Используем EmbeddingService
-                        vec = await self.embedding_service.generate_embedding(text)
-                        logger.info("indexing_embedding_generated",
-                                   post_id=post_id,
-                                   dim=len(vec))
-                    except Exception as e:
-                        logger.error("indexing_embedding_failed", post_id=post_id, error=str(e))
-                        raise PermanentError(
-                            reason_code=DLQReason.EMBED_GEN_FAIL,
-                            details=f"post_id={post_id}, error={str(e)}"
-                        )
-                else:
-                    raise PermanentError(
-                        reason_code=DLQReason.NO_TEXT,
-                        details=f"post_id={post_id}, embedding missing and INDEXER_EMBED_IF_MISSING=false"
-                    )
-            
-            # [C7-ID: WORKER-INDEXING-QDRANT-001] Qdrant upsert с идемпотентностью
-            text = event_dict.get("text", "")
-            text_hash = calc_text_hash(text)
-            point_id = str(event_dict.get("post_id") or event_dict.get("idempotency_key"))
-            
-            payload = {
-                "post_id": event_dict.get("post_id"),
-                "channel_id": event_dict.get("channel_id"),
-                "telegram_post_url": event_dict.get("telegram_post_url"),
-                "text": text,
-                "text_sha256": text_hash,  # [C7-ID: INDEXING-IDEMPOTENCY-002] Идемпотентность
-                "embed_version": EMBED_VERSION,  # Версия эмбеддинга для инвалидации кеша
-                "tags": event_dict.get("tags", []),
-                "posted_at": str(event_dict.get("posted_at")),
-            }
-            
-            try:
-                vector_id = await self.qdrant_client.upsert_vector(
-                    collection_name="telegram_posts",
-                    vector_id=point_id,
-                    vector=vec,
-                    payload=payload
-                )
-                logger.info("indexing_qdrant_upsert_ok",
-                           post_id=post_id,
-                           point_id=point_id,
-                           vector_id=vector_id,
-                           text_hash=text_hash[:16])
-                
-                # [C7-ID: WORKER-INDEXING-NEO4J-001] Индексация в Neo4j
-                post_data = {
-                    "expires_at": None,
-                    "user_id": event_dict.get("user_id", "user_123"),  # Fallback для тестирования
-                    "tenant_id": event_dict.get("tenant_id", "tenant_123"),
-                    "channel_id": event_dict.get("channel_id", "channel_456")
-                }
-                
-                # Индексация в Neo4j
-                neo4j_success = True
-                if self.neo4j_client:
-                    logger.info("Indexing to Neo4j", post_id=post_id)
-                    neo4j_success = await self._index_to_neo4j(enriched_event, post_data)
-                    
-                    if not neo4j_success:
-                        logger.error("Failed to index to Neo4j", post_id=post_id)
-                        raise TransientError("Neo4j indexing failed")
-                else:
-                    logger.warning("Neo4j client not available", post_id=post_id)
-                
-                # Публикация события posts.indexed
-                await self._publish_indexed_event(enriched_event, post_data, 0.0)
-                
-                # [C7-ID: INDEXING-METRICS-001] Метрики успешной обработки
-                indexing_processed_total.labels(status="ok").inc()
-                logger.info("indexing_completed_successfully", post_id=post_id)
-                
-            except Exception as e:
-                logger.error("indexing_qdrant_upsert_failed", post_id=post_id, point_id=point_id, error=str(e))
-                indexing_processed_total.labels(status="error").inc()
-                raise TransientError(f"Qdrant upsert failed: {str(e)}")
-            
-        except PermanentError as e:
-            # [C7-ID: INDEXING-DLQ-001] Перманентная ошибка → DLQ + ACK
-            logger.error("indexing_permanent_error", post_id=post_id, reason=e.reason_code, details=e.details)
-            indexing_dlq_total.labels(reason=e.reason_code).inc()
-            
-            # Публикация в DLQ с правильным stream
-            if hasattr(self, 'publisher') and self.publisher:
-                try:
-                    from event_bus import EventPublisher
-                    await self.publisher.to_dlq("posts.enriched", event_dict if 'event_dict' in locals() else {}, reason=e.reason_code, details=e.details)
-                except Exception as dlq_err:
-                    logger.error("dlq_publish_failed", error=str(dlq_err))
-            
-            # ACK сообщение для предотвращения повторных попыток
-            return
-            
-        except TransientError as e:
-            # [C7-ID: INDEXING-RETRY-001] Транзиентная ошибка → пробрасываем для retry
-            logger.warning("indexing_transient_error", post_id=post_id, error=str(e))
-            raise
-            
-        except Exception as e:
-            # [C7:INDEXING-GUARD-001] Неожиданная ошибка → DLQ с кодом UNHANDLED
-            payload = message.get('payload', message) if isinstance(message, dict) else message
-            try:
-                payload_keys = list(payload.keys()) if isinstance(payload, dict) else None
-            except Exception:
-                payload_keys = None
-            logger.exception("indexing_unhandled_exception",
-                             post_id=post_id,
-                             err=str(e),
-                             payload_type=type(payload).__name__,
-                             payload_keys=payload_keys)
-            
-            # Отправляем в DLQ
-            indexing_dlq_total.labels(reason=DLQReason.UNHANDLED).inc()
-            if hasattr(self, 'publisher') and self.publisher:
-                try:
-                    await self.publisher.to_dlq("posts.enriched", payload, reason=DLQReason.UNHANDLED, details=str(e))
-                except Exception as dlq_err:
-                    logger.error("dlq_publish_failed", error=str(dlq_err))
-            
-            return
-
-    # legacy batch handler removed
-    async def _get_post_data(self, post_id: str) -> Optional[Dict[str, Any]]:
-        """Получение данных поста из БД для expires_at."""
-        # TODO: Реализовать запрос к БД для получения expires_at
-        # Пока возвращаем mock данные
-        from datetime import timedelta
-        return {
-            'post_id': post_id,
-            'expires_at': (datetime.now(timezone.utc) + timedelta(days=7)).isoformat(),  # Mock expires_at
-            'user_id': 'user_123',
-            'tenant_id': 'tenant_123',
-            'channel_id': 'channel_456'
-        }
-    
-    async def _index_post(self, enriched_event: PostEnrichedEventV1, post_data: Dict[str, Any]) -> bool:
-        """Индексация поста в Qdrant и Neo4j."""
-        try:
             # Генерация эмбеддинга
-            embedding_start = time.time()
-            embedding = await self._generate_embedding(enriched_event, post_data)
-            embedding_time = time.time() - embedding_start
-            
-            if not embedding:
-                logger.error("Failed to generate embedding", post_id=enriched_event.post_id)
-                return False
+            embedding = await self._generate_embedding(post_data)
             
             # Индексация в Qdrant
-            qdrant_start = time.time()
-            qdrant_success = await self._index_to_qdrant(enriched_event, post_data, embedding)
-            qdrant_time = time.time() - qdrant_start
-            
-            if not qdrant_success:
-                logger.error("Failed to index to Qdrant", post_id=enriched_event.post_id)
-                return False
+            vector_id = await self._index_to_qdrant(post_id, post_data, embedding)
             
             # Индексация в Neo4j
-            neo4j_success = True
-            neo4j_time = 0
-            if self.neo4j_client:
-                logger.debug("Indexing to Neo4j", post_id=enriched_event.post_id)
-                neo4j_start = time.time()
-                neo4j_success = await self._index_to_neo4j(enriched_event, post_data)
-                neo4j_time = time.time() - neo4j_start
-                
-                if not neo4j_success:
-                    logger.error("Failed to index to Neo4j", post_id=enriched_event.post_id)
-                    return False
-            else:
-                logger.warning("Neo4j client not available", post_id=enriched_event.post_id)
+            await self._index_to_neo4j(post_id, post_data)
             
-            # Метрики
-            embedding_generation_seconds.labels(provider='gigachat').observe(embedding_time)
-            qdrant_indexing_seconds.observe(qdrant_time)
-            if neo4j_time > 0:
-                neo4j_indexing_seconds.observe(neo4j_time)
-            
-            return True
-            
-        except Exception as e:
-            logger.error("Error indexing post", 
-                        post_id=enriched_event.post_id,
-                        error=str(e))
-            return False
-    
-    async def _get_post_text(self, post_id: str) -> Optional[str]:
-        """Получение текста поста из БД."""
-        try:
-            result = await self.db_session.execute(
-                text("SELECT content FROM posts WHERE id = :post_id"),
-                {"post_id": post_id}
+            # Context7: Обновляем статус completed после успешной индексации
+            await self._update_indexing_status(
+                post_id=post_id,
+                embedding_status='completed',
+                graph_status='completed',
+                vector_id=vector_id
             )
-            row = result.fetchone()
-            return row.content if row else None
+            
+            # Публикация события posts.indexed
+            await self.publisher.publish_event("posts.indexed", {
+                "post_id": post_id,
+                "vector_id": vector_id,
+                "indexed_at": datetime.now(timezone.utc).isoformat()
+            })
+            
+            indexing_processed_total.labels(status='success').inc()
+            logger.info("Post indexed successfully", post_id=post_id, vector_id=vector_id)
+            
         except Exception as e:
-            logger.error("Failed to get post text", post_id=post_id, error=str(e))
+            logger.error("Failed to process post",
+                        post_id=post_id,
+                        error=str(e))
+            indexing_processed_total.labels(status='error').inc()
+            
+            # Context7: Обновляем статус failed при ошибке
+            await self._update_indexing_status(
+                post_id=post_id,
+                embedding_status='failed',
+                graph_status='failed',
+                error_message=str(e)
+            )
+    
+    async def _get_post_data(self, post_id: str) -> Optional[Dict[str, Any]]:
+        """Получение данных поста из БД."""
+        try:
+            from psycopg2.extras import RealDictCursor
+            
+            db_url = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@supabase-db:5432/postgres")
+            conn = psycopg2.connect(db_url)
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            
+            cursor.execute("""
+                SELECT id, channel_id, content as text, telegram_message_id, created_at
+                FROM posts
+                WHERE id = %s
+            """, (post_id,))
+            
+            row = cursor.fetchone()
+            cursor.close()
+            conn.close()
+            
+            if row:
+                return dict(row)
+            return None
+            
+        except Exception as e:
+            logger.error("Failed to get post data", post_id=post_id, error=str(e))
             return None
     
-    async def _generate_embedding(self, enriched_event: PostEnrichedEventV1, post_data: Dict[str, Any]) -> Optional[List[float]]:
+    async def _generate_embedding(self, post_data: Dict[str, Any]) -> list:
         """Генерация эмбеддинга для поста."""
         try:
-            if not self.ai_adapter:
-                logger.error("AI adapter not initialized")
-                return None
+            text = post_data.get('text', '')
+            if not text:
+                raise ValueError("Post text is empty")
             
-            # Получение текста поста из БД
-            post_text = await self._get_post_text(enriched_event.post_id)
-            if not post_text:
-                logger.warning("No text found for post", post_id=enriched_event.post_id)
-                return None
+            # Context7: Используем EmbeddingService для генерации эмбеддинга
+            embedding = await self.embedding_service.generate_embedding(text)
+            return embedding
             
-            # Подготовка текста для эмбеддинга
-            text_parts = [post_text]
-            
-            # Добавление обогащенного контента если есть
-            if enriched_event.enrichment_data:
-                for url, data in enriched_event.enrichment_data.items():
-                    if isinstance(data, dict) and 'content' in data:
-                        text_parts.append(data['content'])
-            
-            # Генерация эмбеддинга
-            embeddings = await self.ai_adapter.generate_embeddings(text_parts)
-            
-            if embeddings and len(embeddings) > 0:
-                return embeddings[0]
-            else:
-                logger.warning("No embeddings generated", post_id=enriched_event.post_id)
-                return None
-                
         except Exception as e:
-            logger.error("Error generating embedding", 
-                        post_id=enriched_event.post_id,
+            logger.error("Failed to generate embedding",
+                        post_id=post_data.get('id'),
                         error=str(e))
-            return None
+            raise
     
-    async def _index_to_qdrant(self, enriched_event: PostEnrichedEventV1, post_data: Dict[str, Any], embedding: List[float]) -> bool:
-        """Индексация в Qdrant с expires_at в payload."""
+    async def _index_to_qdrant(self, post_id: str, post_data: Dict[str, Any], embedding: list) -> str:
+        """Индексация поста в Qdrant."""
         try:
-            # Подготовка payload с expires_at
-            payload = {
-                'post_id': enriched_event.post_id,
-                'user_id': post_data['user_id'],
-                'tenant_id': post_data['tenant_id'],
-                'channel_id': post_data['channel_id'],
-                'expires_at': post_data['expires_at'],  # [C7-ID: WORKER-INDEXING-002] - Сквозной TTL
-                'enrichment_data': enriched_event.enrichment_data,
-                'source_urls': enriched_event.source_urls,
-                'word_count': enriched_event.word_count,
-                'indexed_at': datetime.now(timezone.utc).isoformat()
-            }
+            from config import settings
             
-            # Определение коллекции (per-user)
-            collection_name = f"user_{post_data['user_id']}_posts"
-            
-            # Создание коллекции если не существует
-            await self.qdrant_client.ensure_collection(collection_name, len(embedding))
-            
-            # Индексация вектора
-            print("qdrant_upsert_enter", collection_name, enriched_event.post_id, flush=True)
-            
-            vector_id = await self.qdrant_client.upsert_vector(
-                collection_name=collection_name,
-                vector_id=enriched_event.post_id,
+            vector_id = f"{post_id}"
+            await self.qdrant_client.upsert_vector(
+                collection_name=settings.qdrant_collection,
+                vector_id=vector_id,
                 vector=embedding,
-                payload=payload
+                payload={
+                    "post_id": post_id,
+                    "channel_id": post_data.get('channel_id'),
+                    "text": post_data.get('text', '')[:500],  # text уже алиас для content из SELECT
+                    "telegram_message_id": post_data.get('telegram_message_id'),
+                    "created_at": post_data.get('created_at').isoformat() if post_data.get('created_at') else None
+                }
             )
             
-            print("qdrant_upsert_ok", vector_id, flush=True)
-            
-            logger.debug("Post indexed to Qdrant",
-                        post_id=enriched_event.post_id,
-                        collection=collection_name,
-                        vector_id=vector_id)
-            
-            return True
+            logger.debug("Indexed to Qdrant", post_id=post_id, vector_id=vector_id)
+            return vector_id
             
         except Exception as e:
-            logger.error("Error indexing to Qdrant", 
-                      post_id=enriched_event.post_id,
-                      error=str(e))
-            return False
+            logger.error("Failed to index to Qdrant",
+                        post_id=post_id,
+                        error=str(e))
+            raise
     
-    async def _index_to_neo4j(self, enriched_event: PostEnrichedEventV1, post_data: Dict[str, Any]) -> bool:
-        """Индексация в Neo4j с expires_at как property."""
+    async def _index_to_neo4j(self, post_id: str, post_data: Dict[str, Any]):
+        """Индексация поста в Neo4j граф."""
         try:
-            if not self.neo4j_client:
-                logger.warning("Neo4j client not available")
-                return True  # Не критично для работы
+            channel_id = post_data.get('channel_id')
+            if not channel_id:
+                logger.warning("No channel_id, skipping Neo4j indexing", post_id=post_id)
+                return
             
-            # Создание узлов и связей
-            # Context7: Конвертация Pydantic модели в словарь для Neo4j
-            enrichment_dict = enriched_event.enrichment_data.model_dump() if hasattr(enriched_event.enrichment_data, 'model_dump') else enriched_event.enrichment_data
+            # Context7: Используем create_post_node из Neo4jClient
+            # Определяем expires_at (например, 30 дней от created_at)
+            created_at = post_data.get('created_at')
+            if created_at:
+                if isinstance(created_at, str):
+                    # Парсинг ISO формата строки
+                    try:
+                        created_dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                    except ValueError:
+                        # Fallback: используем текущее время
+                        created_dt = datetime.now(timezone.utc)
+                elif isinstance(created_at, datetime):
+                    created_dt = created_at if created_at.tzinfo else created_at.replace(tzinfo=timezone.utc)
+                else:
+                    created_dt = datetime.now(timezone.utc)
+                expires_at_dt = created_dt + timedelta(days=30)
+                expires_at = expires_at_dt.isoformat()
+            else:
+                expires_at = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
             
-            await self.neo4j_client.create_post_node(
-                post_id=enriched_event.post_id,
-                user_id=post_data['user_id'],
-                tenant_id=post_data['tenant_id'],
-                channel_id=post_data['channel_id'],
-                expires_at=post_data['expires_at'],  # [C7-ID: WORKER-INDEXING-002] - Сквозной TTL
-                enrichment_data=enrichment_dict,
+            # Context7: Вызов метода create_post_node с правильными параметрами
+            success = await self.neo4j_client.create_post_node(
+                post_id=post_id,
+                user_id=post_data.get('user_id', 'system'),  # Fallback для совместимости
+                tenant_id=post_data.get('tenant_id', 'default'),  # Fallback для совместимости
+                channel_id=channel_id,
+                expires_at=expires_at,
+                enrichment_data=None,  # Может быть обогащено позже
                 indexed_at=datetime.now(timezone.utc).isoformat()
             )
             
-            logger.debug("Post indexed to Neo4j",
-                        post_id=enriched_event.post_id)
-            
-            return True
-            
-        except Exception as e:
-            logger.error("Error indexing to Neo4j", 
-                        post_id=enriched_event.post_id,
-                        error=str(e))
-            return False
-    
-    async def _publish_indexed_event(
-        self, 
-        enriched_event: PostEnrichedEventV1, 
-        post_data: Dict[str, Any],
-        processing_time: float
-    ):
-        """Публикация события posts.indexed."""
-        try:
-            # Подготовка данных события
-            indexed_event = PostIndexedEventV1(
-                idempotency_key=f"{enriched_event.post_id}:indexed:v1",
-                post_id=enriched_event.post_id,
-                vector_id=enriched_event.post_id,  # Используем post_id как vector_id
-                embedding_provider="gigachat",
-                embedding_dim=1536,  # TODO: получить из AI адаптера
-                qdrant_collection=f"user_{post_data['user_id']}_posts",
-                neo4j_nodes_created=5,  # TODO: получить из Neo4j клиента
-                neo4j_relationships_created=8,  # TODO: получить из Neo4j клиента
-                indexing_duration_ms=int(processing_time * 1000),
-                embedding_generation_ms=int(processing_time * 1000 * 0.4),  # Примерное распределение
-                qdrant_indexing_ms=int(processing_time * 1000 * 0.3),
-                neo4j_indexing_ms=int(processing_time * 1000 * 0.3),
-                embedding_quality_score=0.92  # TODO: вычислить реальную оценку
-            )
-            
-            # Публикация в Redis Streams через унифицированный EventPublisher
-            from event_bus import EventPublisher
-            publisher = EventPublisher(self.redis_client)
-            msg_id = await publisher.publish_event("posts.indexed", indexed_event)
-            logger.info("indexing_publish_indexed_ok", 
-                        post_id=enriched_event.post_id, msg_id=msg_id)
+            if success:
+                logger.debug("Indexed to Neo4j", post_id=post_id, channel_id=channel_id)
+            else:
+                raise Exception("create_post_node returned False")
             
         except Exception as e:
-            logger.error("Error publishing indexed event",
-                        post_id=enriched_event.post_id,
+            logger.error("Failed to index to Neo4j",
+                        post_id=post_id,
                         error=str(e))
             raise
     
-    async def get_stats(self) -> Dict[str, Any]:
-        """Получение статистики indexing task."""
-        return {
-            'redis_connected': self.redis_client is not None,
-            'ai_adapter_available': self.ai_adapter is not None,
-            'qdrant_connected': self.qdrant_client is not None,
-            'neo4j_connected': self.neo4j_client is not None,
-            'feature_flags': {
-                'neo4j_enabled': feature_flags.neo4j_enabled,
-                'gigachat_enabled': feature_flags.gigachat_enabled
-            }
-        }
-    
-    async def health_check(self) -> Dict[str, Any]:
-        """Health check для indexing task."""
+    async def _update_indexing_status(
+        self,
+        post_id: str,
+        embedding_status: str,
+        graph_status: str,
+        vector_id: Optional[str] = None,
+        error_message: Optional[str] = None
+    ):
+        """
+        Context7 best practice: Обновление indexing_status в БД после индексации.
+        
+        Supabase best practice: Используем параметризованные запросы для безопасности.
+        
+        Args:
+            post_id: ID поста
+            embedding_status: Статус эмбеддинга (pending/processing/completed/failed)
+            graph_status: Статус графа (pending/processing/completed/failed)
+            vector_id: ID вектора в Qdrant
+            error_message: Сообщение об ошибке (если есть)
+        """
         try:
-            # Проверка Redis
-            redis_healthy = False
-            if self.redis_client:
-                await self.redis_client.ping()
-                redis_healthy = True
+            db_url = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@supabase-db:5432/postgres")
+            conn = psycopg2.connect(db_url)
+            cursor = conn.cursor()
             
-            # Проверка Qdrant
-            qdrant_healthy = False
-            if self.qdrant_client:
-                await self.qdrant_client.health_check()
-                qdrant_healthy = True
+            # Context7: Supabase best practice - параметризованные запросы, атомарный upsert
+            processing_started_at = datetime.now(timezone.utc) if embedding_status == 'processing' else None
             
-            # Проверка Neo4j
-            neo4j_healthy = True  # Не критично
-            if self.neo4j_client:
-                neo4j_healthy = await self.neo4j_client.health_check()
+            cursor.execute("""
+                INSERT INTO indexing_status (
+                    post_id, 
+                    embedding_status, 
+                    graph_status, 
+                    vector_id, 
+                    error_message, 
+                    processing_started_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (post_id) DO UPDATE SET
+                    embedding_status = EXCLUDED.embedding_status,
+                    graph_status = EXCLUDED.graph_status,
+                    vector_id = COALESCE(EXCLUDED.vector_id, indexing_status.vector_id),
+                    error_message = EXCLUDED.error_message,
+                    processing_started_at = COALESCE(
+                        indexing_status.processing_started_at, 
+                        EXCLUDED.processing_started_at
+                    ),
+                    processing_completed_at = CASE 
+                        WHEN EXCLUDED.embedding_status = 'completed' 
+                         AND EXCLUDED.graph_status = 'completed' 
+                        THEN NOW() 
+                        ELSE indexing_status.processing_completed_at 
+                    END
+            """, (
+                post_id,
+                embedding_status,
+                graph_status,
+                vector_id,
+                error_message,
+                processing_started_at
+            ))
             
-            return {
-                'status': 'healthy' if (redis_healthy and qdrant_healthy) else 'unhealthy',
-                'redis': 'connected' if redis_healthy else 'disconnected',
-                'qdrant': 'connected' if qdrant_healthy else 'disconnected',
-                'neo4j': 'connected' if neo4j_healthy else 'disconnected',
-                'stats': await self.get_stats()
-            }
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            logger.info("Updated indexing_status", 
+                       post_id=post_id,
+                       embedding_status=embedding_status,
+                       graph_status=graph_status,
+                       vector_id=vector_id)
             
         except Exception as e:
-            logger.error("Health check failed", error=str(e))
+            logger.error("Failed to update indexing_status", 
+                        post_id=post_id, 
+                        error=str(e),
+                        error_type=type(e).__name__)
+            # Не пробрасываем ошибку, чтобы не блокировать основной поток
+    
+    async def stop(self):
+        """Остановка indexing task."""
+        try:
+            if self.event_consumer:
+                await self.event_consumer.stop()
+            
+            if self.redis_client:
+                await self.redis_client.disconnect()
+            
+            if self.qdrant_client:
+                # QdrantClient не имеет метода disconnect, только close если нужно
+                pass
+            
+            if self.neo4j_client:
+                await self.neo4j_client.close()
+            
+            logger.info("IndexingTask stopped")
+            
+        except Exception as e:
+            logger.error("Error stopping IndexingTask", error=str(e))
+    
+    async def health_check(self) -> Dict[str, Any]:
+        """Проверка здоровья indexing task."""
+        try:
+            health = {
+                'status': 'healthy',
+                'redis_connected': self.redis_client is not None,
+                'qdrant_connected': self.qdrant_client is not None,
+                'neo4j_connected': self.neo4j_client is not None,
+                'embedding_service_available': self.embedding_service is not None
+            }
+            
+            # Проверка подключений
+            if self.qdrant_client:
+                health['qdrant_healthy'] = await self.qdrant_client.health_check()
+            
+            if self.neo4j_client:
+                health['neo4j_healthy'] = await self.neo4j_client.health_check()
+            
+            return health
+            
+        except Exception as e:
+            logger.error("Error in health check", error=str(e))
             return {
                 'status': 'unhealthy',
-                'error': str(e),
-                'stats': await self.get_stats()
+                'error': str(e)
             }
-
-# ============================================================================
-# MAIN FUNCTION
-# ============================================================================
-
-async def main():
-    """Основная функция запуска indexing task."""
-    logger.info("Starting IndexingTask...")
-    
-    # Конфигурация
-    redis_url = os.getenv("REDIS_URL", "redis://redis:6379")
-    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres")
-    qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
-    neo4j_url = os.getenv("NEO4J_URL", "bolt://localhost:7687")
-    neo4j_user = os.getenv("NEO4J_USER", "neo4j")
-    neo4j_password = os.getenv("NEO4J_PASSWORD", "changeme")
-    
-    # Создание task
-    task = IndexingTask(redis_url, database_url, qdrant_url, neo4j_url, neo4j_user, neo4j_password)
-    
-    try:
-        # Запуск
-        await task.start()
-    except KeyboardInterrupt:
-        logger.info("IndexingTask stopped by user")
-    except Exception as e:
-        logger.error("IndexingTask failed", error=str(e))
-        raise
-    finally:
-        await task.stop()
-
-if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
