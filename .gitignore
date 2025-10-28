@@ -1,11 +1,114 @@
+# ============================================================================
+# ENVIRONMENT VARIABLES (.env files)
+# ============================================================================
+# Based on Supabase best practices: never commit .env files
+# See: https://supabase.com/docs/guides/functions/secrets
 *.env
+.env
+.env.*
+!env.example
+!.env.example
+.env.local
+.env.*.local
+.env.backup*
+.env.recovered
+.env.json
+
+# Supabase specific
 supabase/.env
+supabase/.env.local
+
+# ============================================================================
+# BACKUP FILES
+# ============================================================================
+# Database backups
+*.dump
+*.sql
+!supabase/migrations/*.sql
+backup_*.sql
+*_backup_*.sql
+*_before_migration_*.sql
+
+# Redis snapshots
+*.rdb
+redis_state_snapshot_*.txt
+dump_*.rdb
+redis_backup_*.rdb
+
+# System backups
+backups/*
+!backups/.gitkeep
+!backups/README.md
+
+# Archive backups
+backups/archive/
+
+# ============================================================================
+# SESSIONS & SECRETS
+# ============================================================================
 telethon-sessions/
 sessions/
+**/sessions/
+**/*session*
+
+# ============================================================================
+# SUPABASE VOLUMES & DATA
+# ============================================================================
 supabase/volumes/db/*.dump
+supabase/.temp/
+
+# ============================================================================
+# DEVELOPMENT & BUILD
+# ============================================================================
 node_modules/
 dist/
-.DS_Store
-.env
+build/
+*.pyc
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.so
+.venv/
+venv/
+ENV/
+env/
+.venv
+.venv.lock
 
-.env.local
+# ============================================================================
+# IDE & EDITOR
+# ============================================================================
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.cursor/
+
+# ============================================================================
+# REPORTS & DOCUMENTATION
+# ============================================================================
+# Auto-generated reports (move to docs/reports/ and exclude from git)
+*_REPORT.md
+*_STATUS.md
+*_SUMMARY.md
+*_COMPLETION.md
+*_SUCCESS.md
+*_VERIFICATION.md
+*_FIXES.md
+*_DIAGNOSIS.md
+!README.md
+!CHANGELOG.md
+!docs/reports/.gitkeep
+# Исключения для важной документации (после удаления чувствительных данных)
+!docs/GIGACHAT_SUCCESS.md
+!docs/CLEANUP_SUMMARY.md
+
+# ============================================================================
+# LOGS
+# ============================================================================
+*.log
+logs/
+*.log.*

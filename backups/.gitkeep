@@ -1,0 +1,3 @@
+# Backups directory
+# This directory contains system backups and should not be committed to git
+

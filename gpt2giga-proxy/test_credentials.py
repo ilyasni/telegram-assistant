@@ -16,7 +16,11 @@ def test_credentials():
     """Тестирует credentials для GigaChat API"""
     
     # Credentials из .env
-    credentials = "your_gigachat_credentials_base64_here"
+    import os
+    credentials = os.getenv("GIGACHAT_CREDENTIALS", "")
+    if not credentials:
+        print("❌ GIGACHAT_CREDENTIALS не установлен в переменных окружения")
+        return False
     
     print("🔍 Тестирование GigaChat credentials...")
     print(f"Credentials: {credentials[:20]}...")
