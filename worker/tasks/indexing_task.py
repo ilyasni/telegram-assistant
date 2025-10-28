@@ -135,53 +135,115 @@ class IndexingTask:
         try:
             from event_bus import STREAMS
             
+            logger.debug(f"Starting backlog processing for {stream_name}")
+            
+            if stream_name not in STREAMS:
+                logger.error(f"Stream name {stream_name} not found in STREAMS mapping")
+                return 0
+            
             stream_key = STREAMS[stream_name]
             batch_size = 100
             max_backlog_messages = 500  # Ограничение для безопасности
             processed_count = 0
             
-            logger.info(f"Processing backlog for {stream_name}...")
+            logger.info(f"Processing backlog for {stream_name} (stream_key: {stream_key})...")
+            print(f"[BACKLOG DEBUG] Starting backlog processing for {stream_name}, stream_key={stream_key}", flush=True)
             
-            # Context7 best practice: читаем все сообщения из stream через XREVRANGE
-            # Получаем последние сообщения и обрабатываем их в обратном порядке
-            # Это позволяет обработать все существующие сообщения независимо от consumer group
+            # Проверяем, что redis_client инициализирован
+            if not hasattr(self, 'redis_client') or self.redis_client is None:
+                error_msg = "redis_client not initialized, cannot process backlog"
+                logger.error(error_msg)
+                print(f"[BACKLOG DEBUG] ERROR: {error_msg}", flush=True)
+                return 0
+            
+            if not hasattr(self.redis_client, 'client') or self.redis_client.client is None:
+                error_msg = "redis_client.client not initialized, cannot process backlog"
+                logger.error(error_msg)
+                print(f"[BACKLOG DEBUG] ERROR: {error_msg}", flush=True)
+                return 0
+            
+            logger.debug(f"Redis client is ready, proceeding with backlog processing")
+            print(f"[BACKLOG DEBUG] Redis client is ready", flush=True)
+            
+            # Context7 best practice: используем прямое чтение через XRANGE для backlog
+            # Это позволяет обработать все сообщения независимо от consumer group состояния
+            # Supabase best practice: batch processing с проверкой идемпотентности через БД
             try:
-                # Используем XREVRANGE для получения последних сообщений
-                messages_data = await self.redis_client.client.xrevrange(
-                    stream_key,
-                    count=max_backlog_messages,
-                    max='+',
-                    min='-'
-                )
+                # Проверяем доступность stream
+                logger.debug(f"Getting stream length for {stream_key}...")
+                print(f"[BACKLOG DEBUG] Getting stream length for {stream_key}...", flush=True)
+                try:
+                    stream_length = await self.redis_client.client.xlen(stream_key)
+                    logger.info(f"Stream {stream_key} length: {stream_length} messages", 
+                               stream_key=stream_key, 
+                               length=stream_length)
+                    print(f"[BACKLOG DEBUG] Stream length: {stream_length}", flush=True)
+                except Exception as e:
+                    logger.error(f"Error getting stream length: {e}", 
+                               error=str(e), 
+                               error_type=type(e).__name__,
+                               stream_key=stream_key)
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    return 0
+                
+                if stream_length == 0:
+                    logger.info("Stream is empty, no backlog to process")
+                    return 0
+                
+                # Читаем сообщения напрямую из stream через XRANGE
+                # Ограничиваемся последними N сообщениями для безопасности
+                logger.info(f"Reading up to {max_backlog_messages} messages from stream {stream_key}...")
+                
+                # Получаем сообщения через XRANGE (от начала к концу)
+                # Используем '-' (начало) до '+' (конец) для чтения всех доступных
+                try:
+                    messages_data = await self.redis_client.client.xrange(
+                        stream_key,
+                        min='-',
+                        max='+',
+                        count=max_backlog_messages
+                    )
+                    logger.debug(f"XRANGE returned {len(messages_data) if messages_data else 0} messages")
+                except Exception as e:
+                    logger.error(f"Error calling XRANGE: {e}", error_type=type(e).__name__)
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    return 0
                 
                 if not messages_data:
-                    logger.info("No messages in stream for backlog processing")
+                    logger.info("XRANGE returned empty result, no messages to process")
                     return 0
                 
                 logger.info(f"Found {len(messages_data)} messages in stream, processing...")
                 
-                # Обрабатываем сообщения в обратном порядке (от новых к старым)
+                # Обрабатываем сообщения (обратный порядок - от новых к старым)
                 for message_id, fields in reversed(messages_data):
                     try:
-                        # Парсинг события
+                        # Парсинг события (поля уже декодированы благодаря decode_responses=True)
                         event_data = self.event_consumer._parse_event_data(fields)
                         
                         # Проверяем post_id
                         post_id = event_data.get('post_id') if isinstance(event_data, dict) else event_data.get('payload', {}).get('post_id')
                         if not post_id:
+                            logger.debug("Skipping message without post_id", message_id=str(message_id))
                             continue
                         
-                        # Проверяем, не обработан ли уже этот пост
+                        # Supabase best practice: проверка идемпотентности через БД перед обработкой
                         db_url = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@supabase-db:5432/postgres")
                         conn = psycopg2.connect(db_url)
                         cursor = conn.cursor()
-                        cursor.execute("SELECT embedding_status FROM indexing_status WHERE post_id = %s", (post_id,))
+                        cursor.execute(
+                            "SELECT embedding_status FROM indexing_status WHERE post_id = %s", 
+                            (post_id,)
+                        )
                         row = cursor.fetchone()
                         cursor.close()
                         conn.close()
                         
-                        # Пропускаем уже обработанные
+                        # Пропускаем уже обработанные (идемпотентность)
                         if row and row[0] in ('completed', 'processing'):
+                            logger.debug(f"Skipping already processed post", post_id=post_id, status=row[0])
                             continue
                         
                         # Обработка сообщения
@@ -195,14 +257,20 @@ class IndexingTask:
                         
                         # Ограничение на количество обработанных сообщений за раз
                         if processed_count >= max_backlog_messages:
-                            logger.info(f"Reached max backlog messages limit ({max_backlog_messages})")
+                            logger.info(f"Reached max backlog messages limit ({max_backlog_messages}), stopping")
                             break
                             
                     except Exception as e:
                         logger.error(f"Error processing backlog message {message_id}",
                                    error=str(e),
-                                   message_id=message_id)
+                                   error_type=type(e).__name__,
+                                   message_id=str(message_id))
+                        # Продолжаем обработку следующих сообщений
+                        import traceback
+                        logger.debug(traceback.format_exc())
                         continue
+                
+                logger.info(f"Backlog batch processing completed: {processed_count} new messages processed")
                 
             except Exception as e:
                 logger.error(f"Error reading backlog: {e}")

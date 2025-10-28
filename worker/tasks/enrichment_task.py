@@ -114,11 +114,10 @@ class EnrichmentWorker:
         await self._initialize()
         
         # Context7: Используем consume_forever для бесконечного цикла
+        # consume_forever принимает только stream_name и handler_func
         await self.consumer.consume_forever(
             stream_name="posts.tagged",
-            handler_func=self._handle_post_tagged,
-            batch_size=10,
-            block_ms=5000
+            handler_func=self._handle_post_tagged
         )
     
     def _sanitize_for_publish(self, obj):
