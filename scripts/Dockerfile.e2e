@@ -1,0 +1,35 @@
+# Dockerfile для E2E тестирования пайплайна
+# Использование: docker build -f scripts/Dockerfile.e2e -t telegram-assistant/e2e:latest .
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Установка зависимостей
+COPY scripts/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Копирование скриптов и конфигурации
+COPY scripts/check_pipeline_e2e.py ./scripts/
+COPY scripts/check_services.sh ./scripts/
+COPY config/e2e_thresholds.json ./config/
+
+# Переменные окружения
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
+
+# Сделать скрипт исполняемым
+RUN chmod +x scripts/check_services.sh
+
+# Entrypoint для запуска E2E проверки
+ENTRYPOINT ["python3", "scripts/check_pipeline_e2e.py"]
+
+# Пример запуска:
+# docker build -f scripts/Dockerfile.e2e -t telegram-assistant/e2e:latest .
+# docker run --rm --network=telegram_assistant_default \
+#   -e DATABASE_URL -e REDIS_URL -e QDRANT_URL \
+#   -e NEO4J_URI -e NEO4J_USER -e NEO4J_PASSWORD \
+#   -e E2E_THRESHOLDS_PATH=config/e2e_thresholds.json \
+#   telegram-assistant/e2e:latest --mode e2e \
+#   --output /tmp/e2e_result.json --junit /tmp/e2e_result.xml
+

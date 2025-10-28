@@ -1,0 +1,21 @@
+{
+  "smoke": {
+    "max_check_time_sec": 30,
+    "required_services": ["db", "redis", "qdrant", "neo4j"]
+  },
+  "e2e": {
+    "max_check_time_sec": 90,
+    "max_watermark_age_min": 30,
+    "max_stream_pending": 50,
+    "min_posts_24h": 1,
+    "qdrant_min_payload_coverage": 0.9
+  },
+  "deep": {
+    "max_check_time_sec": 300,
+    "max_embed_dim_mismatch": 0,
+    "max_qdrant_lag_min": 10,
+    "max_skew_vs_pg_min": 5,
+    "qdrant_min_payload_coverage": 0.9
+  }
+}
+
