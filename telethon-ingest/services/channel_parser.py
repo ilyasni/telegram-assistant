@@ -451,8 +451,16 @@ class ChannelParser:
             # Опора на last_parsed_at или Redis HWM
             base = channel.get('last_parsed_at') or redis_hwm
             if base:
+                # Context7: Нормализуем base к UTC перед вычислением возраста
+                base_utc = ensure_dt_utc(base)
+                if not base_utc:
+                    logger.warning(f"Failed to normalize last_parsed_at to UTC, using fallback",
+                                 channel_id=channel['id'],
+                                 base=base)
+                    return now - timedelta(minutes=self.config.incremental_minutes)
+                
                 # Safeguard: если last_parsed_at слишком старый, форсим historical
-                age_hours = (now - base).total_seconds() / 3600
+                age_hours = (now - base_utc).total_seconds() / 3600
                 if age_hours > self.config.lpa_max_age_hours:
                     logger.warning(
                         f"last_parsed_at too old, forcing historical mode: channel_id={channel['id']}, age_hours={age_hours}"
@@ -463,7 +471,23 @@ class ChannelParser:
                 # В incremental режиме используем именно last_parsed_at, чтобы не пропускать сообщения
                 # Использование max(base, now - incremental_minutes) приводило к пропуску сообщений
                 # между last_parsed_at и (now - incremental_minutes)
-                return base
+                
+                # base_utc уже нормализован выше
+                if base_utc and base_utc > now:
+                    # Если last_parsed_at в будущем (возможна ошибка timezone), используем текущее время
+                    logger.warning(f"last_parsed_at is in future, using now instead",
+                                 channel_id=channel['id'],
+                                 last_parsed_at=base_utc,
+                                 now=now)
+                    return now - timedelta(minutes=self.config.incremental_minutes)
+                
+                logger.debug(f"Using last_parsed_at as since_date for incremental mode",
+                           channel_id=channel['id'],
+                           since_date=base_utc,
+                           now=now,
+                           age_minutes=(now - base_utc).total_seconds() / 60 if base_utc else None)
+                
+                return base_utc
             else:
                 # Fallback: если нет last_parsed_at, берём incremental окно
                 # incremental_minutes используется только как fallback, когда нет last_parsed_at
@@ -491,37 +515,77 @@ class ChannelParser:
         try:
             # [C7-ID: dev-mode-017] Context7 best practice: для incremental режима получаем больше сообщений
             # чтобы захватить все новые посты между last_parsed_at и now
-            limit = batch_size * 10 if mode == "incremental" else batch_size
+            # Важно: для incremental режима нужно получать достаточно сообщений,
+            # чтобы гарантированно захватить все новые после since_date
+            limit = batch_size * 100 if mode == "incremental" else batch_size
             
             # Получаем сообщения через retry обвязку
+            # Context7: В incremental режиме НЕ используем offset_date, так как нам нужны последние сообщения
+            # (которые приходят от новых к старым), а фильтрация будет происходить в цикле ниже
+            # offset_date в incremental режиме может пропустить новые сообщения
             messages = await fetch_messages_with_retry(
                 client,
                 channel_entity,
                 limit=limit,
-                redis_client=self.redis_client
+                redis_client=self.redis_client,
+                offset_date=None  # Не используем offset_date, получаем последние N сообщений
             )
             
+            # Диагностика: логируем первое и последнее сообщение для понимания диапазона
+            if messages and mode == "incremental":
+                first_msg = messages[0] if messages else None
+                last_msg = messages[-1] if messages else None
+                first_msg_date = ensure_dt_utc(first_msg.date) if first_msg and first_msg.date else None
+                last_msg_date = ensure_dt_utc(last_msg.date) if last_msg and last_msg.date else None
+                
+                # Считаем сколько сообщений новее since_date
+                newer_count = sum(1 for msg in messages 
+                                if msg.date and ensure_dt_utc(msg.date) and ensure_dt_utc(msg.date) > since_date)
+                
+                logger.info(f"Fetched messages range for incremental mode",
+                          channel_id=channel_entity.id,
+                          count=len(messages),
+                          first_message_date=first_msg_date,
+                          first_message_date_original=first_msg.date if first_msg else None,
+                          last_message_date=last_msg_date,
+                          since_date=since_date,
+                          messages_newer_than_since_date=newer_count)
+            
             # Обрабатываем полученные сообщения
+            messages_filtered = 0
             for message in messages:
-                # [C7-ID: dev-mode-017] Context7: Унифицированная логика фильтрации
+                # Context7: КРИТИЧНО - нормализуем message.date к UTC для корректного сравнения
+                # Telethon может возвращать datetime с разными timezone или без timezone
+                message_date_utc = ensure_dt_utc(message.date) if message.date else None
+                
+                if not message_date_utc:
+                    logger.warning(f"Message {message.id} has no date, skipping",
+                                 channel_id=channel_entity.id,
+                                 message_id=message.id)
+                    continue
+                
+                # [C7-ID: dev-mode-017] Context7: Унифицированная логика фильтрации с нормализацией timezone
                 # Historical: включаем сообщения >= since_date (парсим от новых к старым, останавливаемся на < since_date)
                 # Incremental: включаем только сообщения > since_date (строго новее last_parsed_at, останавливаемся на <= since_date)
                 if mode == "historical":
                     # Historical: парсим назад, останавливаемся когда дошли до since_date
-                    # Включаем сообщения с message.date >= since_date
-                    if message.date < since_date:
-                        logger.debug(f"Reached since_date, stopping. message.date={message.date}, since_date={since_date}")
+                    # Включаем сообщения с message_date_utc >= since_date
+                    if message_date_utc < since_date:
+                        logger.info(f"Reached since_date in historical mode, stopping. message_date_utc={message_date_utc}, since_date={since_date}, messages_yielded={messages_yielded}, messages_filtered={messages_filtered}")
                         break
                 else:  # incremental
                     # Incremental: парсим только сообщения строго новее since_date (между last_parsed_at и now)
                     # Сообщения приходят от новых к старым, поэтому при встрече <= since_date останавливаемся
                     # Это исключает сообщения на границе since_date (равные last_parsed_at), предотвращая дубликаты
-                    if message.date <= since_date:
-                        logger.debug(f"Reached since_date in incremental mode, stopping. message.date={message.date}, since_date={since_date}")
+                    if message_date_utc <= since_date:
+                        logger.info(f"Reached since_date in incremental mode, stopping. message_date_utc={message_date_utc}, since_date={since_date}, messages_yielded={messages_yielded}, messages_filtered={messages_filtered}")
                         break
                 
+                # Используем нормализованную дату для batch
+                # Сохраняем оригинальный message, но используем нормализованную дату для сравнений
                 batch.append(message)
                 messages_yielded += 1
+                messages_filtered += 1
                 
                 if len(batch) >= batch_size:
                     yield batch
@@ -553,17 +617,23 @@ class ChannelParser:
                 # [C7-ID: dev-mode-017] Context7: Унифицированная логика фильтрации (соответствует основному пути)
                 # Historical: включаем сообщения >= since_date, останавливаемся на < since_date
                 # Incremental: включаем только сообщения > since_date, останавливаемся на <= since_date
+                # Context7: Нормализуем message.date к UTC для корректного сравнения
+                message_date_utc = ensure_dt_utc(message.date) if message.date else None
+                
+                if not message_date_utc:
+                    continue  # Пропускаем сообщения без даты
+                
                 if mode == "historical":
                     # Historical: останавливаемся когда дошли до since_date
-                    # Включаем сообщения с message.date >= since_date
-                    if message.date < since_date:
-                        logger.debug(f"Reached since_date, stopping. message.date={message.date}, since_date={since_date}")
+                    # Включаем сообщения с message_date_utc >= since_date
+                    if message_date_utc < since_date:
+                        logger.debug(f"Reached since_date, stopping. message_date_utc={message_date_utc}, since_date={since_date}")
                         break
                 else:  # incremental
                     # Incremental: сообщения приходят от новых к старым, останавливаемся при встрече <= since_date
                     # Это исключает сообщения на границе since_date (равные last_parsed_at), предотвращая дубликаты
-                    if message.date <= since_date:
-                        logger.debug(f"Reached since_date in incremental mode, stopping. message.date={message.date}, since_date={since_date}")
+                    if message_date_utc <= since_date:
+                        logger.debug(f"Reached since_date in incremental mode, stopping. message_date_utc={message_date_utc}, since_date={since_date}")
                         break
                 
                 batch.append(message)
@@ -599,16 +669,35 @@ class ChannelParser:
         posts_data = []
         events_data = []
         
+        logger.info(f"Processing batch of {len(messages)} messages", 
+                   channel_id=channel_id, mode=mode)
+        
         for message in messages:
             try:
-                # Track max date in batch
-                if message.date:
-                    if max_date is None or message.date > max_date:
-                        max_date = message.date
+                # Context7: КРИТИЧНО - нормализуем message.date к UTC для корректного сравнения
+                message_date_utc = ensure_dt_utc(message.date) if message.date else None
+                
+                # Track max date in batch (нормализованная дата)
+                if message_date_utc:
+                    if max_date is None or message_date_utc > max_date:
+                        max_date = message_date_utc
+                
+                # Диагностическое логирование для проверки фильтрации
+                if message.id % 10 == 0:  # Логируем каждое 10-е сообщение для диагностики
+                    logger.debug(f"Processing message", 
+                               message_id=message.id,
+                               message_date=message.date,
+                               message_date_utc=message_date_utc,
+                               has_text=bool(message.text),
+                               has_media=bool(message.media))
                 
                 # Проверка идемпотентности
-                if await self._is_duplicate_message(message, channel_id, tenant_id):
+                is_duplicate = await self._is_duplicate_message(message, channel_id, tenant_id)
+                if is_duplicate:
                     skipped += 1
+                    logger.debug(f"Message {message.id} skipped as duplicate", 
+                               channel_id=channel_id,
+                               message_id=message.id)
                     continue
                 
                 # Извлечение данных сообщения
@@ -630,10 +719,22 @@ class ChannelParser:
                 processed += 1
                 
             except Exception as e:
-                logger.error(f"Failed to process message {message.id}: {e}")
+                logger.error(f"Failed to process message {message.id}: {e}", 
+                           channel_id=channel_id,
+                           message_id=message.id,
+                           error=str(e),
+                           exc_info=True)
                 skipped += 1
         
         # Context7: Атомарное сохранение в БД с новыми компонентами
+        logger.info(f"Batch processing completed", 
+                   channel_id=channel_id,
+                   total_messages=len(messages),
+                   processed=processed,
+                   skipped=skipped,
+                   posts_data_count=len(posts_data),
+                   max_date=max_date)
+        
         if posts_data:
             # Подготовка данных пользователя и канала
             # [C7-ID: dev-mode-012] tenant_id из параметра функции (передается в parse_channel_messages)
