@@ -21,33 +21,58 @@ from typing import Dict, Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
-from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST, REGISTRY
 from starlette.responses import Response
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Prometheus метрики
-neo4j_query_duration_seconds = Histogram(
+# Context7: Предотвращаем дублирование метрик при hot reload uvicorn
+# При перезапуске модуля старые метрики остаются в REGISTRY, нужно их удалить
+def safe_create_metric(metric_type, name, description, **kwargs):
+    """Создать метрику с проверкой на существование (Context7: предотвращение дублирования)."""
+    try:
+        # Пытаемся найти существующую метрику в регистре
+        if hasattr(REGISTRY, '_names_to_collectors'):
+            existing = REGISTRY._names_to_collectors.get(name)
+            if existing:
+                # Удаляем существующую метрику перед созданием новой
+                try:
+                    REGISTRY.unregister(existing)
+                    logger.debug(f"Unregistered existing metric before recreation: {name}")
+                except (KeyError, ValueError):
+                    pass  # Метрика уже удалена или не найдена
+    except (AttributeError, KeyError, TypeError):
+        pass
+    
+    # Создаем новую метрику
+    return metric_type(name, description, **kwargs)
+
+# Prometheus метрики (Context7: защита от дублирования при hot reload)
+neo4j_query_duration_seconds = safe_create_metric(
+    Histogram,
     'neo4j_query_duration_seconds',
     'Neo4j query duration in seconds',
-    ['query_type']
+    labelnames=['query_type']
 )
 
-neo4j_nodes_total = Gauge(
+neo4j_nodes_total = safe_create_metric(
+    Gauge,
     'neo4j_nodes_total',
     'Total number of nodes in the graph',
-    ['label']
+    labelnames=['label']
 )
 
-neo4j_relationships_total = Gauge(
+neo4j_relationships_total = safe_create_metric(
+    Gauge,
     'neo4j_relationships_total',
     'Total number of relationships',
-    ['type']
+    labelnames=['type']
 )
 
-neo4j_connections_active = Gauge(
+neo4j_connections_active = safe_create_metric(
+    Gauge,
     'neo4j_connections_active',
     'Active Neo4j connections'
 )

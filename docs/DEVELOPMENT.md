@@ -4,7 +4,7 @@
 
 **Рекомендуемый способ через Makefile:**
 ```bash
-make up-dev        # Все сервисы в dev-режиме
+make up-dev        # Все сервисы в dev-режиме (включает realtime/storage для бэкапов сессий)
 make up-dev-api    # Только API в dev-режиме
 ```
 

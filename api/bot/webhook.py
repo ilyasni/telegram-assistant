@@ -7,7 +7,7 @@ import json
 from config import settings
 import os
 import time
-import redis
+import redis.asyncio as redis
 from prometheus_client import Counter, Histogram
 
 logger = structlog.get_logger()
@@ -19,8 +19,8 @@ dp: Dispatcher | None = None
 # One source of truth for webhook path
 WEBHOOK_PATH = "/tg/bot/webhook"
 
-# Redis client for deduplication gate
-redis_client = redis.from_url(settings.redis_url)
+# Context7 best practice: async Redis client for deduplication gate
+redis_client = redis.from_url(settings.redis_url, decode_responses=True)
 
 # Prometheus metrics
 TG_WEBHOOK_REQUESTS = Counter(
@@ -77,10 +77,11 @@ async def telegram_webhook(request: Request):
         data = await request.json()
 
         # Deduplication by update_id (idempotency)
+        # Context7 best practice: используем async Redis операции
         update_id = data.get("update_id")
         if update_id is not None:
             dedup_key = f"tg:update:{update_id}"
-            is_new = redis_client.set(dedup_key, "1", nx=True, ex=86400)
+            is_new = await redis_client.set(dedup_key, "1", nx=True, ex=86400)
             if not is_new:
                 TG_UPDATES_DEDUPLICATED.inc()
                 TG_WEBHOOK_REQUESTS.labels(outcome="dedup").inc()

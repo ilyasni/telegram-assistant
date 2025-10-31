@@ -26,7 +26,8 @@ class Settings(BaseSettings):
     api_version: str = "2.0.0"
     
     # CORS
-    cors_origins: list = ["*"]
+    # Context7 best practice: безопасные дефолты (не используем wildcard с credentials)
+    cors_origins: list = []
     
     @field_validator("cors_origins", mode="before")
     @classmethod

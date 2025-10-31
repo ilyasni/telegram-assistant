@@ -8,7 +8,7 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, AuthKeyError
 import structlog
-import redis
+import redis.asyncio as redis
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import json
@@ -26,7 +26,8 @@ class TelegramIngestionService:
     def __init__(self, client_manager=None):
         self.client: Optional[TelegramClient] = None
         self.client_manager = client_manager  # Context7: TelegramClientManager
-        self.redis_client = redis.from_url(settings.redis_url)
+        # Context7 best practice: используем async Redis клиент для неблокирующих операций
+        self.redis_client = redis.from_url(settings.redis_url, decode_responses=True)
         self.db_connection = None
         self.is_running = False
         
@@ -365,8 +366,9 @@ class TelegramIngestionService:
             }
             
             # Публикация в правильном формате (сериализация в JSON)
+            # Context7 best practice: используем async Redis операции
             event_data_json = {k: json.dumps(v) if isinstance(v, (list, dict)) else str(v) for k, v in event_data.items()}
-            self.redis_client.xadd(STREAM_POST_CREATED, event_data_json)
+            await self.redis_client.xadd(STREAM_POST_CREATED, event_data_json)
             
             logger.info("Historical message processed", 
                        post_id=post_id, 
@@ -519,8 +521,9 @@ class TelegramIngestionService:
             }
             
             # Публикация в правильном формате (сериализация в JSON)
+            # Context7 best practice: используем async Redis операции
             event_data_json = {k: json.dumps(v) if isinstance(v, (list, dict)) else str(v) for k, v in event_data.items()}
-            self.redis_client.xadd(STREAM_POST_CREATED, event_data_json)
+            await self.redis_client.xadd(STREAM_POST_CREATED, event_data_json)
             
             logger.info("Message processed", 
                        post_id=post_id, 
@@ -682,6 +685,9 @@ class TelegramIngestionService:
         self.is_running = False
         if self.client:
             await self.client.disconnect()
+        # Context7 best practice: закрываем async Redis клиент
+        if self.redis_client:
+            await self.redis_client.aclose()
         if self.db_connection:
             self.db_connection.close()
         logger.info("Telegram ingestion service stopped")
