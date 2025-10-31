@@ -3,7 +3,7 @@ services:
     environment:
       LOG_LEVEL: DEBUG
       APP_ENV: development  # [C7-ID: dev-mode-001]
-      CORS_ORIGINS: "*"
+      CORS_ORIGINS: "http://localhost:8000,http://localhost:8080,http://localhost:3000,https://web.telegram.org"
       PYTHONDONTWRITEBYTECODE: "1"
       UVICORN_RELOAD_DELAY: "0.3"
     command: >

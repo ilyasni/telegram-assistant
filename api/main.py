@@ -134,9 +134,16 @@ app.add_middleware(RateLimiterMiddleware, redis_url=settings.redis_url)  # Вт�
 
 # Context7 best practice: CORS whitelist из ENV
 # [C7-ID: fastapi-cors-001]
+# [C7-ID: dev-mode-004] Fail-fast: проверка несовместимости wildcard с credentials
+cors_origins_normalized = [str(o).strip() for o in (settings.cors_origins or [])]
+if any(o == "*" for o in cors_origins_normalized):
+    raise RuntimeError(
+        "CORS configuration error: allow_origins=['*'] is incompatible with allow_credentials=True. "
+        "Use explicit origins (e.g., 'http://localhost:8000,http://localhost:8080') or disable credentials."
+    )
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins,  # Строгий whitelist из ENV
+    allow_origins=cors_origins_normalized,  # Строгий whitelist из ENV
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],  # Ограниченный список методов
     allow_headers=["Authorization", "Content-Type", "X-Requested-With"],  # Ограниченный список заголовков
