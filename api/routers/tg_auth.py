@@ -5,7 +5,7 @@ Metrics: Prometheus counters and histograms.
 """
 
 from fastapi import APIRouter, HTTPException, Request, Depends
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
 import asyncio
 import time
@@ -14,6 +14,7 @@ import os
 import hashlib
 import hmac
 import base64
+import json
 import redis.asyncio as redis
 import structlog
 from prometheus_client import Counter, Histogram
@@ -208,9 +209,8 @@ async def qr_start(body: QrStart, request: Request):
     expires_at = int(time.time()) + QR_TTL_SECONDS
     
     # Проверяем, есть ли уже qr_url (может быть None если telethon-ingest еще не обработал)
+    # Context7 best practice: с decode_responses=True значения уже декодированы в строки
     qr_url = await redis_client.hget(key, "qr_url")
-    if qr_url and isinstance(qr_url, bytes):
-        qr_url = qr_url.decode()
     
     return {
         "session_token": token, 
@@ -239,10 +239,7 @@ async def qr_status_post(body: dict):
     data = await redis_client.hgetall(key)
     if not data:
         raise HTTPException(status_code=404, detail="not found or expired")
-    # redis-py returns bytes in v5? For simplicity, decode where needed
-    def dec(b):
-        return b.decode() if isinstance(b, (bytes, bytearray)) else b
-    data = {dec(k): dec(v) for k, v in data.items()}
+    # Context7 best practice: с decode_responses=True все ключи и значения уже декодированы в строки
     resp = {"status": data.get("status", "pending")}
     if "qr_url" in data:
         resp["qr_url"] = data["qr_url"]
@@ -264,15 +261,16 @@ async def qr_sse(token: str):
                 tenant_id = _extract_tenant_id(payload)
                 key = f"tg:qr:session:{tenant_id}"
                 # Context7 best practice: используем async Redis операции
+                # с decode_responses=True все ключи и значения уже декодированы в строки
                 data = await redis_client.hgetall(key)
-                status = b"pending"
+                status = "pending"
                 qr_url = None
                 if data:
-                    status = data.get(b"status", b"pending")
-                    qr_url = data.get(b"qr_url")
+                    status = data.get("status", "pending")
+                    qr_url = data.get("qr_url")
                 line = {
-                    "status": (status.decode() if isinstance(status, (bytes, bytearray)) else status),
-                    "qr_url": (qr_url.decode() if isinstance(qr_url, (bytes, bytearray)) else qr_url),
+                    "status": status,
+                    "qr_url": qr_url,
                 }
                 yield f"data: {json.dumps(line)}\n\n"
                 await asyncio.sleep(1.5)
@@ -314,8 +312,9 @@ async def qr_png(session_id: str):
     if not await redis_client.exists(key):
         raise HTTPException(status_code=404, detail="not found or expired")
     
+    # Context7 best practice: с decode_responses=True все ключи и значения уже декодированы в строки
     data = await redis_client.hgetall(key)
-    qr_url = data.get(b"qr_url", b"").decode()
+    qr_url = data.get("qr_url", "")
     
     if not qr_url:
         raise HTTPException(status_code=404, detail="qr_url not available")

@@ -40,9 +40,9 @@ async def health_check():
         health_status["status"] = "unhealthy"
     
     # Проверка Redis
-    # Context7 best practice: используем async Redis клиент
+    # Context7 best practice: используем async Redis клиент с decode_responses=True для консистентности
     try:
-        redis_client = redis.from_url(settings.redis_url)
+        redis_client = redis.from_url(settings.redis_url, decode_responses=True)
         await redis_client.ping()
         await redis_client.aclose()
         health_status["checks"]["redis"] = "healthy"
@@ -74,22 +74,23 @@ async def health_auth():
     }
     
     # Проверка Redis
-    # Context7 best practice: используем async Redis клиент
+    # Context7 best practice: используем async Redis клиент с decode_responses=True для консистентности
     try:
-        redis_client = redis.from_url(settings.redis_url)
+        redis_client = redis.from_url(settings.redis_url, decode_responses=True)
         test_key = f"health:check:{int(time.time())}"
         await redis_client.setex(test_key, 10, "ok")
         value = await redis_client.get(test_key)
-        checks["redis_qr_sessions"] = value == b"ok"
+        # Context7 best practice: с decode_responses=True значения возвращаются как строки
+        checks["redis_qr_sessions"] = value == "ok"
         await redis_client.delete(test_key)
         await redis_client.aclose()
     except Exception as e:
         logger.error("Redis QR sessions check failed", error=str(e))
     
     # Проверка telethon-ingest (косвенно, через Redis метрики)
-    # Context7 best practice: используем async Redis клиент
+    # Context7 best practice: используем async Redis клиент с decode_responses=True для консистентности
     try:
-        redis_client = redis.from_url(settings.redis_url)
+        redis_client = redis.from_url(settings.redis_url, decode_responses=True)
         cursor = 0
         cursor, _ = await redis_client.scan(cursor, match="tg:qr:session:*", count=1)
         checks["telethon_service"] = True  # если сканируем, значит сервис работает

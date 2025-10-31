@@ -503,15 +503,19 @@ class ChannelParser:
             
             # Обрабатываем полученные сообщения
             for message in messages:
-                # [C7-ID: dev-mode-017] Context7: Разная логика фильтрации для historical и incremental
+                # [C7-ID: dev-mode-017] Context7: Унифицированная логика фильтрации
+                # Historical: включаем сообщения >= since_date (парсим от новых к старым, останавливаемся на < since_date)
+                # Incremental: включаем только сообщения > since_date (строго новее last_parsed_at, останавливаемся на <= since_date)
                 if mode == "historical":
                     # Historical: парсим назад, останавливаемся когда дошли до since_date
+                    # Включаем сообщения с message.date >= since_date
                     if message.date < since_date:
                         logger.debug(f"Reached since_date, stopping. message.date={message.date}, since_date={since_date}")
                         break
                 else:  # incremental
-                    # Incremental: парсим только сообщения новее since_date (между last_parsed_at и now)
-                    # Сообщения приходят от новых к старым, поэтому при встрече старого останавливаемся
+                    # Incremental: парсим только сообщения строго новее since_date (между last_parsed_at и now)
+                    # Сообщения приходят от новых к старым, поэтому при встрече <= since_date останавливаемся
+                    # Это исключает сообщения на границе since_date (равные last_parsed_at), предотвращая дубликаты
                     if message.date <= since_date:
                         logger.debug(f"Reached since_date in incremental mode, stopping. message.date={message.date}, since_date={since_date}")
                         break
@@ -533,24 +537,31 @@ class ChannelParser:
                         channel_id=channel_entity.id,
                         error=str(e))
             # Fallback к старому методу при ошибке
-            # [C7-ID: dev-mode-017] Разная логика для historical и incremental режимов
+            # [C7-ID: dev-mode-017] Context7 best practice: устанавливаем разумный лимит для безопасности
             if mode == "incremental":
                 # Для incremental: получаем новые сообщения (без offset_date, чтобы получить последние сообщения)
                 limit_fallback = batch_size * 10
                 iter_params = {"limit": limit_fallback}
             else:
                 # Для historical: используем offset_date для получения сообщений до определенной даты
-                iter_params = {"offset_date": since_date, "limit": None}
+                # Context7: Исправлено: установлен разумный лимит вместо None для предотвращения избыточной загрузки
+                # Используем лимит как в основном пути (batch_size * 100 для покрытия большого диапазона)
+                limit_fallback = batch_size * 100
+                iter_params = {"offset_date": since_date, "limit": limit_fallback}
             
             async for message in client.iter_messages(channel_entity, **iter_params):
-                # [C7-ID: dev-mode-017] Разная логика для historical и incremental
+                # [C7-ID: dev-mode-017] Context7: Унифицированная логика фильтрации (соответствует основному пути)
+                # Historical: включаем сообщения >= since_date, останавливаемся на < since_date
+                # Incremental: включаем только сообщения > since_date, останавливаемся на <= since_date
                 if mode == "historical":
                     # Historical: останавливаемся когда дошли до since_date
+                    # Включаем сообщения с message.date >= since_date
                     if message.date < since_date:
                         logger.debug(f"Reached since_date, stopping. message.date={message.date}, since_date={since_date}")
                         break
                 else:  # incremental
-                    # Incremental: сообщения приходят от новых к старым, останавливаемся при встрече старого
+                    # Incremental: сообщения приходят от новых к старым, останавливаемся при встрече <= since_date
+                    # Это исключает сообщения на границе since_date (равные last_parsed_at), предотвращая дубликаты
                     if message.date <= since_date:
                         logger.debug(f"Reached since_date in incremental mode, stopping. message.date={message.date}, since_date={since_date}")
                         break
