@@ -459,10 +459,14 @@ class ChannelParser:
                     )
                     return now - timedelta(hours=self.config.historical_hours)
                 
-                # Инкрементальный режим: с последнего парсинга, но не больше incremental_minutes
-                return max(base, now - timedelta(minutes=self.config.incremental_minutes))
+                # Context7: [C7-ID: incremental-since-date-fix-001] Исправлена логика since_date
+                # В incremental режиме используем именно last_parsed_at, чтобы не пропускать сообщения
+                # Использование max(base, now - incremental_minutes) приводило к пропуску сообщений
+                # между last_parsed_at и (now - incremental_minutes)
+                return base
             else:
                 # Fallback: если нет last_parsed_at, берём incremental окно
+                # incremental_minutes используется только как fallback, когда нет last_parsed_at
                 return now - timedelta(minutes=self.config.incremental_minutes)
         
         elif mode == "historical":
@@ -485,20 +489,36 @@ class ChannelParser:
         
         # Context7: Использование retry обвязки вместо прямого iter_messages
         try:
+            # [C7-ID: dev-mode-017] Context7 best practice: для incremental режима получаем больше сообщений
+            # чтобы захватить все новые посты между last_parsed_at и now
+            limit = batch_size * 10 if mode == "incremental" else batch_size
+            
             # Получаем сообщения через retry обвязку
             messages = await fetch_messages_with_retry(
                 client,
                 channel_entity,
-                limit=batch_size,
+                limit=limit,
                 redis_client=self.redis_client
             )
             
             # Обрабатываем полученные сообщения
             for message in messages:
-                # Клиентская фильтрация (Telethon не умеет >= серверно)
-                if message.date < since_date:
-                    logger.debug(f"Reached since_date, stopping. message.date={message.date}, since_date={since_date}")
-                    break
+                # [C7-ID: dev-mode-017] Context7: Унифицированная логика фильтрации
+                # Historical: включаем сообщения >= since_date (парсим от новых к старым, останавливаемся на < since_date)
+                # Incremental: включаем только сообщения > since_date (строго новее last_parsed_at, останавливаемся на <= since_date)
+                if mode == "historical":
+                    # Historical: парсим назад, останавливаемся когда дошли до since_date
+                    # Включаем сообщения с message.date >= since_date
+                    if message.date < since_date:
+                        logger.debug(f"Reached since_date, stopping. message.date={message.date}, since_date={since_date}")
+                        break
+                else:  # incremental
+                    # Incremental: парсим только сообщения строго новее since_date (между last_parsed_at и now)
+                    # Сообщения приходят от новых к старым, поэтому при встрече <= since_date останавливаемся
+                    # Это исключает сообщения на границе since_date (равные last_parsed_at), предотвращая дубликаты
+                    if message.date <= since_date:
+                        logger.debug(f"Reached since_date in incremental mode, stopping. message.date={message.date}, since_date={since_date}")
+                        break
                 
                 batch.append(message)
                 messages_yielded += 1
@@ -517,14 +537,34 @@ class ChannelParser:
                         channel_id=channel_entity.id,
                         error=str(e))
             # Fallback к старому методу при ошибке
-            async for message in client.iter_messages(
-                channel_entity,
-                offset_date=since_date  # ← Временной лимит
-            ):
-                # Клиентская фильтрация (Telethon не умеет >= серверно)
-                if message.date < since_date:
-                    logger.debug(f"Reached since_date, stopping. message.date={message.date}, since_date={since_date}")
-                    break
+            # [C7-ID: dev-mode-017] Context7 best practice: устанавливаем разумный лимит для безопасности
+            if mode == "incremental":
+                # Для incremental: получаем новые сообщения (без offset_date, чтобы получить последние сообщения)
+                limit_fallback = batch_size * 10
+                iter_params = {"limit": limit_fallback}
+            else:
+                # Для historical: используем offset_date для получения сообщений до определенной даты
+                # Context7: Исправлено: установлен разумный лимит вместо None для предотвращения избыточной загрузки
+                # Используем лимит как в основном пути (batch_size * 100 для покрытия большого диапазона)
+                limit_fallback = batch_size * 100
+                iter_params = {"offset_date": since_date, "limit": limit_fallback}
+            
+            async for message in client.iter_messages(channel_entity, **iter_params):
+                # [C7-ID: dev-mode-017] Context7: Унифицированная логика фильтрации (соответствует основному пути)
+                # Historical: включаем сообщения >= since_date, останавливаемся на < since_date
+                # Incremental: включаем только сообщения > since_date, останавливаемся на <= since_date
+                if mode == "historical":
+                    # Historical: останавливаемся когда дошли до since_date
+                    # Включаем сообщения с message.date >= since_date
+                    if message.date < since_date:
+                        logger.debug(f"Reached since_date, stopping. message.date={message.date}, since_date={since_date}")
+                        break
+                else:  # incremental
+                    # Incremental: сообщения приходят от новых к старым, останавливаемся при встрече <= since_date
+                    # Это исключает сообщения на границе since_date (равные last_parsed_at), предотвращая дубликаты
+                    if message.date <= since_date:
+                        logger.debug(f"Reached since_date in incremental mode, stopping. message.date={message.date}, since_date={since_date}")
+                        break
                 
                 batch.append(message)
                 messages_yielded += 1

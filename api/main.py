@@ -136,18 +136,31 @@ app.add_middleware(RateLimiterMiddleware, redis_url=settings.redis_url)  # Вт�
 # [C7-ID: fastapi-cors-001]
 # [C7-ID: dev-mode-004] Fail-fast: проверка несовместимости wildcard с credentials
 cors_origins_normalized = [str(o).strip() for o in (settings.cors_origins or [])]
-if any(o == "*" for o in cors_origins_normalized):
+
+# Если CORS origins не заданы - разрешаем все origins без credentials
+# (безопасно для development, но для production нужно задать явные origins)
+if not cors_origins_normalized:
+    logger.warning("CORS_ORIGINS not set, allowing all origins without credentials")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,  # Без credentials можно использовать wildcard
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "X-Requested-With"],
+    )
+elif any(o == "*" for o in cors_origins_normalized):
     raise RuntimeError(
         "CORS configuration error: allow_origins=['*'] is incompatible with allow_credentials=True. "
         "Use explicit origins (e.g., 'http://localhost:8000,http://localhost:8080') or disable credentials."
     )
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=cors_origins_normalized,  # Строгий whitelist из ENV
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],  # Ограниченный список методов
-    allow_headers=["Authorization", "Content-Type", "X-Requested-With"],  # Ограниченный список заголовков
-)
+else:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins_normalized,  # Строгий whitelist из ENV
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],  # Ограниченный список методов
+        allow_headers=["Authorization", "Content-Type", "X-Requested-With"],  # Ограниченный список заголовков
+    )
 
 
 # Context7 best practice: Security headers middleware

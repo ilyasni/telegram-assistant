@@ -115,51 +115,19 @@ services:
     depends_on:
       - supabase-db
       - rest
-      - auth
       - meta
     networks:
       - telegram-network
+    healthcheck:
+      # Context7: health check для Supabase Studio - проверка HTTP ответа на корневой endpoint
+      # Используем простую проверку доступности сервера
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:3000', {timeout: 2000}, (r) => {process.exit(r.statusCode < 500 ? 0 : 1)}).on('error', () => process.exit(1)).on('timeout', () => process.exit(1))\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
     profiles:
       - core
-
-  # Realtime
-  realtime:
-    image: supabase/realtime:v2.25.50
-    environment:
-      DB_HOST: supabase-db
-      DB_PASSWORD: ${POSTGRES_PASSWORD}
-      DB_NAME: ${POSTGRES_DB}
-      DB_USER: postgres
-      JWT_SECRET: ${JWT_SECRET}
-      API_JWT_SECRET: ${JWT_SECRET}
-      PORT: 4000
-    depends_on:
-      - supabase-db
-    networks:
-      - telegram-network
-    profiles:
-      - core
-
-  # Storage
-  storage:
-    image: supabase/storage-api:v0.46.4
-    environment:
-      POSTGREST_URL: http://rest:3000
-      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@supabase-db:5432/${POSTGRES_DB}
-      FILE_SIZE_LIMIT: 52428800
-      STORAGE_BACKEND: file
-      GLOBAL_S3_BUCKET: telegram-assistant-storage
-      ANON_KEY: ${ANON_KEY}
-      SERVICE_KEY: ${SERVICE_KEY}
-      JWT_SECRET: ${JWT_SECRET}
-    depends_on:
-      - supabase-db
-      - rest
-    networks:
-      - telegram-network
-    profiles:
-      - core
-
 
   # Redis Cache
   redis:
@@ -265,8 +233,9 @@ services:
     networks:
       - telegram-network
     healthcheck:
-      # Явно указываем протокол neo4j:// и адрес для избежания SSL ошибок
-      test: ["CMD", "cypher-shell", "-a", "neo4j://neo4j:7687", "-u", "neo4j", "-p", "${NEO4J_PASSWORD:-changeme}", "RETURN 1;"]
+      # Context7: используем shell для интерполяции переменных окружения
+      # Пароль берется из NEO4J_AUTH (формат: username/password)
+      test: ["CMD-SHELL", "cypher-shell -a neo4j://localhost:7687 -u neo4j -p $$(echo $$NEO4J_AUTH | cut -d'/' -f2) 'RETURN 1;' || exit 1"]
       interval: 20s
       timeout: 5s
       retries: 15
@@ -508,6 +477,11 @@ services:
       timeout: 10s
       retries: 3
       start_period: 60s
+    # Context7 best practice: ограничение core dumps для предотвращения заполнения диска
+    # При segfault информация будет в логах через signal handlers и faulthandler
+    ulimits:
+      core: 0  # Отключить создание core dump файлов
+      nofile: 65535  # Увеличить лимит открытых файлов для высокой нагрузки
     profiles:
       - core
 

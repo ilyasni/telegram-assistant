@@ -2,10 +2,12 @@
 
 import asyncio
 import os
+import sys
 import logging
 import faulthandler
 import signal
 import threading
+import traceback
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 import structlog
@@ -45,6 +47,65 @@ logging.basicConfig(
 )
 
 logger = structlog.get_logger()
+
+# Context7 best practice: обработчики сигналов для диагностики segfault/crash
+def signal_handler(signum, frame):
+    """
+    Обработчик сигналов для диагностики крашей.
+    Context7: Логируем критичные сигналы для анализа причин падений.
+    """
+    signal_name = signal.Signals(signum).name
+    logger.error(
+        "Received critical signal",
+        signal=signum,
+        signal_name=signal_name,
+        frame_info=str(frame) if frame else None
+    )
+    
+    # Дампим traceback всех потоков
+    try:
+        faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+        faulthandler_dumps_total.inc()
+        logger.error("Dumped traceback to stderr", signal_name=signal_name)
+    except Exception as e:
+        logger.error("Failed to dump traceback", error=str(e))
+    
+    # Context7: Увеличиваем метрику критических сигналов
+    try:
+        crash_signals_total.labels(signal_name=signal_name).inc()
+    except Exception:
+        pass  # Игнорируем ошибки метрик при краше
+    
+    # Для SIGSEGV/SIGABRT - пытаемся сохранить состояние перед выходом
+    if signum in (signal.SIGSEGV, signal.SIGABRT, signal.SIGFPE):
+        try:
+            app_state["status"] = f"crashed_{signal_name.lower()}"
+            logger.error("Application state before crash", app_state=app_state.copy())
+            crash_state_saved_total.labels(status=f"crashed_{signal_name.lower()}").inc()
+        except Exception:
+            pass
+        
+        # Выходим с кодом ошибки
+        sys.exit(128 + signum)
+
+def setup_signal_handlers():
+    """
+    Настройка обработчиков сигналов для диагностики.
+    Context7 best practice: отслеживаем критические сигналы.
+    """
+    # SIGSEGV - segmentation fault (наиболее частая причина core dump)
+    signal.signal(signal.SIGSEGV, signal_handler)
+    # SIGABRT - abort signal
+    signal.signal(signal.SIGABRT, signal_handler)
+    # SIGFPE - floating point exception
+    signal.signal(signal.SIGFPE, signal_handler)
+    # SIGTERM - graceful shutdown (не логируем как критичный)
+    signal.signal(signal.SIGTERM, lambda s, f: logger.info("Received SIGTERM, shutting down gracefully"))
+    # SIGINT - keyboard interrupt (не логируем как критичный)
+    signal.signal(signal.SIGINT, lambda s, f: logger.info("Received SIGINT, shutting down"))
+    
+    logger.info("Signal handlers configured", 
+                signals=["SIGSEGV", "SIGABRT", "SIGFPE", "SIGTERM", "SIGINT"])
 
 def debug_logger_kind(logger, name):
     print(f"[LOGCHECK] {name}: {type(logger)} module={type(logger).__module__}")
@@ -91,6 +152,24 @@ app_state = {
 # Prometheus метрики
 request_count = Counter("http_requests_total", "Total HTTP requests", ["path"])
 request_duration = Histogram("http_request_duration_seconds", "HTTP request duration", ["path"])
+
+# Context7 best practice: метрики для мониторинга крашей и критических событий
+crash_signals_total = Counter(
+    "telethon_ingest_crash_signals_total",
+    "Total critical signals received (SIGSEGV, SIGABRT, SIGFPE)",
+    ["signal_name"]
+)
+
+crash_state_saved_total = Counter(
+    "telethon_ingest_crash_state_saved_total",
+    "Number of times application state was saved before crash",
+    ["status"]
+)
+
+faulthandler_dumps_total = Counter(
+    "telethon_ingest_faulthandler_dumps_total",
+    "Total number of faulthandler traceback dumps"
+)
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -511,8 +590,17 @@ async def main():
     # [C7-ID: dev-mode-002] Логируем окружение при старте
     logger.info("Runtime environment", app_env=os.getenv("APP_ENV", "production"))
     
+    # Context7 best practice: настройка обработчиков сигналов для диагностики
+    setup_signal_handlers()
+    
     # Context7 best practice: "сторожок" зависаний
     faulthandler.dump_traceback_later(30, repeat=True)
+    
+    # Context7: Логируем информацию о faulthandler
+    logger.info("Faulthandler enabled", 
+                dump_later=True, 
+                dump_interval_seconds=30,
+                faulthandler_enabled=faulthandler.is_enabled())
     
     # Запуск health server в отдельном потоке
     health_thread = threading.Thread(target=start_health_server, daemon=True)
@@ -557,10 +645,16 @@ if __name__ == "__main__":
     # Context7 best practice: без uvloop на время диагностики
     # import uvloop; uvloop.install()
     
+    # Context7: Дополнительная настройка faulthandler для stderr
+    # Это поможет видеть traceback в логах Docker даже при segfault
+    faulthandler.enable(file=sys.stderr, all_threads=True)
+    
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Shutdown requested")
     except Exception as e:
-        logger.error("Fatal error", error=str(e))
+        logger.error("Fatal error", error=str(e), exc_info=True)
+        # Context7: Дампим traceback перед выходом
+        traceback.print_exc()
         raise

@@ -5,6 +5,7 @@ Metrics: Prometheus counters and histograms.
 """
 
 from fastapi import APIRouter, HTTPException, Request, Depends
+from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
 import asyncio
 import time
@@ -13,11 +14,11 @@ import os
 import hashlib
 import hmac
 import base64
-import redis
+import json
+import redis.asyncio as redis
 import structlog
 from prometheus_client import Counter, Histogram
 from config import settings
-from fastapi import Response
 import qrcode
 import io
 
@@ -32,7 +33,8 @@ AUTH_QR_EXPIRED = Counter("auth_qr_expired_total", "QR sessions expired", ["tena
 AUTH_QR_OWNERSHIP_FAIL = Counter("auth_qr_ownership_fail_total", "Ownership check failures")
 AUTH_QR_2FA_REQUIRED = Counter("auth_qr_2fa_required_total", "2FA required count") 
 
-redis_client = redis.from_url(settings.redis_url)
+# Context7 best practice: async Redis client для неблокирующих операций
+redis_client = redis.from_url(settings.redis_url, decode_responses=True)
 
 
 class MiniAppInit(BaseModel):
@@ -116,12 +118,12 @@ def _extract_tenant_id(payload: dict) -> str:
 
 # Context7 best practice: Redis-based sliding window rate limiting
 # [C7-ID: fastapi-ratelimit-003]
-def ratelimit(key: str, max_per_minute: int = 30) -> bool:
-    """Sliding window rate limiting с Redis."""
+async def ratelimit(key: str, max_per_minute: int = 30) -> bool:
+    """Sliding window rate limiting с Redis (async)."""
     bucket = f"rl:{key}:{int(time.time() // 60)}"
-    v = redis_client.incr(bucket)
+    v = await redis_client.incr(bucket)
     if v == 1:
-        redis_client.expire(bucket, 120)  # 2 минуты TTL для cleanup
+        await redis_client.expire(bucket, 120)  # 2 минуты TTL для cleanup
     
     # Метрики для мониторинга
     if v > max_per_minute:
@@ -130,12 +132,12 @@ def ratelimit(key: str, max_per_minute: int = 30) -> bool:
     return v <= max_per_minute
 
 
-def ratelimit_strict(key: str, max_per_minute: int = 5) -> bool:
-    """Более жёсткий лимит для критических endpoints."""
+async def ratelimit_strict(key: str, max_per_minute: int = 5) -> bool:
+    """Более жёсткий лимит для критических endpoints (async)."""
     bucket = f"rl:strict:{key}:{int(time.time() // 60)}"
-    v = redis_client.incr(bucket)
+    v = await redis_client.incr(bucket)
     if v == 1:
-        redis_client.expire(bucket, 120)
+        await redis_client.expire(bucket, 120)
     
     if v > max_per_minute:
         # Логирование подозрительной активности
@@ -159,7 +161,7 @@ async def miniapp_init(body: MiniAppInit, request: Request):
 @router.post("/miniapp/link")
 async def miniapp_link(body: MiniAppLink):
     key = f"miniapp:link:{body.tenant_id}"
-    if not ratelimit(key):
+    if not await ratelimit(key):
         raise HTTPException(status_code=429, detail="rate limit")
     token = issue_session_token(body.tenant_id)
     return {"session_token": token}
@@ -172,7 +174,7 @@ async def qr_start(body: QrStart, request: Request):
     ip = request.client.host
     
     # Строгий rate limiting для QR start
-    if not ratelimit_strict(f"qr:start:{ip}"):
+    if not await ratelimit_strict(f"qr:start:{ip}"):
         raise HTTPException(status_code=429, detail="Too many requests. Try again in 1 minute.")
 
     AUTH_QR_START.labels(tenant_id=tenant_id).inc()
@@ -194,20 +196,21 @@ async def qr_start(body: QrStart, request: Request):
         session_data["invite_code"] = body.invite_code
         logger.info("QR session with invite code", tenant_id=tenant_id, invite_code=body.invite_code)
     
-    redis_client.hset(key, mapping=session_data)
+    # Context7 best practice: используем async Redis операции
+    await redis_client.hset(key, mapping=session_data)
     # Context7 best practice: увеличиваем TTL для QR-сессий до 20 минут
     # (временно, пока чиним telethon-ingest)
     QR_TTL_SECONDS = int(os.getenv("QR_TTL_SECONDS", "1200"))  # 20 минут
-    redis_client.expire(key, QR_TTL_SECONDS)
+    await redis_client.expire(key, QR_TTL_SECONDS)
     
-    logger.info("QR session key created", key=key, exists=redis_client.exists(key))
+    exists = await redis_client.exists(key)
+    logger.info("QR session key created", key=key, exists=bool(exists))
 
     expires_at = int(time.time()) + QR_TTL_SECONDS
     
     # Проверяем, есть ли уже qr_url (может быть None если telethon-ingest еще не обработал)
-    qr_url = redis_client.hget(key, "qr_url")
-    if qr_url:
-        qr_url = qr_url.decode()
+    # Context7 best practice: с decode_responses=True значения уже декодированы в строки
+    qr_url = await redis_client.hget(key, "qr_url")
     
     return {
         "session_token": token, 
@@ -233,13 +236,10 @@ async def qr_status_post(body: dict):
         raise HTTPException(status_code=400, detail="invalid token")
     
     key = f"tg:qr:session:{tenant_id}"
-    data = redis_client.hgetall(key)
+    data = await redis_client.hgetall(key)
     if not data:
         raise HTTPException(status_code=404, detail="not found or expired")
-    # redis-py returns bytes in v5? For simplicity, decode where needed
-    def dec(b):
-        return b.decode() if isinstance(b, (bytes, bytearray)) else b
-    data = {dec(k): dec(v) for k, v in data.items()}
+    # Context7 best practice: с decode_responses=True все ключи и значения уже декодированы в строки
     resp = {"status": data.get("status", "pending")}
     if "qr_url" in data:
         resp["qr_url"] = data["qr_url"]
@@ -251,30 +251,34 @@ async def qr_status_post(body: dict):
 
 @router.get("/qr/sse")
 async def qr_sse(token: str):
-    # Простой SSE: периодически шлём статус
-    def gen():
+    """SSE endpoint для статуса QR-авторизации (async генератор)."""
+    
+    async def gen():
         import time as _t
         while True:
             try:
                 payload = decode_session_token(token)
                 tenant_id = _extract_tenant_id(payload)
                 key = f"tg:qr:session:{tenant_id}"
-                data = redis_client.hgetall(key)
-                status = b"pending"
+                # Context7 best practice: используем async Redis операции
+                # с decode_responses=True все ключи и значения уже декодированы в строки
+                data = await redis_client.hgetall(key)
+                status = "pending"
                 qr_url = None
                 if data:
-                    status = data.get(b"status", b"pending")
-                    qr_url = data.get(b"qr_url")
+                    status = data.get("status", "pending")
+                    qr_url = data.get("qr_url")
                 line = {
-                    "status": (status.decode() if isinstance(status, (bytes, bytearray)) else status),
-                    "qr_url": (qr_url.decode() if isinstance(qr_url, (bytes, bytearray)) else qr_url),
+                    "status": status,
+                    "qr_url": qr_url,
                 }
                 yield f"data: {json.dumps(line)}\n\n"
-                _t.sleep(1.5)
+                await asyncio.sleep(1.5)
             except Exception:
                 yield "data: {\"status\": \"error\"}\n\n"
-                _t.sleep(2)
-    return Response(gen(), media_type="text/event-stream")
+                await asyncio.sleep(2)
+    
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
 
 @router.post("/qr/cancel")
@@ -287,9 +291,9 @@ async def qr_cancel(token: str):
         raise HTTPException(status_code=400, detail="invalid token")
     
     key = f"tg:qr:session:{tenant_id}"
-    if not redis_client.exists(key):
+    if not await redis_client.exists(key):
         raise HTTPException(status_code=404, detail="not found or expired")
-    redis_client.hset(key, mapping={"status": "cancelled"})
+    await redis_client.hset(key, mapping={"status": "cancelled"})
     return {"ok": True}
 
 
@@ -305,11 +309,12 @@ async def qr_png(session_id: str):
         raise HTTPException(status_code=400, detail="invalid session")
     
     key = f"tg:qr:session:{tenant_id}"
-    if not redis_client.exists(key):
+    if not await redis_client.exists(key):
         raise HTTPException(status_code=404, detail="not found or expired")
     
-    data = redis_client.hgetall(key)
-    qr_url = data.get(b"qr_url", b"").decode()
+    # Context7 best practice: с decode_responses=True все ключи и значения уже декодированы в строки
+    data = await redis_client.hgetall(key)
+    qr_url = data.get("qr_url", "")
     
     if not qr_url:
         raise HTTPException(status_code=404, detail="qr_url not available")

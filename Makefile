@@ -9,7 +9,8 @@ env-check:
 	./scripts/env-check.sh
 
 up-core: guard
-	docker compose up -d supabase-db kong rest meta auth supabase-studio realtime storage redis qdrant caddy
+	# Context7: realtime и storage только в dev режиме, не включаем в production
+	docker compose --profile core up -d supabase-db kong rest meta auth supabase-studio redis qdrant caddy
 
 up-app: guard
 	docker compose up -d api worker telethon-ingest
