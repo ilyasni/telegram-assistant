@@ -112,3 +112,27 @@ env/
 *.log
 logs/
 *.log.*
+
+# ============================================================================
+# CODE ANALYSIS REPORTS
+# ============================================================================
+# Auto-generated reports (in docs/reports/)
+docs/reports/*.csv
+docs/reports/*.json
+docs/reports/dead_code_*.md
+docs/reports/cleanup_candidates.md
+docs/reports/jscpd_report/
+!docs/reports/.gitkeep
+!docs/reports/README.md
+
+# Vulture whitelist (keep in git, but exclude generated entries)
+# .vulture-whitelist.py is tracked
+
+# Deptry reports
+deptry-report.json
+
+# Import linter cache
+.import_linter_cache/
+
+# Detect secrets baseline (tracked, but exclude from general ignore)
+# .secrets.baseline is tracked

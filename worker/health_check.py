@@ -1,6 +1,46 @@
 """
+⚠️ DEPRECATED ⚠️
+
+@deprecated since=2025-01-30 remove_by=2025-02-13
+Reason: Дубликат функциональности worker/health.py (который использует feature flags)
+Replacement: from worker.health import check_integrations
+
+Этот файл перемещён в legacy/deprecated_2025-01-30/
+[C7-ID: CODE-CLEANUP-025] Context7 best practice: карантин deprecated кода
+"""
+
+import warnings
+import os
+
+# Runtime guard: блокируем импорт в production
+if os.getenv("ENV") == "production":
+    raise ImportError(
+        "worker/health_check.py is deprecated. "
+        "Use 'from worker.health import check_integrations' instead. "
+        "See legacy/deprecated_2025-01-30/README.md"
+    )
+
+warnings.warn(
+    "worker/health_check.py is DEPRECATED. "
+    "Use worker/health.py (with feature flags support) instead. "
+    "See legacy/deprecated_2025-01-30/README.md",
+    DeprecationWarning,
+    stacklevel=2
+)
+
+# Re-export для обратной совместимости
+try:
+    # Пытаемся переиспользовать функциональность из health.py
+    from worker.health import check_redis as _check_redis, check_postgres as _check_postgres
+except ImportError:
+    # Если не доступно, оставляем старую реализацию
+    pass
+
+"""
 Health Check модуль для worker сервисов
 Context7: Comprehensive health monitoring with detailed status reporting
+
+⚠️ DEPRECATED: Use worker/health.py instead (supports feature flags)
 """
 
 import asyncio

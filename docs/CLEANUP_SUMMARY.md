@@ -1,155 +1,108 @@
-# Отчёт об упорядочивании проекта
+# Итоговый отчёт по очистке кодовой базы
 
-**Дата:** 2025-10-28  
-**Задача:** Наведение порядка в структуре проекта, работа с .env файлами, бэкапами и чувствительными данными
+[C7-ID: CODE-CLEANUP-028] Сводный отчёт о выполненной работе
 
-## Выполненные задачи
+**Дата:** 2025-01-30  
+**Этапы:** 1-2 (частично 3)
 
-### 1. Удаление чувствительных данных из репозитория
+## Выполненные работы
 
-- ✅ **env.example**: Заменены реальные `GIGACHAT_CREDENTIALS` на placeholder
-- ✅ **docs/GIGACHAT_SUCCESS.md**: Удалены реальные credentials и токены
-- ✅ **gpt2giga-proxy/test_credentials.py**: Изменён на чтение из переменных окружения вместо хардкода
+### Этап 1: Автоматизированная инвентаризация ✅
 
-### 2. Упорядочивание .env файлов
+#### Инструменты и конфигурация
+- ✅ `pyproject.toml` - единая конфигурация всех инструментов
+- ✅ `.pre-commit-config.yaml` - расширенные hooks (8 инструментов)
+- ✅ `.editorconfig`, `.importlinter` - стандартизация форматирования
+- ✅ `.vulture-whitelist.py` - whitelist для false positives
+- ✅ `.secrets.baseline` - baseline для detect-secrets
 
-Удалены старые бэкапы и дубликаты:
-- `.env.backup`
-- `.env.recovered`
-- `.env.json`
-- `.env.backup.20251025_011045`
-- `.env.example` (дубликат `env.example`)
+#### Автоматизация
+- ✅ `scripts/inventory_dead_code.py` - автоматическая инвентаризация
+- ✅ `scripts/cleanup_legacy.py` - очистка legacy по меткам
+- ✅ Makefile команды для всех проверок
 
-**Осталось в корне:**
-- `.env` - основной файл окружения (в .gitignore)
-- `env.example` - шаблон для разработчиков
-- `.env.schema.json` - схема валидации (можно оставить в git)
+#### Shared Package
+- ✅ `shared/python/shared/feature_flags/` - единая система на pydantic-settings
+- ✅ OpenFeature семантика (variant, reason)
+- ✅ Runtime cache для AI providers
+- ✅ Dockerfile'ы обновлены для установки shared пакета
 
-### 3. Перемещение отчётов
+#### Документация
+- ✅ `.cursor/rules/10-code-cleanup.mdc` - правила для Cursor
+- ✅ `docs/CODE_QUALITY.md` - руководство по инструментам
+- ✅ `docs/SCRIPTS_INDEX.md` - индекс всех скриптов
+- ✅ `docs/MIGRATION_FEATURE_FLAGS.md` - миграция feature flags
 
-Все автоматически генерируемые отчёты перемещены в `docs/reports/`:
-- `*_REPORT.md`
-- `*_STATUS.md`
-- `*_SUMMARY.md`
-- `*_COMPLETION.md`
-- `*_SUCCESS.md`
-- `*_VERIFICATION.md`
-- `*_FIXES.md`
-- `*_DIAGNOSIS.md`
+### Этап 2: Карантин и разрешение дубликатов ✅
 
-### 4. Упорядочивание бэкапов
+#### Разрешение дубликатов
+1. ✅ **worker/shared/s3_storage.py** → помечен как deprecated
+   - Точный дубликат `api/services/s3_storage.py`
+   - Все импорты уже используют `api.services.s3_storage`
+   - Runtime guard добавлен
 
-**Структура:**
-```
-backups/
-├── system_backup_YYYYMMDD_HHMMSS/  # Полные системные бэкапы
-├── archive/                         # Архив старых бэкапов
-│   ├── backup_*.sql                # SQL бэкапы
-│   └── redis_state_snapshot_*.txt  # Redis snapshots
-├── .gitkeep                        # Сохранение директории в git
-└── README.md                       # Документация по бэкапам
-```
+2. ✅ **worker/health_check.py** → помечен как deprecated
+   - Дубликат функциональности `worker/health.py`
+   - `worker/health.py` использует feature flags (лучше)
+   - Runtime guard добавлен
 
-**Перемещено в archive:**
-- `backup_before_migration_*.sql`
-- `redis_state_snapshot_*.txt`
+3. ✅ **worker/simple_health_server.py** → помечен как deprecated
+   - Не используется (проверено через grep)
+   - Используется `worker/health_server.py` вместо этого
 
-### 5. Обновление .gitignore
+#### Карантин
+- ✅ `legacy/deprecated_2025-01-30/` - создана структура карантина
+- ✅ Все deprecated файлы скопированы в legacy с метками
+- ✅ Runtime guards для всех deprecated файлов
+- ✅ `legacy/deprecated_2025-01-30/README.md` - документация
 
-Обновлён `.gitignore` согласно best practices Supabase:
+#### Runtime Guard
+- ✅ `shared/runtime_guard/` - модуль для runtime защиты
+- ✅ Prometheus метрика `legacy_import_attempts_total`
+- ✅ Блокировка импорта в production
 
-#### Секции .gitignore:
-1. **Environment Variables** - все .env файлы, кроме шаблонов
-2. **Backup Files** - все форматы бэкапов (SQL, RDB, dump)
-3. **Sessions & Secrets** - директории с сессиями
-4. **Supabase Volumes** - локальные данные Supabase
-5. **Development & Build** - временные файлы, виртуальные окружения
-6. **IDE & Editor** - настройки редакторов
-7. **Reports & Documentation** - автогенерируемые отчёты
-8. **Logs** - файлы логов
+#### GitHub Actions
+- ✅ `.github/workflows/cleanup-legacy.yml` - автоматическое удаление legacy
+- ✅ Ежедневный запуск + manual trigger
+- ✅ Автоматическое создание PR для удаления
 
-#### Важные паттерны:
-- `*.env`, `.env.*` - все env файлы
-- `!env.example`, `!.env.example` - исключения для шаблонов
-- `backups/*` - все бэкапы
-- `!backups/.gitkeep`, `!backups/README.md` - исключения для документации
-- `*_REPORT.md`, `*_STATUS.md` - автогенерируемые отчёты
+#### Упорядочивание файлов
+- ✅ `TESTING_REPORT.md` → `docs/reports/`
+- ✅ `TESTING_SUMMARY.txt` → `docs/reports/`
+- ✅ `SQL_REPROCESS_PENDING.md` → `docs/`
+- ✅ `save_string_session.py` → `scripts/`
 
-### 6. Удаление из Git индекса
+### Этап 3: Стандартизация (начат)
 
-Удалены из Git (файлы остаются локально, но исключены из версионирования):
-- Все `.env.backup*`, `.env.recovered`, `.env.json` файлы
-- SQL бэкапы из корня
-- Redis snapshots
-- Отчёты и документы
-- Системные бэкапы из `backups/`
+#### CI/CD Integration
+- ⏳ GitHub Actions workflow для всех проверок (планируется)
+- ⏳ Matrix тестирование (планируется)
 
-## Best Practices (Supabase)
+## Результаты
 
-Следовали рекомендациям Supabase:
+### Метрики
+- **Deprecated файлов:** 4 (backup_scheduler, miniapp_auth, s3_storage duplicate, health_check duplicate)
+- **Дубликатов разрешено:** 2 (s3_storage.py, health_check.py)
+- **Инструментов настроено:** 8
+- **Pre-commit hooks:** 8
+- **Скриптов создано:** 2 (inventory, cleanup-legacy)
 
-1. **Never commit .env files** - все .env файлы исключены из git
-2. **Use .env.example** - шаблон для документирования переменных
-3. **Secrets management** - использование `supabase secrets set --env-file .env` для production
-4. **Backup security** - бэкапы не хранятся в репозитории
-
-## Структура проекта после очистки
-
-```
-telegram-assistant/
-├── .env                 # Локальный файл (не в git)
-├── env.example          # Шаблон (в git)
-├── .env.schema.json     # Схема валидации (в git)
-├── .gitignore           # Обновлённый (в git)
-├── backups/
-│   ├── archive/         # Старые бэкапы (не в git)
-│   ├── system_backup_*/ # Системные бэкапы (не в git)
-│   ├── .gitkeep
-│   └── README.md        # Документация (в git)
-├── docs/
-│   └── reports/         # Автогенерируемые отчёты (не в git)
-│       └── .gitkeep
-└── ...
-```
+### Улучшения
+1. ✅ Автоматизация предотвращает новый мёртвый код
+2. ✅ Единая система feature flags с типобезопасностью
+3. ✅ Runtime guards защищают от использования deprecated кода
+4. ✅ Документация для Cursor улучшает навигацию
+5. ✅ Shared package изолирует общий код
 
 ## Следующие шаги
 
-1. **Коммит изменений:**
-   ```bash
-   git add .gitignore backups/README.md backups/.gitkeep docs/reports/.gitkeep
-   git commit -m "chore: упорядочивание проекта, обновление .gitignore"
-   ```
+1. ⏳ Миграция feature flags на shared.feature_flags (обновить импорты)
+2. ⏳ Полное CI/CD integration (добавить в существующие workflows)
+3. ⏳ Coverage-guided vulture whitelist (интеграция с pytest --cov)
+4. ⏳ Миграция s3_storage в shared (будущее)
 
-2. **Проверка безопасности:**
-   ```bash
-   # Убедиться, что нет чувствительных данных
-   git log --all --full-history -- "*.env*"
-   git log --all --full-history -- "backups/*"
-   ```
+## Риски и митигация
 
-3. **Ротация секретов (если необходимо):**
-   - Если credentials были скомпрометированы, заменить их
-   - Использовать `scripts/generate_secrets.sh` для генерации новых
-
-## Проверка
-
-Команды для проверки результата:
-
-```bash
-# Проверить, что .env файлы игнорируются
-git status --ignored | grep .env
-
-# Проверить структуру
-ls -la backups/
-ls -la docs/reports/
-
-# Проверить отсутствие чувствительных данных
-grep -r "GIGACHAT_CREDENTIALS.*N2Mw" --include="*.md" --include="*.example" .
-```
-
-## Примечания
-
-- Файлы остаются на диске, но исключены из Git
-- Старые коммиты с чувствительными данными остаются в истории Git
-- Для полной очистки истории может потребоваться `git filter-branch` или BFG Repo-Cleaner
-
+- ✅ Runtime guards предотвращают использование deprecated кода в production
+- ✅ Автоматическая инвентаризация отслеживает технический долг
+- ✅ Карантин 14 дней даёт время для проверки перед удалением

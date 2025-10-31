@@ -266,9 +266,9 @@ class ChannelParser:
             ):
                 batch_count += 1
                 
-                # Обработка батча с передачей mode
+                # Обработка батча с передачей mode и channel_entity
                 batch_result = await self._process_message_batch(
-                    message_batch, channel_id, user_id, tenant_id, tg_channel_id, mode
+                    message_batch, channel_id, user_id, tenant_id, tg_channel_id, channel_entity, mode
                 )
                 
                 messages_processed += batch_result['processed']
@@ -547,6 +547,7 @@ class ChannelParser:
         user_id: str,
         tenant_id: str,
         tg_channel_id: int,
+        channel_entity: Any = None,  # [C7-ID: dev-mode-012] Для получения title/username канала
         mode: str = "historical"
     ) -> Dict[str, int]:
         """Обработка батча сообщений с обновлением HWM."""
@@ -589,21 +590,39 @@ class ChannelParser:
         # Context7: Атомарное сохранение в БД с новыми компонентами
         if posts_data:
             # Подготовка данных пользователя и канала
+            # [C7-ID: dev-mode-012] tenant_id из параметра функции (передается в parse_channel_messages)
             user_data = {
                 'telegram_id': user_id,
+                'tenant_id': tenant_id,  # Используем переданный tenant_id
                 'first_name': '',  # TODO: Получить из Telegram API
                 'last_name': '',
                 'username': ''
             }
             
+            # [C7-ID: dev-mode-012] channel_data использует tg_channel_id (bigint) для UPSERT, а не channel_id (UUID)
+            # tg_channel_id уже получен из _get_channel_entity
+            # Получаем title и username из channel_entity или из БД
+            channel_title = channel_entity.title if channel_entity and hasattr(channel_entity, 'title') else ''
+            channel_username = channel_entity.username if channel_entity and hasattr(channel_entity, 'username') else ''
+            
+            # Если не получили из entity - берем из БД
+            if not channel_title or not channel_username:
+                try:
+                    result = await self.db_session.execute(
+                        text("SELECT title, username FROM channels WHERE id = :channel_id"),
+                        {"channel_id": channel_id}
+                    )
+                    row = result.fetchone()
+                    if row:
+                        channel_title = row.title or channel_title
+                        channel_username = row.username or channel_username
+                except Exception as e:
+                    logger.warning("Failed to get channel title/username from DB", error=str(e))
+            
             channel_data = {
-                'telegram_id': channel_id,
-                'title': '',  # TODO: Получить из Telegram API
-                'username': '',
-                'description': '',
-                'participants_count': 0,
-                'is_broadcast': False,
-                'is_megagroup': False
+                'telegram_id': tg_channel_id,  # Используем tg_channel_id (bigint), не channel_id (UUID)
+                'title': channel_title,
+                'username': channel_username
             }
             
             # Атомарное сохранение

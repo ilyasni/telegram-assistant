@@ -1,0 +1,152 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "telegram-assistant"
+version = "0.1.0"
+description = "Telegram Channel Parser Bot - Event-driven microservices architecture"
+requires-python = ">=3.11"
+
+# ============================================================================
+# CODE QUALITY TOOLS
+# ============================================================================
+
+[tool.vulture]
+# [C7-ID: CODE-CLEANUP-001] Context7 best practice: vulture для поиска мёртвого кода
+min_confidence = 80
+paths = ["api", "worker", "telethon-ingest", "crawl4ai"]
+exclude = ["*_test.py", "tests/*", "migrations/*", "**/alembic/**", "__pycache__", "*.pyc"]
+ignore_decorators = ["@app.route", "@cli.command", "@pytest.fixture", "@keep"]
+ignore_names = ["visit_*", "do_*"]
+make_whitelist = true
+sort_by_size = true
+
+[tool.ruff]
+# [C7-ID: CODE-CLEANUP-002] Context7 best practice: ruff для линтинга и форматирования
+line-length = 100
+target-version = "py311"
+
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "I",      # isort (import sorting)
+    "B",      # flake8-bugbear
+    "C4",     # flake8-comprehensions
+    "UP",     # pyupgrade
+    "ARG",    # flake8-unused-arguments
+    "SIM",    # flake8-simplify
+]
+
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "B008",   # do not perform function calls in argument defaults
+    "C901",   # too complex
+]
+
+unfixable = [
+    "F401",   # unused imports (require manual review)
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.ruff.isort]
+known-first-party = ["api", "worker", "telethon_ingest", "crawl4ai", "shared"]
+force-sort-within-sections = true
+split-on-trailing-comma = true
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]  # Allow unused imports in __init__.py
+"tests/**/*.py" = ["ARG", "S101"]  # Allow assert and unused args in tests
+"scripts/**/*.py" = ["T201"]  # Allow print statements in scripts
+
+[tool.mypy]
+# [C7-ID: CODE-CLEANUP-003] Context7 best practice: mypy для type checking
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false  # Gradual typing
+disallow_incomplete_defs = false
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+strict_optional = true
+
+[[tool.mypy.overrides]]
+module = [
+    "telethon.*",
+    "crawl4ai.*",
+    "neo4j.*",
+    "qdrant.*",
+]
+ignore_missing_imports = true
+
+[tool.deptry]
+# [C7-ID: CODE-CLEANUP-004] Context7 best practice: deptry для обнаружения неиспользуемых зависимостей
+known_first_party = ["api", "worker", "telethon_ingest", "crawl4ai", "shared"]
+requirements_files_dev = ["requirements-dev.txt", "dev-requirements.txt"]
+
+[tool.bandit]
+# [C7-ID: CODE-CLEANUP-005] Context7 best practice: bandit для SAST
+exclude_dirs = ["tests", "scripts", "legacy"]
+skips = ["B101", "B601"]  # Skip assert_used, shell_injection_subprocess
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-v",
+    "--strict-markers",
+    "-m", "not e2e",
+]
+markers = [
+    "unit: Unit tests",
+    "integration: Integration tests",
+    "e2e: End-to-end tests",
+    "chaos: Chaos engineering tests",
+    "load: Load tests",
+]
+
+# ============================================================================
+# IMPORT LINTER (Architecture boundaries)
+# ============================================================================
+
+[tool.importlinter]
+# [C7-ID: CODE-CLEANUP-006] Context7 best practice: import-linter для архитектурных границ
+root_packages = ["api", "worker", "telethon_ingest", "crawl4ai", "shared"]
+include_external_packages = false
+exclude_type_checking_imports = true
+
+[[tool.importlinter.contracts]]
+name = "API does not import worker or telethon_ingest"
+type = "forbidden"
+source_modules = ["api"]
+forbidden_modules = ["worker", "telethon_ingest"]
+
+[[tool.importlinter.contracts]]
+name = "Worker does not import api (except shared)"
+type = "forbidden"
+source_modules = ["worker"]
+forbidden_modules = ["api"]
+ignore_imports = ["worker.* -> api.services.s3_storage"]  # Temporary until shared package
+
+[[tool.importlinter.contracts]]
+name = "Cross-service imports must use shared"
+type = "forbidden"
+source_modules = ["api", "worker", "telethon_ingest"]
+forbidden_modules = ["worker", "api", "telethon_ingest"]
+ignore_imports = [
+    "api.* -> shared.*",
+    "worker.* -> shared.*",
+    "telethon_ingest.* -> shared.*",
+]
+

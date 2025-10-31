@@ -24,7 +24,7 @@ services:
       PYTHONDONTWRITEBYTECODE: "1"
       # [C7-ID: dev-mode-010] Форс исторического парсинга для вставок прямо сейчас (DEV only)
       PARSER_MODE_OVERRIDE: historical
-      PARSER_HISTORICAL_HOURS: "6"
+      PARSER_HISTORICAL_HOURS: "48"  # Увеличено до 48 часов для большего охвата
       PARSER_MAX_CONCURRENCY: "2"
     volumes:
       - ./telethon-ingest:/app
