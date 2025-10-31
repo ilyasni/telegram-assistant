@@ -507,11 +507,10 @@ class ChannelParser:
                         break
                 else:  # incremental
                     # Incremental: парсим только сообщения новее since_date (между last_parsed_at и now)
+                    # Сообщения приходят от новых к старым, поэтому при встрече старого останавливаемся
                     if message.date <= since_date:
-                        # Пропускаем сообщения старше или равные since_date
-                        continue
-                    # Для incremental также останавливаемся, если дошли до since_date (значит все новые обработаны)
-                    # Но это не должно происходить, т.к. мы фильтруем <=
+                        logger.debug(f"Reached since_date in incremental mode, stopping. message.date={message.date}, since_date={since_date}")
+                        break
                 
                 batch.append(message)
                 messages_yielded += 1
@@ -530,14 +529,16 @@ class ChannelParser:
                         channel_id=channel_entity.id,
                         error=str(e))
             # Fallback к старому методу при ошибке
-            # [C7-ID: dev-mode-017] Для incremental режима используем limit больше для захвата новых сообщений
-            limit_fallback = batch_size * 10 if mode == "incremental" else None
+            # [C7-ID: dev-mode-017] Разная логика для historical и incremental режимов
+            if mode == "incremental":
+                # Для incremental: получаем новые сообщения (без offset_date, чтобы получить последние сообщения)
+                limit_fallback = batch_size * 10
+                iter_params = {"limit": limit_fallback}
+            else:
+                # Для historical: используем offset_date для получения сообщений до определенной даты
+                iter_params = {"offset_date": since_date, "limit": None}
             
-            async for message in client.iter_messages(
-                channel_entity,
-                offset_date=since_date,  # ← Временной лимит
-                limit=limit_fallback
-            ):
+            async for message in client.iter_messages(channel_entity, **iter_params):
                 # [C7-ID: dev-mode-017] Разная логика для historical и incremental
                 if mode == "historical":
                     # Historical: останавливаемся когда дошли до since_date
@@ -545,9 +546,10 @@ class ChannelParser:
                         logger.debug(f"Reached since_date, stopping. message.date={message.date}, since_date={since_date}")
                         break
                 else:  # incremental
-                    # Incremental: пропускаем старые, берем только новые
+                    # Incremental: сообщения приходят от новых к старым, останавливаемся при встрече старого
                     if message.date <= since_date:
-                        continue
+                        logger.debug(f"Reached since_date in incremental mode, stopping. message.date={message.date}, since_date={since_date}")
+                        break
                 
                 batch.append(message)
                 messages_yielded += 1
