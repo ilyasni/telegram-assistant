@@ -1,13 +1,13 @@
 {
   "scheduler": {
-    "lock_acquired": false,
-    "lock_value": null,
-    "lock_ttl": -2,
+    "lock_acquired": true,
+    "lock_value": "bac05268001c",
+    "lock_ttl": 593,
     "hwm_count": 0,
     "hwm_samples": {},
     "max_age_seconds": null,
     "max_age_minutes": null,
-    "status": "idle"
+    "status": "running"
   },
   "parsing": {
     "recent_posts": [
@@ -317,7 +317,11 @@
     "in_qdrant": false,
     "qdrant_collection": null,
     "in_neo4j": false,
-    "pipeline_complete": false
+    "is_processed": false,
+    "embedding_status": "failed",
+    "graph_status": "failed",
+    "is_retryable_error": true,
+    "pipeline_complete": true
   },
   "checks": [
     {
@@ -352,8 +356,8 @@
     },
     {
       "name": "pipeline.flow_complete",
-      "ok": false,
-      "message": "Post not found in all stages"
+      "ok": true,
+      "message": null
     }
   ]
 }

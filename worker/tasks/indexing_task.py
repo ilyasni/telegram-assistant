@@ -383,7 +383,8 @@ class IndexingTask:
                 indexing_processed_total.labels(status='skipped').inc()
                 return
             
-            # Генерация эмбеддинга
+            # Context7: [C7-ID: retry-indexing-001] Генерация эмбеддинга с retry через EmbeddingService
+            # Retry логика уже встроена в EmbeddingService
             embedding = await self._generate_embedding(post_data)
             
             # Индексация в Qdrant
@@ -414,18 +415,36 @@ class IndexingTask:
             logger.info("Post indexed successfully", post_id=post_id, vector_id=vector_id)
             
         except Exception as e:
+            error_str = str(e)
+            error_type = type(e).__name__
+            
+            # Context7: [C7-ID: retry-indexing-002] Классификация ошибок для определения retry стратегии
+            from services.retry_policy import classify_error, ErrorCategory, should_retry
+            
+            error_category = classify_error(e)
+            is_retryable = should_retry(error_category)
+            
             logger.error("Failed to process post",
                         post_id=post_id,
-                        error=str(e))
+                        error=error_str,
+                        error_type=error_type,
+                        error_category=error_category.value,
+                        is_retryable=is_retryable)
+            
             indexing_processed_total.labels(status='error').inc()
             
             # Context7: Обновляем статус failed при ошибке
+            # Для retryable ошибок оставляем возможность ретрая через process_pending_indexing
             await self._update_indexing_status(
                 post_id=post_id,
                 embedding_status='failed',
                 graph_status='failed',
-                error_message=str(e)
+                error_message=f"[{error_category.value}] {error_str}"
             )
+            
+            # Context7: Для retryable ошибок не пробрасываем исключение дальше,
+            # чтобы сообщение осталось в stream для последующего ретрая
+            # Для non-retryable ошибок также не пробрасываем, чтобы не блокировать обработку других сообщений
     
     async def _get_post_data(self, post_id: str) -> Optional[Dict[str, Any]]:
         """Получение данных поста из БД."""

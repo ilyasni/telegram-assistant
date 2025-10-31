@@ -19,21 +19,51 @@ from typing import List, Dict, Any, Optional
 logger = structlog.get_logger()
 
 
-async def get_pending_posts(db_url: str, limit: Optional[int] = None) -> List[str]:
-    """Получение post_id постов со статусом pending.
+async def get_pending_posts(db_url: str, limit: Optional[int] = None, include_failed: bool = True) -> List[str]:
+    """
+    Получение post_id постов со статусом pending или failed с retryable ошибками.
     
+    Context7: [C7-ID: retry-failed-001] - автоматический ретрай failed постов с retryable ошибками
     Supabase best practice: параметризованный SQL запрос.
     """
     conn = psycopg2.connect(db_url)
     cursor = conn.cursor()
     
+    # Context7: Ищем pending посты И failed посты с retryable ошибками
     query = """
-        SELECT p.id
+        SELECT p.id, is_.embedding_status, is_.graph_status, is_.error_message
         FROM posts p
         INNER JOIN indexing_status is_ ON p.id = is_.post_id
-        WHERE is_.embedding_status = 'pending' 
-           OR is_.graph_status = 'pending'
-        ORDER BY p.created_at DESC
+        WHERE (
+            is_.embedding_status = 'pending' OR is_.graph_status = 'pending'
+        )
+    """
+    
+    if include_failed:
+        # Context7: Добавляем failed посты с retryable ошибками
+        query += """
+            OR (
+                (is_.embedding_status = 'failed' OR is_.graph_status = 'failed')
+                AND is_.error_message IS NOT NULL
+                AND (
+                    is_.error_message ILIKE '%retryable_network%'
+                    OR is_.error_message ILIKE '%retryable_rate_limit%'
+                    OR is_.error_message ILIKE '%retryable_server_error%'
+                    OR is_.error_message ILIKE '%connection refused%'
+                    OR is_.error_message ILIKE '%connection error%'
+                    OR is_.error_message ILIKE '%timeout%'
+                    OR is_.error_message ILIKE '%max retries exceeded%'
+                )
+            )
+        """
+    
+    query += """
+        ORDER BY 
+            CASE 
+                WHEN is_.embedding_status = 'pending' OR is_.graph_status = 'pending' THEN 1
+                ELSE 2
+            END,
+            p.created_at DESC
     """
     
     if limit:
@@ -44,15 +74,26 @@ async def get_pending_posts(db_url: str, limit: Optional[int] = None) -> List[st
     
     post_ids = [row[0] for row in rows]
     
+    # Логирование статистики
+    pending_count = sum(1 for r in rows if r[1] == 'pending' or r[2] == 'pending')
+    failed_count = len(rows) - pending_count
+    
+    logger.info("Found posts to retry",
+                total=len(post_ids),
+                pending=pending_count,
+                failed_retryable=failed_count)
+    
     cursor.close()
     conn.close()
     
     return post_ids
 
 
-async def process_pending_posts(limit: Optional[int] = None):
-    """Обработка pending постов через IndexingTask._process_single_message.
+async def process_pending_posts(limit: Optional[int] = None, include_failed: bool = True):
+    """
+    Обработка pending постов и failed постов с retryable ошибками через IndexingTask._process_single_message.
     
+    Context7: [C7-ID: retry-failed-002] - автоматический ретрай failed постов
     Context7 best practice: повторное использование кода из IndexingTask.
     """
     from tasks.indexing_task import IndexingTask
@@ -66,9 +107,9 @@ async def process_pending_posts(limit: Optional[int] = None):
     qdrant_url = os.getenv("QDRANT_URL", "http://qdrant:6333")
     neo4j_url = os.getenv("NEO4J_URI", "neo4j://neo4j:7687")
     
-    # Получение постов со статусом pending
-    logger.info("Fetching pending posts from database...")
-    post_ids = await get_pending_posts(db_url, limit=limit)
+    # Получение постов со статусом pending и failed с retryable ошибками
+    logger.info("Fetching posts to process from database...", include_failed=include_failed)
+    post_ids = await get_pending_posts(db_url, limit=limit, include_failed=include_failed)
     
     if not post_ids:
         logger.info("No pending posts found")
@@ -156,8 +197,9 @@ async def process_pending_posts(limit: Optional[int] = None):
         # Закрытие соединений
         if hasattr(task, 'redis_client') and task.redis_client:
             await task.redis_client.disconnect()
-        if hasattr(task, 'qdrant_client') and task.qdrant_client:
-            await task.qdrant_client.close()
+        # QdrantClient не имеет метода close(), соединение управляется через httpx
+        # if hasattr(task, 'qdrant_client') and task.qdrant_client:
+        #     await task.qdrant_client.close()
         if hasattr(task, 'neo4j_client') and task.neo4j_client:
             await task.neo4j_client.close()
 
@@ -165,11 +207,16 @@ async def process_pending_posts(limit: Optional[int] = None):
 if __name__ == '__main__':
     import argparse
     
-    parser = argparse.ArgumentParser(description='Process pending posts from indexing_status')
+    parser = argparse.ArgumentParser(
+        description='Process pending and failed (retryable) posts from indexing_status',
+        epilog='Context7: [C7-ID: retry-failed-002] - автоматический ретрай failed постов с retryable ошибками'
+    )
     parser.add_argument('--limit', type=int, default=None, 
                        help='Limit number of posts to process (default: all)')
+    parser.add_argument('--skip-failed', action='store_true',
+                       help='Skip failed posts, process only pending posts')
     
     args = parser.parse_args()
     
-    asyncio.run(process_pending_posts(limit=args.limit))
+    asyncio.run(process_pending_posts(limit=args.limit, include_failed=not args.skip_failed))
 

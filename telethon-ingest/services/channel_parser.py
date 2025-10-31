@@ -459,10 +459,14 @@ class ChannelParser:
                     )
                     return now - timedelta(hours=self.config.historical_hours)
                 
-                # Инкрементальный режим: с последнего парсинга, но не больше incremental_minutes
-                return max(base, now - timedelta(minutes=self.config.incremental_minutes))
+                # Context7: [C7-ID: incremental-since-date-fix-001] Исправлена логика since_date
+                # В incremental режиме используем именно last_parsed_at, чтобы не пропускать сообщения
+                # Использование max(base, now - incremental_minutes) приводило к пропуску сообщений
+                # между last_parsed_at и (now - incremental_minutes)
+                return base
             else:
                 # Fallback: если нет last_parsed_at, берём incremental окно
+                # incremental_minutes используется только как fallback, когда нет last_parsed_at
                 return now - timedelta(minutes=self.config.incremental_minutes)
         
         elif mode == "historical":

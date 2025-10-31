@@ -1,6 +1,7 @@
 """
 Унифицированный сервис генерации эмбеддингов.
 [C7-ID: AI-EMBEDDING-SERVICE-001]
+Context7 best practice: retry logic для resilient API calls
 """
 
 import asyncio
@@ -14,6 +15,7 @@ import structlog
 from prometheus_client import Counter, Histogram
 
 from config import settings
+from services.retry_policy import create_retry_decorator, DEFAULT_RETRY_CONFIG, classify_error, ErrorCategory
 
 logger = structlog.get_logger()
 
@@ -102,67 +104,130 @@ class GigaChatEmbeddingProvider(EmbeddingProvider):
         # GigaChat EmbeddingsGigaR возвращает 2560 измерений
         self.dimension = 2560
     
-    async def embed_text(self, text: str) -> List[float]:
-        """Генерация эмбеддинга через gpt2giga proxy."""
+    def _embed_text_internal(self, text: str) -> List[float]:
+        """
+        Внутренний метод генерации эмбеддинга без retry.
+        Context7: [C7-ID: retry-embedding-001] - retry wrapper применяется к этому методу
+        """
         import time
         import requests
         import os
+        from requests.exceptions import RequestException, ConnectionError, Timeout
+        
         start_time = time.time()
         
+        # Предобработка текста
+        text = normalize_text(text)
+        text = truncate_by_tokens(text, max_tokens=8192)
+        
+        # Прямой HTTP запрос к gpt2giga proxy
+        proxy_url = os.getenv("GIGACHAT_PROXY_URL", "http://gpt2giga-proxy:8090")
+        url = f"{proxy_url}/v1/embeddings"
+        
+        # Авторизация через credentials (как в тесте)
+        credentials = os.getenv("GIGACHAT_CREDENTIALS")
+        scope = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
+        auth_header = f"giga-cred-{credentials}:{scope}"
+        
+        response = requests.post(
+            url,
+            json={
+                "input": text,
+                "model": "any"  # gpt2giga сам отправит на GPT2GIGA_EMBEDDINGS
+            },
+            headers={
+                "Authorization": f"Bearer {auth_header}",
+                "Content-Type": "application/json"
+            },
+            timeout=30
+        )
+        
+        if response.status_code != 200:
+            # Преобразуем HTTP ошибки в исключения для retry логики
+            error_msg = f"HTTP {response.status_code}: {response.text}"
+            if response.status_code >= 500:
+                # Server errors - retryable
+                raise ConnectionError(error_msg)
+            elif response.status_code == 429:
+                # Rate limit - retryable
+                raise Timeout(error_msg)
+            else:
+                # Client errors - non-retryable
+                raise ValueError(error_msg)
+        
+        data = response.json()
+        if "data" not in data or not data["data"]:
+            raise ValueError("No embedding data in response")
+        
+        embedding = data["data"][0]["embedding"]
+        if not embedding or len(embedding) != self.dimension:
+            raise ValueError(f"Invalid embedding: len={len(embedding)}, expected={self.dimension}")
+        
+        # Метрики успеха
+        embedding_requests_total.labels(
+            provider='gigachat',
+            model=self.model,
+            status='success'
+        ).inc()
+        
+        embedding_latency_seconds.labels(
+            provider='gigachat',
+            model=self.model
+        ).observe(time.time() - start_time)
+        
+        return embedding
+    
+    async def embed_text(self, text: str) -> List[float]:
+        """
+        Генерация эмбеддинга через gpt2giga proxy с retry логикой.
+        Context7: [C7-ID: retry-embedding-001] - resilient API calls с exponential backoff
+        """
+        import time
+        import requests
+        from requests.exceptions import RequestException, ConnectionError, Timeout
+        
+        # Context7 best practice: retry для network errors и server errors
+        retry_decorator = create_retry_decorator(
+            config=DEFAULT_RETRY_CONFIG,
+            operation_name="gigachat_embedding"
+        )
+        
+        @retry_decorator
+        def _call_with_retry(text: str) -> List[float]:
+            try:
+                return self._embed_text_internal(text)
+            except (ConnectionError, Timeout, RequestException) as e:
+                # Network/connection errors - retryable
+                error_category = classify_error(e)
+                if error_category == ErrorCategory.NON_RETRYABLE_VALIDATION:
+                    # Не retry для validation errors
+                    embedding_requests_total.labels(
+                        provider='gigachat',
+                        model=self.model,
+                        status='error'
+                    ).inc()
+                    raise
+                # Пробрасываем для retry
+                raise
+            except Exception as e:
+                error_category = classify_error(e)
+                if error_category != ErrorCategory.NON_RETRYABLE_VALIDATION:
+                    # Retry для network-like errors
+                    raise ConnectionError(str(e))
+                # Validation errors - не retry
+                embedding_requests_total.labels(
+                    provider='gigachat',
+                    model=self.model,
+                    status='error'
+                ).inc()
+                raise
+        
         try:
-            # Предобработка текста
-            text = normalize_text(text)
-            text = truncate_by_tokens(text, max_tokens=8192)
-            
-            # Прямой HTTP запрос к gpt2giga proxy
-            proxy_url = os.getenv("GIGACHAT_PROXY_URL", "http://gpt2giga-proxy:8090")
-            url = f"{proxy_url}/v1/embeddings"
-            
-            # Авторизация через credentials (как в тесте)
-            credentials = os.getenv("GIGACHAT_CREDENTIALS")
-            scope = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
-            auth_header = f"giga-cred-{credentials}:{scope}"
-            
-            response = requests.post(
-                url,
-                json={
-                    "input": text,
-                    "model": "any"  # gpt2giga сам отправит на GPT2GIGA_EMBEDDINGS
-                },
-                headers={
-                    "Authorization": f"Bearer {auth_header}",
-                    "Content-Type": "application/json"
-                },
-                timeout=30
-            )
-            
-            if response.status_code != 200:
-                raise ValueError(f"HTTP {response.status_code}: {response.text}")
-            
-            data = response.json()
-            if "data" not in data or not data["data"]:
-                raise ValueError("No embedding data in response")
-            
-            embedding = data["data"][0]["embedding"]
-            if not embedding or len(embedding) != self.dimension:
-                raise ValueError(f"Invalid embedding: len={len(embedding)}, expected={self.dimension}")
-            
-            # Метрики успеха
-            embedding_requests_total.labels(
-                provider='gigachat',
-                model=self.model,
-                status='success'
-            ).inc()
-            
-            embedding_latency_seconds.labels(
-                provider='gigachat',
-                model=self.model
-            ).observe(time.time() - start_time)
-            
+            # Выполняем синхронный вызов с retry (requests - синхронная библиотека)
+            embedding = await asyncio.to_thread(_call_with_retry, text)
             return embedding
-            
         except Exception as e:
-            logger.error("gigachat_embedding_failed", error=str(e))
+            logger.error("gigachat_embedding_failed", error=str(e), error_type=type(e).__name__)
             embedding_requests_total.labels(
                 provider='gigachat',
                 model=self.model,
