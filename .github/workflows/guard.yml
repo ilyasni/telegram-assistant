@@ -36,5 +36,32 @@ jobs:
       - name: Install Python dependencies
         run: |
           pip install jsonschema
+      # [C7-ID: dev-mode-011] Создаём минимальный .env для проверки compose конфигурации
+      # docker compose config требует переменные окружения для валидации зависимостей
+      - name: Create minimal .env for compose validation
+        run: |
+          # Создаём минимальный .env с заглушками для проверки синтаксиса compose
+          cat > .env << 'EOF'
+          # Minimal env for compose validation in CI
+          POSTGRES_PASSWORD=postgres
+          POSTGRES_DB=telegram_assistant
+          JWT_SECRET=test-secret-for-validation-only
+          ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.test
+          SERVICE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.test
+          SUPABASE_HOST=localhost
+          TELEGRAM_BOT_TOKEN=test
+          BOT_WEBHOOK_SECRET=test
+          BOT_PUBLIC_URL=http://localhost
+          DEFAULT_TENANT_ID=test
+          ENCRYPTION_KEY=test-key-32-chars-long!!!!
+          MASTER_API_ID=12345
+          MASTER_API_HASH=test-hash
+          OPENROUTER_API_KEY=test
+          GIGACHAT_CREDENTIALS=test
+          NEO4J_PASSWORD=test
+          GF_SECURITY_ADMIN_PASSWORD=test
+          DOMAIN=localhost
+          EOF
+          echo "✓ Minimal .env создан для валидации compose"
       - run: bash scripts/compose-guard.sh
       - run: python3 scripts/env-check.py || true
