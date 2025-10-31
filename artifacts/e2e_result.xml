@@ -1,4 +1,4 @@
-<testsuite name="e2e-e2e" tests="7" failures="1">
+<testsuite name="e2e-e2e" tests="7" failures="0">
   <testcase name="streams.stream:posts:parsed.pending">
   </testcase>
   <testcase name="streams.stream:posts:tagged.pending">
@@ -12,6 +12,5 @@
   <testcase name="qdrant.telegram_posts.payload_coverage">
   </testcase>
   <testcase name="pipeline.flow_complete">
-    <failure message="Post not found in all stages"/>
   </testcase>
 </testsuite>

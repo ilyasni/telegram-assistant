@@ -12,117 +12,117 @@
   "parsing": {
     "recent_posts": [
       {
-        "id": "44444444-4444-4444-8444-444444444444",
-        "channel_id": "ed6e2dad-202c-43b2-ae85-3ba23e30e33a",
-        "channel_title": "@tehnomaniak07",
-        "content_preview": "Long test post for tagging with enough characters to pass minimum length validation and trigger prop",
-        "posted_at": "2025-10-29T09:12:00+00:00",
-        "created_at": "2025-10-29T09:12:00+00:00",
-        "is_processed": true
-      },
-      {
-        "id": "33333333-3333-4333-8333-333333333333",
-        "channel_id": "ed6e2dad-202c-43b2-ae85-3ba23e30e33a",
-        "channel_title": "@tehnomaniak07",
-        "content_preview": "Test with fixed schema",
-        "posted_at": "2025-10-29T09:10:00+00:00",
-        "created_at": "2025-10-29T09:10:00+00:00",
-        "is_processed": true
-      },
-      {
-        "id": "dc4fa139-3389-4c24-9ecf-d1cc2a7dbed2",
-        "channel_id": "a5f1157f-606e-459a-8d53-f5eb6ddda0c8",
-        "channel_title": "@neuro_code",
-        "content_preview": "",
-        "posted_at": "2025-10-28T19:51:28+00:00",
-        "created_at": "2025-10-28T19:51:28+00:00",
-        "is_processed": false
-      },
-      {
-        "id": "0e422dda-609d-46ed-b129-2cf510b8dc29",
-        "channel_id": "a5f1157f-606e-459a-8d53-f5eb6ddda0c8",
-        "channel_title": "@neuro_code",
-        "content_preview": "",
-        "posted_at": "2025-10-28T19:51:28+00:00",
-        "created_at": "2025-10-28T19:51:28+00:00",
-        "is_processed": false
-      },
-      {
-        "id": "dd3a9347-95d2-4a10-a832-a47454e6b9c8",
-        "channel_id": "a5f1157f-606e-459a-8d53-f5eb6ddda0c8",
-        "channel_title": "@neuro_code",
-        "content_preview": "\u0412\u044b\u0448\u0435\u043b \u043c\u043e\u0449\u043d\u044b\u0439 \u0433\u0435\u043d\u0435\u0440\u0430\u0442\u043e\u0440 \u0438\u043d\u0442\u0435\u0440\u0430\u043a\u0442\u0438\u0432\u043d\u044b\u0445 \u0418\u0418-\u0432\u0438\u0434\u0435\u043e \u2014 \u043e\u043d \u043f\u043e\u0437\u0432\u043e\u043b\u044f\u0435\u0442 \u0434\u0435\u043b\u0430\u0442\u044c \u0438 \u0440\u0435\u0434\u0430\u043a\u0442\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0440\u043e\u043b\u0438\u043a\u0438 \u043d\u0430 \u0445\u043e\u0434\u0443. ",
-        "posted_at": "2025-10-28T19:51:28+00:00",
-        "created_at": "2025-10-28T19:51:28+00:00",
-        "is_processed": true
-      },
-      {
-        "id": "dd6a401b-3c47-431a-8db8-da6ca20b9594",
-        "channel_id": "a5f1157f-606e-459a-8d53-f5eb6ddda0c8",
-        "channel_title": "@neuro_code",
-        "content_preview": "\u0412 \u0440\u0438\u043b\u0441\u0430\u0445 \u0437\u0430\u0432\u0438\u0440\u0443\u0441\u0438\u043b\u0430\u0441\u044c \u043f\u0435\u0441\u043d\u044f \u043f\u0440\u043e \u0431\u0443\u0434\u043d\u0438 \u043f\u0440\u043e\u0433\u0440\u0430\u043c\u043c\u0438\u0441\u0442\u043e\u0432 \u0432 \u0441\u0442\u0438\u043b\u0435 \u0441\u043a\u0430\u043d\u0434\u0438\u043d\u0430\u0432\u0441\u043a\u043e\u0433\u043e \u0444\u043e\u043b\u043a\u0430. \n\n\u0421\u0442\u0430\u0432\u0438\u043c \u043d\u0430 \u0440\u0435\u043f\u0438\u0442 ",
-        "posted_at": "2025-10-28T18:46:07+00:00",
-        "created_at": "2025-10-28T18:46:07+00:00",
-        "is_processed": true
-      },
-      {
-        "id": "d2f74e44-0be8-40fb-ab45-dfed864d55da",
+        "id": "57a935d3-1c88-4336-abca-7bd281e3c58a",
         "channel_id": "160e4c95-a21f-469c-8ff2-3eaeb1aae18c",
-        "channel_title": "@breakingtrends",
-        "content_preview": "\u0423\u0436\u0435 \u0437\u0430\u043a\u0440\u044b\u043b\u0438 \u0440\u0430\u0431\u043e\u0447\u0438\u0435 \u043d\u043e\u0443\u0442\u0431\u0443\u043a\u0438? \u0422\u043e\u0433\u0434\u0430 \u0447\u0438\u0442\u0430\u0439\u0442\u0435 \u0441 \u0442\u0435\u043b\u0435\u0444\u043e\u043d\u0430: \u043a\u043e\u043c\u043c\u0443\u043d\u0438\u043a\u0430\u0446\u0438\u043e\u043d\u043d\u043e\u0435 \u0430\u0433\u0435\u043d\u0442\u0441\u0442\u0432\u043e Breaking Trends \u2014",
-        "posted_at": "2025-10-28T18:02:34+00:00",
-        "created_at": "2025-10-28T18:02:34+00:00",
+        "channel_title": "Breaking Trends",
+        "content_preview": "\u0422\u0435\u0445\u043d\u0438\u0447\u0435\u0441\u043a\u0438\u0439 \u043f\u0440\u043e\u0433\u0440\u0435\u0441\u0441 \u043e\u0444\u0438\u0446\u0438\u0430\u043b\u044c\u043d\u043e \u0434\u043e\u0441\u0442\u0438\u0433 \u043f\u0438\u043a\u0430.\n\n\u041a\u0438\u0442\u0430\u0439\u0446\u044b \u0432\u0437\u043b\u043e\u043c\u0430\u043b\u0438 \u043e\u0444\u0438\u0441\u043d\u0443\u044e \u043c\u0443\u0441\u043e\u0440\u043a\u0443 \u2014 \u0442\u0435\u043f\u0435\u0440\u044c \u0432 \u043d\u0435\u0451 \u043d\u0435\u0432\u043e\u0437\u043c",
+        "posted_at": "2025-10-31T15:47:01+00:00",
+        "created_at": "2025-10-31T15:47:01+00:00",
         "is_processed": true
       },
       {
-        "id": "eb21c295-900f-49a3-ab01-05b87b967d8a",
+        "id": "b9cbef65-1dc3-460f-b1f1-1969ff59c1ea",
         "channel_id": "160e4c95-a21f-469c-8ff2-3eaeb1aae18c",
-        "channel_title": "@breakingtrends",
-        "content_preview": "\u041a\u0438\u0442\u0430\u0439\u0441\u043a\u0438\u0445 \u0438\u043d\u0444\u043b\u044e\u0435\u043d\u0441\u0435\u0440\u043e\u0432 \u043e\u0431\u044f\u0437\u0430\u043b\u0438 \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0430\u0442\u044c \u0441\u0432\u043e\u0438 \u0437\u043d\u0430\u043d\u0438\u044f \u0434\u0438\u043f\u043b\u043e\u043c\u043e\u043c. \u041d\u043e\u0432\u044b\u0439 \u0437\u0430\u043a\u043e\u043d \u0442\u0440\u0435\u0431\u0443\u0435\u0442, \u0447\u0442\u043e\u0431\u044b \u0431\u043b\u043e\u0433\u0435\u0440\u044b",
-        "posted_at": "2025-10-28T17:02:25+00:00",
-        "created_at": "2025-10-28T17:02:25+00:00",
+        "channel_title": "Breaking Trends",
+        "content_preview": "Google \u043f\u0440\u0435\u0434\u0441\u0442\u0430\u0432\u0438\u043b \u043f\u0435\u0440\u0432\u0443\u044e \u0440\u0435\u043a\u043b\u0430\u043c\u0443, \u043f\u043e\u043b\u043d\u043e\u0441\u0442\u044c\u044e \u0441\u043e\u0437\u0434\u0430\u043d\u043d\u0443\u044e \u043d\u0435\u0439\u0440\u043e\u0441\u0435\u0442\u044c\u044e. \u0420\u0435\u0447\u044c \u0438\u0434\u0435\u0442 \u043d\u0435 \u0442\u043e\u043b\u044c\u043a\u043e \u043e \u0432\u0438\u0434\u0435\u043e\u0440\u044f\u0434\u0435, \u043d",
+        "posted_at": "2025-10-31T14:04:39+00:00",
+        "created_at": "2025-10-31T14:04:39+00:00",
         "is_processed": true
       },
       {
-        "id": "82adc555-1518-4c28-b0df-157fe7717428",
-        "channel_id": "ed228ec6-448d-4abd-a548-fe891a6736a4",
-        "channel_title": "@bbe_school",
+        "id": "41a8e389-67a8-4c22-9c33-47c952668e2d",
+        "channel_id": "a6c41560-1bd1-4e0d-9211-5eedfed56837",
+        "channel_title": "@uxidesign",
         "content_preview": "",
-        "posted_at": "2025-10-28T16:52:15+00:00",
-        "created_at": "2025-10-28T16:52:15+00:00",
+        "posted_at": "2025-10-31T14:02:26+00:00",
+        "created_at": "2025-10-31T14:02:26+00:00",
         "is_processed": false
       },
       {
-        "id": "eb2a06c3-840b-487e-b9d9-fe5770fbfb40",
-        "channel_id": "ed228ec6-448d-4abd-a548-fe891a6736a4",
-        "channel_title": "@bbe_school",
+        "id": "249c95b9-9a06-4941-921a-d8670376b669",
+        "channel_id": "4791c699-a07d-439d-9d74-e5506fddcfbf",
+        "channel_title": "\u041e \u0411\u0438\u0437\u043d\u0435\u0441\u0435",
+        "content_preview": "**\u042d\u0444\u0444\u0435\u043a\u0442\u0438\u0432\u043d\u043e \u0434\u043b\u044f \u043f\u0440\u043e\u0438\u0437\u0432\u043e\u0434\u0441\u0442\u0432\u0430 \u0438 \u043d\u0435 \u0442\u043e\u043b\u044c\u043a\u043e **\n\n\u041f\u0440\u043e\u0438\u0437\u0432\u043e\u0434\u0441\u0442\u0432\u043e \u043d\u0430\u0447\u0438\u043d\u0430\u0435\u0442\u0441\u044f \u0441 \u043f\u0440\u0430\u0432\u0438\u043b\u044c\u043d\u043e \u0432\u044b\u0431\u0440\u0430\u043d\u043d\u043e\u0433\u043e \u043f\u043e\u043c\u0435\u0449\u0435\u043d",
+        "posted_at": "2025-10-31T14:02:01+00:00",
+        "created_at": "2025-10-31T14:02:01+00:00",
+        "is_processed": true
+      },
+      {
+        "id": "d623e008-cfd9-4e56-8a3d-a7393018a99b",
+        "channel_id": "4791c699-a07d-439d-9d74-e5506fddcfbf",
+        "channel_title": "\u041e \u0411\u0438\u0437\u043d\u0435\u0441\u0435",
+        "content_preview": "\u0418\u043e\u0440\u0434\u0430\u043d\u0438\u044f \u0432\u0432\u043e\u0434\u0438\u0442 \u0431\u0435\u0437\u0432\u0438\u0437 \u0434\u043b\u044f \u0440\u043e\u0441\u0441\u0438\u044f\u043d \u0441 13 \u0434\u0435\u043a\u0430\u0431\u0440\u044f. \u0413\u0440\u0430\u0436\u0434\u0430\u043d\u0435 \u0420\u0424 \u0441\u043c\u043e\u0433\u0443\u0442 \u0441\u0432\u043e\u0431\u043e\u0434\u043d\u043e \u043f\u0440\u0438\u0435\u0437\u0436\u0430\u0442\u044c \u0438 \u043d\u0430\u0445\u043e\u0434\u0438\u0442\u044c\u0441\u044f ",
+        "posted_at": "2025-10-31T14:01:30+00:00",
+        "created_at": "2025-10-31T14:01:30+00:00",
+        "is_processed": true
+      },
+      {
+        "id": "5e34c387-9658-491b-a0de-96d7dffc87c9",
+        "channel_id": "ca0a0cca-3f92-43f5-99b4-55709ca0d98e",
+        "channel_title": "\u041e\u0434\u0438",
+        "content_preview": "**\u0418\u0441\u043a\u0443\u0441\u0441\u0442\u0432\u043e \u043d\u0430\u043f\u0438\u0441\u0430\u043d\u0438\u044f \u043f\u0440\u043e\u043c\u043f\u0442\u043e\u0432: \u0433\u0435\u043d\u0435\u0440\u0438\u0440\u0443\u0435\u043c \u0438 \u0440\u0435\u0434\u0430\u043a\u0442\u0438\u0440\u0443\u0435\u043c \u0438\u0437\u043e\u0431\u0440\u0430\u0436\u0435\u043d\u0438\u044f \u0441 \u043f\u043e\u043c\u043e\u0449\u044c\u044e \u043d\u0435\u0439\u0440\u043e\u0441\u0435\u0442\u0435\u0439**\n\n\u0410\u043b\u0451\u043d\u0430 \u041b",
+        "posted_at": "2025-10-31T13:57:01+00:00",
+        "created_at": "2025-10-31T13:57:01+00:00",
+        "is_processed": true
+      },
+      {
+        "id": "f1f8d051-fe30-48af-ba86-79a82f84ff2a",
+        "channel_id": "c4274c09-91a8-482b-ac9a-d173dc255aae",
+        "channel_title": "Product Management & AI",
+        "content_preview": "**\u0421\u0434\u0435\u043b\u0430\u0435\u043c \u043a\u0430\u0440\u044c\u0435\u0440\u043d\u044b\u0435 \u0441\u043e\u0446\u0441\u0435\u0442\u0438 \u0410\u0432\u0438\u0442\u043e \u0435\u0449\u0451 \u043b\u0443\u0447\u0448\u0435 ****\ud83d\ude0e**\n\n\u0410\u0432\u0438\u0442\u043e \u0437\u0430\u043f\u0443\u0441\u0442\u0438\u043b\u0438 \u043a\u043e\u0440\u043e\u0442\u043a\u0438\u0439 \u043e\u043f\u0440\u043e\u0441, \u0447\u0442\u043e\u0431\u044b \u0443\u0437\u043d\u0430\u0442\u044c \u043e ",
+        "posted_at": "2025-10-31T13:36:22+00:00",
+        "created_at": "2025-10-31T13:48:46.038036+00:00",
+        "is_processed": true
+      },
+      {
+        "id": "cd856d81-6fe7-4c07-8073-4b073766ffa3",
+        "channel_id": "35d8421a-ebe8-4a64-8912-f299a565b287",
+        "channel_title": "\u0414\u0438\u0437\u0430\u0439\u043d-\u0441\u043d\u0430\u0439\u043f\u0435\u0440",
+        "content_preview": "\u041c\u0438\u043d\u0443\u0442\u043a\u0430 \u043a\u043b\u0438\u043f\u0430:\n\n\u0425\u043e\u0440\u043e\u0448\u0438\u0439 \u0434\u0438\u0437\u0430\u0439\u043d \u043a\u043b\u0438\u043f\u0430 \u0433\u0440\u0443\u043f\u043f\u044b A'Studio \u2014 \u00ab\u041e\u043d\u0430 \u043d\u0435 \u0432\u0438\u043d\u043e\u0432\u0430\u0442\u0430\u00bb. \n\n\u041c\u0438\u043d\u0438\u043c\u0430\u043b\u044c\u043d\u044b\u0435 \u0432\u044b\u0440\u0430\u0437\u0438\u0442\u0435\u043b\u044c\u043d\u044b",
+        "posted_at": "2025-10-31T13:09:50+00:00",
+        "created_at": "2025-10-31T13:21:46.192859+00:00",
+        "is_processed": true
+      },
+      {
+        "id": "0a954502-73ef-457a-ad6a-dfa7454c588e",
+        "channel_id": "18770d58-20e6-46f1-9316-ced26afc1e81",
+        "channel_title": "\u0422\u0415\u0425\u041d\u041e: \u042f\u043d\u0434\u0435\u043a\u0441 \u043f\u0440\u043e \u0442\u0435\u0445\u043d\u043e\u043b\u043e\u0433\u0438\u0438",
         "content_preview": "",
-        "posted_at": "2025-10-28T16:52:15+00:00",
-        "created_at": "2025-10-28T16:52:15+00:00",
+        "posted_at": "2025-10-31T13:02:01+00:00",
+        "created_at": "2025-10-31T13:21:47.567014+00:00",
+        "is_processed": false
+      },
+      {
+        "id": "c2c583cb-a928-4412-b45a-45dfaaa46d9e",
+        "channel_id": "18770d58-20e6-46f1-9316-ced26afc1e81",
+        "channel_title": "\u0422\u0415\u0425\u041d\u041e: \u042f\u043d\u0434\u0435\u043a\u0441 \u043f\u0440\u043e \u0442\u0435\u0445\u043d\u043e\u043b\u043e\u0433\u0438\u0438",
+        "content_preview": "",
+        "posted_at": "2025-10-31T13:02:01+00:00",
+        "created_at": "2025-10-31T13:21:47.567023+00:00",
         "is_processed": false
       }
     ],
-    "total": 235,
-    "processed": 99,
-    "last_24h": 2,
+    "total": 464,
+    "processed": 198,
+    "last_24h": 99,
     "oldest_post": "2025-10-26T12:23:14+00:00",
-    "newest_post": "2025-10-29T09:12:00+00:00"
+    "newest_post": "2025-10-31T15:47:01+00:00"
   },
   "streams": {
     "stream:posts:parsed": {
-      "xlen": 1987,
+      "xlen": 2815,
       "groups": [
         {
           "name": "post_persist_workers",
-          "consumers": 15,
+          "consumers": 25,
           "pending": 0,
-          "last_delivered_id": "1761729123865-0"
+          "last_delivered_id": "1761926748178-0"
         },
         {
           "name": "tagging_workers",
           "consumers": 2,
           "pending": 0,
-          "last_delivered_id": "1761729123865-0"
+          "last_delivered_id": "1761926748178-0"
         }
       ],
       "pending_summary": {
@@ -133,25 +133,25 @@
       "errors": []
     },
     "stream:posts:tagged": {
-      "xlen": 1057,
+      "xlen": 1537,
       "groups": [
         {
           "name": "crawl_trigger_workers",
           "consumers": 1,
           "pending": 0,
-          "last_delivered_id": "1761729135998-0"
+          "last_delivered_id": "1761926202510-0"
         },
         {
           "name": "enrich_workers",
           "consumers": 1,
           "pending": 0,
-          "last_delivered_id": "1761729135998-0"
+          "last_delivered_id": "1761926202510-0"
         },
         {
           "name": "tag_persist_workers",
           "consumers": 1,
           "pending": 0,
-          "last_delivered_id": "1761729135998-0"
+          "last_delivered_id": "1761926202510-0"
         }
       ],
       "pending_summary": {
@@ -162,13 +162,13 @@
       "errors": []
     },
     "stream:posts:enriched": {
-      "xlen": 2114,
+      "xlen": 3071,
       "groups": [
         {
           "name": "indexing_workers",
           "consumers": 2,
           "pending": 0,
-          "last_delivered_id": "1761729184796-0"
+          "last_delivered_id": "1761926203189-0"
         }
       ],
       "pending_summary": {
@@ -179,7 +179,7 @@
       "errors": []
     },
     "stream:posts:indexed": {
-      "xlen": 211,
+      "xlen": 430,
       "groups": [
         {
           "name": "indexing_monitoring",
@@ -197,37 +197,37 @@
     }
   },
   "tagging": {
-    "db_posts_with_tags": 235,
-    "db_total_tags": 235,
+    "db_posts_with_tags": 412,
+    "db_total_tags": 412,
     "recent_tags": [
       {
-        "post_id": "44444444-4444-4444-8444-444444444444",
+        "post_id": "e10524eb-60b6-4a00-a886-d2c5b0e5cf9d",
         "tags": [],
-        "enriched_at": "2025-10-29T09:13:04.795377+00:00",
-        "content_preview": "Long test post for tagging with enough characters to pass minimum length validation and trigger prop"
-      },
-      {
-        "post_id": "33333333-3333-4333-8333-333333333333",
-        "tags": [],
-        "enriched_at": "2025-10-29T09:12:16.101831+00:00",
-        "content_preview": "Test with fixed schema"
-      },
-      {
-        "post_id": "88cb23d9-86ab-446e-b7d4-f301ff922fe2",
-        "tags": [],
-        "enriched_at": "2025-10-28T21:11:55.362039+00:00",
+        "enriched_at": "2025-10-31T15:56:43.144204+00:00",
         "content_preview": ""
       },
       {
-        "post_id": "6f1d8147-4df7-4180-b9a7-04fde13785b4",
+        "post_id": "59e20888-792c-42d1-98a2-bfc8f53b75de",
         "tags": [],
-        "enriched_at": "2025-10-28T21:11:55.316380+00:00",
+        "enriched_at": "2025-10-31T15:56:42.938181+00:00",
         "content_preview": ""
       },
       {
-        "post_id": "243602a8-d8bb-4952-8906-048b130d9530",
+        "post_id": "b4dd0a66-b2b7-4529-8b77-77fe87fe5efe",
         "tags": [],
-        "enriched_at": "2025-10-28T21:11:55.261569+00:00",
+        "enriched_at": "2025-10-31T15:56:42.671213+00:00",
+        "content_preview": ""
+      },
+      {
+        "post_id": "0bd7da82-8760-4939-b99d-8d79bee1991f",
+        "tags": [],
+        "enriched_at": "2025-10-31T15:56:42.664183+00:00",
+        "content_preview": ""
+      },
+      {
+        "post_id": "5a4ea575-6de3-490c-a54e-a242bdef9e66",
+        "tags": [],
+        "enriched_at": "2025-10-31T15:56:42.508657+00:00",
         "content_preview": ""
       }
     ]
@@ -242,28 +242,28 @@
   "indexing": {},
   "qdrant": {
     "total_collections": 1,
-    "total_vectors": 113,
+    "total_vectors": 212,
     "collections": [
       {
         "name": "telegram_posts",
-        "vectors_count": 113,
+        "vectors_count": 212,
         "dim": 2560,
         "distance": "Cosine",
         "payload_coverage": 1.0,
         "sample_vectors": [
           {
-            "id": "055b83cf-839e-4241-8e2d-d53d1439cef2",
-            "post_id": "055b83cf-839e-4241-8e2d-d53d1439cef2",
+            "id": "017cb2eb-6488-4002-af41-4e013824d074",
+            "post_id": "017cb2eb-6488-4002-af41-4e013824d074",
             "expires_at": null
           },
           {
-            "id": "0a974504-9894-416b-83c8-b562cd55b851",
-            "post_id": "0a974504-9894-416b-83c8-b562cd55b851",
+            "id": "0269f820-fbaa-4ce3-9975-acbb56ac1eae",
+            "post_id": "0269f820-fbaa-4ce3-9975-acbb56ac1eae",
             "expires_at": null
           },
           {
-            "id": "0d098c9e-d300-467d-8977-ab845457ea5c",
-            "post_id": "0d098c9e-d300-467d-8977-ab845457ea5c",
+            "id": "026e6c7f-ac39-4f30-8cbf-ff9a056d55a5",
+            "post_id": "026e6c7f-ac39-4f30-8cbf-ff9a056d55a5",
             "expires_at": null
           }
         ]
@@ -271,8 +271,8 @@
     ]
   },
   "neo4j": {
-    "total_posts": 102,
-    "newest_post": "2025-11-27T19:51:28+00:00",
+    "total_posts": 201,
+    "newest_post": "2025-11-30T15:47:01+00:00",
     "oldest_post": "2025-11-26T08:05:49+00:00",
     "recent_nodes": [
       {
@@ -302,8 +302,8 @@
       }
     ],
     "relationships": {
-      "OWNS": 126,
-      "HAS_POST": 102
+      "OWNS": 225,
+      "HAS_POST": 201
     },
     "index_post_id_found": false
   },
@@ -311,13 +311,13 @@
   "crawl4ai": {},
   "summary": {
     "flow_check": "complete",
-    "sample_post_id": "44444444-4444-4444-8444-444444444444",
+    "sample_post_id": "57a935d3-1c88-4336-abca-7bd281e3c58a",
     "has_tags": false,
     "has_crawl": false,
-    "in_qdrant": false,
-    "qdrant_collection": null,
-    "in_neo4j": false,
-    "pipeline_complete": false
+    "in_qdrant": true,
+    "qdrant_collection": "telegram_posts",
+    "in_neo4j": true,
+    "pipeline_complete": true
   },
   "checks": [
     {
@@ -352,8 +352,8 @@
     },
     {
       "name": "pipeline.flow_complete",
-      "ok": false,
-      "message": "Post not found in all stages"
+      "ok": true,
+      "message": null
     }
   ]
 }
