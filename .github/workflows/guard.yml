@@ -10,9 +10,31 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Install dependencies
+      # GitHub Actions runner уже имеет Docker, проверяем docker compose
+      # compose-guard.sh использует только 'docker compose config -q' (проверка синтаксиса, без запуска)
+      - name: Setup Docker Compose
         run: |
-          sudo apt-get update && sudo apt-get install -y docker.io
+          # Проверяем наличие Docker (обычно уже установлен в runner)
+          if ! command -v docker &> /dev/null; then
+            echo "ERROR: Docker не найден в runner"
+            exit 1
+          fi
+          echo "✓ Docker найден: $(docker --version)"
+          
+          # Проверяем наличие docker compose plugin (обычно уже установлен в ubuntu-latest runner)
+          if docker compose version &> /dev/null; then
+            echo "✓ docker compose plugin доступен: $(docker compose version)"
+          else
+            echo "⚠️ docker compose plugin не найден, пробуем установить..."
+            # Устанавливаем docker compose plugin через официальный метод (без конфликтов)
+            sudo mkdir -p /usr/local/lib/docker/cli-plugins
+            sudo curl -SL https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64 -o /usr/local/lib/docker/cli-plugins/docker-compose
+            sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+            docker compose version
+            echo "✓ docker compose plugin установлен"
+          fi
+      - name: Install Python dependencies
+        run: |
           pip install jsonschema
       - run: bash scripts/compose-guard.sh
       - run: python3 scripts/env-check.py || true
