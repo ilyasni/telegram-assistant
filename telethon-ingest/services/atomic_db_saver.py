@@ -307,38 +307,59 @@ class AtomicDBSaver:
                 }
                 prepared_posts.append(prepared_post)
             
-            # Bulk insert с ON CONFLICT DO NOTHING
-            sql = """
-            INSERT INTO posts (
-                id, channel_id, telegram_message_id, content, media_urls,
-                posted_at, created_at, is_processed, has_media, yyyymm,
-                views_count, forwards_count, reactions_count, replies_count,
-                is_pinned, is_edited, edited_at, post_author,
-                reply_to_message_id, reply_to_chat_id, via_bot_id, via_business_bot_id,
-                is_silent, is_legacy, noforwards, invert_media, telegram_post_url
-            )
-            VALUES (
-                :id, :channel_id, :telegram_message_id, :content, :media_urls,
-                :posted_at, :created_at, :is_processed, :has_media, :yyyymm,
-                :views_count, :forwards_count, :reactions_count, :replies_count,
-                :is_pinned, :is_edited, :edited_at, :post_author,
-                :reply_to_message_id, :reply_to_chat_id, :via_bot_id, :via_business_bot_id,
-                :is_silent, :is_legacy, :noforwards, :invert_media, :telegram_post_url
-            )
-            ON CONFLICT (channel_id, telegram_message_id)
-            DO NOTHING
-            """
+            # Context7: Bulk insert с ON CONFLICT DO NOTHING
+            # Используем правильный подход: передаем список словарей в execute()
+            # SQLAlchemy автоматически использует executemany для списка параметров
+            # Для PostgreSQL ON CONFLICT используем text() с правильным синтаксисом
             
-            result = await db_session.execute(text(sql), prepared_posts)
+            sql = text("""
+                INSERT INTO posts (
+                    id, channel_id, telegram_message_id, content, media_urls,
+                    posted_at, created_at, is_processed, has_media, yyyymm,
+                    views_count, forwards_count, reactions_count, replies_count,
+                    is_pinned, is_edited, edited_at, post_author,
+                    reply_to_message_id, reply_to_chat_id, via_bot_id, via_business_bot_id,
+                    is_silent, is_legacy, noforwards, invert_media, telegram_post_url
+                )
+                VALUES (
+                    :id, :channel_id, :telegram_message_id, :content, :media_urls,
+                    :posted_at, :created_at, :is_processed, :has_media, :yyyymm,
+                    :views_count, :forwards_count, :reactions_count, :replies_count,
+                    :is_pinned, :is_edited, :edited_at, :post_author,
+                    :reply_to_message_id, :reply_to_chat_id, :via_bot_id, :via_business_bot_id,
+                    :is_silent, :is_legacy, :noforwards, :invert_media, :telegram_post_url
+                )
+                ON CONFLICT (channel_id, telegram_message_id)
+                DO NOTHING
+            """)
             
-            # Возвращаем количество вставленных строк
-            # В PostgreSQL это может быть сложно получить точно,
-            # поэтому используем приблизительную оценку
-            inserted_count = len(prepared_posts)
+            # Context7 best practice: SQLAlchemy автоматически использует executemany
+            # при передаче списка словарей во второй аргумент execute()
+            # Это правильно обработает bulk insert и даст корректный rowcount
+            result = await db_session.execute(sql, prepared_posts)
             
-            self.logger.debug("Posts bulk inserted", 
-                            count=len(prepared_posts),
-                            estimated_inserted=inserted_count)
+            # Context7: Правильный подсчет вставленных строк
+            # result.rowcount возвращает количество действительно вставленных/обновленных строк
+            # При ON CONFLICT DO NOTHING это количество новых строк (не конфликтных)
+            inserted_count = result.rowcount if result.rowcount is not None else 0
+            
+            # Если rowcount недоступен (старые версии SQLAlchemy), используем приблизительную оценку
+            # Но для bulk insert с executemany это может быть неправильно
+            # Поэтому добавляем предупреждение если rowcount не совпадает с ожидаемым
+            if inserted_count == 0 and len(prepared_posts) > 0:
+                self.logger.warning("No posts inserted despite having data", 
+                                  posts_count=len(prepared_posts),
+                                  rowcount=result.rowcount)
+            elif inserted_count < len(prepared_posts):
+                self.logger.debug("Some posts were duplicates and not inserted",
+                                total=len(prepared_posts),
+                                inserted=inserted_count,
+                                duplicates=len(prepared_posts) - inserted_count)
+            
+            self.logger.info("Posts bulk insert completed", 
+                            total_count=len(prepared_posts),
+                            inserted_count=inserted_count,
+                            rowcount=result.rowcount)
             
             return inserted_count
             

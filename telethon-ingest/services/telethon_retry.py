@@ -60,7 +60,8 @@ async def fetch_messages_with_retry(
     channel,
     limit: int = 50,
     max_retries: int = MAX_RETRIES,
-    redis_client: Optional[redis.Redis] = None
+    redis_client: Optional[redis.Redis] = None,
+    offset_date: Optional[datetime] = None  # Context7: Для получения сообщений после определенной даты
 ) -> List[Message]:
     """
     Context7: Retry с FloodWait и cooldown управлением.
@@ -71,6 +72,7 @@ async def fetch_messages_with_retry(
         limit: Количество сообщений
         max_retries: Максимальное количество попыток
         redis_client: Redis клиент для cooldown
+        offset_date: Дата для получения сообщений после этой даты (опционально)
         
     Returns:
         List[Message] или пустой список при ошибке
@@ -87,15 +89,24 @@ async def fetch_messages_with_retry(
                           channel_id=channel_id)
                 return []
             
-            # Выполняем запрос
-            messages = await client.get_messages(channel, limit=limit)
+            # Context7: Используем iter_messages для правильного получения сообщений
+            # iter_messages() гарантирует порядок от новых к старым
+            # Если указан offset_date, получаем сообщения после этой даты
+            messages = []
+            iter_params = {"limit": limit}
+            if offset_date:
+                iter_params["offset_date"] = offset_date
+            
+            async for msg in client.iter_messages(channel, **iter_params):
+                messages.append(msg)
             
             # Сброс backoff после успешного запроса
             backoff = 0.5
             
             logger.debug("Messages fetched successfully", 
                         channel_id=channel_id,
-                        count=len(messages))
+                        count=len(messages),
+                        offset_date=offset_date)
             return messages
             
         except errors.FloodWaitError as e:
