@@ -508,6 +508,11 @@ services:
       timeout: 10s
       retries: 3
       start_period: 60s
+    # Context7 best practice: ограничение core dumps для предотвращения заполнения диска
+    # При segfault информация будет в логах через signal handlers и faulthandler
+    ulimits:
+      core: 0  # Отключить создание core dump файлов
+      nofile: 65535  # Увеличить лимит открытых файлов для высокой нагрузки
     profiles:
       - core
 
