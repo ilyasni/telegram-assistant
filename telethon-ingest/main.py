@@ -508,6 +508,8 @@ async def main():
     
     logger.info("Phase A0: startup")
     app_state["phase"] = "A0"
+    # [C7-ID: dev-mode-002] Логируем окружение при старте
+    logger.info("Runtime environment", app_env=os.getenv("APP_ENV", "production"))
     
     # Context7 best practice: "сторожок" зависаний
     faulthandler.dump_traceback_later(30, repeat=True)

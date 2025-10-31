@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from contextlib import asynccontextmanager
 import structlog
+import os
 import time
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST, make_asgi_app
 from config import settings
@@ -52,6 +53,12 @@ neo4j_connections_active = Gauge('neo4j_connections_active', 'Active Neo4j conne
 async def lifespan(app: FastAPI):
     # Startup
     logger.info("Application startup - lifespan started")
+    # [C7-ID: dev-mode-002] Логируем окружение при старте
+    logger.info(
+        "Runtime environment",
+        app_env=os.getenv("APP_ENV", "production"),
+        environment=settings.environment,
+    )
     
     # Инициализация Redis для rate limiter
     try:

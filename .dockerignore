@@ -1,0 +1,14 @@
+# [C7-ID: dev-mode-006] Aggressive docker ignore for faster builds and security
+.git
+.venv
+__pycache__/
+*.pyc
+node_modules/
+sessions/
+logs/
+data/
+.artifacts/
+.cursor/
+webapp/node_modules/
+**/.DS_Store
+**/Thumbs.db
