@@ -63,6 +63,8 @@ class EventWorker:
         
         # BOOT логи для диагностики
         import os
+        # [C7-ID: dev-mode-002] Логируем окружение при старте
+        logger.info("Runtime environment", app_env=os.getenv("APP_ENV", "production"))
         logger.info("BOOT", {
             "stream": "posts.parsed",
             "group": "telegram-assistant", 

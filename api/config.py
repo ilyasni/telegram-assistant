@@ -1,7 +1,8 @@
 """Конфигурация для API сервиса."""
 
+import json
 from pydantic_settings import BaseSettings
-from typing import Optional
+from pydantic import field_validator
 
 
 class Settings(BaseSettings):
@@ -26,6 +27,22 @@ class Settings(BaseSettings):
     
     # CORS
     cors_origins: list = ["*"]
+    
+    @field_validator("cors_origins", mode="before")
+    @classmethod
+    def parse_cors_origins(cls, v):
+        """Парсинг CORS_ORIGINS: поддерживает JSON массив и строку через запятую."""
+        if isinstance(v, str):
+            # Попытка распарсить как JSON массив
+            try:
+                parsed = json.loads(v)
+                if isinstance(parsed, list):
+                    return parsed
+            except (json.JSONDecodeError, TypeError):
+                pass
+            # Если не JSON, парсим как строку через запятую
+            return [origin.strip() for origin in v.split(",") if origin.strip()]
+        return v
 
     # Bot/Webhook
     telegram_bot_token: str | None = None

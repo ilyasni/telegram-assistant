@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-.PHONY: guard env-check up-core up-app logs smoke
+.PHONY: guard env-check up-core up-app logs smoke up-dev up-dev-api
 
 guard:
 	./scripts/compose-guard.sh
@@ -13,6 +13,15 @@ up-core: guard
 
 up-app: guard
 	docker compose up -d api worker telethon-ingest
+
+# [C7-ID: dev-mode-009] Dev-режим сборки с горячей перезагрузкой
+up-dev: guard
+	@echo "Starting in DEV mode with hot reload..."
+	docker compose --env-file .env.development -f docker-compose.yml -f docker-compose.dev.yml up -d
+
+up-dev-api: guard
+	@echo "Starting API in DEV mode with hot reload..."
+	docker compose --env-file .env.development -f docker-compose.yml -f docker-compose.dev.yml up -d api
 
 logs:
 	docker compose ps

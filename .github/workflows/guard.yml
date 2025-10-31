@@ -5,7 +5,63 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y nodejs npm docker.io
-      - run: npm i -g ajv-cli
+      # [C7-ID: dev-mode-010] Context7 best practice: используем Python инструменты вместо Node.js
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      # GitHub Actions runner уже имеет Docker, проверяем docker compose
+      # compose-guard.sh использует только 'docker compose config -q' (проверка синтаксиса, без запуска)
+      - name: Setup Docker Compose
+        run: |
+          # Проверяем наличие Docker (обычно уже установлен в runner)
+          if ! command -v docker &> /dev/null; then
+            echo "ERROR: Docker не найден в runner"
+            exit 1
+          fi
+          echo "✓ Docker найден: $(docker --version)"
+          
+          # Проверяем наличие docker compose plugin (обычно уже установлен в ubuntu-latest runner)
+          if docker compose version &> /dev/null; then
+            echo "✓ docker compose plugin доступен: $(docker compose version)"
+          else
+            echo "⚠️ docker compose plugin не найден, пробуем установить..."
+            # Устанавливаем docker compose plugin через официальный метод (без конфликтов)
+            sudo mkdir -p /usr/local/lib/docker/cli-plugins
+            sudo curl -SL https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64 -o /usr/local/lib/docker/cli-plugins/docker-compose
+            sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+            docker compose version
+            echo "✓ docker compose plugin установлен"
+          fi
+      - name: Install Python dependencies
+        run: |
+          pip install jsonschema
+      # [C7-ID: dev-mode-011] Создаём минимальный .env для проверки compose конфигурации
+      # docker compose config требует переменные окружения для валидации зависимостей
+      - name: Create minimal .env for compose validation
+        run: |
+          # Создаём минимальный .env с заглушками для проверки синтаксиса compose
+          cat > .env << 'EOF'
+          # Minimal env for compose validation in CI
+          POSTGRES_PASSWORD=postgres
+          POSTGRES_DB=telegram_assistant
+          JWT_SECRET=test-secret-for-validation-only
+          ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.test
+          SERVICE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.test
+          SUPABASE_HOST=localhost
+          TELEGRAM_BOT_TOKEN=test
+          BOT_WEBHOOK_SECRET=test
+          BOT_PUBLIC_URL=http://localhost
+          DEFAULT_TENANT_ID=test
+          ENCRYPTION_KEY=test-key-32-chars-long!!!!
+          MASTER_API_ID=12345
+          MASTER_API_HASH=test-hash
+          OPENROUTER_API_KEY=test
+          GIGACHAT_CREDENTIALS=test
+          NEO4J_PASSWORD=test
+          GF_SECURITY_ADMIN_PASSWORD=test
+          DOMAIN=localhost
+          EOF
+          echo "✓ Minimal .env создан для валидации compose"
       - run: bash scripts/compose-guard.sh
-      - run: echo {} > .env.json && ajv validate -s .env.schema.json -d .env.json || true
+      - run: python3 scripts/env-check.py || true

@@ -5,8 +5,8 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Установка системных зависимостей для Playwright
-RUN apt-get update && apt-get install -y \
+# [C7-ID: dev-mode-006] Оптимизация слоёв: системные зависимости для Playwright
+RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
     fonts-liberation \
@@ -14,9 +14,12 @@ RUN apt-get update && apt-get install -y \
     fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
 
-# Установка Python зависимостей
+# [C7-ID: dev-mode-006] Оптимизация кеша: копируем requirements отдельно
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+
+# [C7-ID: dev-mode-006] Используем cache mount для pip (Context7 best practice)
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-cache-dir -r requirements.txt
 
 # Установка Playwright browsers ПОСЛЕ установки пакета
 RUN python -m playwright install --with-deps chromium
@@ -25,7 +28,7 @@ RUN python -m playwright install --with-deps chromium
 ENV TMPDIR=/tmp/playwright
 RUN mkdir -p /tmp/playwright && chmod 1777 /tmp/playwright
 
-# Копирование исходного кода
+# [C7-ID: dev-mode-006] Копируем код ПОСЛЕ установки зависимостей
 COPY . .
 
 # Health check endpoint

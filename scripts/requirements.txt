@@ -22,3 +22,7 @@ structlog==23.2.0
 # Metrics (опционально для Pushgateway)
 prometheus-client==0.19.0
 
+# JSON Schema validation (для env-check.py)
+# [C7-ID: dev-mode-010] Context7 best practice: используем Python jsonschema вместо Node.js ajv-cli
+jsonschema==4.20.0
+

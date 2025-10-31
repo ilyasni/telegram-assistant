@@ -2,5 +2,43 @@ services:
   api:
     environment:
       LOG_LEVEL: DEBUG
+      APP_ENV: development  # [C7-ID: dev-mode-001]
+      CORS_ORIGINS: "http://localhost:8000,http://localhost:8080,http://localhost:3000,https://web.telegram.org"
+      PYTHONDONTWRITEBYTECODE: "1"
+      UVICORN_RELOAD_DELAY: "0.3"
+    command: >
+      uvicorn main:app
+      --host 0.0.0.0 --port 8000
+      --reload --reload-dir /app
+      --reload-include "*.py"
+      --reload-exclude "sessions/*" --reload-exclude "logs/*" --reload-exclude "__pycache__/*"
+      --reload-use-polling
+      --reload-delay 0.3
+    volumes:
+      - ./api:/app
+  telethon-ingest:
+    environment:
+      LOG_LEVEL: DEBUG
+      APP_ENV: development  # [C7-ID: dev-mode-001]
+      PYTHONASYNCIODEBUG: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      # [C7-ID: dev-mode-010] Форс исторического парсинга для вставок прямо сейчас (DEV only)
+      PARSER_MODE_OVERRIDE: historical
+      PARSER_HISTORICAL_HOURS: "6"
+      PARSER_MAX_CONCURRENCY: "2"
+    volumes:
+      - ./telethon-ingest:/app
+  worker:
+    environment:
+      LOG_LEVEL: DEBUG
+      APP_ENV: development  # [C7-ID: dev-mode-001]
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - ./worker:/app
+  crawl4ai:
+    environment:
+      APP_ENV: development  # [C7-ID: dev-mode-001]
+    volumes:
+      - ./crawl4ai:/app
   redis:
     ports: ["6379:6379"]

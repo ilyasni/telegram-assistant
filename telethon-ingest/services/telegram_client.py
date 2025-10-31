@@ -12,7 +12,7 @@ import redis
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 
 from config import settings
 from services.events import publish_post_created, STREAM_POST_CREATED
@@ -342,7 +342,7 @@ class TelegramIngestionService:
             event_data = {
                 'schema_version': 'v1',
                 'trace_id': str(uuid.uuid4()),
-                'occurred_at': datetime.now().isoformat() + 'Z',
+                'occurred_at': datetime.now(timezone.utc).isoformat(),
                 'idempotency_key': f"139883458:{channel_info['id']}:{message.id}",
                 'user_id': '139883458',
                 'channel_id': str(channel_info['id']),
@@ -496,7 +496,7 @@ class TelegramIngestionService:
             event_data = {
                 'schema_version': 'v1',
                 'trace_id': str(uuid.uuid4()),
-                'occurred_at': datetime.now().isoformat() + 'Z',
+                'occurred_at': datetime.now(timezone.utc).isoformat(),
                 'idempotency_key': f"139883458:{channel_info['id']}:{message.id}",
                 'user_id': '139883458',
                 'channel_id': str(channel_info['id']),
