@@ -365,6 +365,24 @@ class IndexingTask:
                 )
                 return
             
+            # [C7-ID: dev-mode-016] Context7 best practice: проверка текста перед индексацией
+            # Посты без текста (только медиа, стикеры) пропускаем с статусом skipped, а не failed
+            text = post_data.get('text', '')
+            if not text or not text.strip():
+                logger.info("Post text is empty, skipping indexing", 
+                          post_id=post_id,
+                          has_media=post_data.get('has_media', False))
+                await self._update_indexing_status(
+                    post_id=post_id,
+                    embedding_status='skipped',
+                    graph_status='skipped',
+                    error_message='Post text is empty - no content to index'
+                )
+                # Context7: Помечаем пост как обработанный даже при пропуске
+                await self._update_post_processed(post_id)
+                indexing_processed_total.labels(status='skipped').inc()
+                return
+            
             # Генерация эмбеддинга
             embedding = await self._generate_embedding(post_data)
             
@@ -437,11 +455,18 @@ class IndexingTask:
             return None
     
     async def _generate_embedding(self, post_data: Dict[str, Any]) -> list:
-        """Генерация эмбеддинга для поста."""
+        """
+        Генерация эмбеддинга для поста.
+        
+        [C7-ID: dev-mode-016] Context7 best practice: 
+        Предполагается, что проверка на пустой текст уже выполнена в вызывающем коде.
+        Если текст пуст, это считается ошибкой программирования, а не ожидаемым случаем.
+        """
         try:
             text = post_data.get('text', '')
-            if not text:
-                raise ValueError("Post text is empty")
+            # Защита на случай если проверка пропущена
+            if not text or not text.strip():
+                raise ValueError("Post text is empty - should be checked before calling this method")
             
             # Context7: Используем EmbeddingService для генерации эмбеддинга
             embedding = await self.embedding_service.generate_embedding(text)
@@ -546,8 +571,8 @@ class IndexingTask:
         
         Args:
             post_id: ID поста
-            embedding_status: Статус эмбеддинга (pending/processing/completed/failed)
-            graph_status: Статус графа (pending/processing/completed/failed)
+            embedding_status: Статус эмбеддинга (pending/processing/completed/failed/skipped)
+            graph_status: Статус графа (pending/processing/completed/failed/skipped)
             vector_id: ID вектора в Qdrant
             error_message: Сообщение об ошибке (если есть)
         """
@@ -582,6 +607,9 @@ class IndexingTask:
                         WHEN EXCLUDED.embedding_status = 'completed' 
                          AND EXCLUDED.graph_status = 'completed' 
                         THEN NOW() 
+                        WHEN EXCLUDED.embedding_status = 'skipped' 
+                         AND EXCLUDED.graph_status = 'skipped' 
+                        THEN NOW()  -- [C7-ID: dev-mode-016] skipped посты тоже считаются обработанными
                         ELSE indexing_status.processing_completed_at 
                     END
             """, (

@@ -22,9 +22,11 @@ services:
       APP_ENV: development  # [C7-ID: dev-mode-001]
       PYTHONASYNCIODEBUG: "1"
       PYTHONDONTWRITEBYTECODE: "1"
-      # [C7-ID: dev-mode-010] Форс исторического парсинга для вставок прямо сейчас (DEV only)
-      PARSER_MODE_OVERRIDE: historical
-      PARSER_HISTORICAL_HOURS: "48"  # Увеличено до 48 часов для большего охвата
+      # [C7-ID: dev-mode-010] Переключение на auto режим для incremental парсинга новых постов
+      # auto режим автоматически использует incremental если есть last_parsed_at
+      PARSER_MODE_OVERRIDE: auto
+      PARSER_HISTORICAL_HOURS: "48"  # Используется только при historical режиме
+      PARSER_INCREMENTAL_MINUTES: "5"  # Окно для incremental парсинга (от last_parsed_at)
       PARSER_MAX_CONCURRENCY: "2"
     volumes:
       - ./telethon-ingest:/app
