@@ -5,7 +5,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y nodejs npm docker.io
-      - run: npm i -g ajv-cli
+      # [C7-ID: dev-mode-010] Context7 best practice: используем Python инструменты вместо Node.js
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y docker.io
+          pip install jsonschema
       - run: bash scripts/compose-guard.sh
-      - run: echo {} > .env.json && ajv validate -s .env.schema.json -d .env.json || true
+      - run: python3 scripts/env-check.py || true
