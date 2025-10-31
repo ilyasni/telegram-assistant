@@ -14,6 +14,10 @@ COPY requirements.txt .
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --no-cache-dir -r requirements.txt
 
+# [C7-ID: CODE-CLEANUP-022] Установка shared пакета
+COPY shared/ /app/shared/
+RUN pip install -e /app/shared/python
+
 # [C7-ID: dev-mode-006] Копируем код ПОСЛЕ установки зависимостей
 COPY . .
 

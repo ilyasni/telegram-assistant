@@ -1,0 +1,87 @@
+# [C7-ID: CODE-CLEANUP-007] Context7 best practice: pre-commit hooks для автоматизации проверок
+# See: https://pre-commit.com/
+
+repos:
+  # Basic file checks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-added-large-files
+        args: ['--maxkb=1000']
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: mixed-line-ending
+      - id: detect-private-key
+
+  # Ruff (linting + formatting)
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.1.9
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+      - id: ruff-format
+
+  # Vulture (dead code detection)
+  - repo: https://github.com/jendrikseipp/vulture
+    rev: v2.11
+    hooks:
+      - id: vulture
+        args: [--min-confidence, 80]
+        exclude: ^(tests/|legacy/|migrations/|.*_test\.py)
+
+  # Bandit (security)
+  - repo: https://github.com/pycqa/bandit
+    rev: 1.7.6
+    hooks:
+      - id: bandit
+        args: [-ll, -ii, --exclude, "tests/,scripts/,legacy/"]
+        additional_dependencies: ["bandit[toml]"]
+
+  # Detect secrets
+  - repo: https://github.com/ibm/detect-secrets
+    rev: master
+    hooks:
+      - id: detect-secrets
+        args: [
+            --baseline,
+            .secrets.baseline,
+            --use-all-plugins,
+        ]
+
+  # Deptry (dependency management)
+  - repo: https://github.com/fpgmaas/deptry
+    rev: 0.18.0
+    hooks:
+      - id: deptry
+        args: [--json-output, deptry-report.json]
+
+  # Mypy (type checking) - only for shared/ and api/ initially
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.8.0
+    hooks:
+      - id: mypy
+        additional_dependencies: [types-all]
+        args: [--config-file, pyproject.toml]
+        files: ^(shared/|api/)
+        exclude: ^(tests/|legacy/)
+
+  # Import linter (architecture boundaries)
+  - repo: local
+    hooks:
+      - id: import-linter
+        name: Import Linter
+        entry: lint-imports
+        language: system
+        pass_filenames: false
+        require_serial: true
+
+  # EditorConfig
+  - repo: https://github.com/editorconfig/editorconfig-checker
+    rev: 3.0.1
+    hooks:
+      - id: editorconfig-checker
+

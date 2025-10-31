@@ -141,6 +141,29 @@ redis-cli XLEN posts.tagged
 
 ## 🛠️ Разработка
 
+### Code Quality
+
+Проект использует автоматизированные инструменты для поддержания качества кода:
+
+```bash
+# Установка инструментов
+make pre-commit-install
+
+# Проверки
+make quality              # Все проверки
+make lint                # Линтинг (ruff)
+make dead-code           # Мёртвый код (vulture)
+make check-duplicates    # Дубликаты (jscpd)
+
+# Инвентаризация
+make inventory           # Генерация отчётов о техническом долге
+```
+
+**Документация:**
+- [Code Quality Guide](docs/CODE_QUALITY.md)
+- [Cleanup Quick Start](docs/CLEANUP_QUICK_START.md)
+- [Migration Guide (Feature Flags)](docs/MIGRATION_FEATURE_FLAGS.md)
+
 ### Структура проекта
 ```
 telegram-assistant/

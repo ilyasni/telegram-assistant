@@ -1,0 +1,47 @@
+# [C7-ID: CODE-CLEANUP-010] Import Linter configuration (INI format)
+# Alternative to pyproject.toml for import-linter
+# See: https://github.com/seddonym/import-linter
+
+[importlinter]
+root_packages =
+    api
+    worker
+    telethon_ingest
+    crawl4ai
+    shared
+include_external_packages = False
+exclude_type_checking_imports = True
+
+[importlinter:contract:1]
+name = API does not import worker or telethon_ingest
+type = forbidden
+source_modules =
+    api
+forbidden_modules =
+    worker
+    telethon_ingest
+
+[importlinter:contract:2]
+name = Worker does not import api (except shared)
+type = forbidden
+source_modules =
+    worker
+forbidden_modules =
+    api
+
+[importlinter:contract:3]
+name = All cross-service imports must use shared prefix
+type = forbidden
+source_modules =
+    api
+    worker
+    telethon_ingest
+forbidden_modules =
+    worker
+    api
+    telethon_ingest
+ignore_imports =
+    api.* -> shared.*
+    worker.* -> shared.*
+    telethon_ingest.* -> shared.*
+

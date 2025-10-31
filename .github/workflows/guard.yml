@@ -65,3 +65,16 @@ jobs:
           echo "✓ Minimal .env создан для валидации compose"
       - run: bash scripts/compose-guard.sh
       - run: python3 scripts/env-check.py || true
+      # [C7-ID: CODE-CLEANUP-030] Code quality checks
+      - name: Install code quality tools
+        run: |
+          pip install ruff vulture mypy bandit deptry detect-secrets import-linter || true
+      - name: Run linting
+        run: |
+          ruff check . --output-format=github || true
+      - name: Check for dead code
+        run: |
+          vulture . --min-confidence 80 --exclude tests/ --exclude legacy/ || true
+      - name: Check import boundaries
+        run: |
+          lint-imports || true

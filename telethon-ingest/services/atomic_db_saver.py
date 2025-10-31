@@ -95,6 +95,16 @@ class AtomicDBSaver:
         start_time = time.time()
         inserted_count = 0
         
+        # [C7-ID: dev-mode-011] Context7 best practice: проверка состояния сессии перед транзакцией
+        # Исправление ошибки "A transaction is already begun on this Session"
+        try:
+            # Если сессия уже в транзакции - делаем rollback для чистого состояния
+            if db_session.in_transaction():
+                await db_session.rollback()
+                self.logger.debug("Rolled back existing transaction before starting new one")
+        except Exception as e:
+            self.logger.warning("Failed to check/rollback session state", error=str(e))
+        
         try:
             async with db_session.begin():
                 # 1. UPSERT user (ON CONFLICT telegram_id)
@@ -109,7 +119,7 @@ class AtomicDBSaver:
                     posts_data
                 )
                 
-            # Коммит успешен
+            # Коммит успешен (context manager автоматически коммитит)
             duration = time.time() - start_time
             db_batch_commit_latency_seconds.observe(duration)
             db_posts_insert_success_total.inc(inserted_count)
@@ -144,26 +154,30 @@ class AtomicDBSaver:
         """
         try:
             # Подготовка данных пользователя
+            # [C7-ID: dev-mode-012] Context7 best practice: соответствие реальной схеме БД
+            # Таблица users имеет: id, tenant_id, telegram_id, username, created_at, last_active_at, first_name, last_name
+            # НЕТ: updated_at
             user_record = {
                 'id': str(uuid.uuid4()),
+                'tenant_id': user_data.get('tenant_id') or str(uuid.uuid4()),  # Используем переданный tenant_id или создаем новый
                 'telegram_id': user_data.get('telegram_id'),
                 'first_name': user_data.get('first_name', ''),
                 'last_name': user_data.get('last_name', ''),
                 'username': user_data.get('username', ''),
                 'created_at': datetime.now(timezone.utc),
-                'updated_at': datetime.now(timezone.utc)
+                'last_active_at': datetime.now(timezone.utc)
             }
             
-            # UPSERT через PostgreSQL ON CONFLICT
+            # UPSERT через PostgreSQL ON CONFLICT (без updated_at)
             sql = """
-            INSERT INTO users (id, telegram_id, first_name, last_name, username, created_at, updated_at)
-            VALUES (:id, :telegram_id, :first_name, :last_name, :username, :created_at, :updated_at)
+            INSERT INTO users (id, tenant_id, telegram_id, first_name, last_name, username, created_at, last_active_at)
+            VALUES (:id, :tenant_id, :telegram_id, :first_name, :last_name, :username, :created_at, :last_active_at)
             ON CONFLICT (telegram_id) 
             DO UPDATE SET
                 first_name = EXCLUDED.first_name,
                 last_name = EXCLUDED.last_name,
                 username = EXCLUDED.username,
-                updated_at = EXCLUDED.updated_at
+                last_active_at = EXCLUDED.last_active_at
             """
             
             await db_session.execute(text(sql), user_record)
@@ -184,36 +198,27 @@ class AtomicDBSaver:
         """
         try:
             # Подготовка данных канала
+            # [C7-ID: dev-mode-012] Context7 best practice: соответствие реальной схеме БД
+            # Таблица channels имеет: id, tg_channel_id, username, title, is_active, last_message_at, created_at, settings, last_parsed_at
+            # НЕТ: updated_at, description, participants_count, is_broadcast, is_megagroup, telegram_id
             channel_record = {
                 'id': str(uuid.uuid4()),
-                'telegram_id': channel_data.get('telegram_id'),
+                'tg_channel_id': channel_data.get('telegram_id'),  # В схеме используется tg_channel_id, не telegram_id
                 'title': channel_data.get('title', ''),
                 'username': channel_data.get('username', ''),
-                'description': channel_data.get('description', ''),
-                'participants_count': channel_data.get('participants_count', 0),
-                'is_broadcast': channel_data.get('is_broadcast', False),
-                'is_megagroup': channel_data.get('is_megagroup', False),
-                'created_at': datetime.now(timezone.utc),
-                'updated_at': datetime.now(timezone.utc)
+                'is_active': True,
+                'created_at': datetime.now(timezone.utc)
             }
             
-            # UPSERT через PostgreSQL ON CONFLICT
+            # UPSERT через PostgreSQL ON CONFLICT (по tg_channel_id, без несуществующих полей)
             sql = """
-            INSERT INTO channels (id, telegram_id, title, username, description, 
-                                participants_count, is_broadcast, is_megagroup, 
-                                created_at, updated_at)
-            VALUES (:id, :telegram_id, :title, :username, :description, 
-                   :participants_count, :is_broadcast, :is_megagroup,
-                   :created_at, :updated_at)
-            ON CONFLICT (telegram_id)
+            INSERT INTO channels (id, tg_channel_id, title, username, is_active, created_at)
+            VALUES (:id, :tg_channel_id, :title, :username, :is_active, :created_at)
+            ON CONFLICT (tg_channel_id)
             DO UPDATE SET
                 title = EXCLUDED.title,
                 username = EXCLUDED.username,
-                description = EXCLUDED.description,
-                participants_count = EXCLUDED.participants_count,
-                is_broadcast = EXCLUDED.is_broadcast,
-                is_megagroup = EXCLUDED.is_megagroup,
-                updated_at = EXCLUDED.updated_at
+                is_active = EXCLUDED.is_active
             """
             
             await db_session.execute(text(sql), channel_record)
