@@ -485,20 +485,33 @@ class ChannelParser:
         
         # Context7: Использование retry обвязки вместо прямого iter_messages
         try:
+            # [C7-ID: dev-mode-017] Context7 best practice: для incremental режима получаем больше сообщений
+            # чтобы захватить все новые посты между last_parsed_at и now
+            limit = batch_size * 10 if mode == "incremental" else batch_size
+            
             # Получаем сообщения через retry обвязку
             messages = await fetch_messages_with_retry(
                 client,
                 channel_entity,
-                limit=batch_size,
+                limit=limit,
                 redis_client=self.redis_client
             )
             
             # Обрабатываем полученные сообщения
             for message in messages:
-                # Клиентская фильтрация (Telethon не умеет >= серверно)
-                if message.date < since_date:
-                    logger.debug(f"Reached since_date, stopping. message.date={message.date}, since_date={since_date}")
-                    break
+                # [C7-ID: dev-mode-017] Context7: Разная логика фильтрации для historical и incremental
+                if mode == "historical":
+                    # Historical: парсим назад, останавливаемся когда дошли до since_date
+                    if message.date < since_date:
+                        logger.debug(f"Reached since_date, stopping. message.date={message.date}, since_date={since_date}")
+                        break
+                else:  # incremental
+                    # Incremental: парсим только сообщения новее since_date (между last_parsed_at и now)
+                    if message.date <= since_date:
+                        # Пропускаем сообщения старше или равные since_date
+                        continue
+                    # Для incremental также останавливаемся, если дошли до since_date (значит все новые обработаны)
+                    # Но это не должно происходить, т.к. мы фильтруем <=
                 
                 batch.append(message)
                 messages_yielded += 1
@@ -517,14 +530,24 @@ class ChannelParser:
                         channel_id=channel_entity.id,
                         error=str(e))
             # Fallback к старому методу при ошибке
+            # [C7-ID: dev-mode-017] Для incremental режима используем limit больше для захвата новых сообщений
+            limit_fallback = batch_size * 10 if mode == "incremental" else None
+            
             async for message in client.iter_messages(
                 channel_entity,
-                offset_date=since_date  # ← Временной лимит
+                offset_date=since_date,  # ← Временной лимит
+                limit=limit_fallback
             ):
-                # Клиентская фильтрация (Telethon не умеет >= серверно)
-                if message.date < since_date:
-                    logger.debug(f"Reached since_date, stopping. message.date={message.date}, since_date={since_date}")
-                    break
+                # [C7-ID: dev-mode-017] Разная логика для historical и incremental
+                if mode == "historical":
+                    # Historical: останавливаемся когда дошли до since_date
+                    if message.date < since_date:
+                        logger.debug(f"Reached since_date, stopping. message.date={message.date}, since_date={since_date}")
+                        break
+                else:  # incremental
+                    # Incremental: пропускаем старые, берем только новые
+                    if message.date <= since_date:
+                        continue
                 
                 batch.append(message)
                 messages_yielded += 1
