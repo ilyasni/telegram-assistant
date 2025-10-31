@@ -24,6 +24,7 @@ from tasks.enrichment_task import EnrichmentWorker
 from tasks.indexing_task import IndexingTask
 from tasks.tag_persistence_task import TagPersistenceTask
 from tasks.crawl_trigger_task import CrawlTriggerTask
+from tasks.post_persistence_task import PostPersistenceWorker
 
 async def create_tagging_task():
     """Создание и запуск tagging task."""
@@ -71,6 +72,14 @@ async def create_crawl_trigger_task():
         trigger_tags=trigger_tags
     )
     await task.start()
+
+async def create_post_persistence_task():
+    """Создание и запуск PostPersistenceWorker."""
+    redis_url = os.getenv("REDIS_URL", "redis://redis:6379")
+    database_url = os.getenv("DATABASE_URL", "postgresql+asyncpg://postgres:postgres@supabase-db:5432/postgres")
+    worker = PostPersistenceWorker(redis_url=redis_url, database_url=database_url)
+    await worker.initialize()
+    await worker.start()
 
 async def main():
     """Запуск всех tasks с supervisor."""
@@ -142,6 +151,16 @@ async def main():
     supervisor.register_task(TaskConfig(
         name="crawl_trigger",
         task_func=create_crawl_trigger_task,
+        max_retries=5,
+        initial_backoff=1.0,
+        max_backoff=60.0,
+        backoff_multiplier=2.0
+    ))
+
+    # Post persistence должен идти первым этапом после parsed
+    supervisor.register_task(TaskConfig(
+        name="post_persistence",
+        task_func=create_post_persistence_task,
         max_retries=5,
         initial_backoff=1.0,
         max_backoff=60.0,

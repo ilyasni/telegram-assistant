@@ -297,8 +297,28 @@ class TagPersistenceTask:
         if isinstance(payload.get("metadata"), str):
             payload["metadata"] = json.loads(payload["metadata"])
         
-        # Валидация через Pydantic
-        event = PostTaggedEventV1(**payload)
+        # Валидация через Pydantic с безопасным переводом в DLQ при ошибке
+        try:
+            event = PostTaggedEventV1(**payload)
+        except Exception as e:
+            # [C7-ID: EVENTBUS-DLQ-001] Любая ошибка валидации уходит в DLQ и ACK
+            try:
+                dlq_payload = {
+                    "error": str(e),
+                    "raw": payload,
+                    "msg_id": msg_id,
+                }
+                await self.publisher.publish_event("posts.tagged.dlq", dlq_payload)
+                tags_persist_phase_total.labels(phase='pending', status='fail').inc()
+                logger.error("PostTaggedEventV1 validation failed; moved to DLQ",
+                             msg_id=msg_id, error=str(e))
+            finally:
+                # ACK, чтобы сообщение не застревало в PEL
+                try:
+                    await self.redis.xack(self.stream_key, self.consumer_group, msg_id)
+                except Exception:
+                    pass
+            return
         
         # Сохранение в БД
         start_time = time.time()

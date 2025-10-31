@@ -155,7 +155,11 @@ class SessionStorageService:
         username: Optional[str],
         invite_code: Optional[str]
     ):
-        """Синхронное сохранение сессии в упрощенной схеме (прямо в users)."""
+        """
+        Context7 best practice: сохранение сессии в telegram_sessions (single source of truth).
+        
+        Сохраняет в таблицу telegram_sessions и также обновляет users для обратной совместимости.
+        """
         with self.db_connection.cursor() as cursor:
             # 1) Если передан invite_code — валидируем и получаем tenant и роль
             resolved_tenant_id = tenant_id
@@ -185,7 +189,55 @@ class SessionStorageService:
                             """,
                             (invite_code,)
                         )
-            # Context7 best practice: обновление существующего пользователя с данными профиля
+            # Context7 best practice: сохранение в telegram_sessions (основная таблица)
+            # Сначала отзываем старые сессии для этого tenant+user
+            cursor.execute("""
+                UPDATE telegram_sessions 
+                SET status = 'revoked', updated_at = NOW()
+                WHERE tenant_id::text = %s 
+                  AND (user_id::text = %s OR user_id IS NULL)
+                  AND status = 'authorized'
+            """, (resolved_tenant_id, user_id))
+            
+            # Получаем UUID tenant_id и user_id из БД
+            cursor.execute("""
+                SELECT t.id, u.id 
+                FROM tenants t
+                LEFT JOIN users u ON u.telegram_id = %s AND u.tenant_id = t.id
+                WHERE t.id::text = %s OR t.id IS NULL
+                LIMIT 1
+            """, (telegram_user_id, resolved_tenant_id))
+            tenant_user_result = cursor.fetchone()
+            
+            db_tenant_uuid = None
+            db_user_uuid = None
+            if tenant_user_result:
+                db_tenant_uuid = tenant_user_result[0]
+                db_user_uuid = tenant_user_result[1]
+            else:
+                # Fallback: создаем UUID из строки или используем NULL
+                try:
+                    import uuid as _uuid
+                    db_tenant_uuid = _uuid.UUID(resolved_tenant_id) if resolved_tenant_id else None
+                except:
+                    db_tenant_uuid = None
+            
+            # Context7: UPSERT в telegram_sessions с уникальным ограничением
+            cursor.execute("""
+                INSERT INTO telegram_sessions (
+                    id, tenant_id, user_id, session_string_enc, key_id, status, created_at, updated_at
+                ) VALUES (
+                    %s, %s, %s, %s, %s, 'authorized', NOW(), NOW()
+                )
+                ON CONFLICT (tenant_id, user_id, status) 
+                WHERE status = 'authorized'
+                DO UPDATE SET
+                    session_string_enc = EXCLUDED.session_string_enc,
+                    key_id = EXCLUDED.key_id,
+                    updated_at = NOW()
+            """, (session_id, db_tenant_uuid, db_user_uuid, encrypted_session, key_id))
+            
+            # Context7 best practice: обновление users для обратной совместимости
             cursor.execute("""
                 UPDATE users 
                 SET 
@@ -201,7 +253,7 @@ class SessionStorageService:
                     tenant_id = COALESCE(%s, tenant_id),
                     role = COALESCE(%s, role)
                 WHERE telegram_id = %s
-            """, (encrypted_session, key_id, first_name, last_name, username, resolved_tenant_id, resolved_role, telegram_user_id))
+            """, (encrypted_session, key_id, first_name, last_name, username, db_tenant_uuid, resolved_role, telegram_user_id))
             
             # Context7 best practice: логирование события авторизации
             cursor.execute("""
@@ -327,8 +379,35 @@ class SessionStorageService:
             self.db_connection.commit()
     
     def _get_session_sync(self, tenant_id: str, user_id: str) -> Optional[dict]:
-        """Синхронное получение сессии из упрощенной схемы (прямо в users)."""
+        """
+        Context7 best practice: получение сессии из telegram_sessions (single source of truth).
+        
+        Fallback на users для обратной совместимости.
+        """
         with self.db_connection.cursor(cursor_factory=RealDictCursor) as cursor:
+            # 1) Пробуем получить из telegram_sessions
+            cursor.execute("""
+                SELECT 
+                    ts.id,
+                    ts.session_string_enc,
+                    ts.status,
+                    ts.created_at,
+                    ts.key_id,
+                    ts.updated_at,
+                    u.telegram_id as telegram_user_id
+                FROM telegram_sessions ts
+                LEFT JOIN users u ON u.id::uuid = ts.user_id::uuid
+                WHERE ts.tenant_id::text = %s 
+                  AND ts.status = 'authorized'
+                ORDER BY ts.updated_at DESC
+                LIMIT 1
+            """, (tenant_id,))
+            
+            result = cursor.fetchone()
+            if result:
+                return dict(result)
+            
+            # 2) Fallback: получаем из users (обратная совместимость)
             cursor.execute("""
                 SELECT 
                     u.id,

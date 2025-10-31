@@ -202,36 +202,76 @@ async def is_channel_in_cooldown(
     Проверка cooldown перед парсингом.
     
     Args:
-        redis_client: Redis клиент
+        redis_client: Redis клиент (async)
         channel_id: ID канала
         
     Returns:
         True если канал в cooldown
     """
     try:
-        cooldown_key = f"channel:cooldown:{channel_id}"
-        # Context7: exists() - асинхронная функция в redis.asyncio
-        exists = await redis_client.exists(cooldown_key)
-        result = bool(exists)
+        # Context7: Проверка типа redis_client - должен быть async
+        if redis_client is None:
+            logger.warning("redis_client is None", channel_id=channel_id)
+            return False
+            
+        # Context7: Проверяем, что это async redis клиент (redis.asyncio.Redis)
+        redis_type = type(redis_client).__name__
+        redis_module = type(redis_client).__module__
         
-        # Context7: Детальное логирование для диагностики (INFO для видимости)
+        # Проверяем, что это redis.asyncio, а не redis (sync)
+        if not redis_module or 'asyncio' not in redis_module:
+            logger.warning("Redis client is not async (sync client passed)", 
+                          channel_id=channel_id,
+                          redis_type=redis_type,
+                          redis_module=redis_module)
+            return False
+            
+        if not hasattr(redis_client, 'exists') or not callable(redis_client.exists):
+            logger.warning("Invalid redis_client passed to is_channel_in_cooldown", 
+                          channel_id=channel_id,
+                          redis_type=redis_type)
+            return False
+            
+        cooldown_key = f"channel:cooldown:{channel_id}"
+        # Context7: exists() в redis.asyncio возвращает int (0 или 1), но требует await
+        exists_result = await redis_client.exists(cooldown_key)
+        # Context7: exists_result может быть int (0/1) или bool, нормализуем
+        result = bool(exists_result) if exists_result is not None else False
+        
+        # Context7: Детальное логирование только если нужно (убираем INFO, оставляем DEBUG)
         if result:
-            ttl = await redis_client.ttl(cooldown_key)
-            logger.info("Channel cooldown found", 
-                        channel_id=channel_id,
-                        cooldown_key=cooldown_key,
-                        ttl=ttl)
+            try:
+                ttl = await redis_client.ttl(cooldown_key)
+                logger.debug("Channel cooldown found", 
+                            channel_id=channel_id,
+                            cooldown_key=cooldown_key,
+                            ttl=ttl)
+            except Exception:
+                pass  # Игнорируем ошибки получения TTL
         else:
-            logger.info("Channel cooldown NOT found (will parse)", 
+            logger.debug("Channel cooldown NOT found (will parse)", 
                         channel_id=channel_id,
                         cooldown_key=cooldown_key)
         
         return result
         
+    except TypeError as e:
+        # Context7: Специальная обработка для "object int can't be used in 'await' expression"
+        if "can't be used in 'await' expression" in str(e):
+            logger.error("Redis client is not async (sync client passed?)", 
+                        channel_id=channel_id,
+                        error=str(e),
+                        redis_type=type(redis_client).__name__ if redis_client else None)
+        else:
+            logger.error("Type error in cooldown check", 
+                        channel_id=channel_id,
+                        error=str(e))
+        return False
     except Exception as e:
         logger.error("Failed to check channel cooldown", 
                     channel_id=channel_id,
-                    error=str(e))
+                    error=str(e),
+                    error_type=type(e).__name__)
         return False
 
 

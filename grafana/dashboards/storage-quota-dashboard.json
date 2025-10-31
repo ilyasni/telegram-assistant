@@ -1,0 +1,109 @@
+{
+  "dashboard": {
+    "id": null,
+    "title": "Storage Quota Management (15 GB)",
+    "tags": ["telegram-assistant", "storage", "quota", "s3"],
+    "style": "dark",
+    "timezone": "browser",
+    "panels": [
+      {
+        "id": 1,
+        "title": "Bucket Usage by Type",
+        "type": "piechart",
+        "targets": [
+          {
+            "expr": "storage_bucket_usage_gb{type=\"media\"}",
+            "legendFormat": "Media"
+          },
+          {
+            "expr": "storage_bucket_usage_gb{type=\"vision\"}",
+            "legendFormat": "Vision Cache"
+          },
+          {
+            "expr": "storage_bucket_usage_gb{type=\"crawl\"}",
+            "legendFormat": "Crawl Cache"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}
+      },
+      {
+        "id": 2,
+        "title": "Per-Tenant Usage",
+        "type": "bargauge",
+        "targets": [
+          {
+            "expr": "storage_bucket_usage_gb",
+            "legendFormat": "{{tenant_id}}"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "decbytes",
+            "max": 2,
+            "thresholds": {
+              "steps": [
+                {"color": "green", "value": null},
+                {"color": "yellow", "value": 1.5},
+                {"color": "red", "value": 2}
+              ]
+            }
+          }
+        },
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}
+      },
+      {
+        "id": 3,
+        "title": "Emergency Cleanups",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(storage_emergency_cleanups_total[5m])",
+            "legendFormat": "Cleanups - {{tenant_id}}"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}
+      },
+      {
+        "id": 4,
+        "title": "LRU Evictions",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(storage_lru_evictions_total[5m])",
+            "legendFormat": "Evictions - {{tenant_id}}"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8}
+      },
+      {
+        "id": 5,
+        "title": "Compression Ratio",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "s3_compression_ratio",
+            "legendFormat": "{{tenant_id}}"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16}
+      },
+      {
+        "id": 6,
+        "title": "Quota Check Duration",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(storage_quota_check_duration_seconds_bucket[5m]))",
+            "legendFormat": "P95 Duration"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16}
+      }
+    ],
+    "time": {
+      "from": "now-1h",
+      "to": "now"
+    },
+    "refresh": "30s"
+  }
+}

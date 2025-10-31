@@ -152,17 +152,43 @@ class GigaChainAdapter:
         
         # Используем семафор для соблюдения лимита в 1 поток
         async with self._request_semaphore:
-            try:
-                # Используем GigaChat через gpt2giga-proxy
-                return await self._generate_tags_with_gigachat(texts)
-            except Exception as e:
-                logger.error("GigaChat tagging failed", extra={"error": str(e)})
-                # Fallback на OpenRouter
-                try:
+            primary_name = (self.primary_config.name or "").lower()
+            fallback_name = (self.fallback_config.name if self.fallback_config else "").lower()
+
+            async def call_provider(name: str) -> List[TaggingResult]:
+                if name == "gigachat":
+                    return await self._generate_tags_with_gigachat(texts)
+                elif name == "openrouter":
                     return await self._generate_tags_with_openrouter(texts)
+                # Неизвестный провайдер – вернуть пустые
+                logger.warning("Unknown provider name, returning empty results", extra={"provider": name})
+                return [TaggingResult(tags=[], language="unknown")] * len(texts)
+
+            # 1) Вызываем primary провайдера
+            try:
+                results = await call_provider(primary_name)
+            except Exception as e:
+                logger.error("Primary provider failed", extra={"provider": primary_name, "error": str(e)})
+                results = None
+
+            # 2) Если primary вернул пустые теги для всех текстов – пробуем fallback
+            def all_empty(res: Optional[List[TaggingResult]]) -> bool:
+                return res is None or all((not r.tags) for r in res)
+
+            if all_empty(results) and fallback_name:
+                try:
+                    logger.info("Falling back to secondary provider due to empty tags", extra={"fallback": fallback_name})
+                    fallback_results = await call_provider(fallback_name)
+                    # Берём fallback если он дал непустые теги хотя бы для одного текста
+                    if not all_empty(fallback_results):
+                        return fallback_results
+                    # Иначе используем исходные результаты (все пустые)
+                    results = results or fallback_results
                 except Exception as fallback_e:
-                    logger.error("OpenRouter fallback also failed", extra={"error": str(fallback_e)})
-                    return [TaggingResult(tags=[], language="unknown")] * len(texts)
+                    logger.error("Fallback provider failed", extra={"provider": fallback_name, "error": str(fallback_e)})
+
+            # 3) Если всё ещё нет результатов – вернуть заглушки
+            return results or ([TaggingResult(tags=[], language="unknown")] * len(texts))
     
     async def _generate_tags_with_gigachat(self, texts: List[str]) -> List[TaggingResult]:
         """
@@ -226,12 +252,8 @@ class GigaChainAdapter:
                 results.append(TaggingResult(tags=[], language="unknown"))
                 continue
             
-            # Создаем промпт для тегирования
-            prompt = f"""Проанализируй текст и верни 1-5 тегов в формате JSON массива строк.
-            
-Текст: {text[:500]}
-
-Ответь только JSON массивом тегов, например: ["технологии", "искусственный интеллект"]"""
+            # Создаём строгий промпт из централизованного шаблона
+            prompt = STRICT_TAGGING_PROMPT.format(text=text[:1000])
             
             start_time = time.time()
             try:

@@ -1,0 +1,222 @@
+groups:
+  - name: vision_s3_alerts
+    interval: 30s
+    rules:
+      # ============================================================================
+      # VISION ANALYSIS SLO
+      # ============================================================================
+      
+      - alert: VisionAnalysisHighLatency
+        expr: histogram_quantile(0.95, rate(vision_analysis_duration_seconds_bucket[5m])) > 5
+        for: 5m
+        labels:
+          severity: warning
+          component: vision
+        annotations:
+          summary: "Vision analysis p95 latency превышает 5 секунд"
+          description: "Vision analysis p95 latency = {{ $value }}s (threshold: 5s) для provider={{ $labels.provider }}, tenant={{ $labels.tenant_id }}"
+      
+      - alert: VisionAnalysisErrorRateHigh
+        expr: |
+          (
+            sum(rate(vision_analysis_requests_total{status="error"}[5m])) by (tenant_id, provider)
+            /
+            sum(rate(vision_analysis_requests_total[5m])) by (tenant_id, provider)
+          ) > 0.02
+        for: 5m
+        labels:
+          severity: warning
+          component: vision
+        annotations:
+          summary: "Vision analysis error rate превышает 2%"
+          description: "Error rate = {{ $value | humanizePercentage }} для provider={{ $labels.provider }}, tenant={{ $labels.tenant_id }}"
+      
+      - alert: VisionAnalysisAvailabilityLow
+        expr: |
+          (
+            sum(rate(vision_analysis_requests_total{status="success"}[5m])) by (tenant_id)
+            /
+            sum(rate(vision_analysis_requests_total[5m])) by (tenant_id)
+          ) < 0.95
+        for: 10m
+        labels:
+          severity: critical
+          component: vision
+        annotations:
+          summary: "Vision analysis availability ниже 95%"
+          description: "Availability = {{ $value | humanizePercentage }} для tenant={{ $labels.tenant_id }}"
+      
+      # ============================================================================
+      # S3 STORAGE QUOTA ALERTS
+      # ============================================================================
+      
+      - alert: S3StorageQuotaWarning
+        expr: storage_bucket_usage_gb / 15 > 0.85
+        for: 5m
+        labels:
+          severity: warning
+          component: storage
+        annotations:
+          summary: "S3 storage usage превышает 85% (12.75 GB / 15 GB)"
+          description: "Текущее использование: {{ $value | humanize }} GB ({{ $value | humanizePercentage }} от лимита)"
+      
+      - alert: S3StorageQuotaCritical
+        expr: storage_bucket_usage_gb / 15 > 0.93
+        for: 2m
+        labels:
+          severity: critical
+          component: storage
+        annotations:
+          summary: "S3 storage usage критично (14 GB / 15 GB)"
+          description: "Требуется немедленная очистка! Использование: {{ $value | humanize }} GB"
+      
+      - alert: S3StorageQuotaViolationsHigh
+        expr: rate(storage_quota_violations_total[10m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+          component: storage
+        annotations:
+          summary: "Высокий уровень нарушений S3 quota ({{ $value | humanize }} violations/min)"
+          description: "Tenant={{ $labels.tenant_id }}, reason={{ $labels.reason }}"
+      
+      - alert: S3EmergencyCleanupFrequent
+        expr: rate(storage_emergency_cleanups_total[1h]) > 2
+        for: 10m
+        labels:
+          severity: warning
+          component: storage
+        annotations:
+          summary: "Emergency cleanup запускается слишком часто"
+          description: "{{ $value | humanize }} cleanup операций за последний час"
+      
+      # ============================================================================
+      # BUDGET GATE ALERTS
+      # ============================================================================
+      
+      - alert: VisionBudgetExhausted
+        expr: vision_budget_usage_gauge > 0.95
+        for: 5m
+        labels:
+          severity: warning
+          component: budget
+        annotations:
+          summary: "Vision budget для tenant {{ $labels.tenant_id }} превышает 95%"
+          description: "Использовано: {{ $value | humanizePercentage }} от дневного лимита"
+      
+      - alert: VisionBudgetGateBlocksHigh
+        expr: rate(vision_budget_gate_blocks_total[10m]) > 5
+        for: 5m
+        labels:
+          severity: warning
+          component: budget
+        annotations:
+          summary: "Частые блокировки Vision API из-за budget ({{ $value | humanize }} блоков/min)"
+          description: "Tenant={{ $labels.tenant_id }}, reason={{ $labels.reason }}"
+      
+      # ============================================================================
+      # DLQ ALERTS
+      # ============================================================================
+      
+      - alert: VisionDLQBacklogHigh
+        expr: |
+          (
+            sum(redis_xpending{stream=~"stream:posts:vision.*"}) 
+            or 
+            sum(events_dlq_total{base_event=~"posts.vision.*"})
+          ) > 100
+        for: 10m
+        labels:
+          severity: warning
+          component: dlq
+        annotations:
+          summary: "Высокий backlog в Vision DLQ ({{ $value | humanize }} сообщений)"
+          description: "Требуется ручная обработка или увеличение workers"
+      
+      # ============================================================================
+      # CRAWL4AI SLO
+      # ============================================================================
+      
+      - alert: Crawl4aiHighLatency
+        expr: histogram_quantile(0.95, rate(crawl_latency_seconds_bucket[5m])) > 30
+        for: 5m
+        labels:
+          severity: warning
+          component: crawl4ai
+        annotations:
+          summary: "Crawl4ai p95 latency превышает 30 секунд"
+          description: "Latency = {{ $value }}s для tenant={{ $labels.tenant_id }}, host={{ $labels.host }}"
+      
+      - alert: Crawl4aiLowSuccessRate
+        expr: |
+          (
+            sum(rate(crawl_latency_seconds_count{status="success"}[5m])) by (tenant_id)
+            /
+            sum(rate(crawl_latency_seconds_count[5m])) by (tenant_id)
+          ) < 0.90
+        for: 10m
+        labels:
+          severity: warning
+          component: crawl4ai
+        annotations:
+          summary: "Crawl4ai success rate ниже 90%"
+          description: "Success rate = {{ $value | humanizePercentage }} для tenant={{ $labels.tenant_id }}"
+      
+      # ============================================================================
+      # S3 OPERATIONS
+      # ============================================================================
+      
+      - alert: S3OperationsErrorRateHigh
+        expr: |
+          (
+            sum(rate(s3_operations_total{result="error"}[5m])) by (operation, content_type)
+            /
+            sum(rate(s3_operations_total[5m])) by (operation, content_type)
+          ) > 0.01
+        for: 5m
+        labels:
+          severity: warning
+          component: s3
+        annotations:
+          summary: "S3 operations error rate превышает 1%"
+          description: "Error rate = {{ $value | humanizePercentage }} для operation={{ $labels.operation }}, content_type={{ $labels.content_type }}"
+      
+      - alert: S3UploadSlow
+        expr: histogram_quantile(0.95, rate(s3_upload_duration_seconds_bucket[5m])) > 10
+        for: 5m
+        labels:
+          severity: warning
+          component: s3
+        annotations:
+          summary: "S3 upload p95 latency превышает 10 секунд"
+          description: "Upload latency = {{ $value }}s для content_type={{ $labels.content_type }}"
+      
+      # ============================================================================
+      # WORKER HEALTH
+      # ============================================================================
+      
+      - alert: VisionWorkerNotProcessing
+        expr: rate(vision_worker_processed_total[5m]) == 0
+        for: 10m
+        labels:
+          severity: critical
+          component: worker
+        annotations:
+          summary: "Vision worker не обрабатывает события"
+          description: "Worker не обработал ни одного события за последние 10 минут"
+      
+      - alert: VisionWorkerHighFailureRate
+        expr: |
+          (
+            sum(rate(vision_worker_processed_total{status="error"}[5m])) by (tenant_id)
+            /
+            sum(rate(vision_worker_processed_total[5m])) by (tenant_id)
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          component: worker
+        annotations:
+          summary: "Vision worker failure rate превышает 5%"
+          description: "Failure rate = {{ $value | humanizePercentage }} для tenant={{ $labels.tenant_id }}"
+

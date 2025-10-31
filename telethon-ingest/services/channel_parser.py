@@ -914,15 +914,37 @@ class ChannelParser:
     async def _publish_parsed_events(self, events_data: List[Dict[str, Any]]):  # PostParsedEventV1 - temporarily disabled
         """Публикация событий post.parsed."""
         try:
-            # Публикация событий
-            for event in events_data:
-                await self.event_publisher.publish_event('posts.parsed', event)
-            
-            logger.info(f"Published {len(events_data)} post.parsed events")
+            if not events_data:
+                return
+                
+            # Context7: Если event_publisher=None, публикуем напрямую в Redis Streams
+            if self.event_publisher is None:
+                stream_key = "posts.parsed"
+                for event in events_data:
+                    # Context7: Публикация в Redis Streams через xadd()
+                    # Конвертируем значения в строки для Redis
+                    event_payload = {}
+                    for key, value in event.items():
+                        if value is None:
+                            continue
+                        elif isinstance(value, (dict, list)):
+                            import json
+                            event_payload[key] = json.dumps(value, ensure_ascii=False)
+                        elif isinstance(value, datetime):
+                            event_payload[key] = value.isoformat()
+                        else:
+                            event_payload[key] = str(value)
+                    await self.redis_client.xadd(stream_key, event_payload, maxlen=10000)  # Context7: ограничиваем размер stream
+                logger.info(f"Published {len(events_data)} post.parsed events to Redis Streams")
+            else:
+                # Используем event_publisher, если он доступен
+                for event in events_data:
+                    await self.event_publisher.publish_event('posts.parsed', event)
+                logger.info(f"Published {len(events_data)} post.parsed events via event_publisher")
             
         except Exception as e:
-            logger.error(f"Failed to publish events: {e}")
-            raise
+            logger.error(f"Failed to publish events: {e}", exc_info=True)
+            # Context7: не падаем, только логируем ошибку
     
     async def _update_last_parsed_at(self, channel_id: str, parsed_count: int):
         """

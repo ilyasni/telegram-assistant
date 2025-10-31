@@ -73,7 +73,7 @@ class QrAuthService:
                             session_string = None
                             try:
                                 from crypto_utils import decrypt_session
-                                session_string = decrypt_session(existing_session.get('session_string_enc'), existing_session.get('key_id'))
+                                session_string = decrypt_session(existing_session.get('session_string_enc'))
                             except Exception as e:
                                 logger.warning("Failed to decrypt session_string for Redis", error=str(e))
                             
@@ -103,6 +103,20 @@ class QrAuthService:
                                     await self._validate_authorized_session(key, tenant_id)
                                 else:
                                     logger.debug("Skipping validation for recent session", key=key, tenant_id=tenant_id)
+                                    # Context7: ensure backfill to ingest Redis key if missing
+                                    try:
+                                        ingest_key = f"telegram:session:{tenant_id}"
+                                        if not self.redis_client.exists(ingest_key):
+                                            ss = self.redis_client.hget(key, "session_string")
+                                            if ss:
+                                                self.redis_client.set(ingest_key, ss, ex=86400)
+                                                logger.info("Backfilled telegram:session for ingest", tenant_id=tenant_id)
+                                            else:
+                                                # Пометить для повторной авторизации миниаппом
+                                                self.redis_client.hset(key, "status", "not_found")
+                                                logger.warning("Authorized session has no session_string; marked not_found", tenant_id=tenant_id)
+                                    except Exception as e:
+                                        logger.warning("Backfill to ingest redis failed", tenant_id=tenant_id, error=str(e))
                             except (ValueError, AttributeError):
                                 logger.warning("Invalid created_at timestamp", key=key, tenant_id=tenant_id)
                         continue
@@ -323,6 +337,11 @@ class QrAuthService:
                     "telegram_user_id": str(telegram_user_id)
                 })
                 self.redis_client.expire(redis_key, 3600)
+                # Context7: публикуем StringSession в единый ключ для ingest
+                try:
+                    self.redis_client.set(f"telegram:session:{tenant_id}", session_string, ex=86400)
+                except Exception:
+                    pass
                 AUTH_QR_SUCCESS.inc()
             else:
                 logger.error("Failed to save existing session_string", tenant_id=tenant_id)
@@ -346,7 +365,7 @@ class QrAuthService:
             session_string = None
             try:
                 from crypto_utils import decrypt_session
-                session_string = decrypt_session(existing_session.get('session_string_enc'), existing_session.get('key_id'))
+                session_string = decrypt_session(existing_session.get('session_string_enc'))
             except Exception as e:
                 logger.warning("Failed to decrypt session_string for Redis", error=str(e))
             
@@ -358,6 +377,12 @@ class QrAuthService:
                 "session_string": session_string or ""
             })
             self.redis_client.expire(redis_key, 3600)
+            # Context7: публикуем StringSession в единый ключ для ingest
+            try:
+                if session_string:
+                    self.redis_client.set(f"telegram:session:{tenant_id}", session_string, ex=86400)
+            except Exception:
+                pass
             AUTH_QR_SUCCESS.inc()
             return
         

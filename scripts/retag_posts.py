@@ -95,6 +95,7 @@ async def publish_tagged_event(redis_client: redis.Redis, retag_result: Dict[str
     try:
         # Создаём событие
         event = PostTaggedEventV1(
+            idempotency_key=f"{retag_result['post_id']}:tagged:v1",
             post_id=retag_result['post_id'],
             tags=retag_result['new_tags'],
             tags_hash=PostTaggedEventV1.compute_hash(retag_result['new_tags']),

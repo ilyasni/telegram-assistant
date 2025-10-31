@@ -1,0 +1,56 @@
+# Vision Policy Configuration
+# Context7 best practice: конфигурируемые политики обработки медиа
+
+# Лимиты размеров и квоты
+limits:
+  max_image_mb: 15  # GigaChat Vision лимит
+  max_document_mb: 40  # GigaChat документы лимит
+  max_daily_tokens_per_tenant: 250000
+  max_concurrent_requests: 3
+  max_queue_depth: 1000
+
+# Budget gates (проверка перед анализом)
+budget_gates:
+  check_before_analysis: true
+  fallback_to_ocr_if_exhausted: true
+  sampling_threshold_per_day: 100000  # tokens
+
+# Sampling стратегии (экономия токенов)
+sampling:
+  per_post_max_images: 2  # Максимум 2 изображения на пост
+  prefer_with_text_overlay: true  # Приоритет мемам/скриншотам
+  skip_small_images_kb: 10  # Пропускать < 10KB
+
+# Routing правила
+routing:
+  ocr_only_if:
+    - quota_exhausted  # OCR fallback при исчерпании квоты
+    - mime: ["application/pdf", "image/png", "image/jpeg"]  # Определённые типы
+  
+  skip_if_channel:
+    - "@large_memes_dump"  # Исключения по каналам
+  
+  skip_if_lang_not_in: ["ru", "en"]  # Только RU/EN
+
+# Fallback стратегии
+fallback:
+  ocr_engine: "tesseract"  # tesseract | rapidocr
+  classification_model: "zero-shot-local"  # Лёгкий классификатор
+  
+# Allowed MIME types для GigaChat Vision
+allowed_mime_types:
+  images:
+    - "image/jpeg"
+    - "image/png"
+    - "image/tiff"
+    - "image/bmp"
+  
+  documents:
+    - "application/pdf"
+    - "application/msword"
+    - "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    - "text/plain"
+    - "application/epub+zip"
+    - "application/vnd.ms-powerpoint"
+    - "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+

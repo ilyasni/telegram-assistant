@@ -48,6 +48,12 @@ telethon_connected_clients = Gauge(
     'Currently connected clients'
 )
 
+# Context7: отдельная метрика авторизованных клиентов
+telethon_authorized_clients = Gauge(
+    'telethon_authorized_clients',
+    'Currently authorized clients'
+)
+
 # telegram_floodwait_seconds определен в main.py
 
 # cooldown_channels_total определен в telethon_retry.py
@@ -115,7 +121,13 @@ class TelegramClientManager:
             # Проверяем авторизацию
             if not await client.is_user_authorized():
                 logger.error("Client not authorized", telegram_id=telegram_id)
+                # [C7-ID: INGEST-AUTH-STATUS-001] Запишем статус в Redis для наблюдаемости
+                try:
+                    await self._redis.setex(f"ingest:auth:{telegram_id}", 600, "unauthorized")
+                except Exception:
+                    pass
                 await client.disconnect()
+                telethon_authorized_clients.set(max(0, telethon_authorized_clients._value.get() - 1))
                 return None
                 
             # Сохраняем клиент
@@ -125,6 +137,12 @@ class TelegramClientManager:
             self._reconnect_backoffs[telegram_id] = 1.0
             
             logger.info("Client connected successfully", telegram_id=telegram_id)
+            # Отметим авторизацию
+            try:
+                await self._redis.setex(f"ingest:auth:{telegram_id}", 600, "authorized")
+            except Exception:
+                pass
+            telethon_authorized_clients.set(1)
             return client
             
         except Exception as e:
@@ -139,7 +157,7 @@ class TelegramClientManager:
         """
         session = StringSession(session_string)
         
-        # Context7: Получаем credentials сначала, потом используем
+        # Context7: Используем только мастер-приложение (единая пара api_id/api_hash)
         api_id, api_hash = await self._get_api_credentials()
         
         return TelegramClient(
@@ -157,28 +175,76 @@ class TelegramClientManager:
         )
     
     async def _get_api_credentials(self) -> tuple:
-        """Получение API credentials из настроек."""
+        """Получение API credentials мастер-приложения (Context7)."""
         from config import settings
         return (settings.master_api_id, settings.master_api_hash)
     
     async def _get_session_from_db(self, telegram_id: int) -> Optional[str]:
         """
-        Context7: Получение сессии из Redis.
+        Context7: Получение сессии: Redis -> fallback БД -> запись в Redis.
         """
+        # 1) Redis fast-path
         try:
-            # Получаем сессию из Redis (где она хранится после QR auth)
             session_key = f"telegram:session:{telegram_id}"
             session_string = await self._redis.get(session_key)
-            
             if session_string:
-                return session_string.decode('utf-8')
-                
-            return None
-            
+                # Context7: безопасное декодирование (bytes или str)
+                if isinstance(session_string, bytes):
+                    return session_string.decode('utf-8')
+                return session_string
         except Exception as e:
-            logger.error("Failed to get session from Redis", 
-                        telegram_id=telegram_id, 
-                        error=str(e))
+            logger.error("Failed to get session from Redis", telegram_id=telegram_id, error=str(e))
+        
+        # 2) Fallback A: если miniapp записал session_id в tg:qr:session:<id>
+        try:
+            qr_key = f"tg:qr:session:{telegram_id}"
+            qr_data = await self._redis.hgetall(qr_key)
+            if qr_data and (qr_data.get('session_id') or qr_data.get(b'session_id')):
+                session_id = qr_data.get('session_id') or (qr_data.get(b'session_id').decode() if isinstance(qr_data.get(b'session_id'), (bytes, bytearray)) else None)
+                if session_id:
+                    from crypto_utils import decrypt_session
+                    import psycopg2
+                    from psycopg2.extras import RealDictCursor
+                    with self._db.cursor(cursor_factory=RealDictCursor) as cur:
+                        cur.execute("SELECT session_string_enc FROM telegram_sessions WHERE id = %s AND status IN ('authorized','active')", (session_id,))
+                        row = cur.fetchone()
+                        if row:
+                            session_dec = decrypt_session(row['session_string_enc'])
+                            try:
+                                await self._redis.set(f"telegram:session:{telegram_id}", session_dec, ex=86400)
+                            except Exception:
+                                pass
+                            return session_dec
+        except Exception as e:
+            logger.warning("QR session fallback failed", telegram_id=telegram_id, error=str(e))
+
+        # 2) Fallback B: читать из БД авторизованную сессию и расшифровать
+        try:
+            import psycopg2
+            from psycopg2.extras import RealDictCursor
+            from crypto_utils import decrypt_session
+            with self._db.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT session_string_enc
+                    FROM telegram_sessions
+                    WHERE status IN ('authorized','active')
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                    """
+                )
+                row = cur.fetchone()
+                if not row:
+                    return None
+                session_dec = decrypt_session(row['session_string_enc'])
+                # Запишем в Redis для последующих обращений
+                try:
+                    await self._redis.set(f"telegram:session:{telegram_id}", session_dec, ex=86400)
+                except Exception:
+                    pass
+                return session_dec
+        except Exception as e:
+            logger.error("Failed to load session from DB", telegram_id=telegram_id, error=str(e))
             return None
     
     async def _reconnect_with_backoff(self, telegram_id: int) -> bool:

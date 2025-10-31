@@ -201,8 +201,8 @@ class ParseAllChannelsTask:
         except Exception as e:
             logger.error(f"Failed to clear HWM for channel {channel_id}: {str(e)}")
     
-    async def _get_system_user_and_tenant(self) -> Tuple[str, str]:
-        """Get system user_id and tenant_id from the first authorized session."""
+    async def _get_system_user_and_tenant(self) -> Tuple[int, str]:
+        """Get system telegram_id (int) and tenant_id (str) from the first authorized session."""
         try:
             import psycopg2
             from psycopg2.extras import RealDictCursor
@@ -212,7 +212,7 @@ class ParseAllChannelsTask:
             cursor.execute("""
                 SELECT u.telegram_id as telegram_id, u.tenant_id as tenant_id
                 FROM users u
-                WHERE u.telegram_auth_status = 'authorized'
+                WHERE u.telegram_auth_status = 'authorized' AND u.telegram_id IS NOT NULL
                 ORDER BY u.telegram_auth_created_at DESC
                 LIMIT 1
             """)
@@ -221,15 +221,24 @@ class ParseAllChannelsTask:
             cursor.close()
             conn.close()
             
-            if result:
-                return str(result['telegram_id']), str(result['tenant_id'])
+            if result and result['telegram_id']:
+                # Context7: telegram_id должен быть int для get_client()
+                return int(result['telegram_id']), str(result['tenant_id'])
             else:
-                # Fallback to system values
-                return "00000000-0000-0000-0000-000000000000", "00000000-0000-0000-0000-000000000000"
+                # Fallback: попробуем найти любой telegram_id
+                conn = psycopg2.connect(self.db_url)
+                cursor = conn.cursor(cursor_factory=RealDictCursor)
+                cursor.execute("SELECT telegram_id FROM users WHERE telegram_id IS NOT NULL LIMIT 1")
+                fallback_result = cursor.fetchone()
+                cursor.close()
+                conn.close()
+                if fallback_result and fallback_result['telegram_id']:
+                    return int(fallback_result['telegram_id']), "00000000-0000-0000-0000-000000000000"
+                return 0, "00000000-0000-0000-0000-000000000000"
                 
         except Exception as e:
             logger.error(f"Failed to get system user/tenant: {str(e)}")
-            return "00000000-0000-0000-0000-000000000000", "00000000-0000-0000-0000-000000000000"
+            return 0, "00000000-0000-0000-0000-000000000000"
     
     async def _parse_channel_with_retry(self, channel: Dict[str, Any], mode: str):
         """
@@ -250,13 +259,17 @@ class ParseAllChannelsTask:
             logger.warning(f"TelegramClientManager not available for channel {channel['id']}, skipping parsing")
             return {"status": "skipped", "reason": "no_client_manager", "parsed": 0, "max_message_date": None}
         
-        # Get user_id and tenant_id from database
-        user_id, tenant_id = await self._get_system_user_and_tenant()
+        # Get telegram_id (int) and tenant_id (str) from database
+        telegram_id, tenant_id = await self._get_system_user_and_tenant()
         
-        # Get telegram client from manager
-        telegram_client = await self.telegram_client_manager.get_client(user_id)
+        if not telegram_id or telegram_id == 0:
+            logger.warning("No telegram_id found in database, skipping parsing")
+            return {"status": "skipped", "reason": "no_telegram_id", "parsed": 0, "max_message_date": None}
+        
+        # Get telegram client from manager (expects int telegram_id)
+        telegram_client = await self.telegram_client_manager.get_client(telegram_id)
         if not telegram_client:
-            logger.warning(f"No telegram client available for user {user_id}, skipping parsing")
+            logger.warning(f"No telegram client available for telegram_id {telegram_id}, skipping parsing")
             return {"status": "skipped", "reason": "no_client", "parsed": 0, "max_message_date": None}
         
         for attempt in range(max_retries):
@@ -304,7 +317,7 @@ class ParseAllChannelsTask:
                     # Call actual parser
                     result = await self.parser.parse_channel_messages(
                         channel_id=channel['id'],
-                        user_id=user_id,
+                        user_id=str(telegram_id),  # user_id для парсера — строка
                         tenant_id=tenant_id,
                         mode=mode
                     )
