@@ -22,6 +22,10 @@ services:
       APP_ENV: development  # [C7-ID: dev-mode-001]
       PYTHONASYNCIODEBUG: "1"
       PYTHONDONTWRITEBYTECODE: "1"
+      # [C7-ID: dev-mode-010] Форс исторического парсинга для вставок прямо сейчас (DEV only)
+      PARSER_MODE_OVERRIDE: historical
+      PARSER_HISTORICAL_HOURS: "6"
+      PARSER_MAX_CONCURRENCY: "2"
     volumes:
       - ./telethon-ingest:/app
   worker:
