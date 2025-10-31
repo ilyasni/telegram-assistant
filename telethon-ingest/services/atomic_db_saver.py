@@ -11,6 +11,7 @@ HWM обновляется ТОЛЬКО после успешного commit.
 
 import time
 import uuid
+import json
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple, Any
 import structlog
@@ -157,10 +158,17 @@ class AtomicDBSaver:
             # [C7-ID: dev-mode-012] Context7 best practice: соответствие реальной схеме БД
             # Таблица users имеет: id, tenant_id, telegram_id, username, created_at, last_active_at, first_name, last_name
             # НЕТ: updated_at
+            # [C7-ID: dev-mode-013] telegram_id должен быть int (bigint в БД), не str
+            telegram_id = user_data.get('telegram_id')
+            if isinstance(telegram_id, str):
+                telegram_id = int(telegram_id)
+            elif telegram_id is None:
+                raise ValueError("telegram_id is required")
+            
             user_record = {
                 'id': str(uuid.uuid4()),
                 'tenant_id': user_data.get('tenant_id') or str(uuid.uuid4()),  # Используем переданный tenant_id или создаем новый
-                'telegram_id': user_data.get('telegram_id'),
+                'telegram_id': telegram_id,  # int для bigint в БД
                 'first_name': user_data.get('first_name', ''),
                 'last_name': user_data.get('last_name', ''),
                 'username': user_data.get('username', ''),
@@ -201,9 +209,16 @@ class AtomicDBSaver:
             # [C7-ID: dev-mode-012] Context7 best practice: соответствие реальной схеме БД
             # Таблица channels имеет: id, tg_channel_id, username, title, is_active, last_message_at, created_at, settings, last_parsed_at
             # НЕТ: updated_at, description, participants_count, is_broadcast, is_megagroup, telegram_id
+            # [C7-ID: dev-mode-013] tg_channel_id должен быть int (bigint в БД), не str
+            tg_channel_id = channel_data.get('telegram_id')
+            if isinstance(tg_channel_id, str):
+                tg_channel_id = int(tg_channel_id)
+            elif tg_channel_id is None:
+                raise ValueError("telegram_id (tg_channel_id) is required for channel")
+            
             channel_record = {
                 'id': str(uuid.uuid4()),
-                'tg_channel_id': channel_data.get('telegram_id'),  # В схеме используется tg_channel_id, не telegram_id
+                'tg_channel_id': tg_channel_id,  # int для bigint в БД
                 'title': channel_data.get('title', ''),
                 'username': channel_data.get('username', ''),
                 'is_active': True,
@@ -251,12 +266,22 @@ class AtomicDBSaver:
             # Подготовка данных постов
             prepared_posts = []
             for post in posts_data:
+                # [C7-ID: dev-mode-014] Context7 best practice: JSONB сериализация
+                # media_urls должен быть JSON строкой или уже JSON строкой для jsonb типа в PostgreSQL
+                media_urls = post.get('media_urls', [])
+                if isinstance(media_urls, list):
+                    # Конвертируем список в JSON строку для jsonb
+                    media_urls = json.dumps(media_urls)
+                elif media_urls is None:
+                    media_urls = '[]'  # Пустой JSON массив по умолчанию
+                # Если уже строка - оставляем как есть (может быть уже JSON строка)
+                
                 prepared_post = {
                     'id': str(uuid.uuid4()),
                     'channel_id': post.get('channel_id'),
                     'telegram_message_id': post.get('telegram_message_id'),
                     'content': post.get('content', ''),
-                    'media_urls': post.get('media_urls', []),
+                    'media_urls': media_urls,
                     'posted_at': post.get('posted_at'),
                     'created_at': datetime.now(timezone.utc),
                     'is_processed': False,

@@ -340,7 +340,9 @@ services:
 
   # API Service (FastAPI)
   api:
-    build: ./api
+    build:
+      context: .
+      dockerfile: api/Dockerfile
     environment:
       DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@supabase-db:5432/${POSTGRES_DB}
       REDIS_URL: redis://redis:6379
@@ -375,7 +377,9 @@ services:
 
   # Worker Service
   worker:
-    build: ./worker
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
     environment:
       DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@supabase-db:5432/${POSTGRES_DB}
       REDIS_URL: redis://redis:6379
@@ -454,7 +458,9 @@ services:
 
   # Telethon Ingest Service
   telethon-ingest:
-    build: ./telethon-ingest
+    build:
+      context: .
+      dockerfile: telethon-ingest/Dockerfile
     environment:
       MASTER_API_ID: ${MASTER_API_ID}
       MASTER_API_HASH: ${MASTER_API_HASH}

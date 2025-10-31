@@ -1,8 +1,0 @@
-apiVersion: 1
-
-providers:
-  - name: 'Telegram Assistant Dashboards'
-    folder: 'Telegram Assistant'
-    type: file
-    options:
-      path: /etc/grafana/dashboards/*.json

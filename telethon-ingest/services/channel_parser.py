@@ -573,6 +573,12 @@ class ChannelParser:
                 
                 # Извлечение данных сообщения
                 post_data = await self._extract_message_data(message, channel_id, tenant_id, tg_channel_id)
+                # [C7-ID: dev-mode-015] Context7 best practice: генерация idempotency_key для идемпотентности
+                # Формат: {tenant_id}:{channel_id}:{telegram_message_id}
+                telegram_message_id = post_data.get('telegram_message_id')
+                if not post_data.get('idempotency_key'):
+                    post_data['idempotency_key'] = f"{tenant_id}:{channel_id}:{telegram_message_id}"
+                
                 posts_data.append(post_data)
                 
                 # Подготовка события
@@ -736,7 +742,7 @@ class ChannelParser:
             'channel_id': channel_id,  # Context7: глобальные каналы без tenant_id
             'telegram_message_id': message.id if hasattr(message, 'id') else int(time.time() * 1000),
             'content': text,
-            'media_urls': json.dumps(urls) if urls else [],  # Context7: JSONB формат
+            'media_urls': json.dumps(urls) if urls else '[]',  # [C7-ID: dev-mode-014] Context7: JSONB формат (строка JSON, не список)
             'posted_at': posted_at,
             'created_at': datetime.now(timezone.utc),
             'is_processed': False,
@@ -818,9 +824,20 @@ class ChannelParser:
         else:
             posted_at_iso = str(posted_at)
 
+        # [C7-ID: dev-mode-015] Context7 best practice: безопасный доступ к idempotency_key с fallback
+        # Если idempotency_key отсутствует, генерируем его (должен быть уже сгенерирован в _extract_message_data)
+        idempotency_key = post_data.get('idempotency_key')
+        if not idempotency_key:
+            telegram_message_id = post_data.get('telegram_message_id')
+            idempotency_key = f"{tenant_id}:{channel_id}:{telegram_message_id}"
+            logger.warning("idempotency_key missing, generated fallback", 
+                         tenant_id=tenant_id, 
+                         channel_id=channel_id, 
+                         telegram_message_id=telegram_message_id)
+
         # PostParsedEventV1 temporarily disabled - returning dict instead
         return dict(
-            idempotency_key=post_data['idempotency_key'],
+            idempotency_key=idempotency_key,
             user_id=user_id,
             channel_id=channel_id,
             post_id=post_data['id'],

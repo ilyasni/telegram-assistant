@@ -13,18 +13,18 @@ ENV TZ=Europe/Moscow
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
 # [C7-ID: dev-mode-006] Оптимизация кеша: копируем requirements отдельно
-COPY requirements.txt .
+COPY api/requirements.txt .
 
 # [C7-ID: dev-mode-006] Используем cache mount для pip (Context7 best practice)
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --no-cache-dir -r requirements.txt
 
-# [C7-ID: CODE-CLEANUP-022] Установка shared пакета
+# [C7-ID: CODE-CLEANUP-022] Установка shared пакета (build context теперь корень репозитория)
 COPY shared/ /app/shared/
 RUN pip install -e /app/shared/python
 
 # [C7-ID: dev-mode-006] Копируем код ПОСЛЕ установки зависимостей
-COPY . .
+COPY api/ .
 
 # Создание пользователя для безопасности
 RUN useradd -m -u 1000 api && chown -R api:api /app
