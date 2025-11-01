@@ -1,6 +1,6 @@
 """Модели базы данных."""
 
-from sqlalchemy import create_engine, Column, String, Integer, Boolean, DateTime, Text, JSON, BigInteger, ForeignKey, UniqueConstraint, Index, CheckConstraint, PrimaryKeyConstraint
+from sqlalchemy import create_engine, Column, String, Integer, Boolean, DateTime, Text, JSON, BigInteger, ForeignKey, UniqueConstraint, Index, CheckConstraint, PrimaryKeyConstraint, func, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship, Session
 from sqlalchemy.dialects.postgresql import UUID, JSONB
@@ -121,6 +121,7 @@ class Post(Base):
     indexing_status = relationship("IndexingStatus", back_populates="post")
     enrichment = relationship("PostEnrichment", back_populates="post", uselist=False)
     media = relationship("PostMedia", back_populates="post")
+    media_map = relationship("PostMediaMap", back_populates="post", cascade="all, delete-orphan")
     reactions = relationship("PostReaction", back_populates="post")
     forwards = relationship("PostForward", back_populates="post")
     replies = relationship("PostReply", back_populates="post", foreign_keys="PostReply.post_id")
@@ -216,22 +217,82 @@ class UserChannel(Base):
 
 
 class PostEnrichment(Base):
-    """Обогащённые данные постов."""
+    """Обогащённые данные постов (унифицированная модель с kind/provider/data)."""
     __tablename__ = "post_enrichment"
     
-    post_id = Column(UUID(as_uuid=True), ForeignKey("posts.id"), primary_key=True)
-    tags = Column(JSONB, default=[])  # Используем JSONB для GIN индексов
-    vision_labels = Column(JSONB, default=[])
-    ocr_text = Column(Text)
-    crawl_md = Column(Text)
-    enrichment_provider = Column(String(50))
-    enriched_at = Column(DateTime, default=datetime.utcnow)
-    enrichment_latency_ms = Column(Integer)
-    enrichment_metadata = Column(JSONB, default={})
-    updated_at = Column(DateTime, default=datetime.utcnow)
+    # Context7: Составной первичный ключ (post_id, kind) для модульного хранения
+    post_id = Column(UUID(as_uuid=True), ForeignKey("posts.id", ondelete="CASCADE"), primary_key=True)
+    kind = Column(String(50), nullable=False, primary_key=True)  # 'vision', 'vision_ocr', 'crawl', 'tags', 'classify', 'general'
+    provider = Column(String(50), nullable=False)  # 'gigachat-vision', 'tesseract', 'crawl4ai'
+    params_hash = Column(String(64))  # SHA256 hash параметров для версионирования
+    data = Column(JSONB, nullable=False, default={})  # Унифицированное JSONB поле для всех обогащений
+    status = Column(String(20), nullable=False, default='ok')  # 'ok', 'partial', 'error'
+    error = Column(Text)  # Текст ошибки при status='error'
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Legacy поля (deprecated, будут удалены после миграции)
+    tags = Column(JSONB, default=[])  # DEPRECATED: использовать data->'tags'
+    vision_labels = Column(JSONB, default=[])  # DEPRECATED: использовать data->'labels'
+    ocr_text = Column(Text)  # DEPRECATED: использовать data->'ocr'->>'text'
+    crawl_md = Column(Text)  # DEPRECATED: использовать data->>'crawl_md'
+    enrichment_provider = Column(String(50))  # DEPRECATED: использовать provider
+    enriched_at = Column(DateTime, default=datetime.utcnow)  # DEPRECATED: использовать created_at
+    enrichment_latency_ms = Column(Integer)  # DEPRECATED: использовать data->>'latency_ms'
+    enrichment_metadata = Column(JSONB, default={})  # DEPRECATED: использовать data
+    summary = Column(Text)  # DEPRECATED: использовать data->>'caption' или data->>'summary'
+    
+    # Legacy Vision поля (deprecated)
+    vision_classification = Column(JSONB)  # DEPRECATED: использовать data->'labels'
+    vision_description = Column(Text)  # DEPRECATED: использовать data->>'caption'
+    vision_ocr_text = Column(Text)  # DEPRECATED: использовать data->'ocr'->>'text'
+    vision_is_meme = Column(Boolean, default=False)  # DEPRECATED: использовать data->>'is_meme'
+    vision_context = Column(JSONB)  # DEPRECATED: использовать data->'context'
+    vision_provider = Column(String(50))  # DEPRECATED: использовать provider
+    vision_model = Column(String(100))  # DEPRECATED: использовать data->>'model'
+    vision_analyzed_at = Column(DateTime)  # DEPRECATED: использовать created_at
+    vision_file_id = Column(String(255))  # DEPRECATED: использовать data->>'file_id'
+    vision_tokens_used = Column(Integer, default=0)  # DEPRECATED: использовать data->>'tokens_used'
+    vision_cost_microunits = Column(Integer, default=0)  # DEPRECATED: использовать data->>'cost_microunits'
+    vision_analysis_reason = Column(String(50))  # DEPRECATED: использовать data->>'analysis_reason'
+    
+    # Legacy S3 references (deprecated)
+    s3_media_keys = Column(JSONB, default=[])  # DEPRECATED: использовать post_media_map + media_objects
+    s3_vision_keys = Column(JSONB, default=[])  # DEPRECATED: использовать data->'s3_keys'
+    s3_crawl_keys = Column(JSONB, default=[])  # DEPRECATED: использовать data->'s3_keys'
     
     # Relationships
     post = relationship("Post", back_populates="enrichment")
+    
+    # Constraints (Context7: CHECK constraints из миграций)
+    __table_args__ = (
+        UniqueConstraint('post_id', 'kind', name='ux_post_enrichment_post_kind'),
+        CheckConstraint(
+            "kind IN ('vision', 'vision_ocr', 'crawl', 'tags', 'classify', 'general')",
+            name='chk_enrichment_kind'
+        ),
+        CheckConstraint(
+            "status IN ('ok', 'partial', 'error')",
+            name='chk_enrichment_status'
+        ),
+        CheckConstraint(
+            "vision_provider IS NULL OR vision_provider IN ('gigachat', 'ocr_fallback', 'none')",
+            name='chk_vision_provider'
+        ),
+        CheckConstraint(
+            "vision_analysis_reason IS NULL OR vision_analysis_reason IN ('new', 'retry', 'cache_hit', 'fallback', 'skipped')",
+            name='chk_vision_analysis_reason'
+        ),
+        CheckConstraint(
+            'vision_tokens_used >= 0',
+            name='chk_vision_tokens_used'
+        ),
+        Index('idx_pe_post_kind', 'post_id', 'kind'),
+        Index('idx_pe_kind', 'kind', postgresql_where=text('kind IS NOT NULL')),
+        Index('idx_pe_updated_at', 'updated_at', postgresql_ops={'updated_at': 'DESC'}),
+        Index('idx_pe_data_gin', 'data', postgresql_using='gin'),
+    )
 
 
 class PostMedia(Base):
@@ -259,6 +320,69 @@ class PostMedia(Base):
     # Constraints
     __table_args__ = (
         CheckConstraint("media_type IN ('photo', 'video', 'document')", name='chk_media_type'),
+    )
+
+
+# ============================================================================
+# MEDIA REGISTRY & VISION MODELS (Context7: добавлены согласно миграции 20250128_add_media_registry_vision)
+# ============================================================================
+
+class MediaObject(Base):
+    """Централизованный реестр всех медиафайлов (content-addressed storage)."""
+    __tablename__ = "media_objects"
+    
+    file_sha256 = Column(String(64), primary_key=True)  # SHA256 hex (64 символа)
+    mime = Column(Text, nullable=False)
+    size_bytes = Column(BigInteger, nullable=False)
+    s3_key = Column(Text, nullable=False)
+    s3_bucket = Column(Text, nullable=False, server_default='test-467940')
+    first_seen_at = Column(DateTime, server_default=func.now())
+    last_seen_at = Column(DateTime, server_default=func.now(), onupdate=datetime.utcnow)
+    refs_count = Column(Integer, server_default='0')  # Количество ссылок на этот файл
+    
+    # Relationships
+    post_media_links = relationship("PostMediaMap", back_populates="media_object")
+    
+    # Constraints (Context7: CHECK constraints из миграции)
+    __table_args__ = (
+        CheckConstraint(
+            'size_bytes >= 0 AND size_bytes <= 41943040',
+            name='chk_media_size_bytes'
+        ),  # 0-40MB (GigaChat Vision лимит)
+        CheckConstraint(
+            "mime ~ '^(image|video|application)/'",
+            name='chk_media_mime'
+        ),
+        Index('idx_media_mime', 'mime'),
+        Index('idx_media_size', 'size_bytes'),
+        Index('idx_media_refs', 'refs_count'),
+        Index('idx_media_last_seen', 'last_seen_at'),
+    )
+
+
+class PostMediaMap(Base):
+    """Связь многие-ко-многим: посты ↔ медиафайлы."""
+    __tablename__ = "post_media_map"
+    
+    post_id = Column(UUID(as_uuid=True), ForeignKey("posts.id", ondelete="CASCADE"), nullable=False)
+    file_sha256 = Column(String(64), ForeignKey("media_objects.file_sha256"), nullable=False)
+    position = Column(Integer, server_default='0')
+    role = Column(String(50), server_default='primary')  # primary | attachment | thumbnail
+    uploaded_at = Column(DateTime, server_default=func.now())
+    
+    # Relationships
+    post = relationship("Post", back_populates="media_map")
+    media_object = relationship("MediaObject", back_populates="post_media_links")
+    
+    # Constraints (Context7: CHECK constraints из миграции)
+    __table_args__ = (
+        PrimaryKeyConstraint('post_id', 'file_sha256'),
+        CheckConstraint(
+            "role IN ('primary', 'attachment', 'thumbnail')",
+            name='chk_pmm_role'
+        ),
+        Index('idx_pmm_sha', 'file_sha256'),
+        Index('idx_pmm_post', 'post_id'),
     )
 
 

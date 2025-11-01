@@ -157,6 +157,41 @@ async def health_check():
 - **Action items** — планы улучшений
 - **Knowledge sharing** — обмен опытом
 
+## Периодический мониторинг пайплайна (Context7)
+
+### Скрипты
+- `scripts/check_pipeline_health.py` — основной чекер
+- `scripts/pipeline_health_cron.sh` — cron wrapper
+- `config/slo_thresholds.json` — SLO пороги
+
+### Context7 Best Practices
+- asyncpg connection pool с lifecycle callbacks
+- Redis SCAN вместо KEYS
+- Qdrant через httpx.AsyncClient (async)
+- Neo4j агрегаты вместо сканов
+- Prometheus Pushgateway с low cardinality labels
+- flock для exclusive lock в cron
+
+### Prometheus метрики
+```promql
+# Алерты
+pipeline_health_up{component="database"} == 0
+redis_stream_lag{stream="stream:posts:parsed"} > 1000
+indexing_gap_pct{target="qdrant"} > 10
+```
+
+### Cron настройка
+```bash
+# Каждые 30 минут
+*/30 * * * * /opt/telegram-assistant/scripts/pipeline_health_cron.sh 30
+
+# Каждый час (с логированием)
+0 * * * * /opt/telegram-assistant/scripts/pipeline_health_cron.sh 60 >> /var/log/cron_health.log 2>&1
+```
+
+### Pushgateway использование
+Pushgateway использовать только для джоб-стиля (cron/E2E), не для long-running сервисов.
+
 ## Docker и сборка
 
 ### Пересборка контейнеров

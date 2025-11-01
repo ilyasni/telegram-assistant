@@ -1,6 +1,6 @@
 """Модели базы данных."""
 
-from sqlalchemy import create_engine, Column, String, Integer, Boolean, DateTime, Text, JSON, BigInteger, ForeignKey, UniqueConstraint, Index, CheckConstraint, PrimaryKeyConstraint
+from sqlalchemy import create_engine, Column, String, Integer, Boolean, DateTime, Text, JSON, BigInteger, ForeignKey, UniqueConstraint, Index, CheckConstraint, PrimaryKeyConstraint, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship, Session
 from sqlalchemy.dialects.postgresql import UUID, JSONB
@@ -217,45 +217,65 @@ class UserChannel(Base):
 
 
 class PostEnrichment(Base):
-    """Обогащённые данные постов (теги, summary, vision analysis, etc)."""
+    """Обогащённые данные постов (унифицированная модель с kind/provider/data)."""
     __tablename__ = "post_enrichment"
     
-    post_id = Column(UUID(as_uuid=True), ForeignKey("posts.id"), primary_key=True)
-    tags = Column(JSONB, default=[])  # Используем JSONB для GIN индексов
-    summary = Column(Text)
-    vision_labels = Column(JSONB, default=[])  # Legacy, используем vision_classification
-    ocr_text = Column(Text)
-    crawl_md = Column(Text)
-    enrichment_provider = Column(String(50))
-    enriched_at = Column(DateTime, default=datetime.utcnow)
-    enrichment_latency_ms = Column(Integer)
-    enrichment_metadata = Column(JSONB, default={})
-    updated_at = Column(DateTime, default=datetime.utcnow)
+    # Context7: Составной первичный ключ (post_id, kind) для модульного хранения
+    post_id = Column(UUID(as_uuid=True), ForeignKey("posts.id", ondelete="CASCADE"), primary_key=True)
+    kind = Column(String(50), nullable=False, primary_key=True)  # 'vision', 'vision_ocr', 'crawl', 'tags', 'classify', 'general'
+    provider = Column(String(50), nullable=False)  # 'gigachat-vision', 'tesseract', 'crawl4ai'
+    params_hash = Column(String(64))  # SHA256 hash параметров для версионирования
+    data = Column(JSONB, nullable=False, default={})  # Унифицированное JSONB поле для всех обогащений
+    status = Column(String(20), nullable=False, default='ok')  # 'ok', 'partial', 'error'
+    error = Column(Text)  # Текст ошибки при status='error'
     
-    # Vision analysis fields
-    vision_classification = Column(JSONB)
-    vision_description = Column(Text)
-    vision_ocr_text = Column(Text)
-    vision_is_meme = Column(Boolean, default=False)
-    vision_context = Column(JSONB)
-    vision_provider = Column(String(50))
-    vision_model = Column(String(100))
-    vision_analyzed_at = Column(DateTime)
-    vision_file_id = Column(String(255))  # GigaChat file_id для кэша
-    vision_tokens_used = Column(Integer, default=0)
-    vision_cost_microunits = Column(Integer, default=0)
-    vision_analysis_reason = Column(String(50))  # new | retry | cache_hit | fallback | skipped
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
-    # S3 storage references
-    s3_media_keys = Column(JSONB, default=[])
-    s3_vision_keys = Column(JSONB, default=[])
-    s3_crawl_keys = Column(JSONB, default=[])
+    # Legacy поля (deprecated, будут удалены после миграции)
+    tags = Column(JSONB, default=[])  # DEPRECATED: использовать data->'tags'
+    vision_labels = Column(JSONB, default=[])  # DEPRECATED: использовать data->'labels'
+    ocr_text = Column(Text)  # DEPRECATED: использовать data->'ocr'->>'text'
+    crawl_md = Column(Text)  # DEPRECATED: использовать data->>'crawl_md'
+    enrichment_provider = Column(String(50))  # DEPRECATED: использовать provider
+    enriched_at = Column(DateTime, default=datetime.utcnow)  # DEPRECATED: использовать created_at
+    enrichment_latency_ms = Column(Integer)  # DEPRECATED: использовать data->>'latency_ms'
+    enrichment_metadata = Column(JSONB, default={})  # DEPRECATED: использовать data
+    summary = Column(Text)  # DEPRECATED: использовать data->>'caption' или data->>'summary'
+    
+    # Legacy Vision поля (deprecated)
+    vision_classification = Column(JSONB)  # DEPRECATED: использовать data->'labels'
+    vision_description = Column(Text)  # DEPRECATED: использовать data->>'caption'
+    vision_ocr_text = Column(Text)  # DEPRECATED: использовать data->'ocr'->>'text'
+    vision_is_meme = Column(Boolean, default=False)  # DEPRECATED: использовать data->>'is_meme'
+    vision_context = Column(JSONB)  # DEPRECATED: использовать data->'context'
+    vision_provider = Column(String(50))  # DEPRECATED: использовать provider
+    vision_model = Column(String(100))  # DEPRECATED: использовать data->>'model'
+    vision_analyzed_at = Column(DateTime)  # DEPRECATED: использовать created_at
+    vision_file_id = Column(String(255))  # DEPRECATED: использовать data->>'file_id'
+    vision_tokens_used = Column(Integer, default=0)  # DEPRECATED: использовать data->>'tokens_used'
+    vision_cost_microunits = Column(Integer, default=0)  # DEPRECATED: использовать data->>'cost_microunits'
+    vision_analysis_reason = Column(String(50))  # DEPRECATED: использовать data->>'analysis_reason'
+    
+    # Legacy S3 references (deprecated)
+    s3_media_keys = Column(JSONB, default=[])  # DEPRECATED: использовать post_media_map + media_objects
+    s3_vision_keys = Column(JSONB, default=[])  # DEPRECATED: использовать data->'s3_keys'
+    s3_crawl_keys = Column(JSONB, default=[])  # DEPRECATED: использовать data->'s3_keys'
     
     # Relationships
     post = relationship("Post", back_populates="enrichment")
     
-    # Constraints
+    # Constraints (Context7: CHECK constraints из миграций)
     __table_args__ = (
+        UniqueConstraint('post_id', 'kind', name='ux_post_enrichment_post_kind'),
+        CheckConstraint(
+            "kind IN ('vision', 'vision_ocr', 'crawl', 'tags', 'classify', 'general')",
+            name='chk_enrichment_kind'
+        ),
+        CheckConstraint(
+            "status IN ('ok', 'partial', 'error')",
+            name='chk_enrichment_status'
+        ),
         CheckConstraint(
             "vision_provider IS NULL OR vision_provider IN ('gigachat', 'ocr_fallback', 'none')",
             name='chk_vision_provider'
@@ -268,11 +288,10 @@ class PostEnrichment(Base):
             "vision_tokens_used >= 0",
             name='chk_vision_tokens_used'
         ),
-        Index('idx_pe_vision_class', 'vision_classification', postgresql_using='gin'),
-        Index('idx_pe_vision_ctx', 'vision_context', postgresql_using='gin'),
-        Index('idx_pe_s3_media', 's3_media_keys', postgresql_using='gin'),
-        Index('idx_pe_vision_at', 'vision_analyzed_at'),
-        Index('idx_pe_memes', 'vision_is_meme', postgresql_where=vision_is_meme==True),
+        Index('idx_pe_post_kind', 'post_id', 'kind'),
+        Index('idx_pe_kind', 'kind', postgresql_where=text('kind IS NOT NULL')),
+        Index('idx_pe_updated_at', 'updated_at', postgresql_ops={'updated_at': 'DESC'}),
+        Index('idx_pe_data_gin', 'data', postgresql_using='gin'),
     )
 
 

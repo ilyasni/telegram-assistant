@@ -95,12 +95,23 @@
 
 Содержит alerting rules для:
 - Vision Analysis SLO (latency, error rate, availability)
-- S3 Storage Quota (usage, violations, emergency cleanup)
 - Budget Gate (exhaustion, blocks)
 - DLQ (backlog, events)
 - Crawl4ai SLO (latency, success rate)
 - S3 Operations (error rate, upload latency)
 - Worker Health (processing, failure rate)
+
+### Файл: `prometheus/alerts/storage_quota_alerts.yml`
+
+**Context7: критичные alerts для соблюдения лимита 15 GB**
+
+Содержит alerting rules для:
+- **StorageQuotaCritical** (>93%, 14 GB из 15 GB) - critical
+- **StorageQuotaWarning** (>85%, 12.75 GB) - warning
+- **StorageQuotaViolationsHigh** (rate > 0.1/sec) - warning
+- **StorageCleanupIneffective** (cleanup не освобождает место) - critical
+- **StorageMediaQuotaHigh** (>9 GB из 10 GB) - warning
+- **StorageVisionQuotaHigh** (>1.8 GB из 2 GB) - warning
 
 ---
 
@@ -171,12 +182,16 @@
 ### Severity Levels
 
 - **critical**: Немедленная реакция (pager, SMS)
-  - Storage quota > 93%
+  - Storage quota > 93% (14 GB из 15 GB) - Context7: критично для соблюдения лимита
+  - Storage cleanup ineffective - Context7: cleanup не освобождает место
   - Vision availability < 90%
   - Worker not processing
 
 - **warning**: Мониторинг, плановая реакция
-  - Storage quota > 85%
+  - Storage quota > 85% (12.75 GB) - Context7: предупреждение о приближении к лимиту
+  - Storage quota violations rate > 0.1/sec - Context7: частые нарушения квот
+  - Storage media quota > 9 GB - Context7: приближение к лимиту media (10 GB)
+  - Storage vision quota > 1.8 GB - Context7: приближение к лимиту vision (2 GB)
   - Vision latency > 5s
   - Budget usage > 95%
 

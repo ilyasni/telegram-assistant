@@ -26,23 +26,18 @@ from services.ocr_fallback import OCRFallbackService
 from services.storage_quota import StorageQuotaService
 from services.retry_policy import create_retry_decorator, DEFAULT_RETRY_CONFIG, DLQService, should_retry, classify_error
 
-# Context7: Импорты из shared модуля worker
-try:
-    from shared.s3_storage import S3StorageService
-    from shared.database import PostEnrichment
-except ImportError:
-    # Fallback для обратной совместимости
-    import sys
-    import os
-    parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-    if parent_dir not in sys.path:
-        sys.path.insert(0, parent_dir)
-    try:
-        from api.services.s3_storage import S3StorageService
-        from api.models.database import PostEnrichment
-    except ImportError:
-        from shared.s3_storage import S3StorageService
-        from shared.database import PostEnrichment
+# Context7: Импорты из api (ВРЕМЕННОЕ ИСКЛЮЧЕНИЕ для архитектурной границы)
+# ⚠️ КРИТИЧЕСКОЕ ПРАВИЛО: Worker НЕ должен импортировать из API
+# TODO: [ARCH-SHARED-001] Переместить S3StorageService в shared-пакет в будущем
+# Context7: Настройка путей для cross-service импортов (только для S3StorageService)
+import sys
+import os
+parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
+
+from api.services.s3_storage import S3StorageService
+# Context7: PostEnrichment НЕ импортируем - используем прямые SQL запросы через async БД
 
 logger = structlog.get_logger()
 
@@ -410,54 +405,111 @@ class VisionAnalysisTask:
         analysis_results: List[Dict[str, Any]],
         trace_id: str
     ):
-        """Сохранение результатов Vision анализа в БД."""
+        """
+        Context7: Сохранение результатов Vision анализа в БД через EnrichmentRepository.
+        Использует единую модель с kind='vision' и структурированное JSONB поле data.
+        """
+        # Context7: Импорт shared репозитория
+        import sys
+        import os
+        shared_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'shared', 'python'))
+        if shared_path not in sys.path:
+            sys.path.insert(0, shared_path)
+        
+        from shared.repositories.enrichment_repository import EnrichmentRepository
+        
         try:
-            # Получаем или создаём PostEnrichment
-            result = await self.db.execute(
-                select(PostEnrichment).where(PostEnrichment.post_id == post_id)
+            if not analysis_results:
+                return
+            
+            # Context7: Агрегация результатов от нескольких медиа
+            first_result = analysis_results[0]["analysis"]
+            analyzed_at = datetime.now(timezone.utc)
+            
+            # Структурируем данные для JSONB поля data с использованием VisionEnrichment структуры
+            # Извлекаем classification type из classification dict или напрямую
+            classification = first_result.get("classification")
+            if isinstance(classification, dict):
+                classification_type = classification.get("type", "other")
+                labels_from_classification = classification.get("tags", [])
+            else:
+                classification_type = classification if classification else "other"
+                labels_from_classification = []
+            
+            # Формируем s3_keys для vision_data
+            s3_keys_dict = {}
+            s3_keys_list = []
+            for r in analysis_results:
+                sha256 = r.get("sha256")
+                s3_key = r.get("s3_key")
+                if sha256 and s3_key:
+                    s3_keys_dict["image"] = s3_key  # Основное изображение
+                    s3_keys_list.append({
+                        "sha256": sha256,
+                        "s3_key": s3_key,
+                        "analyzed_at": analyzed_at.isoformat()
+                    })
+            
+            # Используем новую структуру VisionEnrichment с обязательными полями
+            vision_data = {
+                "model": first_result.get("model", "unknown"),
+                "model_version": None,  # TODO: добавить версию модели если доступна
+                "provider": first_result.get("provider", "unknown"),
+                "analyzed_at": analyzed_at.isoformat(),
+                # Обязательные поля VisionEnrichment
+                "classification": classification_type,
+                "description": first_result.get("description") or "Изображение без описания",
+                "is_meme": first_result.get("is_meme", False),
+                # Labels из classification.tags или напрямую из labels
+                "labels": labels_from_classification or first_result.get("labels", []),
+                # Objects и scene
+                "objects": first_result.get("objects", []),
+                "scene": first_result.get("scene"),
+                # OCR данные
+                "ocr": {
+                    "text": first_result.get("ocr_text"),
+                    "engine": "tesseract" if first_result.get("provider") == "ocr_fallback" else "gigachat",
+                    "confidence": first_result.get("ocr", {}).get("confidence") if isinstance(first_result.get("ocr"), dict) else None
+                } if first_result.get("ocr_text") or first_result.get("ocr") else None,
+                # NSFW и aesthetic scores
+                "nsfw_score": first_result.get("nsfw_score"),
+                "aesthetic_score": first_result.get("aesthetic_score"),
+                # Dominant colors
+                "dominant_colors": first_result.get("dominant_colors", []),
+                # Context (emotions, themes, relationships)
+                "context": first_result.get("context", {}),
+                # S3 keys (новый формат)
+                "s3_keys": s3_keys_dict,
+                # Legacy поля для обратной совместимости
+                "file_id": first_result.get("file_id"),
+                "tokens_used": first_result.get("tokens_used", 0),
+                "cost_microunits": first_result.get("cost_microunits", 0),
+                "analysis_reason": first_result.get("analysis_reason", "new"),
+                # Legacy s3_keys как список для обратной совместимости
+                "s3_keys_list": s3_keys_list
+            }
+            
+            # Вычисляем params_hash для идемпотентности
+            repo = EnrichmentRepository(self.db)
+            params_hash = repo.compute_params_hash(
+                model=first_result.get("model"),
+                version=None,  # TODO: добавить версию
+                inputs={"provider": first_result.get("provider")}
             )
-            enrichment = result.scalar_one_or_none()
             
-            if not enrichment:
-                # Создаём новую запись
-                enrichment = PostEnrichment(
-                    post_id=post_id,
-                    vision_classification={},
-                    vision_context={},
-                    s3_media_keys=[],
-                    s3_vision_keys=[]
-                )
-                self.db.add(enrichment)
+            # Используем единый репозиторий для upsert
+            await repo.upsert_enrichment(
+                post_id=post_id,
+                kind='vision',
+                provider=first_result.get("provider", "unknown"),
+                data=vision_data,
+                params_hash=params_hash,
+                status='ok',
+                error=None,
+                trace_id=trace_id
+            )
             
-            # Обновляем vision поля
-            # TODO: Агрегация результатов от нескольких медиа
-            if analysis_results:
-                first_result = analysis_results[0]["analysis"]
-                enrichment.vision_classification = first_result.get("classification")
-                enrichment.vision_description = first_result.get("description")
-                enrichment.vision_ocr_text = first_result.get("ocr_text")
-                enrichment.vision_is_meme = first_result.get("is_meme", False)
-                enrichment.vision_context = first_result.get("context", {})
-                enrichment.vision_provider = first_result.get("provider")
-                enrichment.vision_model = first_result.get("model")
-                enrichment.vision_analyzed_at = datetime.now(timezone.utc)
-                enrichment.vision_file_id = first_result.get("file_id")
-                enrichment.vision_tokens_used = first_result.get("tokens_used", 0)
-                enrichment.vision_analysis_reason = "new"
-                
-                # S3 keys
-                enrichment.s3_vision_keys = [
-                    {
-                        "sha256": r["sha256"],
-                        "s3_key": r["s3_key"],
-                        "analyzed_at": datetime.now(timezone.utc).isoformat()
-                    }
-                    for r in analysis_results
-                ]
-            
-            await self.db.commit()
-            
-            logger.debug("Vision results saved to DB", post_id=post_id, trace_id=trace_id)
+            logger.debug("Vision results saved to DB via EnrichmentRepository", post_id=post_id, trace_id=trace_id)
             
             # Context7: Синхронизация Vision результатов в Neo4j
             if self.neo4j_client and analysis_results:
@@ -630,6 +682,23 @@ async def create_vision_analysis_task(
     async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     db_session = async_session()
     
+    # Context7: Создание asyncpg pool для StorageQuotaService (LRU eviction)
+    import asyncpg
+    db_pool = None
+    try:
+        # Конвертируем SQLAlchemy URL в asyncpg DSN
+        dsn = database_url.replace("postgresql+asyncpg://", "postgresql://")
+        db_pool = await asyncpg.create_pool(
+            dsn,
+            min_size=2,
+            max_size=5,
+            command_timeout=30
+        )
+        logger.info("AsyncPG pool created for StorageQuotaService")
+    except Exception as e:
+        logger.warning("Failed to create asyncpg pool for StorageQuotaService", error=str(e))
+        # Продолжаем без db_pool - LRU eviction будет работать без БД интеграции
+    
     # S3 Service
     s3_service = S3StorageService(
         endpoint_url=s3_config["endpoint_url"],
@@ -640,15 +709,22 @@ async def create_vision_analysis_task(
         use_compression=s3_config.get("use_compression", True)
     )
     
-    # Storage Quota
-    storage_quota = StorageQuotaService(
-        s3_service=s3_service,
-        limits=s3_config.get("limits", {
+    # Context7: StorageQuotaService с db_pool для LRU eviction
+    # Проверяем наличие параметра через inspect для совместимости
+    import inspect
+    sig = inspect.signature(StorageQuotaService.__init__)
+    init_params = {
+        's3_service': s3_service,
+        'limits': s3_config.get("limits", {
             "total_gb": 15.0,
             "emergency_threshold_gb": 14.0,
             "per_tenant_gb": 2.0
         })
-    )
+    }
+    if 'db_pool' in sig.parameters:
+        init_params['db_pool'] = db_pool
+    
+    storage_quota = StorageQuotaService(**init_params)
     
     # Budget Gate
     budget_gate = BudgetGateService(
@@ -671,8 +747,10 @@ async def create_vision_analysis_task(
     )
     
     # Policy Engine
+    # Context7: Правильный путь к конфигу политики (абсолютный или относительно /app)
+    policy_config_path = vision_config.get("policy_config_path", "/app/config/vision_policy.yml")
     policy_engine = VisionPolicyEngine(
-        policy_config_path=vision_config.get("policy_config_path")
+        policy_config_path=policy_config_path
     )
     
     # OCR Fallback (опционально)

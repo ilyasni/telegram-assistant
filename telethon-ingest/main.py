@@ -526,18 +526,76 @@ async def run_scheduler_loop():
             parsed.params, new_query, parsed.fragment
         ))
         logger.info("Creating async engine", db_url=db_url[:100])  # Log first 100 chars to avoid exposing password
-        engine = create_async_engine(db_url, pool_pre_ping=True, pool_size=5)
+        # Context7: Добавляем таймауты для предотвращения зависаний транзакций
+        engine = create_async_engine(
+            db_url, 
+            pool_pre_ping=True, 
+            pool_size=5,
+            pool_timeout=30,  # Timeout для получения соединения из пула
+            connect_args={
+                "command_timeout": 60,  # Timeout для каждой команды (через asyncpg)
+                "server_settings": {
+                    "application_name": "telethon_ingest"
+                }
+            }
+        )
         
         # Создание AsyncSession для парсера
         db_session = AsyncSession(engine)
         
-        # Context7: Создаём общий Redis клиент для parser и scheduler
+        # Context7: Создаём общий Redis клиент для parser и scheduler с таймаутами
         import redis.asyncio as redis
         shared_redis_client = redis.from_url(
             settings.redis_url,
-            decode_responses=True
+            decode_responses=True,
+            socket_connect_timeout=10,  # Timeout для подключения
+            socket_timeout=30,  # Timeout для операций
+            retry_on_timeout=True
         )
         logger.info("Shared Redis client created for parser and scheduler")
+        
+        # Context7: Инициализация MediaProcessor для обработки медиа
+        media_processor = None
+        try:
+            import sys
+            parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+            if parent_dir not in sys.path:
+                sys.path.insert(0, parent_dir)
+            
+            from api.services.s3_storage import S3StorageService
+            from worker.services.storage_quota import StorageQuotaService
+            from services.media_processor import MediaProcessor
+            
+            # Инициализация S3StorageService
+            s3_service = S3StorageService()
+            logger.info("S3StorageService initialized for MediaProcessor")
+            
+            # Инициализация StorageQuotaService
+            storage_quota = StorageQuotaService(s3_service)
+            logger.info("StorageQuotaService initialized for MediaProcessor")
+            
+            # MediaProcessor будет инициализирован с TelegramClient при первом использовании
+            # Создаём временный клиент для инициализации (будет заменён при обработке)
+            from telethon import TelegramClient
+            temp_client = None  # Будет установлен при первом использовании
+            
+            # Создаём MediaProcessor (telegram_client будет обновлён при обработке)
+            # Используем Redis без decode_responses для совместимости с MediaProcessor
+            redis_for_media = redis.from_url(settings.redis_url, decode_responses=False)
+            media_processor = MediaProcessor(
+                telegram_client=temp_client,  # Будет обновлён при обработке
+                s3_service=s3_service,
+                storage_quota=storage_quota,
+                redis_client=redis_for_media
+            )
+            logger.info("MediaProcessor initialized for ChannelParser")
+        except Exception as e:
+            logger.warning(
+                "Failed to initialize MediaProcessor, continuing without media processing",
+                error=str(e),
+                exc_info=True
+            )
+            # Продолжаем без MediaProcessor
         
         # Создание ChannelParser с DI и общим Redis клиентом
         parser = ChannelParser(
@@ -545,7 +603,8 @@ async def run_scheduler_loop():
             db_session=db_session,
             event_publisher=None,  # Temporarily disabled
             redis_client=shared_redis_client,  # Context7: Передаём общий Redis клиент
-            telegram_client_manager=client_manager  # Передаём TelegramClientManager
+            telegram_client_manager=client_manager,  # Передаём TelegramClientManager
+            media_processor=media_processor  # Context7: Передаём MediaProcessor
         )
         
         # Update app_state with parser info

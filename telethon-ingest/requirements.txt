@@ -42,3 +42,7 @@ pytest-mock==3.12.0
 # Logging and debugging
 rich==13.7.0
 loguru==0.7.2
+
+# S3 Storage (Cloud.ru) - Context7: для MediaProcessor и S3 integration
+boto3>=1.34.0
+botocore>=1.34.0

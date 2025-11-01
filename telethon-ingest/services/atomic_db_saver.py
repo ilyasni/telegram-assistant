@@ -56,6 +56,37 @@ db_channels_upserted_total = Counter(
     'Channels upserted'
 )
 
+# Context7: Метрики для CAS операций (media_objects + post_media_map)
+media_objects_upserted_total = Counter(
+    'media_objects_upserted_total',
+    'Total media_objects upserted',
+    ['status']  # 'new', 'existing'
+)
+
+media_objects_refs_updated_total = Counter(
+    'media_objects_refs_updated_total',
+    'Total refs_count increments'
+)
+
+post_media_map_inserted_total = Counter(
+    'post_media_map_inserted_total',
+    'Total post_media_map inserts',
+    ['status']  # 'new', 'duplicate'
+)
+
+cas_operations_latency_seconds = Histogram(
+    'cas_operations_latency_seconds',
+    'CAS operations latency',
+    ['operation'],  # 'save_media_to_cas'
+    buckets=[0.01, 0.05, 0.1, 0.5, 1, 2, 5]
+)
+
+cas_operations_errors_total = Counter(
+    'cas_operations_errors_total',
+    'CAS operations errors',
+    ['operation', 'error_type']
+)
+
 
 class AtomicDBSaver:
     """
@@ -148,6 +179,286 @@ class AtomicDBSaver:
                             error=str(e), 
                             reason=reason)
             return False, str(e), 0
+    
+    async def save_forwards_reactions_replies(
+        self,
+        db_session: AsyncSession,
+        post_id: str,
+        forwards_data: List[Dict[str, Any]] = None,
+        reactions_data: List[Dict[str, Any]] = None,
+        replies_data: List[Dict[str, Any]] = None
+    ) -> None:
+        """
+        Context7: Сохранение деталей forwards, reactions и replies в БД.
+        Использует batch insert с идемпотентностью через ON CONFLICT.
+        
+        Args:
+            db_session: SQLAlchemy AsyncSession
+            post_id: UUID поста
+            forwards_data: Список данных о forwards
+            reactions_data: Список данных о reactions
+            replies_data: Список данных о replies
+        """
+        from sqlalchemy import text
+        
+        try:
+            # Сохранение forwards
+            if forwards_data:
+                forwards_sql = text("""
+                    INSERT INTO post_forwards (
+                        post_id, from_chat_id, from_message_id,
+                        from_chat_title, from_chat_username, forwarded_at
+                    ) VALUES (
+                        :post_id, :from_chat_id, :from_message_id,
+                        :from_chat_title, :from_chat_username, :forwarded_at
+                    )
+                    ON CONFLICT DO NOTHING
+                """)
+                
+                forwards_params = [
+                    {
+                        'post_id': post_id,
+                        'from_chat_id': fwd.get('from_chat_id'),
+                        'from_message_id': fwd.get('from_message_id'),
+                        'from_chat_title': fwd.get('from_chat_title'),
+                        'from_chat_username': fwd.get('from_chat_username'),
+                        'forwarded_at': fwd.get('forwarded_at')
+                    }
+                    for fwd in forwards_data
+                ]
+                
+                if forwards_params:
+                    await db_session.execute(forwards_sql, forwards_params)
+                    logger.debug("Saved forwards", post_id=post_id, count=len(forwards_data))
+            
+            # Сохранение reactions
+            if reactions_data:
+                reactions_sql = text("""
+                    INSERT INTO post_reactions (
+                        post_id, reaction_type, reaction_value, user_tg_id, is_big
+                    ) VALUES (
+                        :post_id, :reaction_type, :reaction_value, :user_tg_id, :is_big
+                    )
+                    ON CONFLICT (post_id, reaction_type, reaction_value, user_tg_id) 
+                    DO UPDATE SET updated_at = NOW()
+                """)
+                
+                reactions_params = [
+                    {
+                        'post_id': post_id,
+                        'reaction_type': reaction.get('reaction_type', 'emoji'),
+                        'reaction_value': reaction.get('reaction_value'),
+                        'user_tg_id': reaction.get('user_tg_id'),
+                        'is_big': reaction.get('is_big', False)
+                    }
+                    for reaction in reactions_data
+                ]
+                
+                if reactions_params:
+                    await db_session.execute(reactions_sql, reactions_params)
+                    logger.debug("Saved reactions", post_id=post_id, count=len(reactions_data))
+            
+            # Сохранение replies
+            if replies_data:
+                replies_sql = text("""
+                    INSERT INTO post_replies (
+                        post_id, reply_to_post_id, reply_message_id, reply_chat_id,
+                        reply_author_tg_id, reply_author_username, reply_content, reply_posted_at
+                    ) VALUES (
+                        :post_id, :reply_to_post_id, :reply_message_id, :reply_chat_id,
+                        :reply_author_tg_id, :reply_author_username, :reply_content, :reply_posted_at
+                    )
+                    ON CONFLICT DO NOTHING
+                """)
+                
+                replies_params = [
+                    {
+                        'post_id': post_id,
+                        'reply_to_post_id': reply.get('reply_to_post_id'),
+                        'reply_message_id': reply.get('reply_message_id'),
+                        'reply_chat_id': reply.get('reply_chat_id'),
+                        'reply_author_tg_id': reply.get('reply_author_tg_id'),
+                        'reply_author_username': reply.get('reply_author_username'),
+                        'reply_content': reply.get('reply_content'),
+                        'reply_posted_at': reply.get('reply_posted_at')
+                    }
+                    for reply in replies_data
+                ]
+                
+                if replies_params:
+                    await db_session.execute(replies_sql, replies_params)
+                    logger.debug("Saved replies", post_id=post_id, count=len(replies_data))
+                    
+        except Exception as e:
+            logger.error("Failed to save forwards/reactions/replies", 
+                        post_id=post_id, error=str(e))
+            # Не прерываем транзакцию - это дополнительная информация
+    
+    async def save_media_to_cas(
+        self,
+        db_session: AsyncSession,
+        post_id: str,
+        media_files: List[Any],  # List[MediaFile] - объекты с sha256, s3_key, mime_type, size_bytes
+        s3_bucket: str,
+        trace_id: Optional[str] = None
+    ) -> None:
+        """
+        Context7: Сохранение медиа в CAS таблицы (media_objects и post_media_map).
+        
+        Использует:
+        - UPSERT в media_objects с инкрементом refs_count
+        - INSERT в post_media_map с ON CONFLICT DO NOTHING
+        - Транзакционность через db_session
+        - Метрики Prometheus для мониторинга
+        
+        Args:
+            db_session: SQLAlchemy AsyncSession
+            post_id: UUID поста
+            media_files: Список MediaFile объектов (sha256, s3_key, mime_type, size_bytes)
+            s3_bucket: Имя S3 bucket
+            trace_id: Trace ID для логирования
+        """
+        if not media_files:
+            return
+        
+        start_time = time.time()
+        
+        try:
+            # Context7: Batch insert для media_objects (UPSERT с инкрементом refs_count)
+            media_objects_params = []
+            for media_file in media_files:
+                media_objects_params.append({
+                    'file_sha256': media_file.sha256,
+                    'mime': media_file.mime_type,
+                    'size_bytes': media_file.size_bytes,
+                    's3_key': media_file.s3_key,
+                    's3_bucket': s3_bucket,
+                    'now': datetime.now(timezone.utc)
+                })
+            
+            if media_objects_params:
+                # Context7: Проверяем, какие медиа уже существуют (для метрик)
+                existing_check_sql = text("""
+                    SELECT file_sha256 FROM media_objects 
+                    WHERE file_sha256 = ANY(:sha256_list::text[])
+                """)
+                existing_result = await db_session.execute(
+                    existing_check_sql,
+                    {"sha256_list": [mf.sha256 for mf in media_files]}
+                )
+                existing_sha256s = {row[0] for row in existing_result.fetchall()}
+                
+                media_objects_sql = text("""
+                    INSERT INTO media_objects (
+                        file_sha256, mime, size_bytes, s3_key, s3_bucket,
+                        first_seen_at, last_seen_at, refs_count
+                    ) VALUES (
+                        :file_sha256, :mime, :size_bytes, :s3_key, :s3_bucket,
+                        :now, :now, 1
+                    )
+                    ON CONFLICT (file_sha256) DO UPDATE SET
+                        last_seen_at = :now,
+                        refs_count = media_objects.refs_count + 1,
+                        s3_key = EXCLUDED.s3_key,
+                        s3_bucket = EXCLUDED.s3_bucket
+                """)
+                
+                await db_session.execute(media_objects_sql, media_objects_params)
+                
+                # Context7: Обновляем метрики
+                for mf in media_files:
+                    if mf.sha256 in existing_sha256s:
+                        media_objects_upserted_total.labels(status='existing').inc()
+                        media_objects_refs_updated_total.inc()
+                    else:
+                        media_objects_upserted_total.labels(status='new').inc()
+                
+                logger.debug(
+                    "Saved media_objects",
+                    post_id=post_id,
+                    count=len(media_files),
+                    trace_id=trace_id
+                )
+            
+            # Context7: Batch insert для post_media_map
+            post_media_map_params = []
+            for idx, media_file in enumerate(media_files):
+                post_media_map_params.append({
+                    'post_id': post_id,
+                    'file_sha256': media_file.sha256,
+                    'position': idx,
+                    'role': 'primary',
+                    'uploaded_at': datetime.now(timezone.utc)
+                })
+            
+            if post_media_map_params:
+                # Context7: Проверяем существующие связи (для метрик)
+                existing_map_check_sql = text("""
+                    SELECT file_sha256 FROM post_media_map 
+                    WHERE post_id = :post_id AND file_sha256 = ANY(:sha256_list::text[])
+                """)
+                existing_map_result = await db_session.execute(
+                    existing_map_check_sql,
+                    {"post_id": post_id, "sha256_list": [mf.sha256 for mf in media_files]}
+                )
+                existing_map_sha256s = {row[0] for row in existing_map_result.fetchall()}
+                
+                post_media_map_sql = text("""
+                    INSERT INTO post_media_map (
+                        post_id, file_sha256, position, role, uploaded_at
+                    ) VALUES (
+                        :post_id, :file_sha256, :position, :role, :uploaded_at
+                    )
+                    ON CONFLICT (post_id, file_sha256) DO NOTHING
+                """)
+                
+                result = await db_session.execute(post_media_map_sql, post_media_map_params)
+                
+                # Context7: Обновляем метрики
+                inserted_count = len(media_files) - len(existing_map_sha256s)
+                duplicate_count = len(existing_map_sha256s)
+                if inserted_count > 0:
+                    post_media_map_inserted_total.labels(status='new').inc(inserted_count)
+                if duplicate_count > 0:
+                    post_media_map_inserted_total.labels(status='duplicate').inc(duplicate_count)
+                
+                logger.debug(
+                    "Saved post_media_map",
+                    post_id=post_id,
+                    count=len(media_files),
+                    inserted=inserted_count,
+                    duplicates=duplicate_count,
+                    trace_id=trace_id
+                )
+            
+            duration = time.time() - start_time
+            cas_operations_latency_seconds.labels(operation='save_media_to_cas').observe(duration)
+            
+            logger.info(
+                "Media saved to CAS",
+                post_id=post_id,
+                media_count=len(media_files),
+                duration_ms=int(duration * 1000),
+                trace_id=trace_id
+            )
+                    
+        except Exception as e:
+            duration = time.time() - start_time
+            cas_operations_latency_seconds.labels(operation='save_media_to_cas').observe(duration)
+            cas_operations_errors_total.labels(
+                operation='save_media_to_cas',
+                error_type=type(e).__name__
+            ).inc()
+            
+            logger.error(
+                "Failed to save media to CAS",
+                post_id=post_id,
+                error=str(e),
+                duration_ms=int(duration * 1000),
+                trace_id=trace_id,
+                exc_info=True
+            )
+            # Context7: Не прерываем транзакцию - медиа уже в S3, CAS можно восстановить позже
     
     async def _upsert_user(self, db_session: AsyncSession, user_data: Dict[str, Any]) -> None:
         """
@@ -341,7 +652,18 @@ class AtomicDBSaver:
             # Context7: Правильный подсчет вставленных строк
             # result.rowcount возвращает количество действительно вставленных/обновленных строк
             # При ON CONFLICT DO NOTHING это количество новых строк (не конфликтных)
+            # Следим: при executemany с PostgreSQL rowcount может быть -1 (не поддерживается)
             inserted_count = result.rowcount if result.rowcount is not None else 0
+            
+            # Context7: Проверяем на некорректные значения rowcount
+            if inserted_count < 0:
+                # PostgreSQL/asyncpg может вернуть -1 для bulk операций
+                # В этом случае считаем, что все посты были вставлены (оптимистичный подход)
+                # Лучше пересчитать через SELECT, но это дорого - используем логику идемпотентности
+                self.logger.warning("Invalid rowcount from bulk insert, assuming all inserted",
+                                  total_count=len(prepared_posts),
+                                  rowcount=result.rowcount)
+                inserted_count = len(prepared_posts)
             
             # Если rowcount недоступен (старые версии SQLAlchemy), используем приблизительную оценку
             # Но для bulk insert с executemany это может быть неправильно

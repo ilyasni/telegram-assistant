@@ -103,6 +103,54 @@ class GigaChatEmbeddingProvider(EmbeddingProvider):
         self.model = settings.GIGACHAT_EMBEDDINGS_MODEL
         # GigaChat EmbeddingsGigaR возвращает 2560 измерений
         self.dimension = 2560
+        # Context7: [C7-ID: gigachat-resilience-001] Кэш для результата health check
+        self._proxy_health_cache = None
+        self._proxy_health_cache_ttl = 30  # секунд
+        self._proxy_health_cache_time = 0
+    
+    def _check_proxy_health(self) -> bool:
+        """
+        Context7: [C7-ID: gigachat-resilience-001] Проверка доступности gpt2giga-proxy.
+        Использует /v1/models endpoint согласно документации gpt2giga.
+        Результат кэшируется для снижения нагрузки на прокси.
+        """
+        import time
+        import requests
+        import os
+        
+        # Проверка кэша
+        current_time = time.time()
+        if (self._proxy_health_cache is not None and 
+            current_time - self._proxy_health_cache_time < self._proxy_health_cache_ttl):
+            return self._proxy_health_cache
+        
+        try:
+            proxy_url = os.getenv("GIGACHAT_PROXY_URL", "http://gpt2giga-proxy:8090")
+            # Согласно документации gpt2giga: /v1/models endpoint для health check
+            response = requests.get(f"{proxy_url}/v1/models", timeout=5)
+            is_healthy = response.status_code == 200
+            
+            # Обновление кэша
+            self._proxy_health_cache = is_healthy
+            self._proxy_health_cache_time = current_time
+            
+            if not is_healthy:
+                logger.warning("gpt2giga-proxy health check failed", 
+                             status_code=response.status_code,
+                             proxy_url=proxy_url)
+            else:
+                logger.debug("gpt2giga-proxy health check passed", proxy_url=proxy_url)
+            
+            return is_healthy
+        except Exception as e:
+            logger.warning("gpt2giga-proxy health check error", 
+                         error=str(e), 
+                         error_type=type(e).__name__,
+                         proxy_url=os.getenv("GIGACHAT_PROXY_URL", "http://gpt2giga-proxy:8090"))
+            # Кэшируем отрицательный результат на короткое время
+            self._proxy_health_cache = False
+            self._proxy_health_cache_time = current_time
+            return False
     
     def _embed_text_internal(self, text: str) -> List[float]:
         """
@@ -194,6 +242,14 @@ class GigaChatEmbeddingProvider(EmbeddingProvider):
         
         @retry_decorator
         def _call_with_retry(text: str) -> List[float]:
+            import os
+            # Context7: [C7-ID: gigachat-resilience-001] Проверка доступности прокси перед запросом
+            if not self._check_proxy_health():
+                logger.warning("gpt2giga-proxy unavailable, proceeding with retry logic",
+                             proxy_url=os.getenv("GIGACHAT_PROXY_URL", "http://gpt2giga-proxy:8090"))
+                # Пробрасываем ConnectionError для retry логики
+                raise ConnectionError("gpt2giga-proxy health check failed")
+            
             try:
                 return self._embed_text_internal(text)
             except (ConnectionError, Timeout, RequestException) as e:

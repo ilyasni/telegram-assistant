@@ -82,7 +82,8 @@ class ChannelParser:
         redis_client: Optional[Any] = None,
         atomic_saver: Optional[AtomicDBSaver] = None,
         rate_limiter: Optional[RateLimiter] = None,
-        telegram_client_manager: Optional[Any] = None
+        telegram_client_manager: Optional[Any] = None,
+        media_processor: Optional[Any] = None  # MediaProcessor для обработки медиа
     ):
         self.config = config
         self.db_session = db_session
@@ -99,6 +100,7 @@ class ChannelParser:
         self.atomic_saver = atomic_saver or AtomicDBSaver()
         self.rate_limiter = rate_limiter
         self.telegram_client_manager = telegram_client_manager
+        self.media_processor = media_processor  # MediaProcessor для обработки медиа
         
         # Статистика
         self.stats = {
@@ -110,7 +112,8 @@ class ChannelParser:
             'cooldown_skipped': 0
         }
         
-        logger.info("Channel parser initialized with Context7 components")
+        logger.info("Channel parser initialized with Context7 components", 
+                   has_media_processor=media_processor is not None)
     
     async def parse_channel_messages(
         self,
@@ -133,6 +136,16 @@ class ChannelParser:
         """
         start_time = time.time()
         max_message_date = None
+        
+        # Context7: Сброс статистики для каждого канала
+        self.stats = {
+            'messages_parsed': 0,
+            'messages_skipped': 0,
+            'flood_wait_count': 0,
+            'errors': 0,
+            'rate_limited': 0,
+            'cooldown_skipped': 0
+        }
         
         logger.info("parse_channel_messages started", 
                    channel_id=channel_id,
@@ -668,6 +681,8 @@ class ChannelParser:
         # Подготовка данных для bulk insert
         posts_data = []
         events_data = []
+        # Context7: Сохраняем mapping между сообщениями и post_data для извлечения forwards/reactions/replies
+        message_to_post_mapping = []
         
         logger.info(f"Processing batch of {len(messages)} messages", 
                    channel_id=channel_id, mode=mode)
@@ -708,7 +723,66 @@ class ChannelParser:
                 if not post_data.get('idempotency_key'):
                     post_data['idempotency_key'] = f"{tenant_id}:{channel_id}:{telegram_message_id}"
                 
+                post_id = post_data.get('id')
+                trace_id = post_data.get('idempotency_key', str(uuid.uuid4()))
+                
+                # Context7: Обработка медиа через MediaProcessor (если доступен и сообщение содержит медиа)
+                media_files = []
+                if self.media_processor and message.media:
+                    try:
+                        # Получаем TelegramClient из telegram_client_manager для MediaProcessor
+                        if self.telegram_client_manager:
+                            telegram_client = await self.telegram_client_manager.get_client(user_id)
+                            if telegram_client:
+                                # Обновляем telegram_client в MediaProcessor
+                                self.media_processor.telegram_client = telegram_client
+                                
+                                # Обработка медиа
+                                media_files = await self.media_processor.process_message_media(
+                                    message=message,
+                                    post_id=post_id,
+                                    trace_id=trace_id,
+                                    tenant_id=tenant_id
+                                )
+                                
+                                logger.debug(
+                                    "Media processed",
+                                    post_id=post_id,
+                                    media_count=len(media_files),
+                                    channel_id=channel_id
+                                )
+                            else:
+                                logger.debug(
+                                    "TelegramClient not available for media processing",
+                                    post_id=post_id,
+                                    user_id=user_id,
+                                    channel_id=channel_id
+                                )
+                        else:
+                            logger.debug(
+                                "TelegramClientManager not available for media processing",
+                                post_id=post_id,
+                                channel_id=channel_id
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to process media",
+                            post_id=post_id,
+                            error=str(e),
+                            channel_id=channel_id,
+                            exc_info=True
+                        )
+                        # Продолжаем обработку даже при ошибке медиа
+                
+                # Сохраняем информацию о медиа в post_data для последующего использования
+                if media_files:
+                    post_data['media_files'] = media_files
+                    post_data['media_count'] = len(media_files)
+                
                 posts_data.append(post_data)
+                
+                # Context7: Сохраняем mapping для последующего извлечения forwards/reactions/replies
+                message_to_post_mapping.append((message, post_data))
                 
                 # Подготовка события
                 event_data = await self._prepare_parsed_event(
@@ -785,6 +859,109 @@ class ChannelParser:
                           channel_id=channel_id,
                           inserted_count=inserted_count)
                 
+                # Context7: Сохранение деталей forwards/reactions/replies и медиа в CAS для каждого поста
+                try:
+                    from services.message_enricher import (
+                        extract_forwards_details,
+                        extract_reactions_details,
+                        extract_replies_details
+                    )
+                    
+                    # Context7: Используем сохранённый mapping для извлечения деталей
+                    for message, post_data in message_to_post_mapping:
+                        # Context7: Получаем реальный post_id из БД после вставки
+                        # Используем channel_id + telegram_message_id для поиска
+                        channel_id = post_data.get('channel_id')
+                        telegram_message_id = post_data.get('telegram_message_id')
+                        
+                        if not channel_id or not telegram_message_id:
+                            logger.warning("Missing channel_id or telegram_message_id for post",
+                                         post_data=post_data)
+                            continue
+                        
+                        # Получаем post_id из БД
+                        try:
+                            result = await self.db_session.execute(
+                                text("SELECT id FROM posts WHERE channel_id = :channel_id AND telegram_message_id = :telegram_message_id"),
+                                {"channel_id": channel_id, "telegram_message_id": telegram_message_id}
+                            )
+                            row = result.fetchone()
+                            if not row:
+                                logger.warning("Post not found in DB after insert",
+                                             channel_id=channel_id,
+                                             telegram_message_id=telegram_message_id)
+                                continue
+                            post_id = str(row.id)
+                        except Exception as e:
+                            logger.error("Failed to get post_id from DB",
+                                       channel_id=channel_id,
+                                       telegram_message_id=telegram_message_id,
+                                       error=str(e))
+                            continue
+                        
+                        try:
+                            # Извлекаем детали из оригинального сообщения
+                            forwards = extract_forwards_details(message)
+                            reactions = extract_reactions_details(message)
+                            replies = extract_replies_details(message, post_id)
+                            
+                            # Сохраняем forwards/reactions/replies в БД, если есть данные
+                            if forwards or reactions or replies:
+                                await self.atomic_saver.save_forwards_reactions_replies(
+                                    db_session=self.db_session,
+                                    post_id=post_id,
+                                    forwards_data=forwards,
+                                    reactions_data=reactions,
+                                    replies_data=replies
+                                )
+                                logger.debug("Saved forwards/reactions/replies",
+                                           post_id=post_id,
+                                           forwards=len(forwards),
+                                           reactions=len(reactions),
+                                           replies=len(replies))
+                            
+                            # Context7: Сохранение медиа в CAS таблицы (media_objects + post_media_map)
+                            # Выполняется для всех постов с медиа, независимо от наличия forwards/reactions/replies
+                            media_files = post_data.get('media_files', [])
+                            if media_files and self.media_processor:
+                                try:
+                                    s3_bucket = self.media_processor.s3_service.bucket_name
+                                    await self.atomic_saver.save_media_to_cas(
+                                        db_session=self.db_session,
+                                        post_id=post_id,
+                                        media_files=media_files,
+                                        s3_bucket=s3_bucket,
+                                        trace_id=trace_id
+                                    )
+                                    logger.debug("Saved media to CAS",
+                                               post_id=post_id,
+                                               media_count=len(media_files),
+                                               trace_id=trace_id)
+                                except Exception as e:
+                                    logger.warning(
+                                        "Failed to save media to CAS",
+                                        post_id=post_id,
+                                        error=str(e),
+                                        trace_id=trace_id
+                                    )
+                                    # Не прерываем транзакцию
+                            
+                            # Commit после сохранения всех данных для поста
+                            await self.db_session.commit()
+                            
+                        except Exception as e:
+                            await self.db_session.rollback()
+                            logger.warning("Failed to save post details",
+                                         post_id=post_id, error=str(e), exc_info=True)
+                            # Не прерываем основной поток - продолжаем с следующим постом
+                
+                except ImportError as e:
+                    logger.warning("message_enricher not available", error=str(e))
+                except Exception as e:
+                    logger.warning("Failed to save post details",
+                                 error=str(e), exc_info=True)
+                    # Не прерываем основной поток
+                
                 # HWM ТОЛЬКО после успешного commit
                 if processed > 0 and max_date:
                     hwm_key = f"parse_hwm:{channel_id}"
@@ -798,6 +975,38 @@ class ChannelParser:
                 # Публикация событий только после успешного сохранения
                 if events_data:
                     await self._publish_parsed_events(events_data)
+                
+                # Context7: Эмиссия VisionUploadedEventV1 для медиа файлов
+                if self.media_processor:
+                    for post_data in posts_data:
+                        if post_data.get('media_files'):
+                            try:
+                                post_id = post_data.get('id')
+                                media_files = post_data.get('media_files', [])
+                                trace_id = post_data.get('idempotency_key', str(uuid.uuid4()))
+                                
+                                await self.media_processor.emit_vision_uploaded_event(
+                                    post_id=post_id,
+                                    tenant_id=tenant_id,
+                                    media_files=media_files,
+                                    trace_id=trace_id
+                                )
+                                
+                                logger.debug(
+                                    "Vision uploaded event emitted",
+                                    post_id=post_id,
+                                    media_count=len(media_files),
+                                    channel_id=channel_id
+                                )
+                            except Exception as e:
+                                logger.warning(
+                                    "Failed to emit vision uploaded event",
+                                    post_id=post_data.get('id'),
+                                    error=str(e),
+                                    channel_id=channel_id,
+                                    exc_info=True
+                                )
+                                # Продолжаем обработку даже при ошибке события
             else:
                 logger.error("Atomic batch save failed", 
                            channel_id=channel_id,
@@ -860,6 +1069,9 @@ class ChannelParser:
         # Извлечение URL
         urls = self._extract_urls(text)
         
+        # Context7: Генерация content_hash для идемпотентности
+        content_hash = self._create_content_hash(text)
+        
         # Context7 best practice: безопасная генерация ID на клиенте
         post_id = str(uuid.uuid4())
         
@@ -884,6 +1096,8 @@ class ChannelParser:
             'telegram_message_id': message.id if hasattr(message, 'id') else int(time.time() * 1000),
             'content': text,
             'media_urls': json.dumps(urls) if urls else '[]',  # [C7-ID: dev-mode-014] Context7: JSONB формат (строка JSON, не список)
+            'urls': urls,  # Context7: Raw URLs список для events
+            'content_hash': content_hash,  # Context7: Hash для идемпотентности
             'posted_at': posted_at,
             'created_at': datetime.now(timezone.utc),
             'is_processed': False,
@@ -1096,7 +1310,7 @@ class ChannelParser:
                 
             # Context7: Если event_publisher=None, публикуем напрямую в Redis Streams
             if self.event_publisher is None:
-                stream_key = "posts.parsed"
+                stream_key = "stream:posts:parsed"  # Context7: Unified stream naming
                 for event in events_data:
                     # Context7: Публикация в Redis Streams через xadd()
                     # Конвертируем значения в строки для Redis

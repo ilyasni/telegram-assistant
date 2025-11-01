@@ -176,6 +176,7 @@ services:
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - ./prometheus/alerts:/etc/prometheus/alerts:ro  # Context7: монтируем директорию с alerts для Storage Quota
       - prometheus_data:/prometheus
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
@@ -312,6 +313,11 @@ services:
     build:
       context: .
       dockerfile: api/Dockerfile
+    # Context7: Публичные DNS для надежного резолвинга s3.cloud.ru
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+      - 127.0.0.11  # Docker embedded DNS
     environment:
       DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@supabase-db:5432/${POSTGRES_DB}
       REDIS_URL: redis://redis:6379
@@ -325,8 +331,22 @@ services:
       ENVIRONMENT: ${ENVIRONMENT:-production}
       # Context7 best practice: timezone для корректной работы с временем
       TZ: Europe/Moscow
+      # S3 Storage Configuration (Cloud.ru) - Context7: для Vision + S3 Integration
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-https://s3.cloud.ru}
+      S3_BUCKET_NAME: ${S3_BUCKET_NAME}
+      S3_REGION: ${S3_REGION:-ru-central-1}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY}
+      S3_DEFAULT_TENANT_ID: ${S3_DEFAULT_TENANT_ID}
+      S3_USE_COMPRESSION: ${S3_USE_COMPRESSION:-true}
+      S3_COMPRESSION_LEVEL: ${S3_COMPRESSION_LEVEL:-6}
+      S3_MULTIPART_THRESHOLD_MB: ${S3_MULTIPART_THRESHOLD_MB:-5}
+      S3_ADDRESSING_STYLE: ${S3_ADDRESSING_STYLE:-path}
+      AWS_SIGNATURE_VERSION: ${AWS_SIGNATURE_VERSION:-s3v4}
     volumes:
       - ./webapp:/app/webapp:ro
+      - ./api:/app:ro  # Context7: монтируем код для разработки (read-only для безопасности)
+      - ./worker:/opt/telegram-assistant/worker:ro  # Context7: для импорта StorageQuotaService
       # Context7 best practice: монтируем timezone данные хоста
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
@@ -349,6 +369,11 @@ services:
     build:
       context: .
       dockerfile: worker/Dockerfile
+    # Context7: Публичные DNS для надежного резолвинга s3.cloud.ru
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+      - 127.0.0.11  # Docker embedded DNS
     environment:
       DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@supabase-db:5432/${POSTGRES_DB}
       REDIS_URL: redis://redis:6379
@@ -366,6 +391,9 @@ services:
       GIGACHAT_PROXY_URL: ${GIGACHAT_PROXY_URL:-http://gpt2giga-proxy:8090}
       # Убираем GIGACHAT_ACCESS_TOKEN - используем только прокси
       # GIGACHAT_ACCESS_TOKEN: ${GIGACHAT_ACCESS_TOKEN}
+      # Context7: GigaChat Vision API Credentials (для VisionAnalysisTask)
+      GIGACHAT_CREDENTIALS: ${GIGACHAT_CREDENTIALS}
+      GIGACHAT_SCOPE: ${GIGACHAT_SCOPE:-GIGACHAT_API_PERS}
       # Fallback: OpenRouter
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
       # DEV Feature Flags
@@ -400,11 +428,30 @@ services:
       PYTHONUNBUFFERED: 1
       # Context7 best practice: timezone для корректной работы с временем
       TZ: Europe/Moscow
+      # S3 Storage Configuration (Cloud.ru) - Context7: для Vision + S3 Integration
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-https://s3.cloud.ru}
+      S3_BUCKET_NAME: ${S3_BUCKET_NAME}
+      S3_REGION: ${S3_REGION:-ru-central-1}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY}
+      S3_DEFAULT_TENANT_ID: ${S3_DEFAULT_TENANT_ID}
+      S3_USE_COMPRESSION: ${S3_USE_COMPRESSION:-true}
+      S3_COMPRESSION_LEVEL: ${S3_COMPRESSION_LEVEL:-6}
+      S3_MULTIPART_THRESHOLD_MB: ${S3_MULTIPART_THRESHOLD_MB:-5}
+      S3_MEDIA_TTL_DAYS: ${S3_MEDIA_TTL_DAYS:-30}
+      S3_VISION_TTL_DAYS: ${S3_VISION_TTL_DAYS:-14}
+      S3_CRAWL_TTL_DAYS: ${S3_CRAWL_TTL_DAYS:-7}
+      S3_ABORT_MULTIPART_DAYS: ${S3_ABORT_MULTIPART_DAYS:-1}
+      S3_ADDRESSING_STYLE: ${S3_ADDRESSING_STYLE:-path}
+      AWS_SIGNATURE_VERSION: ${AWS_SIGNATURE_VERSION:-s3v4}
     volumes:
       - ./worker/config:/app/config:ro
       # Context7 best practice: монтируем timezone данные хоста
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
+      # Context7: Volume mount для api модуля (cross-service import для VisionAnalysisTask)
+      # TODO: [C7-ID: ARCH-SHARED-001] Переместить S3StorageService в shared-пакет
+      - ./api:/opt/telegram-assistant/api:ro
     depends_on:
       supabase-db:
         condition: service_started
@@ -430,6 +477,11 @@ services:
     build:
       context: .
       dockerfile: telethon-ingest/Dockerfile
+    # Context7: Публичные DNS для надежного резолвинга s3.cloud.ru
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+      - 127.0.0.11  # Docker embedded DNS
     environment:
       MASTER_API_ID: ${MASTER_API_ID}
       MASTER_API_HASH: ${MASTER_API_HASH}
@@ -459,6 +511,9 @@ services:
       ALL_PROXY: ""
     volumes:
       - ./telethon-ingest/sessions:/app/sessions  # персистентность сессий
+      - ./telethon-ingest:/app:ro  # Context7: монтируем код для разработки (read-only для безопасности)
+      - ./api:/opt/telegram-assistant/api:ro  # Context7: монтируем api для импорта S3StorageService
+      - ./worker:/opt/telegram-assistant/worker:ro  # Context7: монтируем worker для импорта StorageQuotaService
       # Context7 best practice: монтируем timezone данные хоста
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro

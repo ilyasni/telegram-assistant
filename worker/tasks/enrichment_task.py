@@ -22,7 +22,8 @@ from event_bus import EventConsumer, ConsumerConfig, PostEnrichedEvent, get_even
 from metrics import (
     enrichment_requests_total,
     enrichment_latency_seconds,
-    enrichment_skipped_total
+    enrichment_skipped_total,
+    posts_processed_total
 )
 
 # ============================================================================
@@ -243,6 +244,9 @@ class EnrichmentWorker:
             
             logger.debug(f"Processing post {post_id} for enrichment")
             
+            # МЕТРИКА: попытка обработки
+            posts_processed_total.labels(stage='enrichment', success='attempt').inc()
+            
             # Проверка триггеров enrichment
             should_enrich, skip_reason = await self._should_enrich_post(post_id, tags)
             
@@ -251,6 +255,8 @@ class EnrichmentWorker:
                 await self._publish_skipped_enrichment(event_data, skip_reason)
                 self.stats['posts_skipped'] += 1
                 enrichment_skipped_total.labels(reason=skip_reason).inc()
+                # МЕТРИКА: пропуск обогащения
+                posts_processed_total.labels(stage='enrichment', success='skip').inc()
                 return
             
             # [C7-ID: ENRICH-URLS-001] Источники URLs: event.urls → regex из text → []
@@ -271,6 +277,12 @@ class EnrichmentWorker:
             post_context = await self._get_post_with_urls(sanitized_post_id)
             
             logger.info("enrich_after_db_query", extra={"post_id": post_id, "post_context": bool(post_context)})
+            
+            # Context7: Проверка существования поста перед обогащением
+            if not post_context:
+                logger.warning("Post not found in DB, skipping enrichment", post_id=post_id, trace_id=event_data.get('trace_id'))
+                posts_processed_total.labels(stage='enrichment', success='skip').inc()
+                return
             
             # [C7-ID: ENRICH-DBG-011] Построение enriched_event с логами «между шагами»
             logger.info("enrich_build_start", extra={"post_id": post_id})
@@ -313,6 +325,8 @@ class EnrichmentWorker:
                 })
                 # DLQ, чтобы не стопорить CG:
                 await self.publisher.to_dlq("posts.tagged", event_data, reason="serialize_error", details=str(e))
+                # МЕТРИКА: ошибка сериализации
+                posts_processed_total.labels(stage='enrichment', success='error').inc()
                 return
             
             # [C7-ID: ENRICH-DEV-FIX-003] Санитизация post_id перед сохранением в БД
@@ -334,6 +348,8 @@ class EnrichmentWorker:
                 })  # exception → стектрейс
                 # DLQ вместо break-падения:
                 await self.publisher.to_dlq("posts.tagged", {"data": body if 'body' in locals() else b""}, reason="publish_fail", details=str(e))
+                # МЕТРИКА: ошибка публикации
+                posts_processed_total.labels(stage='enrichment', success='error').inc()
                 return
             
             self.stats['posts_processed'] += 1
@@ -344,6 +360,9 @@ class EnrichmentWorker:
                 operation='enrich',
                 success=True
             ).inc()
+            
+            # МЕТРИКА: успешная обработка
+            posts_processed_total.labels(stage='enrichment', success='true').inc()
             
             logger.info(f"Post {post_id} enriched successfully with {len(urls)} URLs")
                 
@@ -358,6 +377,8 @@ class EnrichmentWorker:
                 operation='enrich',
                 success=False
             ).inc()
+            # МЕТРИКА: ошибка обработки
+            posts_processed_total.labels(stage='enrichment', success='error').inc()
             self.stats['errors'] += 1
     
     async def _should_enrich_post(self, post_id: str, tags: List[Dict[str, Any]]) -> tuple[bool, str]:
@@ -699,19 +720,42 @@ class EnrichmentWorker:
             return False
     
     async def _save_enrichment_data(self, post_id: str, enrichment_data: Dict[str, Any]):
-        """Сохранение данных enrichment в БД."""
+        """
+        Context7: Сохранение данных enrichment через EnrichmentRepository.
+        
+        Определяет kind по наличию crawl_results:
+        - kind='crawl' если есть crawl_results (результаты crawl4ai)
+        - kind='general' если нет crawl_results (простое обогащение через теги/URLs)
+        """
+        # Context7: Импорт shared репозитория
+        import sys
+        import os
+        shared_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'shared', 'python'))
+        if shared_path not in sys.path:
+            sys.path.insert(0, shared_path)
+        
+        from shared.repositories.enrichment_repository import EnrichmentRepository
+        
         try:
             logger.info("enrichment_save_start", extra={"post_id": post_id, "enrichment_keys": list(enrichment_data.keys())})
             
             # Подготовка данных для сохранения
             crawl_results = enrichment_data.get('crawl_results', [])
+            
+            # Context7: Определяем kind и provider по наличию crawl_results
             if crawl_results:
+                # Crawl данные - используем kind='crawl'
+                kind = 'crawl'
+                provider = 'crawl4ai'
                 crawl_md = "\n\n---\n\n".join([
                     result.get('markdown', '') 
                     for result in crawl_results
                 ])
             else:
-                crawl_md = ""  # Пустая строка если нет результатов
+                # Общее обогащение - используем kind='general'
+                kind = 'general'
+                provider = 'enrichment_task'
+                crawl_md = ""
             
             logger.info(f"enrichment_crawl_md: length={len(crawl_md)}")
             
@@ -731,45 +775,37 @@ class EnrichmentWorker:
             cleaned_data = clean_none_values(enrichment_data)
             logger.info(f"enrichment_data_cleaned: original_keys={list(enrichment_data.keys())}, cleaned_keys={list(cleaned_data.keys())}")
             
-            # Context7 best practice: используем json.dumps с ensure_ascii=False для корректной сериализации
-            enrichment_json = json.dumps(cleaned_data, ensure_ascii=False)
-            logger.info(f"enrichment_json_created: length={len(enrichment_json)}")
-            
-            update_data = {
-                'post_id': post_id,
-                'crawl_md': crawl_md,
-                'enrichment_data': enrichment_json,
-                'enriched_at': datetime.now(timezone.utc)  # Оставляем datetime объект
+            # Структурируем данные для JSONB поля data
+            enrichment_payload = {
+                'enrichment_data': cleaned_data,
+                'urls': [r.get('url') for r in crawl_results if r.get('url')] if crawl_results else enrichment_data.get('urls', []),
+                'word_count': sum(r.get('word_count', 0) or 0 for r in crawl_results) if crawl_results else enrichment_data.get('word_count', 0),
+                'latency_ms': enrichment_data.get('latency_ms', 0),
+                'created_at': datetime.now(timezone.utc).isoformat(),
+                'source': provider,
+                'metadata': {k: v for k, v in enrichment_data.items() if k not in ['crawl_results', 'latency_ms']}
             }
             
-            # Обновление post_enrichment
-            await self.db_session.execute(
-                text("""
-                UPDATE post_enrichment 
-                SET crawl_md = :crawl_md,
-                    metadata = COALESCE(metadata, '{}'::jsonb) || CAST(:enrichment_json AS jsonb),
-                    enriched_at = :enriched_at,
-                    updated_at = NOW()
-                WHERE post_id = :post_id
-                """),
-                {
-                    'post_id': post_id,
-                    'crawl_md': crawl_md,
-                    'enrichment_json': enrichment_json,
-                    'enriched_at': datetime.now(timezone.utc)
-                }
+            # Добавляем crawl_md только для crawl kind
+            if kind == 'crawl':
+                enrichment_payload['crawl_md'] = crawl_md
+            
+            # Используем EnrichmentRepository (принимает SQLAlchemy AsyncSession)
+            repo = EnrichmentRepository(self.db_session)
+            await repo.upsert_enrichment(
+                post_id=post_id,
+                kind=kind,
+                provider=provider,
+                data=enrichment_payload,
+                params_hash=None,
+                status='ok',
+                error=None,
+                trace_id=enrichment_data.get('trace_id')
             )
             
-            # Обновление статуса поста (поле enrichment_status не существует в таблице posts)
-            # await self.db_session.execute(
-            #     text("UPDATE posts SET enrichment_status = 'enriched' WHERE id = :post_id"),
-            #     {"post_id": post_id}
-            # )
-            
-            await self.db_session.commit()
+            logger.info(f"Enrichment data saved via EnrichmentRepository for post_id={post_id} kind={kind} provider={provider}")
             
         except Exception as e:
-            await self.db_session.rollback()
             logger.error(f"Failed to save enrichment data: {e}")
             raise
     
@@ -948,10 +984,16 @@ class EnrichmentTask:
         if self.worker is None:
             # Создание worker'а
             from config import settings
-            import asyncpg
+            from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
             
-            # Подключение к БД
-            db_session = await asyncpg.create_pool(settings.database_url)
+            # Context7: Используем SQLAlchemy AsyncSession для совместимости с EnrichmentRepository
+            db_url = settings.database_url
+            # Заменяем postgresql:// на postgresql+asyncpg:// для async драйвера
+            if db_url.startswith("postgresql://"):
+                db_url = db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+            
+            engine = create_async_engine(db_url, pool_pre_ping=True)
+            db_session = AsyncSession(engine)
             
             # Создание redis клиента
             from event_bus import RedisStreamsClient

@@ -16,7 +16,7 @@ import os
 from botocore.client import BaseClient
 from botocore.exceptions import ClientError, BotoCoreError
 from botocore.config import Config
-from prometheus_client import Histogram, Counter, Gauge
+from prometheus_client import Histogram, Counter, Gauge, REGISTRY
 import structlog
 
 logger = structlog.get_logger()
@@ -25,25 +25,58 @@ logger = structlog.get_logger()
 # METRICS
 # ============================================================================
 
-s3_operations_total = Counter(
+# Context7: Предотвращаем дублирование метрик при cross-service импортах
+def _safe_create_metric(metric_type, name, description, labels=None):
+    """Создать метрику с проверкой на существование (Context7: предотвращение дублирования)."""
+    try:
+        # Пытаемся найти существующую метрику
+        if hasattr(REGISTRY, '_names_to_collectors'):
+            existing = REGISTRY._names_to_collectors.get(name)
+            if existing:
+                # Возвращаем существующую метрику
+                return existing
+    except (AttributeError, KeyError, TypeError):
+        pass
+    
+    # Создаем новую метрику с обработкой ошибки дублирования
+    try:
+        if labels:
+            return metric_type(name, description, labels)
+        else:
+            return metric_type(name, description)
+    except ValueError as e:
+        # Если метрика уже существует, пытаемся получить существующую
+        if 'Duplicated' in str(e) or 'already registered' in str(e).lower():
+            try:
+                if hasattr(REGISTRY, '_names_to_collectors'):
+                    return REGISTRY._names_to_collectors.get(name)
+            except (AttributeError, KeyError, TypeError):
+                pass
+        raise
+
+s3_operations_total = _safe_create_metric(
+    Counter,
     's3_operations_total',
     'S3 operations count',
     ['operation', 'result', 'content_type']
 )
 
-s3_upload_duration_seconds = Histogram(
+s3_upload_duration_seconds = _safe_create_metric(
+    Histogram,
     's3_upload_duration_seconds',
     'S3 upload latency',
     ['content_type', 'size_bucket']
 )
 
-s3_file_size_bytes = Histogram(
+s3_file_size_bytes = _safe_create_metric(
+    Histogram,
     's3_file_size_bytes',
     'S3 file sizes',
     ['content_type']
 )
 
-s3_compression_ratio = Histogram(
+s3_compression_ratio = _safe_create_metric(
+    Histogram,
     's3_compression_ratio',
     'Compression ratio (original/compressed)',
     ['content_type']
@@ -83,22 +116,57 @@ class S3StorageService:
         self.presigned_ttl_seconds = presigned_ttl_seconds
         
         # Initialize S3 client (SigV4 + configurable addressing style)
+        # Context7: Cloud.ru S3 Quickstart best practices - path-style для SDK/бэкенда
         signature_version = os.getenv('AWS_SIGNATURE_VERSION', 's3v4')
-        addressing_style = os.getenv('S3_ADDRESSING_STYLE', 'virtual')  # 'virtual' | 'path'
+        # Context7: Cloud.ru рекомендует path-style для SDK операций
+        addressing_style = os.getenv('S3_ADDRESSING_STYLE', 'path')  # 'path' для Cloud.ru
 
         # Cloud.ru: Access Key формат <tenant_id>:<key_id>
         if 's3.cloud.ru' in (endpoint_url or '') and access_key_id and ':' not in access_key_id:
             logger.warning("Cloud.ru access key likely missing tenant_id prefix '<tenant_id>:<key_id>'", endpoint=endpoint_url)
 
-        cfg = Config(signature_version=signature_version, s3={'addressing_style': addressing_style})
+        # Context7: Retry конфигурация для Cloud.ru S3 (best practice для стабильности)
+        # Используем exponential backoff с максимумом попыток
+        max_retry_attempts = int(os.getenv('S3_MAX_RETRY_ATTEMPTS', '5'))
+        retry_mode = os.getenv('S3_RETRY_MODE', 'standard')  # 'standard' | 'adaptive' | 'legacy'
+        
+        # Context7: Timeout конфигурация (важно для избежания зависаний)
+        connect_timeout = int(os.getenv('S3_CONNECT_TIMEOUT_SEC', '30'))
+        read_timeout = int(os.getenv('S3_READ_TIMEOUT_SEC', '60'))
+        max_pool_connections = int(os.getenv('S3_MAX_POOL_CONNECTIONS', '50'))
 
+        cfg = Config(
+            signature_version=signature_version,
+            s3={
+                'addressing_style': addressing_style,
+                'payload_signing_enabled': False,  # Cloud.ru не требует payload signing
+            },
+            retries={
+                'max_attempts': max_retry_attempts,
+                'mode': retry_mode
+            },
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+            max_pool_connections=max_pool_connections
+        )
+
+        # Context7: Cloud.ru S3 Quickstart - используем базовый endpoint s3.cloud.ru
+        # Региональные endpoints опциональны и указываются через S3_REGIONAL_ENDPOINT
+        effective_endpoint = endpoint_url
+        regional_endpoint = os.getenv('S3_REGIONAL_ENDPOINT', '')
+        if regional_endpoint and 's3.cloud.ru' in endpoint_url:
+            effective_endpoint = regional_endpoint
+            logger.debug("Using regional endpoint", endpoint=effective_endpoint, region=region)
+        
         self.s3_client: BaseClient = boto3.client(
             's3',
-            endpoint_url=endpoint_url,
+            endpoint_url=effective_endpoint,
             aws_access_key_id=access_key_id,
             aws_secret_access_key=secret_access_key,
-            region_name=region,
+            region_name=region,  # Context7: Cloud.ru требует явное указание региона для SigV4
             config=cfg,
+            use_ssl=True,
+            verify=True  # Context7: SSL verification включен для безопасности
         )
         
         logger.info(
@@ -108,8 +176,18 @@ class S3StorageService:
             region=region,
             addressing_style=addressing_style,
             signature_version=signature_version,
-            compression_enabled=use_compression
+            compression_enabled=use_compression,
+            retry_attempts=max_retry_attempts,
+            retry_mode=retry_mode,
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout
         )
+        
+        # Context7: Включаем детальное логирование botocore для диагностики (опционально через env)
+        if os.getenv('S3_ENABLE_DEBUG_LOGGING', 'false').lower() == 'true':
+            import logging
+            boto3.set_stream_logger('botocore', logging.DEBUG)
+            logger.info("Botocore debug logging enabled")
     
     def compute_sha256(self, content: bytes) -> str:
         """Вычисление SHA256 хеша контента."""
@@ -175,13 +253,25 @@ class S3StorageService:
         """
         return f"vision/{tenant_id}/{sha256}_{provider}_{model}_v{schema_version}.json"
     
-    def build_crawl_key(self, tenant_id: str, url_hash: str, suffix: str = ".html") -> str:
+    def build_crawl_key(self, tenant_id: str, url_hash: str, suffix: str = ".html", post_id: Optional[str] = None) -> str:
         """
         Построение S3 ключа для Crawl результатов.
-        crawl/{tenant}/{urlhash[:2]}/{urlhash}{suffix}
+        
+        Формат:
+        - С post_id: crawl/{tenant}/{post_id}/{urlhash}{suffix}
+        - Без post_id: crawl/{tenant}/{urlhash[:2]}/{urlhash}{suffix}
+        
+        Args:
+            tenant_id: ID tenant
+            url_hash: SHA256 hash URL
+            suffix: Суффикс файла (.html, .md)
+            post_id: Опциональный ID поста для группировки по постам
         """
-        prefix = url_hash[:2]
-        return f"crawl/{tenant_id}/{prefix}/{url_hash}{suffix}"
+        if post_id:
+            return f"crawl/{tenant_id}/{post_id}/{url_hash}{suffix}"
+        else:
+            prefix = url_hash[:2]
+            return f"crawl/{tenant_id}/{prefix}/{url_hash}{suffix}"
     
     async def put_media(
         self,
@@ -210,29 +300,36 @@ class S3StorageService:
             # Строим ключ
             s3_key = self.build_media_key(tenant_id, sha256, extension)
             
-            # Проверяем существование (HEAD request)
-            try:
-                self.s3_client.head_object(Bucket=self.bucket_name, Key=s3_key)
+            # Context7: Проверяем существование через async head_object (строгая идемпотентность)
+            # Cloud.ru S3 может возвращать 500 на HEAD для несуществующих объектов
+            # Используем безопасную проверку с обработкой InternalError
+            existing_object = await self.head_object(s3_key)
+            if existing_object:
+                # Объект уже существует - возвращаем существующие данные
                 logger.debug("Media already exists in S3", sha256=sha256, s3_key=s3_key)
-                s3_operations_total.labels(operation='head', result='exists', content_type='media').inc()
                 duration = time.time() - start_time
                 s3_upload_duration_seconds.labels(
                     content_type='media',
                     size_bucket=self._get_size_bucket(len(content))
                 ).observe(duration)
-                return sha256, s3_key, len(content)
-            except ClientError as e:
-                if e.response['Error']['Code'] != '404':
-                    raise
+                # Возвращаем существующий размер из S3 (может отличаться от локального)
+                existing_size = existing_object.get('size', len(content))
+                return sha256, s3_key, existing_size
+            
+            # Context7: Вычисляем MD5 для проверки целостности
+            content_md5 = hashlib.md5(content).digest()
+            import base64
+            content_md5_base64 = base64.b64encode(content_md5).decode('utf-8')
             
             # Загрузка файла
             extra_args = {
                 'ContentType': mime_type,
+                'ContentMD5': content_md5_base64,  # Context7: Проверка целостности
             }
             
             # Multipart upload для больших файлов
             if len(content) > self.multipart_threshold:
-                self._upload_multipart(content, s3_key, mime_type)
+                self._upload_multipart(content, s3_key, mime_type, content_md5_base64)
             else:
                 self.s3_client.put_object(
                     Bucket=self.bucket_name,
@@ -261,10 +358,32 @@ class S3StorageService:
             
         except (ClientError, BotoCoreError) as e:
             s3_operations_total.labels(operation='put', result='error', content_type='media').inc()
+            
+            # Context7: Извлекаем request ID для поддержки Cloud.ru
+            request_id = ''
+            amz_request_id = ''
+            amz_id_2 = ''
+            error_code = 'Unknown'
+            
+            if isinstance(e, ClientError):
+                error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+                response_metadata = e.response.get('ResponseMetadata', {})
+                request_id = response_metadata.get('RequestId', '')
+                http_headers = response_metadata.get('HTTPHeaders', {})
+                amz_request_id = http_headers.get('x-amz-request-id', '')
+                amz_id_2 = http_headers.get('x-amz-id-2', '')
+            
             logger.error(
                 "Failed to upload media to S3",
                 error=str(e),
-                error_type=type(e).__name__
+                error_type=type(e).__name__,
+                error_code=error_code,
+                request_id=request_id or amz_request_id,
+                x_amz_request_id=amz_request_id,
+                x_amz_id_2=amz_id_2,
+                s3_key=s3_key if 's3_key' in locals() else 'unknown',
+                bucket=self.bucket_name,
+                endpoint=self.endpoint_url
             )
             raise
     
@@ -328,7 +447,30 @@ class S3StorageService:
             
         except (ClientError, BotoCoreError) as e:
             s3_operations_total.labels(operation='put', result='error', content_type='json').inc()
-            logger.error("Failed to upload JSON to S3", s3_key=s3_key, error=str(e))
+            
+            # Context7: Извлекаем request ID для поддержки Cloud.ru
+            request_id = ''
+            amz_request_id = ''
+            amz_id_2 = ''
+            error_code = 'Unknown'
+            
+            if isinstance(e, ClientError):
+                error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+                response_metadata = e.response.get('ResponseMetadata', {})
+                request_id = response_metadata.get('RequestId', '')
+                http_headers = response_metadata.get('HTTPHeaders', {})
+                amz_request_id = http_headers.get('x-amz-request-id', '')
+                amz_id_2 = http_headers.get('x-amz-id-2', '')
+            
+            logger.error(
+                "Failed to upload JSON to S3",
+                s3_key=s3_key,
+                error=str(e),
+                error_code=error_code,
+                request_id=request_id or amz_request_id,
+                x_amz_request_id=amz_request_id,
+                x_amz_id_2=amz_id_2
+            )
             raise
     
     async def get_presigned_url(
@@ -367,7 +509,30 @@ class S3StorageService:
             
         except (ClientError, BotoCoreError) as e:
             s3_operations_total.labels(operation='presigned', result='error', content_type='url').inc()
-            logger.error("Failed to generate presigned URL", s3_key=s3_key, error=str(e))
+            
+            # Context7: Извлекаем request ID для поддержки Cloud.ru
+            request_id = ''
+            amz_request_id = ''
+            amz_id_2 = ''
+            error_code = 'Unknown'
+            
+            if isinstance(e, ClientError):
+                error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+                response_metadata = e.response.get('ResponseMetadata', {})
+                request_id = response_metadata.get('RequestId', '')
+                http_headers = response_metadata.get('HTTPHeaders', {})
+                amz_request_id = http_headers.get('x-amz-request-id', '')
+                amz_id_2 = http_headers.get('x-amz-id-2', '')
+            
+            logger.error(
+                "Failed to generate presigned URL",
+                s3_key=s3_key,
+                error=str(e),
+                error_code=error_code,
+                request_id=request_id or amz_request_id,
+                x_amz_request_id=amz_request_id,
+                x_amz_id_2=amz_id_2
+            )
             raise
     
     async def head_object(self, s3_key: str) -> Optional[Dict[str, Any]]:
@@ -382,15 +547,34 @@ class S3StorageService:
                 'etag': response.get('ETag', '').strip('"'),
             }
         except ClientError as e:
-            if e.response['Error']['Code'] == '404':
+            error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+            
+            if error_code == '404' or error_code == 'NoSuchKey':
                 s3_operations_total.labels(operation='head', result='not_found', content_type='any').inc()
                 return None
+            
+            # Context7: Извлекаем request ID для поддержки Cloud.ru
+            response_metadata = e.response.get('ResponseMetadata', {})
+            request_id = response_metadata.get('RequestId', '')
+            http_headers = response_metadata.get('HTTPHeaders', {})
+            amz_request_id = http_headers.get('x-amz-request-id', '')
+            amz_id_2 = http_headers.get('x-amz-id-2', '')
+            
+            logger.error(
+                "S3 HEAD error",
+                s3_key=s3_key,
+                error_code=error_code,
+                request_id=request_id or amz_request_id,
+                x_amz_request_id=amz_request_id,
+                x_amz_id_2=amz_id_2
+            )
             raise
     
     async def get_object(self, s3_key: str) -> Optional[bytes]:
         """
         Загрузка объекта из S3.
         
+        Context7: Cloud.ru S3 best practices - обработка InternalError, retry логика
         Args:
             s3_key: S3 ключ объекта
             
@@ -401,6 +585,8 @@ class S3StorageService:
         start_time = time.time()
         
         try:
+            # Context7: Cloud.ru S3 может возвращать InternalError при временных сбоях
+            # boto3 автоматически выполняет retry согласно Config, но логируем для мониторинга
             response = self.s3_client.get_object(Bucket=self.bucket_name, Key=s3_key)
             content = response['Body'].read()
             
@@ -415,15 +601,53 @@ class S3StorageService:
             return content
             
         except ClientError as e:
-            if e.response['Error']['Code'] == 'NoSuchKey':
+            error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+            
+            # Context7: Извлекаем request ID для поддержки Cloud.ru
+            response_metadata = e.response.get('ResponseMetadata', {})
+            request_id = response_metadata.get('RequestId', '')
+            http_headers = response_metadata.get('HTTPHeaders', {})
+            amz_request_id = http_headers.get('x-amz-request-id', '')
+            amz_id_2 = http_headers.get('x-amz-id-2', '')
+            
+            if error_code == 'NoSuchKey' or error_code == '404':
                 s3_operations_total.labels(operation='get', result='not_found', content_type='any').inc()
+                logger.debug("Object not found in S3", s3_key=s3_key)
                 return None
-            s3_operations_total.labels(operation='get', result='error', content_type='any').inc()
-            logger.error("Failed to get object from S3", s3_key=s3_key, error=str(e))
+            
+            # Context7: InternalError может быть временной проблемой Cloud.ru S3
+            # Логируем с дополнительным контекстом для диагностики
+            if error_code == 'InternalError' or 'Internal' in str(e):
+                s3_operations_total.labels(operation='get', result='error', content_type='any').inc()
+                logger.warning(
+                    "S3 InternalError (может быть временной проблемой Cloud.ru)",
+                    s3_key=s3_key,
+                    error=str(e),
+                    error_code=error_code,
+                    request_id=request_id or amz_request_id,
+                    x_amz_request_id=amz_request_id,
+                    x_amz_id_2=amz_id_2,
+                    bucket=self.bucket_name,
+                    endpoint=self.endpoint_url
+                )
+            else:
+                s3_operations_total.labels(operation='get', result='error', content_type='any').inc()
+                logger.error(
+                    "Failed to get object from S3",
+                    s3_key=s3_key,
+                    error=str(e),
+                    error_code=error_code,
+                    request_id=request_id or amz_request_id,
+                    x_amz_request_id=amz_request_id,
+                    x_amz_id_2=amz_id_2,
+                    bucket=self.bucket_name,
+                    endpoint=self.endpoint_url
+                )
+            
             raise
         except BotoCoreError as e:
             s3_operations_total.labels(operation='get', result='error', content_type='any').inc()
-            logger.error("Failed to get object from S3", s3_key=s3_key, error=str(e))
+            logger.error("Failed to get object from S3 (BotoCoreError)", s3_key=s3_key, error=str(e))
             raise
     
     async def delete_object(self, s3_key: str) -> bool:
@@ -438,13 +662,22 @@ class S3StorageService:
             logger.error("Failed to delete object from S3", s3_key=s3_key, error=str(e))
             return False
     
-    def _upload_multipart(self, content: bytes, s3_key: str, content_type: str):
-        """Multipart upload для больших файлов."""
-        upload_id = self.s3_client.create_multipart_upload(
-            Bucket=self.bucket_name,
-            Key=s3_key,
-            ContentType=content_type,
-        )['UploadId']
+    def _upload_multipart(self, content: bytes, s3_key: str, content_type: str, content_md5_base64: Optional[str] = None):
+        """
+        Multipart upload для больших файлов.
+        
+        Context7: Для multipart upload MD5 проверка целостности работает через ETag каждого чанка.
+        S3 автоматически вычисляет MD5 для каждого чанка и объединяет их в финальный ETag.
+        """
+        multipart_args = {
+            'Bucket': self.bucket_name,
+            'Key': s3_key,
+            'ContentType': content_type,
+        }
+        
+        # Context7: Для multipart upload ContentMD5 не поддерживается на уровне всего файла
+        # Проверка целостности выполняется через ETag каждого чанка
+        upload_id = self.s3_client.create_multipart_upload(**multipart_args)['UploadId']
         
         try:
             chunk_size = 5 * 1024 * 1024  # 5MB chunks

@@ -9,7 +9,7 @@ from typing import Dict, Any, Optional, TYPE_CHECKING
 from datetime import datetime
 
 if TYPE_CHECKING:
-    from worker.services.storage_quota import StorageQuotaService
+    from services.storage_quota import StorageQuotaService
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
 from fastapi.responses import JSONResponse
@@ -92,10 +92,41 @@ class CleanupResponse(BaseModel):
 # ============================================================================
 
 async def get_storage_quota_service():
-    """Dependency для получения StorageQuotaService."""
+    """
+    Context7: Dependency для получения StorageQuotaService.
+    
+    Best practice: правильная настройка путей для cross-service импортов
+    с поддержкой dev (volume mounts) и production окружений.
+    """
     try:
-        from api.services.s3_storage import S3StorageService
-        from worker.services.storage_quota import StorageQuotaService
+        import sys
+        import os
+        
+        # Context7: Настройка путей для импортов с учетом архитектурных границ
+        # Порядок важен: сначала добавляем основные пути, затем специфичные
+        
+        # 1. Добавляем корень проекта для абсолютных импортов
+        project_root = '/opt/telegram-assistant'
+        if project_root not in sys.path and os.path.exists(project_root):
+            sys.path.insert(0, project_root)
+        
+        # 2. Добавляем /app для локальных импортов в API контейнере
+        app_root = '/app'
+        if app_root not in sys.path and os.path.exists(app_root):
+            sys.path.insert(0, app_root)
+        
+        # 3. Импорт S3StorageService - из локального services (API контейнер)
+        # В dev: /app/services/s3_storage.py (volume mount)
+        # В production: должен быть в установленном пакете
+        try:
+            from services.s3_storage import S3StorageService
+        except ImportError:
+            # Fallback: пробуем через api.services (production образ)
+            from api.services.s3_storage import S3StorageService
+        
+        # 4. Импорт StorageQuotaService из api/services (sync версия для API)
+        # Context7: API использует только sync операции, не импортирует из worker
+        from services.storage_quota import StorageQuotaService
         
         # Инициализация S3 сервиса
         s3_service = S3StorageService(
@@ -138,7 +169,8 @@ async def get_storage_quota(
         Информация о текущем использовании и лимитах
     """
     try:
-        usage = await quota_service.get_bucket_usage()
+        # Context7: API использует sync версию StorageQuotaService
+        usage = quota_service.get_bucket_usage()
         
         return StorageUsageResponse(
             total_gb=usage.get("total_gb", 0.0),
@@ -170,7 +202,8 @@ async def get_tenant_usage(
         Использование tenant в GB и процент от лимита
     """
     try:
-        usage = await quota_service.get_bucket_usage()
+        # Context7: API использует sync версию StorageQuotaService
+        usage = quota_service.get_bucket_usage()
         tenant_usage = usage.get("by_tenant", {}).get(tenant_id, {})
         
         return {
@@ -202,19 +235,16 @@ async def check_quota_before_upload(
         Результат проверки с рекомендациями
     """
     try:
-        # Синхронный вызов через executor
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            lambda: quota_service.check_quota_before_upload(
-                tenant_id=request.tenant_id,
-                size_bytes=request.size_bytes,
-                content_type=request.content_type
-            )
+        # Context7: API использует sync версию StorageQuotaService
+        # check_quota_before_upload - async метод, вызываем напрямую
+        result = await quota_service.check_quota_before_upload_async(
+            tenant_id=request.tenant_id,
+            size_bytes=request.size_bytes,
+            content_type=request.content_type
         )
         
-        # Получаем текущее использование для ответа
-        usage = await quota_service.get_bucket_usage()
+        # Получаем текущее использование для ответа (sync метод)
+        usage = quota_service.get_bucket_usage()
         tenant_usage = usage.get("by_tenant", {}).get(request.tenant_id, {})
         
         return QuotaCheckResponse(
@@ -260,7 +290,7 @@ async def trigger_cleanup(
         # Определяем целевой объём
         target_gb = request.target_free_gb or 12.0  # Default: target_after_cleanup
         
-        # Запускаем cleanup в фоне
+        # Запускаем cleanup в фоне (async метод)
         cleanup_result = await quota_service.trigger_emergency_cleanup()
         
         duration = time.time() - start_time
@@ -288,7 +318,8 @@ async def get_storage_stats(
         Детальная статистика использования storage
     """
     try:
-        usage = await quota_service.get_bucket_usage()
+        # Context7: API использует sync версию StorageQuotaService
+        usage = quota_service.get_bucket_usage()
         
         return {
             "current": {

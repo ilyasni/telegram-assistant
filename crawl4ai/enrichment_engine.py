@@ -75,6 +75,13 @@ crawl_policy_explain_reasons_total = Counter(
     ['reason']  # no_urls, no_trigger_tags, below_word_count, robots_disallow
 )
 
+# Context7: Метрики для сохранения в S3
+crawl_persist_total = Counter(
+    'crawl_persist_total',
+    'Total crawl persistence operations',
+    ['status', 'destination']  # status: success|error|cache_hit, destination: s3|redis
+)
+
 # ============================================================================
 # ENRICHMENT ENGINE
 # ============================================================================
@@ -97,13 +104,15 @@ class EnrichmentEngine:
         max_concurrent_crawls: int = 3,
         rate_limit_per_host: int = 10,  # запросов в минуту
         cache_ttl: int = 3600,  # 1 час
-        user_agent: str = "Crawl4AI/1.0 (Telegram Assistant)"
+        user_agent: str = "Crawl4AI/1.0 (Telegram Assistant)",
+        s3_service: Optional[Any] = None  # S3StorageService для сохранения HTML/MD в S3
     ):
         self.redis_url = redis_url
         self.max_concurrent_crawls = max_concurrent_crawls
         self.rate_limit_per_host = rate_limit_per_host
         self.cache_ttl = cache_ttl
         self.user_agent = user_agent
+        self.s3_service = s3_service  # Context7: для долговечного хранения в S3
         
         # Redis клиент для кеширования
         self.redis_client: Optional[redis.Redis] = None
@@ -120,7 +129,8 @@ class EnrichmentEngine:
         logger.info("EnrichmentEngine initialized",
                    max_concurrent_crawls=max_concurrent_crawls,
                    rate_limit_per_host=rate_limit_per_host,
-                   cache_ttl=cache_ttl)
+                   cache_ttl=cache_ttl,
+                   s3_enabled=bool(s3_service))
     
     async def start(self):
         """Запуск enrichment engine."""
@@ -193,11 +203,26 @@ class EnrichmentEngine:
                 if not urls:
                     return False, {}, "no_urls"
                 
-                # Обогащение каждого URL
+                # Обогащение каждого URL с передачей tenant_id и post_id для S3
+                tenant_id = post_data.get('tenant_id')
+                if not tenant_id:
+                    # Context7: Логируем предупреждение если tenant_id отсутствует
+                    logger.warning(
+                        "tenant_id not found in post_data, using fallback 'default'",
+                        post_id=post_data.get('post_id'),
+                        post_data_keys=list(post_data.keys())
+                    )
+                    tenant_id = 'default'
+                post_id = post_data.get('post_id')
                 enrichment_data = {}
                 for url in urls:
                     try:
-                        url_data = await self._enrich_url(url, policy_config)
+                        url_data = await self._enrich_url(
+                            url=url, 
+                            policy_config=policy_config,
+                            tenant_id=tenant_id,
+                            post_id=post_id
+                        )
                         if url_data:
                             enrichment_data[url] = url_data
                     except Exception as e:
@@ -298,22 +323,44 @@ class EnrichmentEngine:
         
         return explain
     
-    async def _enrich_url(self, url: str, policy_config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Обогащение одного URL с кешированием."""
+    async def _enrich_url(
+        self, 
+        url: str, 
+        policy_config: Dict[str, Any],
+        tenant_id: Optional[str] = None,
+        post_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Обогащение одного URL с детерминированным кешированием и сохранением в S3.
+        
+        Context7: Использует url_hash (SHA256 от нормализованного URL) и content_sha256
+        для детерминированного кеширования. Сохраняет HTML/MD в S3 для долговечности.
+        
+        Args:
+            url: URL для обогащения
+            policy_config: Конфигурация политики
+            tenant_id: ID tenant для S3 ключей
+            post_id: ID поста для S3 ключей
+        """
         try:
-            # Проверка кеша
-            cache_key = f"enrichment:{hashlib.md5(url.encode()).hexdigest()}"
+            # Context7: Вычисляем url_hash (SHA256 от нормализованного URL)
+            # Нормализация: приведение к lowercase, удаление фрагментов
+            normalized_url = self._normalize_url(url)
+            url_hash = hashlib.sha256(normalized_url.encode('utf-8')).hexdigest()
+            
+            # Context7: Проверка кеша по url_hash
+            cache_key = f"crawl:enrichment:{url_hash}"
             cached_data = await self._get_from_cache(cache_key)
             
             if cached_data:
                 cache_hits_total.labels(type='enrichment').inc()
-                logger.debug("Using cached enrichment data", url=url)
+                logger.debug("Using cached enrichment data", url=url, url_hash=url_hash)
                 return cached_data
             
             # HTTP кеширование: проверка ETag/Last-Modified
             headers = {}
-            etag_key = f"etag:{hashlib.md5(url.encode()).hexdigest()}"
-            last_modified_key = f"last_modified:{hashlib.md5(url.encode()).hexdigest()}"
+            etag_key = f"crawl:etag:{url_hash}"
+            last_modified_key = f"crawl:last_modified:{url_hash}"
             
             cached_etag = await self.redis_client.get(etag_key)
             cached_last_modified = await self.redis_client.get(last_modified_key)
@@ -341,13 +388,131 @@ class EnrichmentEngine:
                     return None
                 
                 # Извлечение контента
-                content = await response.text()
+                content_bytes = await response.read()
+                content = content_bytes.decode('utf-8', errors='ignore')
+                
+                # Context7: Вычисляем content_sha256 для детерминированного кеширования
+                content_sha256 = hashlib.sha256(content_bytes).hexdigest()
+                
+                # Context7: Проверяем кеш по content_sha256 (если контент не изменился)
+                content_cache_key = f"crawl:content:{content_sha256}"
+                cached_by_content = await self._get_from_cache(content_cache_key)
+                
+                if cached_by_content:
+                    cache_hits_total.labels(type='content_hash').inc()
+                    logger.debug("Using cached data by content_sha256", 
+                               url=url, content_sha256=content_sha256)
+                    # Обновляем кеш по url_hash для быстрого доступа
+                    await self._save_to_cache(cache_key, cached_by_content)
+                    return cached_by_content
                 
                 # Обогащение данных
                 enrichment_data = await self._extract_content_data(content, url)
                 
-                # Сохранение в кеш
+                # Context7: Сохраняем content_sha256 в enrichment_data
+                enrichment_data['content_sha256'] = content_sha256
+                enrichment_data['url_hash'] = url_hash
+                
+                # Context7: Сохранение HTML в S3 для долговечности (если s3_service доступен)
+                html_s3_key = None
+                md_s3_key = None
+                html_md5 = None
+                md_md5 = None
+                
+                if self.s3_service and tenant_id and post_id:
+                    try:
+                        # Сохранение HTML в S3
+                        html_content_bytes = content_bytes  # Используем оригинальные байты
+                        html_s3_key = self.s3_service.build_crawl_key(
+                            tenant_id=tenant_id,
+                            url_hash=url_hash,
+                            suffix='.html',
+                            post_id=post_id
+                        )
+                        
+                        # Context7: HEAD проверка перед PUT для идемпотентности
+                        existing_html = await self.s3_service.head_object(html_s3_key)
+                        if not existing_html:
+                            # Вычисляем MD5 для целостности
+                            import hashlib as hl
+                            import base64
+                            html_md5 = base64.b64encode(hl.md5(html_content_bytes).digest()).decode('utf-8')
+                            
+                            # Сохраняем HTML через put_media (использует Content-MD5)
+                            # Используем put_object напрямую для HTML с gzip сжатием
+                            import gzip
+                            html_compressed = gzip.compress(html_content_bytes)
+                            
+                            self.s3_service.s3_client.put_object(
+                                Bucket=self.s3_service.bucket_name,
+                                Key=html_s3_key,
+                                Body=html_compressed,
+                                ContentType='text/html',
+                                ContentEncoding='gzip',
+                                ContentMD5=html_md5
+                            )
+                            
+                            crawl_persist_total.labels(status='success', destination='s3').inc()
+                            logger.debug("HTML saved to S3", 
+                                       url=url, 
+                                       s3_key=html_s3_key,
+                                       size_bytes=len(html_content_bytes))
+                        else:
+                            # HTML уже существует в S3
+                            html_s3_key = html_s3_key  # Используем существующий ключ
+                            crawl_persist_total.labels(status='cache_hit', destination='s3').inc()
+                            logger.debug("HTML already exists in S3", s3_key=html_s3_key)
+                        
+                        # Сохранение Markdown в S3 (если есть)
+                        if enrichment_data.get('markdown'):
+                            md_content = enrichment_data['markdown'].encode('utf-8')
+                            md_s3_key = self.s3_service.build_crawl_key(
+                                tenant_id=tenant_id,
+                                url_hash=url_hash,
+                                suffix='.md',
+                                post_id=post_id
+                            )
+                            
+                            existing_md = await self.s3_service.head_object(md_s3_key)
+                            if not existing_md:
+                                md_md5 = base64.b64encode(hl.md5(md_content).digest()).decode('utf-8')
+                                md_compressed = gzip.compress(md_content)
+                                
+                                self.s3_service.s3_client.put_object(
+                                    Bucket=self.s3_service.bucket_name,
+                                    Key=md_s3_key,
+                                    Body=md_compressed,
+                                    ContentType='text/markdown',
+                                    ContentEncoding='gzip',
+                                    ContentMD5=md_md5
+                                )
+                                
+                                logger.debug("Markdown saved to S3", s3_key=md_s3_key)
+                            else:
+                                md_s3_key = md_s3_key  # Используем существующий ключ
+                    
+                    except Exception as e:
+                        # Ошибка сохранения в S3 не критична - логируем но продолжаем
+                        crawl_persist_total.labels(status='error', destination='s3').inc()
+                        logger.warning("Failed to save HTML to S3", 
+                                     url=url, 
+                                     error=str(e),
+                                     tenant_id=tenant_id,
+                                     post_id=post_id)
+                
+                # Сохраняем s3_keys и checksums в enrichment_data
+                enrichment_data['s3_keys'] = {
+                    'html': html_s3_key,
+                    'md': md_s3_key
+                }
+                enrichment_data['checksums'] = {
+                    'html_md5': html_md5,
+                    'md_md5': md_md5
+                }
+                
+                # Сохранение в кеш по url_hash и content_sha256
                 await self._save_to_cache(cache_key, enrichment_data)
+                await self._save_to_cache(content_cache_key, enrichment_data)
                 
                 # Сохранение HTTP заголовков для кеширования
                 etag = response.headers.get('ETag')
@@ -390,7 +555,8 @@ class EnrichmentEngine:
             'word_count': len(content.split()),
             'language': self._detect_language(content),
             'url': url,
-            'extracted_at': datetime.now(timezone.utc).isoformat()
+            'extracted_at': datetime.now(timezone.utc).isoformat(),
+            # Context7: url_hash и content_sha256 будут добавлены в _enrich_url
         }
     
     def _extract_title(self, content: str) -> str:
@@ -457,6 +623,27 @@ class EnrichmentEngine:
         # Добавление текущего запроса
         self._rate_limit_cache[host].append(now)
         return True
+    
+    def _normalize_url(self, url: str) -> str:
+        """
+        Нормализация URL для детерминированного хеширования.
+        
+        Context7: Приводит URL к каноническому виду (lowercase, без фрагментов, сортировка query).
+        """
+        from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
+        parsed = urlparse(url.lower())
+        # Удаляем фрагмент (#), сортируем query параметры
+        query_params = parse_qs(parsed.query, keep_blank_values=True)
+        sorted_query = urlencode(sorted(query_params.items()), doseq=True)
+        normalized = urlunparse((
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            parsed.params,
+            sorted_query,
+            ''  # Удаляем fragment
+        ))
+        return normalized
     
     async def _get_from_cache(self, key: str) -> Optional[Dict[str, Any]]:
         """Получение данных из кеша."""

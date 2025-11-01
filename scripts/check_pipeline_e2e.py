@@ -77,7 +77,8 @@ NEO4J_URI = os.getenv("NEO4J_URI", "neo4j://neo4j:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "changeme")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "posts")
-EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "384"))
+# Используем EMBEDDING_DIMENSION (основной) или EMBEDDING_DIM (fallback), дефолт 2560 для GigaChat
+EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIMENSION", os.getenv("EMBEDDING_DIM", "2560")))
 
 # ============================================================================
 # УТИЛИТЫ

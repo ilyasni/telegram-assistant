@@ -5,7 +5,7 @@
 чем помечать их как 'failed', так как это ожидаемое поведение, а не ошибка.
 
 Revision ID: 20251031_add_skipped_status
-Revises: 20250128_add_media_registry_vision
+Revises: 20250128_media_vision
 Create Date: 2025-10-31 16:45:00.000000
 
 """
@@ -15,7 +15,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision = '20251031_add_skipped_status'
-down_revision = '20250128_add_media_registry_vision'
+down_revision = '20250128_media_vision'  # Context7: Исправлено для соответствия revision ID из 20250128_add_media_registry_vision.py
 branch_labels = None
 depends_on = None
 

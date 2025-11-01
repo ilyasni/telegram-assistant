@@ -356,13 +356,20 @@ class IndexingTask:
             # Получение данных поста
             post_data = await self._get_post_data(post_id)
             if not post_data:
-                logger.warning("Post not found", post_id=post_id)
+                # Context7: [C7-ID: indexing-graceful-001] Graceful degradation для удалённых постов
+                # Посты, удалённые после публикации события, помечаем как skipped, а не failed
+                logger.info("Post not found, skipping indexing", 
+                          post_id=post_id,
+                          reason="post_deleted_or_race_condition")
                 await self._update_indexing_status(
                     post_id=post_id,
-                    embedding_status='failed',
-                    graph_status='failed',
-                    error_message='Post not found'
+                    embedding_status='skipped',
+                    graph_status='skipped',
+                    error_message='Post not found - likely deleted after event publication'
                 )
+                # Context7: Помечаем пост как обработанный для избежания повторных попыток
+                await self._update_post_processed(post_id)
+                indexing_processed_total.labels(status='skipped').inc()
                 return
             
             # [C7-ID: dev-mode-016] Context7 best practice: проверка текста перед индексацией
@@ -447,18 +454,45 @@ class IndexingTask:
             # Для non-retryable ошибок также не пробрасываем, чтобы не блокировать обработку других сообщений
     
     async def _get_post_data(self, post_id: str) -> Optional[Dict[str, Any]]:
-        """Получение данных поста из БД."""
+        """
+        Получение данных поста из БД с загрузкой enrichment данных из post_enrichment.
+        
+        Context7 best practice: плоский агрегат всех enrichment данных для downstream-задач
+        (эмбеддинги, Qdrant, Neo4j) без необходимости знать о БД-структуре.
+        
+        Returns:
+            Dict с полями: id, channel_id, text, telegram_message_id, created_at,
+            vision_data (dict или None), crawl_data (dict или None), tags_data (dict или None)
+        """
         try:
             from psycopg2.extras import RealDictCursor
+            import json
             
             db_url = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@supabase-db:5432/postgres")
             conn = psycopg2.connect(db_url)
             cursor = conn.cursor(cursor_factory=RealDictCursor)
             
+            # Context7: JOIN с post_enrichment для загрузки всех enrichment данных
             cursor.execute("""
-                SELECT id, channel_id, content as text, telegram_message_id, created_at
-                FROM posts
-                WHERE id = %s
+                SELECT 
+                    p.id,
+                    p.channel_id,
+                    p.content as text,
+                    p.telegram_message_id,
+                    p.created_at,
+                    p.tenant_id,
+                    p.user_id,
+                    pe_vision.data as vision_data,
+                    pe_crawl.data as crawl_data,
+                    pe_tags.data as tags_data
+                FROM posts p
+                LEFT JOIN post_enrichment pe_vision 
+                    ON pe_vision.post_id = p.id AND pe_vision.kind = 'vision'
+                LEFT JOIN post_enrichment pe_crawl 
+                    ON pe_crawl.post_id = p.id AND pe_crawl.kind = 'crawl'
+                LEFT JOIN post_enrichment pe_tags 
+                    ON pe_tags.post_id = p.id AND pe_tags.kind = 'tags'
+                WHERE p.id = %s
             """, (post_id,))
             
             row = cursor.fetchone()
@@ -466,7 +500,22 @@ class IndexingTask:
             conn.close()
             
             if row:
-                return dict(row)
+                result = dict(row)
+                
+                # Context7: Парсинг JSONB полей data из post_enrichment
+                # Если данные уже dict (psycopg2 может автоматически парсить JSONB), оставляем как есть
+                # Если это строки, парсим через json.loads
+                for key in ['vision_data', 'crawl_data', 'tags_data']:
+                    value = result.get(key)
+                    if value and isinstance(value, str):
+                        try:
+                            result[key] = json.loads(value)
+                        except (json.JSONDecodeError, TypeError):
+                            result[key] = None
+                    elif value is None:
+                        result[key] = None
+                
+                return result
             return None
             
         except Exception as e:
@@ -475,20 +524,92 @@ class IndexingTask:
     
     async def _generate_embedding(self, post_data: Dict[str, Any]) -> list:
         """
-        Генерация эмбеддинга для поста.
+        Генерация эмбеддинга для поста с включением enrichment данных.
         
-        [C7-ID: dev-mode-016] Context7 best practice: 
-        Предполагается, что проверка на пустой текст уже выполнена в вызывающем коде.
-        Если текст пуст, это считается ошибкой программирования, а не ожидаемым случаем.
+        Context7 best practice: композиция текста с приоритетом и лимитами:
+        - post.text (2000 символов)
+        - vision.description (500)
+        - vision.ocr.text (300)
+        - crawl.md (1500, заголовки+аннотация)
+        - crawl.ocr (300)
+        
+        Дедуп и нормализация для предотвращения раздувания токенов.
+        
+        [C7-ID: dev-mode-016] Предполагается, что проверка на пустой текст уже выполнена в вызывающем коде.
         """
         try:
-            text = post_data.get('text', '')
+            # Базовый текст поста (приоритет 1)
+            post_text = post_data.get('text', '')[:2000]  # Лимит 2000 символов
+            text_parts = [post_text] if post_text.strip() else []
+            
+            # Vision enrichment данные (приоритет 2)
+            vision_data = post_data.get('vision_data')
+            if vision_data and isinstance(vision_data, dict):
+                # Vision description (caption)
+                vision_desc = vision_data.get('description', '')
+                if vision_desc and len(vision_desc.strip()) >= 5:
+                    text_parts.append(vision_desc[:500])  # Лимит 500 символов
+                
+                # Vision OCR text
+                vision_ocr = vision_data.get('ocr')
+                if vision_ocr:
+                    if isinstance(vision_ocr, dict):
+                        ocr_text = vision_ocr.get('text', '')
+                    else:
+                        ocr_text = str(vision_ocr)
+                    
+                    if ocr_text and ocr_text.strip():
+                        text_parts.append(ocr_text[:300])  # Лимит 300 символов
+            
+            # Crawl enrichment данные (приоритет 3)
+            crawl_data = post_data.get('crawl_data')
+            if crawl_data and isinstance(crawl_data, dict):
+                # Используем md_excerpt если доступен (первые ~1-2k символов), иначе полный markdown
+                crawl_md = crawl_data.get('md_excerpt') or crawl_data.get('markdown') or crawl_data.get('crawl_md', '')
+                if crawl_md and crawl_md.strip():
+                    # Ограничиваем до 1500 символов
+                    crawl_text = crawl_md[:1500]
+                    text_parts.append(crawl_text)
+                
+                # Crawl OCR (если есть)
+                crawl_ocr_texts = crawl_data.get('ocr_texts', [])
+                if crawl_ocr_texts and isinstance(crawl_ocr_texts, list):
+                    # Берём первый OCR текст (если несколько)
+                    if crawl_ocr_texts and isinstance(crawl_ocr_texts[0], dict):
+                        ocr_text = crawl_ocr_texts[0].get('text', '')
+                    else:
+                        ocr_text = str(crawl_ocr_texts[0]) if crawl_ocr_texts else ''
+                    
+                    if ocr_text and ocr_text.strip():
+                        text_parts.append(ocr_text[:300])  # Лимит 300 символов
+            
+            # Объединение всех частей с дедупликацией
+            # Простая дедупликация: убираем дубликаты (точные совпадения)
+            seen = set()
+            unique_parts = []
+            for part in text_parts:
+                part_normalized = part.strip().lower()
+                if part_normalized and part_normalized not in seen:
+                    seen.add(part_normalized)
+                    unique_parts.append(part.strip())
+            
+            # Финальный текст для эмбеддинга
+            final_text = '\n\n'.join(unique_parts) if unique_parts else post_text
+            
             # Защита на случай если проверка пропущена
-            if not text or not text.strip():
-                raise ValueError("Post text is empty - should be checked before calling this method")
+            if not final_text or not final_text.strip():
+                raise ValueError("Post text is empty after enrichment composition - should be checked before calling this method")
             
             # Context7: Используем EmbeddingService для генерации эмбеддинга
-            embedding = await self.embedding_service.generate_embedding(text)
+            embedding = await self.embedding_service.generate_embedding(final_text)
+            
+            logger.debug("Generated embedding with enrichment",
+                        post_id=post_data.get('id'),
+                        text_length=len(final_text),
+                        parts_count=len(unique_parts),
+                        has_vision=bool(vision_data),
+                        has_crawl=bool(crawl_data))
+            
             return embedding
             
         except Exception as e:
@@ -498,25 +619,163 @@ class IndexingTask:
             raise
     
     async def _index_to_qdrant(self, post_id: str, post_data: Dict[str, Any], embedding: list) -> str:
-        """Индексация поста в Qdrant."""
+        """
+        Индексация поста в Qdrant с расширенным payload для фильтрации и фасетирования.
+        
+        Context7 best practice: расширенный payload с enrichment данными для фильтрации:
+        - tags, vision.is_meme, vision.labels, vision.scene, vision.nsfw_score, vision.aesthetic_score
+        - crawl.has_crawl, crawl.html_key, crawl.word_count
+        
+        В payload храним только фасеты/флаги (< 64KB), полные тексты (md/html) в S3.
+        """
         try:
             from config import settings
             
             vector_id = f"{post_id}"
+            
+            # Базовый payload
+            payload = {
+                "post_id": post_id,
+                "channel_id": post_data.get('channel_id'),
+                "text_short": post_data.get('text', '')[:500],  # Превью для быстрого доступа
+                "telegram_message_id": post_data.get('telegram_message_id'),
+                "created_at": post_data.get('created_at').isoformat() if post_data.get('created_at') else None
+            }
+            
+            # Tags enrichment
+            tags_data = post_data.get('tags_data')
+            if tags_data and isinstance(tags_data, dict):
+                tags_list = tags_data.get('tags', [])
+                if tags_list:
+                    payload["tags"] = tags_list if isinstance(tags_list, list) else []
+            
+            # Vision enrichment данные
+            vision_data = post_data.get('vision_data')
+            if vision_data and isinstance(vision_data, dict):
+                vision_payload = {}
+                
+                # Обязательные поля для фильтрации
+                if 'is_meme' in vision_data:
+                    vision_payload["is_meme"] = bool(vision_data['is_meme'])
+                if 'labels' in vision_data:
+                    labels = vision_data['labels']
+                    if isinstance(labels, list):
+                        vision_payload["labels"] = labels[:20]  # Максимум 20 labels
+                    else:
+                        vision_payload["labels"] = []
+                if 'objects' in vision_data:
+                    objects = vision_data['objects']
+                    if isinstance(objects, list):
+                        vision_payload["objects"] = objects[:10]  # Максимум 10 objects
+                
+                # Опциональные поля
+                if 'scene' in vision_data and vision_data['scene']:
+                    vision_payload["scene"] = str(vision_data['scene'])
+                if 'nsfw_score' in vision_data and vision_data['nsfw_score'] is not None:
+                    vision_payload["nsfw_score"] = float(vision_data['nsfw_score'])
+                if 'aesthetic_score' in vision_data and vision_data['aesthetic_score'] is not None:
+                    vision_payload["aesthetic_score"] = float(vision_data['aesthetic_score'])
+                if 'classification' in vision_data:
+                    vision_payload["classification"] = str(vision_data['classification'])
+                if 'dominant_colors' in vision_data:
+                    colors = vision_data['dominant_colors']
+                    if isinstance(colors, list):
+                        vision_payload["dominant_colors"] = colors[:5]  # Максимум 5 цветов
+                
+                if vision_payload:
+                    payload["vision"] = vision_payload
+            
+            # Crawl enrichment данные
+            crawl_data = post_data.get('crawl_data')
+            if crawl_data and isinstance(crawl_data, dict):
+                crawl_payload = {
+                    "has_crawl": True
+                }
+                
+                # Извлекаем s3_keys для HTML
+                s3_keys = crawl_data.get('s3_keys', {})
+                if s3_keys:
+                    # s3_keys может быть dict {url: {html: '...', md: '...'}} или просто dict с html/md
+                    if isinstance(s3_keys, dict):
+                        # Если это dict с url в качестве ключей, берём первый URL
+                        first_url = next(iter(s3_keys.keys())) if s3_keys else None
+                        if first_url and isinstance(s3_keys[first_url], dict):
+                            html_key = s3_keys[first_url].get('html')
+                            md_key = s3_keys[first_url].get('md')
+                        else:
+                            # Простой dict с html/md напрямую
+                            html_key = s3_keys.get('html')
+                            md_key = s3_keys.get('md')
+                        
+                        if html_key:
+                            crawl_payload["html_key"] = str(html_key)
+                
+                # Word count
+                word_count = crawl_data.get('word_count') or crawl_data.get('meta', {}).get('word_count')
+                if word_count:
+                    crawl_payload["word_count"] = int(word_count)
+                elif crawl_data.get('md_excerpt') or crawl_data.get('markdown'):
+                    # Оценочный word_count из текста
+                    crawl_text = crawl_data.get('md_excerpt') or crawl_data.get('markdown', '')
+                    if crawl_text:
+                        crawl_payload["word_count"] = len(crawl_text.split())
+                
+                payload["crawl"] = crawl_payload
+            
+            # Context7: Валидация размера payload (< 64KB для Qdrant)
+            import json
+            payload_json = json.dumps(payload, default=str)
+            payload_size_bytes = len(payload_json.encode('utf-8'))
+            
+            if payload_size_bytes > 64 * 1024:
+                original_payload = payload.copy()  # Сохраняем для логирования
+                logger.warning(
+                    "Qdrant payload exceeds 64KB, truncating enrichment data",
+                    post_id=post_id,
+                    payload_size_bytes=payload_size_bytes,
+                    payload_size_kb=round(payload_size_bytes / 1024, 2),
+                    has_vision=bool(vision_data),
+                    has_crawl=bool(crawl_data),
+                    has_tags=bool(tags_data)
+                )
+                # Упрощаем payload, оставляя только критичные поля
+                payload = {
+                    "post_id": post_id,
+                    "channel_id": post_data.get('channel_id'),
+                    "text_short": post_data.get('text', '')[:500],
+                    "telegram_message_id": post_data.get('telegram_message_id'),
+                    "created_at": payload["created_at"]
+                }
+                # Добавляем только критичные флаги
+                if vision_data and isinstance(vision_data, dict):
+                    payload["vision"] = {
+                        "is_meme": bool(vision_data.get('is_meme', False))
+                    }
+                if crawl_data:
+                    payload["crawl"] = {"has_crawl": True}
+                
+                # Логируем что было потеряно
+                logger.info(
+                    "Qdrant payload truncated - enrichment filters may be limited",
+                    post_id=post_id,
+                    original_size_kb=round(payload_size_bytes / 1024, 2),
+                    truncated_size_kb=round(len(json.dumps(payload, default=str).encode('utf-8')) / 1024, 2)
+                )
+            
             await self.qdrant_client.upsert_vector(
                 collection_name=settings.qdrant_collection,
                 vector_id=vector_id,
                 vector=embedding,
-                payload={
-                    "post_id": post_id,
-                    "channel_id": post_data.get('channel_id'),
-                    "text": post_data.get('text', '')[:500],  # text уже алиас для content из SELECT
-                    "telegram_message_id": post_data.get('telegram_message_id'),
-                    "created_at": post_data.get('created_at').isoformat() if post_data.get('created_at') else None
-                }
+                payload=payload
             )
             
-            logger.debug("Indexed to Qdrant", post_id=post_id, vector_id=vector_id)
+            logger.debug("Indexed to Qdrant with enrichment payload",
+                        post_id=post_id,
+                        vector_id=vector_id,
+                        has_vision=bool(vision_data),
+                        has_crawl=bool(crawl_data),
+                        has_tags=bool(tags_data))
+            
             return vector_id
             
         except Exception as e:
@@ -553,21 +812,124 @@ class IndexingTask:
             else:
                 expires_at = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
             
-            # Context7: Вызов метода create_post_node с правильными параметрами
+            # Context7: Агрегируем все enrichment данные для передачи в create_post_node
+            enrichment_data = {}
+            if post_data.get('vision_data'):
+                enrichment_data['vision'] = post_data.get('vision_data')
+            if post_data.get('crawl_data'):
+                enrichment_data['crawl'] = post_data.get('crawl_data')
+            if post_data.get('tags_data'):
+                enrichment_data['tags'] = post_data.get('tags_data')
+            
+            # Context7: Вызов метода create_post_node с enrichment данными
             success = await self.neo4j_client.create_post_node(
                 post_id=post_id,
                 user_id=post_data.get('user_id', 'system'),  # Fallback для совместимости
                 tenant_id=post_data.get('tenant_id', 'default'),  # Fallback для совместимости
                 channel_id=channel_id,
                 expires_at=expires_at,
-                enrichment_data=None,  # Может быть обогащено позже
+                enrichment_data=enrichment_data if enrichment_data else None,
                 indexed_at=datetime.now(timezone.utc).isoformat()
             )
             
-            if success:
-                logger.debug("Indexed to Neo4j", post_id=post_id, channel_id=channel_id)
-            else:
+            if not success:
                 raise Exception("create_post_node returned False")
+            
+            # Context7: Создание Tag relationships
+            tags_data = post_data.get('tags_data')
+            if tags_data and isinstance(tags_data, dict):
+                tags_list = tags_data.get('tags', [])
+                if tags_list:
+                    # Преобразуем список строк в список dict для create_tag_relationships
+                    tags_dicts = [
+                        {'name': tag, 'category': 'general', 'confidence': 1.0}
+                        if isinstance(tag, str) else tag
+                        for tag in tags_list
+                    ]
+                    await self.neo4j_client.create_tag_relationships(post_id, tags_dicts)
+            
+            # Context7: Создание ImageContent nodes для Vision
+            vision_data = post_data.get('vision_data')
+            if vision_data and isinstance(vision_data, dict):
+                # Извлекаем s3_keys из vision_data
+                s3_keys = vision_data.get('s3_keys', {})
+                image_key = None
+                sha256 = None
+                
+                if isinstance(s3_keys, dict):
+                    # s3_keys может быть dict {image: '...', thumb: '...'}
+                    image_key = s3_keys.get('image')
+                elif isinstance(s3_keys, list) and s3_keys:
+                    # Если это список, берём первый элемент
+                    image_key = s3_keys[0].get('s3_key') if isinstance(s3_keys[0], dict) else None
+                
+                # Используем legacy s3_keys_list если s3_keys не содержит image_key
+                s3_keys_list = None
+                if not image_key:
+                    s3_keys_list = vision_data.get('s3_keys_list', [])
+                    if s3_keys_list and isinstance(s3_keys_list, list) and s3_keys_list:
+                        image_key = s3_keys_list[0].get('s3_key')
+                        sha256 = s3_keys_list[0].get('sha256')
+                
+                if image_key or sha256:
+                    labels = vision_data.get('labels', [])
+                    # Context7: Предупреждение если sha256 отсутствует
+                    if not sha256:
+                        logger.warning(
+                            "SHA256 not found in vision_data for ImageContent node",
+                            post_id=post_id,
+                            has_s3_key=bool(image_key),
+                            vision_data_keys=list(vision_data.keys()),
+                            has_s3_keys_list=bool(s3_keys_list)
+                        )
+                    
+                    await self.neo4j_client.create_image_content_node(
+                        post_id=post_id,
+                        sha256=sha256 or 'unknown',  # Fallback если нет sha256
+                        s3_key=image_key,
+                        mime_type=None,  # TODO: извлечь из media metadata
+                        vision_classification=vision_data.get('classification'),
+                        is_meme=vision_data.get('is_meme', False),
+                        labels=labels if isinstance(labels, list) else [],
+                        provider=vision_data.get('provider', 'gigachat')
+                    )
+            
+            # Context7: Создание WebPage nodes для Crawl
+            crawl_data = post_data.get('crawl_data')
+            if crawl_data and isinstance(crawl_data, dict):
+                urls_metadata = crawl_data.get('urls', [])
+                s3_keys = crawl_data.get('s3_keys', {})
+                
+                # Обрабатываем каждый URL из crawl_data
+                for url_info in urls_metadata if isinstance(urls_metadata, list) else []:
+                    if isinstance(url_info, dict):
+                        url = url_info.get('url')
+                        url_hash = url_info.get('url_hash')
+                        content_sha256 = url_info.get('content_sha256')
+                        
+                        # Извлекаем s3_html_key из s3_keys
+                        html_key = None
+                        if s3_keys:
+                            if isinstance(s3_keys, dict):
+                                # s3_keys может быть {url: {html: '...', md: '...'}}
+                                if url in s3_keys and isinstance(s3_keys[url], dict):
+                                    html_key = s3_keys[url].get('html')
+                        
+                        if url:
+                            await self.neo4j_client.create_webpage_node(
+                                post_id=post_id,
+                                url=url,
+                                s3_html_key=html_key,
+                                url_hash=url_hash,
+                                content_sha256=content_sha256
+                            )
+            
+            logger.debug("Indexed to Neo4j with enrichment",
+                        post_id=post_id,
+                        channel_id=channel_id,
+                        has_tags=bool(tags_data),
+                        has_vision=bool(vision_data),
+                        has_crawl=bool(crawl_data))
             
         except Exception as e:
             logger.error("Failed to index to Neo4j",

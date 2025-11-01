@@ -118,8 +118,14 @@ class ParseAllChannelsTask:
         # Инициализация Redis, если не передан
         if self.redis is None:
             try:
-                # Context7: Создаём async Redis клиент с decode_responses для совместимости с parser
-                self.redis = redis.from_url(settings.redis_url, decode_responses=True)
+                # Context7: Создаём async Redis клиент с decode_responses для совместимости с parser и таймаутами
+                self.redis = redis.from_url(
+                    settings.redis_url, 
+                    decode_responses=True,
+                    socket_connect_timeout=10,
+                    socket_timeout=30,
+                    retry_on_timeout=True
+                )
                 logger.info("Redis initialized for scheduler")
             except Exception as e:
                 logger.error(f"Failed to initialize Redis: {str(e)}")
@@ -301,7 +307,19 @@ class ParseAllChannelsTask:
                         new_query = urlencode(qs, doseq=True)
                         db_url_async = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
                         
-                        engine = create_async_engine(db_url_async, pool_pre_ping=True, pool_size=5)
+                        # Context7: Добавляем таймауты для предотвращения зависаний
+                        engine = create_async_engine(
+                            db_url_async, 
+                            pool_pre_ping=True, 
+                            pool_size=5,
+                            pool_timeout=30,
+                            connect_args={
+                                "command_timeout": 60,
+                                "server_settings": {
+                                    "application_name": "telethon_parser"
+                                }
+                            }
+                        )
                         async_session_factory = async_sessionmaker(engine, expire_on_commit=False)
                         db_session = async_session_factory()
                         

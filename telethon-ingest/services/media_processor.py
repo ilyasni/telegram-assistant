@@ -3,6 +3,7 @@ Media Processor для Telethon Ingestion
 Context7 best practice: SHA256 content-addressed storage, quota checks, S3 upload
 """
 
+import asyncio
 import hashlib
 import io
 import logging
@@ -11,7 +12,7 @@ from typing import Dict, List, Optional, Any, Tuple
 
 import structlog
 from telethon import TelegramClient
-from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument, MessageMedia
+from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
 
 # Импорты для S3 и quota
 import sys
@@ -40,13 +41,13 @@ class MediaProcessor:
     
     def __init__(
         self,
-        telegram_client: TelegramClient,
+        telegram_client: Optional[TelegramClient],
         s3_service: S3StorageService,
         storage_quota: StorageQuotaService,
         redis_client: Any,
         tenant_id: str = None
     ):
-        self.telegram_client = telegram_client
+        self.telegram_client = telegram_client  # Может быть None, будет установлен при использовании
         self.s3_service = s3_service
         self.storage_quota = storage_quota
         self.redis_client = redis_client
@@ -121,7 +122,11 @@ class MediaProcessor:
         """Обработка фото."""
         try:
             # Скачивание фото (получаем самое большое доступное)
-            file_bytes = await self.telegram_client.download_media(message, file=bytes)
+            # Context7: Добавляем timeout для предотвращения зависаний при медленном соединении
+            file_bytes = await asyncio.wait_for(
+                self.telegram_client.download_media(message, file=bytes),
+                timeout=120  # 2 минуты максимум на фото
+            )
             
             if not file_bytes:
                 logger.warning("Failed to download photo", trace_id=trace_id)
@@ -138,6 +143,9 @@ class MediaProcessor:
                 trace_id=trace_id
             )
             
+        except asyncio.TimeoutError:
+            logger.error("Photo download timeout after 120s", trace_id=trace_id)
+            return None
         except Exception as e:
             logger.error("Failed to process photo", error=str(e), trace_id=trace_id)
             return None
@@ -175,7 +183,11 @@ class MediaProcessor:
                 return None
             
             # Скачивание документа
-            file_bytes = await self.telegram_client.download_media(message, file=bytes)
+            # Context7: Добавляем timeout для предотвращения зависаний при медленном соединении
+            file_bytes = await asyncio.wait_for(
+                self.telegram_client.download_media(message, file=bytes),
+                timeout=300  # 5 минут максимум на документы
+            )
             
             if not file_bytes:
                 logger.warning("Failed to download document", trace_id=trace_id)
@@ -189,6 +201,9 @@ class MediaProcessor:
                 trace_id=trace_id
             )
             
+        except asyncio.TimeoutError:
+            logger.error("Document download timeout after 300s", trace_id=trace_id)
+            return None
         except Exception as e:
             logger.error("Failed to process document", error=str(e), trace_id=trace_id)
             return None
@@ -207,16 +222,11 @@ class MediaProcessor:
             MediaFile объект или None при ошибке
         """
         try:
-            # Проверка квоты перед загрузкой
-            import asyncio
-            loop = asyncio.get_event_loop()
-            quota_check = await loop.run_in_executor(
-                None,
-                lambda: self.storage_quota.check_quota_before_upload(
-                    tenant_id=tenant_id,
-                    size_bytes=len(content),
-                    content_type="media"
-                )
+            # Проверка квоты перед загрузкой (async метод)
+            quota_check = await self.storage_quota.check_quota_before_upload(
+                tenant_id=tenant_id,
+                size_bytes=len(content),
+                content_type="media"
             )
             
             if not quota_check.allowed:
@@ -230,16 +240,11 @@ class MediaProcessor:
                 return None
             
             # Загрузка в S3 (идемпотентная - возвращает существующий SHA256 если есть)
-            # Note: put_media синхронный, но работает быстро для небольших файлов
-            import asyncio
-            loop = asyncio.get_event_loop()
-            sha256, s3_key, size_bytes = await loop.run_in_executor(
-                None,
-                lambda: self.s3_service.put_media(
-                    content=content,
-                    mime_type=mime_type,
-                    tenant_id=tenant_id
-                )
+            # Note: put_media async метод
+            sha256, s3_key, size_bytes = await self.s3_service.put_media(
+                content=content,
+                mime_type=mime_type,
+                tenant_id=tenant_id
             )
             
             # Создание MediaFile объекта
