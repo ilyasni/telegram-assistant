@@ -349,39 +349,67 @@ class TagPersistenceTask:
         tags_hash: str,
         metadata: Dict[str, Any]
     ):
-        """Сохранение тегов в post_enrichment с идемпотентностью + публикация в posts.enriched."""
+        """
+        Context7: Сохранение тегов в post_enrichment через EnrichmentRepository.
+        Использует единую модель с kind='tags' и структурированное JSONB поле data.
+        """
+        # Context7: Импорт shared репозитория
+        import sys
+        import os
+        shared_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'shared', 'python'))
+        if shared_path not in sys.path:
+            sys.path.insert(0, shared_path)
+        
+        from shared.repositories.enrichment_repository import EnrichmentRepository
+        
         async with self.pool.acquire() as conn:
             async with conn.transaction():
-                # UPSERT с проверкой изменений
-                result = await conn.execute(
-                    """
-                    INSERT INTO post_enrichment (
-                        post_id, kind, tags, enrichment_provider,
-                        enriched_at, enrichment_latency_ms, metadata, updated_at
-                    )
-                    VALUES (
-                        $1, 'tags', $2::text[], $3,
-                        NOW(), COALESCE($4, 0), $5::jsonb, NOW()
-                    )
-                    ON CONFLICT (post_id, kind)
-                    DO UPDATE SET
-                        tags = EXCLUDED.tags,
-                        enrichment_provider = EXCLUDED.enrichment_provider,
-                        enrichment_latency_ms = EXCLUDED.enrichment_latency_ms,
-                        metadata = post_enrichment.metadata || EXCLUDED.metadata,
-                        updated_at = NOW()
-                    WHERE post_enrichment.tags IS DISTINCT FROM EXCLUDED.tags
-                    """,
-                    post_id,
-                    tags,
-                    metadata.get("provider", "gigachat"),
-                    int(metadata.get("latency_ms") or 0),
-                    json.dumps(metadata, ensure_ascii=False)
+                # Проверяем, изменились ли теги (для метрик)
+                existing_tags_result = await conn.fetchrow(
+                    "SELECT tags FROM post_enrichment WHERE post_id = $1 AND kind = 'tags'",
+                    post_id
+                )
+                existing_tags = existing_tags_result["tags"] if existing_tags_result and existing_tags_result.get("tags") else []
+                
+                # Структурируем данные для JSONB поля data
+                tags_data = {
+                    "tags": tags or [],
+                    "tags_hash": tags_hash,
+                    "provider": metadata.get("provider", "gigachat"),
+                    "latency_ms": int(metadata.get("latency_ms") or 0),
+                    "tenant_id": metadata.get("tenant_id", "default"),
+                    "trace_id": metadata.get("trace_id", str(uuid.uuid4())),
+                    "metadata": {k: v for k, v in metadata.items() if k not in ["provider", "latency_ms", "tenant_id", "trace_id"]}
+                }
+                
+                # Используем EnrichmentRepository (принимает asyncpg.Pool)
+                repo = EnrichmentRepository(self.pool)
+                await repo.upsert_enrichment(
+                    post_id=post_id,
+                    kind='tags',
+                    provider=metadata.get("provider", "gigachat"),
+                    data=tags_data,
+                    params_hash=None,  # Теги не версионируются по параметрам модели
+                    status='ok',
+                    error=None,
+                    trace_id=metadata.get("trace_id")
                 )
                 
-                # Если строка не обновилась — конфликт (теги не изменились)
-                if result == "INSERT 0 0":
+                # Если теги не изменились — инкрементируем метрику конфликтов
+                if existing_tags == (tags or []):
                     tags_persist_conflicts_total.inc()
+                
+                # Context7: Также сохраняем в legacy поле tags для обратной совместимости
+                # (будет удалено после полной миграции)
+                await conn.execute(
+                    """
+                    UPDATE post_enrichment
+                    SET tags = $1::text[]
+                    WHERE post_id = $2 AND kind = 'tags'
+                    """,
+                    tags or [],
+                    post_id
+                )
                 
                 # КРИТИЧНО: Публикация в posts.enriched (даже если теги пустые!)
                 enriched_event = {

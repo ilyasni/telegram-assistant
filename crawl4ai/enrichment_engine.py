@@ -299,21 +299,31 @@ class EnrichmentEngine:
         return explain
     
     async def _enrich_url(self, url: str, policy_config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Обогащение одного URL с кешированием."""
+        """
+        Обогащение одного URL с детерминированным кешированием.
+        
+        Context7: Использует url_hash (SHA256 от нормализованного URL) и content_sha256
+        для детерминированного кеширования.
+        """
         try:
-            # Проверка кеша
-            cache_key = f"enrichment:{hashlib.md5(url.encode()).hexdigest()}"
+            # Context7: Вычисляем url_hash (SHA256 от нормализованного URL)
+            # Нормализация: приведение к lowercase, удаление фрагментов
+            normalized_url = self._normalize_url(url)
+            url_hash = hashlib.sha256(normalized_url.encode('utf-8')).hexdigest()
+            
+            # Context7: Проверка кеша по url_hash
+            cache_key = f"crawl:enrichment:{url_hash}"
             cached_data = await self._get_from_cache(cache_key)
             
             if cached_data:
                 cache_hits_total.labels(type='enrichment').inc()
-                logger.debug("Using cached enrichment data", url=url)
+                logger.debug("Using cached enrichment data", url=url, url_hash=url_hash)
                 return cached_data
             
             # HTTP кеширование: проверка ETag/Last-Modified
             headers = {}
-            etag_key = f"etag:{hashlib.md5(url.encode()).hexdigest()}"
-            last_modified_key = f"last_modified:{hashlib.md5(url.encode()).hexdigest()}"
+            etag_key = f"crawl:etag:{url_hash}"
+            last_modified_key = f"crawl:last_modified:{url_hash}"
             
             cached_etag = await self.redis_client.get(etag_key)
             cached_last_modified = await self.redis_client.get(last_modified_key)
@@ -341,13 +351,34 @@ class EnrichmentEngine:
                     return None
                 
                 # Извлечение контента
-                content = await response.text()
+                content_bytes = await response.read()
+                content = content_bytes.decode('utf-8', errors='ignore')
+                
+                # Context7: Вычисляем content_sha256 для детерминированного кеширования
+                content_sha256 = hashlib.sha256(content_bytes).hexdigest()
+                
+                # Context7: Проверяем кеш по content_sha256 (если контент не изменился)
+                content_cache_key = f"crawl:content:{content_sha256}"
+                cached_by_content = await self._get_from_cache(content_cache_key)
+                
+                if cached_by_content:
+                    cache_hits_total.labels(type='content_hash').inc()
+                    logger.debug("Using cached data by content_sha256", 
+                               url=url, content_sha256=content_sha256)
+                    # Обновляем кеш по url_hash для быстрого доступа
+                    await self._save_to_cache(cache_key, cached_by_content)
+                    return cached_by_content
                 
                 # Обогащение данных
                 enrichment_data = await self._extract_content_data(content, url)
                 
-                # Сохранение в кеш
+                # Context7: Сохраняем content_sha256 в enrichment_data
+                enrichment_data['content_sha256'] = content_sha256
+                enrichment_data['url_hash'] = url_hash
+                
+                # Сохранение в кеш по url_hash и content_sha256
                 await self._save_to_cache(cache_key, enrichment_data)
+                await self._save_to_cache(content_cache_key, enrichment_data)
                 
                 # Сохранение HTTP заголовков для кеширования
                 etag = response.headers.get('ETag')
@@ -390,7 +421,8 @@ class EnrichmentEngine:
             'word_count': len(content.split()),
             'language': self._detect_language(content),
             'url': url,
-            'extracted_at': datetime.now(timezone.utc).isoformat()
+            'extracted_at': datetime.now(timezone.utc).isoformat(),
+            # Context7: url_hash и content_sha256 будут добавлены в _enrich_url
         }
     
     def _extract_title(self, content: str) -> str:
@@ -457,6 +489,27 @@ class EnrichmentEngine:
         # Добавление текущего запроса
         self._rate_limit_cache[host].append(now)
         return True
+    
+    def _normalize_url(self, url: str) -> str:
+        """
+        Нормализация URL для детерминированного хеширования.
+        
+        Context7: Приводит URL к каноническому виду (lowercase, без фрагментов, сортировка query).
+        """
+        from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
+        parsed = urlparse(url.lower())
+        # Удаляем фрагмент (#), сортируем query параметры
+        query_params = parse_qs(parsed.query, keep_blank_values=True)
+        sorted_query = urlencode(sorted(query_params.items()), doseq=True)
+        normalized = urlunparse((
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            parsed.params,
+            sorted_query,
+            ''  # Удаляем fragment
+        ))
+        return normalized
     
     async def _get_from_cache(self, key: str) -> Optional[Dict[str, Any]]:
         """Получение данных из кеша."""

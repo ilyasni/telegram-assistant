@@ -16,20 +16,23 @@ from gigachat.exceptions import GigaChatException, AuthenticationError, Response
 
 from prometheus_client import Counter, Histogram
 
-# Context7: Импорт S3StorageService из shared модуля worker
-try:
-    from shared.s3_storage import S3StorageService
-except ImportError:
-    # Fallback для обратной совместимости
-    import sys
-    import os
-    parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-    if parent_dir not in sys.path:
-        sys.path.insert(0, parent_dir)
-    try:
-        from api.services.s3_storage import S3StorageService
-    except ImportError:
-        from shared.s3_storage import S3StorageService
+# Context7: Импорт S3StorageService из api (временное исключение для архитектурной границы)
+# TODO: Переместить в shared-пакет в будущем
+import sys
+import os
+
+# Добавляем пути для импорта api модуля (поддержка dev и production)
+# Важно: добавляем РОДИТЕЛЬСКУЮ директорию, чтобы импорт "from api.services..." работал
+project_root = '/opt/telegram-assistant'
+if project_root not in sys.path and os.path.exists(os.path.join(project_root, 'api')):
+    sys.path.insert(0, project_root)
+
+# Fallback: относительный путь (dev)
+parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+if parent_dir not in sys.path and os.path.exists(os.path.join(parent_dir, 'api')):
+    sys.path.insert(0, parent_dir)
+
+from api.services.s3_storage import S3StorageService
 from services.budget_gate import BudgetGateService
 from services.retry_policy import create_retry_decorator, DEFAULT_RETRY_CONFIG
 
@@ -111,7 +114,15 @@ class GigaChatVisionAdapter:
         # Библиотека gigachat принимает credentials напрямую
         self.credentials = credentials
         self.scope = scope
-        self.model = model
+        
+        # Context7: Поддержка динамического выбора модели через env
+        # Приоритет: переданный параметр > GIGACHAT_VISION_MODEL > GIGACHAT_MODEL > default
+        self.model = (
+            model or 
+            os.getenv('GIGACHAT_VISION_MODEL') or 
+            os.getenv('GIGACHAT_MODEL') or 
+            "GigaChat-Pro"
+        )
         self.base_url = base_url
         self.s3_service = s3_service
         self.budget_gate = budget_gate
@@ -148,14 +159,19 @@ class GigaChatVisionAdapter:
         self,
         file_content: bytes,
         filename: Optional[str] = None,
+        mime_type: Optional[str] = None,
         purpose: str = "general"
     ) -> str:
         """
         Загрузка файла в GigaChat хранилище.
         
+        Context7: GigaChat требует правильный filename с расширением для определения MIME типа.
+        Если filename не передан, генерируется из mime_type.
+        
         Args:
             file_content: Содержимое файла
-            filename: Имя файла (опционально)
+            filename: Имя файла с расширением (опционально)
+            mime_type: MIME тип файла (используется для генерации filename если не передан)
             purpose: Назначение файла (general)
             
         Returns:
@@ -164,33 +180,77 @@ class GigaChatVisionAdapter:
         try:
             client = self._get_client()
             
+            # Context7: Генерируем filename из mime_type если не передан
+            # GigaChat API требует правильное расширение для определения типа файла
+            if not filename and mime_type:
+                extension = self._get_extension_from_mime(mime_type)
+                filename = f"file.{extension}"
+            elif not filename:
+                # Fallback: используем generic имя
+                filename = "file.bin"
+            
             # Создаём file-like object
             file_obj = io.BytesIO(file_content)
-            if filename:
-                file_obj.name = filename
+            file_obj.name = filename
             
             # Загрузка файла
             uploaded_file = client.upload_file(file_obj, purpose=purpose)
+            
+            # Context7: GigaChat библиотека возвращает id_ (с подчеркиванием), не id
+            file_id = uploaded_file.id_
             
             vision_file_uploads_total.labels(status="success").inc()
             
             logger.debug(
                 "File uploaded to GigaChat",
-                file_id=uploaded_file.id,
+                file_id=file_id,
                 filename=filename,
+                mime_type=mime_type,
                 size_bytes=len(file_content)
             )
             
-            return uploaded_file.id
+            return file_id
             
         except (GigaChatException, Exception) as e:
             vision_file_uploads_total.labels(status="error").inc()
             logger.error(
                 "Failed to upload file to GigaChat",
                 error=str(e),
-                error_type=type(e).__name__
+                error_type=type(e).__name__,
+                filename=filename,
+                mime_type=mime_type,
+                size_bytes=len(file_content)
             )
             raise
+    
+    def _get_extension_from_mime(self, mime_type: str) -> str:
+        """
+        Context7: Определение расширения файла из MIME типа для GigaChat API.
+        
+        Args:
+            mime_type: MIME тип файла
+            
+        Returns:
+            Расширение файла (без точки)
+        """
+        mime_to_ext = {
+            'image/jpeg': 'jpg',
+            'image/jpg': 'jpg',
+            'image/png': 'png',
+            'image/gif': 'gif',
+            'image/webp': 'webp',
+            'image/tiff': 'tiff',
+            'image/bmp': 'bmp',
+            'application/pdf': 'pdf',
+            'application/msword': 'doc',
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+            'text/plain': 'txt',
+            'application/epub+zip': 'epub',
+            'video/mp4': 'mp4',
+            'audio/mpeg': 'mp3',
+            'audio/wav': 'wav',
+        }
+        return mime_to_ext.get(mime_type.lower(), 'bin')
     
     async def analyze_media(
         self,
@@ -265,8 +325,12 @@ class GigaChatVisionAdapter:
                     raise Exception("Concurrent request limit exceeded")
             
             try:
-                # Загрузка файла в GigaChat
-                file_id = await self.upload_file(file_content)
+                # Context7: Загрузка файла в GigaChat с правильным filename
+                # Передаем mime_type для автоматической генерации filename с расширением
+                file_id = await self.upload_file(
+                    file_content=file_content,
+                    mime_type=mime_type
+                )
                 
                 # Промпт для анализа
                 if not analysis_prompt:

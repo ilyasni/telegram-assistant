@@ -1,0 +1,76 @@
+groups:
+  # Storage Quota Alerts (Context7: критичные для соблюдения лимита 15 GB)
+  - name: storage_quota
+    interval: 30s
+    rules:
+      # Критическое использование > 93% (14 GB из 15 GB)
+      - alert: StorageQuotaCritical
+        expr: |
+          storage_bucket_usage_gb / 15.0 > 0.93
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Storage quota критичен: {{ $value | humanizePercentage }}"
+          description: "Использование storage превысило 93% от лимита. Требуется немедленная очистка. Проверить: curl http://localhost:8000/api/storage/quota"
+      
+      # Предупреждение > 85% (12.75 GB)
+      - alert: StorageQuotaWarning
+        expr: |
+          storage_bucket_usage_gb / 15.0 > 0.85
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Storage quota высокий: {{ $value | humanizePercentage }}"
+          description: "Использование storage превысило 85%. Рекомендуется запустить cleanup. API: POST /api/storage/cleanup"
+      
+      # Частые нарушения квот
+      - alert: StorageQuotaViolationsHigh
+        expr: |
+          rate(storage_quota_violations_total[10m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Высокий rate нарушений квот: {{ $value }} нарушений/сек"
+          description: "Много попыток загрузки при превышении квоты. Проверить логи и метрики storage_quota_violations_total"
+      
+      # Emergency cleanup не освобождает место
+      - alert: StorageCleanupIneffective
+        expr: |
+          (
+            storage_bucket_usage_gb / 15.0 > 0.93
+            and
+            increase(storage_emergency_cleanups_total[30m]) > 0
+            and
+            increase(storage_cleanup_freed_gb_sum[30m]) < 1.0
+          )
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Emergency cleanup неэффективен: освобождено < 1 GB за 30 минут"
+          description: "Cleanup запускается, но не освобождает достаточно места. Проверить S3 lifecycle policies и LRU eviction"
+      
+      # По типам контента
+      - alert: StorageMediaQuotaHigh
+        expr: |
+          storage_bucket_usage_gb{content_type="media"} > 9.0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Media storage высокий: {{ $value }} GB / 10 GB"
+          description: "Использование media storage близко к лимиту. Проверить TTL policies для media/"
+      
+      - alert: StorageVisionQuotaHigh
+        expr: |
+          storage_bucket_usage_gb{content_type="vision"} > 1.8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Vision storage высокий: {{ $value }} GB / 2 GB"
+          description: "Использование vision storage близко к лимиту. Проверить TTL policies для vision/"
+

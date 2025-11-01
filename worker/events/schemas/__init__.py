@@ -15,6 +15,15 @@ from .posts_indexed_v1 import PostIndexedEventV1
 from .posts_deleted_v1 import PostDeletedEventV1
 from .channels_v1 import ChannelSubscribedEventV1
 
+# Context7: Vision events для S3 + Vision integration
+try:
+    from .posts_vision_v1 import VisionUploadedEventV1, VisionAnalyzedEventV1, MediaFile
+except ImportError:
+    # Fallback если модуль не существует
+    VisionUploadedEventV1 = None
+    VisionAnalyzedEventV1 = None
+    MediaFile = None
+
 __all__ = [
     'BaseEvent',
     'PostParsedEventV1',
@@ -24,3 +33,7 @@ __all__ = [
     'PostDeletedEventV1',
     'ChannelSubscribedEventV1'
 ]
+
+# Context7: Добавляем Vision events в __all__ если они доступны
+if VisionUploadedEventV1 is not None:
+    __all__.extend(['VisionUploadedEventV1', 'VisionAnalyzedEventV1', 'MediaFile'])

@@ -264,6 +264,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 # Подключение роутеров
 # Подключаем критичные роутеры
 from routers import health, channels, tg_auth, tg_webapp_auth, users, sessions, session_management, posts
+from routers import storage  # Context7: Storage Quota Management API
 app.include_router(health.router, prefix="/api")
 app.include_router(channels.router, prefix="/api")
 app.include_router(tg_auth.router)  # QR auth endpoints
@@ -272,6 +273,7 @@ app.include_router(users.router, prefix="/api")
 app.include_router(sessions.router, prefix="/api")
 app.include_router(posts.router, prefix="/api")
 app.include_router(session_management.router)  # Session management API
+app.include_router(storage.router, prefix="/api")  # Context7: Storage Quota Management API
 app.include_router(bot_router, prefix="/tg")
 
 # Диагностический код временно убран

@@ -6,6 +6,7 @@ import asyncio
 import os
 import json
 from typing import Dict, Any, Optional
+from datetime import datetime, timezone
 import structlog
 import asyncpg
 from redis.asyncio import Redis
@@ -277,51 +278,48 @@ class Crawl4AIService:
                 crawl_requests_total.labels(status='skipped', reason=reason or 'unknown').inc()
                 return
             
-            # Модульное сохранение в post_enrichment
+            # Context7: Модульное сохранение в post_enrichment через EnrichmentRepository
             latency_ms = int((time.time() - start_time) * 1000)
             
+            # Агрегируем все данные от всех URL в единую структуру для kind='crawl'
+            crawl_md_parts = []
+            ocr_texts = []
+            vision_labels_list = []
+            urls_data = []
+            
             for url, url_data in enrichment_data.items():
-                # Сохранение crawl_md (kind='crawl')
                 if url_data.get('markdown'):
-                    await self._save_enrichment(
-                        post_id=post_id,
-                        kind='crawl',
-                        crawl_md=url_data['markdown'],
-                        enrichment_latency_ms=latency_ms,
-                        metadata={
-                            'url': url, 
-                            'source': 'crawl4ai',
-                            'trace_id': trace_id
-                        }
-                    )
-                
-                # Сохранение ocr_text (kind='ocr')
+                    crawl_md_parts.append(url_data['markdown'])
                 if url_data.get('ocr_text'):
-                    await self._save_enrichment(
-                        post_id=post_id,
-                        kind='ocr',
-                        ocr_text=url_data['ocr_text'],
-                        enrichment_latency_ms=latency_ms,
-                        metadata={
-                            'url': url, 
-                            'source': 'crawl4ai',
-                            'trace_id': trace_id
-                        }
-                    )
-                
-                # Сохранение vision_labels (kind='vision')
+                    ocr_texts.append({
+                        'url': url,
+                        'text': url_data['ocr_text']
+                    })
                 if url_data.get('vision_labels'):
-                    await self._save_enrichment(
-                        post_id=post_id,
-                        kind='vision',
-                        vision_labels=url_data['vision_labels'],
-                        enrichment_latency_ms=latency_ms,
-                        metadata={
-                            'url': url, 
-                            'source': 'crawl4ai',
-                            'trace_id': trace_id
-                        }
-                    )
+                    vision_labels_list.append({
+                        'url': url,
+                        'labels': url_data['vision_labels']
+                    })
+                urls_data.append({
+                    'url': url,
+                    'word_count': url_data.get('word_count'),
+                    'status': url_data.get('status')
+                })
+            
+            # Сохраняем всё в едином обогащении kind='crawl'
+            if crawl_md_parts or ocr_texts or vision_labels_list:
+                await self._save_enrichment(
+                    post_id=post_id,
+                    crawl_md='\n\n---\n\n'.join(crawl_md_parts) if crawl_md_parts else None,
+                    ocr_texts=ocr_texts if ocr_texts else None,
+                    vision_labels=vision_labels_list if vision_labels_list else None,
+                    enrichment_latency_ms=latency_ms,
+                    metadata={
+                        'urls': urls_data,
+                        'source': 'crawl4ai',
+                        'trace_id': trace_id
+                    }
+                )
             
             crawl_requests_total.labels(status='success').inc()
             crawl_processing_seconds.observe(time.time() - start_time)
@@ -341,43 +339,72 @@ class Crawl4AIService:
     async def _save_enrichment(
         self,
         post_id: str,
-        kind: str,
         crawl_md: Optional[str] = None,
-        ocr_text: Optional[str] = None,
+        ocr_texts: Optional[list] = None,
         vision_labels: Optional[list] = None,
         enrichment_latency_ms: int = 0,
         metadata: Dict[str, Any] = None
     ):
         """
-        Модульное сохранение обогащения в post_enrichment.
-        Каждый вид обогащения - отдельная запись с уникальным (post_id, kind).
+        Context7: Сохранение crawl обогащения через EnrichmentRepository.
+        Использует единую модель с kind='crawl' и структурированное JSONB поле data.
         """
+        # Context7: Импорт shared репозитория
+        import sys
+        import os
+        shared_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'shared', 'python'))
+        if shared_path not in sys.path:
+            sys.path.insert(0, shared_path)
+        
+        from shared.repositories.enrichment_repository import EnrichmentRepository
+        
+        # Структурируем данные для JSONB поля data
+        crawl_data = {
+            'crawl_md': crawl_md,
+            'urls': metadata.get('urls', []) if metadata else [],
+            'word_count': sum(url.get('word_count', 0) or 0 for url in (metadata.get('urls', []) if metadata else [])),
+            'ocr_texts': ocr_texts or [],
+            'vision_labels': vision_labels or [],
+            'latency_ms': enrichment_latency_ms,
+            'crawled_at': datetime.now(timezone.utc).isoformat(),
+            'source': metadata.get('source', 'crawl4ai') if metadata else 'crawl4ai',
+            'trace_id': metadata.get('trace_id') if metadata else None,
+            'metadata': {k: v for k, v in (metadata or {}).items() if k not in ['urls', 'source', 'trace_id']}
+        }
+        
+        # Используем EnrichmentRepository (принимает asyncpg.Pool)
+        repo = EnrichmentRepository(self.db_pool)
+        await repo.upsert_enrichment(
+            post_id=post_id,
+            kind='crawl',
+            provider='crawl4ai',
+            data=crawl_data,
+            params_hash=None,  # Crawl не версионируется по параметрам модели
+            status='ok',
+            error=None,
+            trace_id=metadata.get('trace_id') if metadata else None
+        )
+        
+        # Context7: Также сохраняем в legacy поля для обратной совместимости
+        # (будет удалено после полной миграции)
         async with self.db_pool.acquire() as conn:
             await conn.execute(
                 """
-                INSERT INTO post_enrichment (
-                    post_id, kind, crawl_md, ocr_text, vision_labels,
-                    enrichment_provider, enrichment_latency_ms, metadata,
-                    enriched_at, updated_at
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
-                ON CONFLICT (post_id, kind)
-                DO UPDATE SET
-                    crawl_md = COALESCE(EXCLUDED.crawl_md, post_enrichment.crawl_md),
-                    ocr_text = COALESCE(EXCLUDED.ocr_text, post_enrichment.ocr_text),
-                    vision_labels = COALESCE(EXCLUDED.vision_labels, post_enrichment.vision_labels),
-                    enrichment_latency_ms = EXCLUDED.enrichment_latency_ms,
-                    metadata = post_enrichment.metadata || EXCLUDED.metadata,
-                    updated_at = NOW()
+                UPDATE post_enrichment
+                SET crawl_md = $1,
+                    ocr_text = $2,
+                    vision_labels = $3::jsonb,
+                    enrichment_provider = 'crawl4ai',
+                    enrichment_latency_ms = $4,
+                    metadata = COALESCE(metadata, '{}'::jsonb) || $5::jsonb
+                WHERE post_id = $6 AND kind = 'crawl'
                 """,
-                post_id,
-                kind,
                 crawl_md,
-                ocr_text,
-                vision_labels,
-                'crawl4ai',
+                (ocr_texts[0]['text'] if ocr_texts and len(ocr_texts) > 0 else None) if ocr_texts else None,
+                json.dumps([vl['labels'] for vl in vision_labels] if vision_labels else []),
                 enrichment_latency_ms,
-                json.dumps(metadata or {})
+                json.dumps(metadata or {}),
+                post_id
             )
     
     async def _monitor_queue_backlog(self):

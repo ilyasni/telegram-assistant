@@ -589,6 +589,40 @@ class EventConsumer:
             logger.error(f"Error reading new messages from {stream_name}: {e}")
             return 0
 
+    async def _update_queue_metrics(self, stream_name: str):
+        """
+        Context7: Обновление метрик размера очереди на основе реальных данных Redis.
+        Вызывается периодически для актуальных метрик.
+        """
+        try:
+            stream_key = STREAMS.get(stream_name)
+            if not stream_key:
+                return
+            
+            # Получаем реальный размер стрима
+            stream_length = await self.client.client.xlen(stream_key)
+            
+            # Обновляем метрику posts_in_queue_total
+            posts_in_queue_total.labels(queue=stream_name, status='total').set(stream_length)
+            
+            # Получаем pending сообщения через XPENDING
+            try:
+                pending_info = await self.client.client.xpending_range(
+                    stream_key,
+                    self.config.group_name,
+                    min='-',
+                    max='+',
+                    count=1000
+                )
+                pending_count = len(pending_info) if pending_info else 0
+                stream_pending_size.labels(stream=stream_name).set(pending_count)
+                posts_in_queue_total.labels(queue=stream_name, status='pending').set(pending_count)
+            except Exception as e:
+                logger.debug(f"Could not get pending info for {stream_name}: {e}")
+                
+        except Exception as e:
+            logger.debug(f"Error updating queue metrics for {stream_name}: {e}")
+    
     async def consume_forever(self, stream_name: str, handler_func):
         """
         Context7: Бесконечный цикл потребления с правильным паттерном pending → новые.
@@ -604,6 +638,9 @@ class EventConsumer:
         
         logger.info(f"Started consuming {stream_name} with group {self.config.group_name}")
         
+        # Счётчик для периодического обновления метрик
+        iteration_count = 0
+        
         while self.running:
             try:
                 processed = 0
@@ -616,6 +653,12 @@ class EventConsumer:
                 
                 # Context7: Метрики для итераций цикла
                 consumer_loop_iterations_total.labels(task=self.config.consumer_name).inc()
+                
+                # Обновляем метрики очереди каждые 10 итераций (примерно каждые 2 секунды)
+                iteration_count += 1
+                if iteration_count >= 10:
+                    await self._update_queue_metrics(stream_name)
+                    iteration_count = 0
                 
                 if processed == 0:
                     await asyncio.sleep(0.2)  # Короткий backoff, чтобы не жечь CPU

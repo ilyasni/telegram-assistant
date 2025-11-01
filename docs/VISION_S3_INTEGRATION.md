@@ -111,32 +111,146 @@ GIGACHAT_VISION_MODEL=GigaChat-Pro
 
 ## API Endpoints
 
-### Storage Quota Monitoring
+### Storage Quota Management API
 
-```bash
-# Общая квота
-GET /api/v1/storage/quota
+**Base URL**: `/api/storage`
 
-# Использование по tenant
-GET /api/v1/storage/usage/{tenant_id}
+Все endpoints требуют JWT токен в заголовке `Authorization: Bearer <token>`.
 
-# Проверка перед загрузкой
-POST /api/v1/storage/quota/check
+#### GET /api/storage/quota
+
+Получение текущего использования storage и квот.
+
+**Response 200**:
+```json
 {
-  "tenant_id": "uuid",
+  "total_gb": 12.5,
+  "limit_gb": 15.0,
+  "usage_percent": 83.33,
+  "by_type": {
+    "media": 8.2,
+    "vision": 2.1,
+    "crawl": 2.2
+  },
+  "emergency_threshold_gb": 14.0,
+  "last_updated": "2025-01-28T12:00:00Z"
+}
+```
+
+**Example**:
+```bash
+curl -X GET "http://localhost:8000/api/storage/quota" \
+  -H "Authorization: Bearer <token>"
+```
+
+#### GET /api/storage/usage/{tenant_id}
+
+Получение использования storage для конкретного tenant.
+
+**Path Parameters**:
+- `tenant_id` (string) - UUID tenant
+
+**Response 200**:
+```json
+{
+  "tenant_id": "877193ef-be80-4977-aaeb-8009c3d772ee",
+  "usage_gb": 1.5,
+  "limit_gb": 2.0,
+  "usage_percent": 75.0,
+  "last_updated": "2025-01-28T12:00:00Z"
+}
+```
+
+#### POST /api/storage/quota/check
+
+Проверка квоты перед загрузкой файла.
+
+**Request Body**:
+```json
+{
+  "tenant_id": "877193ef-be80-4977-aaeb-8009c3d772ee",
   "size_bytes": 1024000,
   "content_type": "media"
 }
+```
 
-# Ручная очистка
-POST /api/v1/storage/cleanup
+**Response 200**:
+```json
+{
+  "allowed": true,
+  "reason": "quota_available",
+  "current_usage_gb": 1.5,
+  "tenant_limit_gb": 2.0,
+  "bucket_usage_gb": 12.5
+}
+```
+
+**Response 200 (quota exceeded)**:
+```json
+{
+  "allowed": false,
+  "reason": "tenant_limit_exceeded",
+  "current_usage_gb": 2.0,
+  "tenant_limit_gb": 2.0,
+  "bucket_usage_gb": 12.5
+}
+```
+
+#### POST /api/storage/cleanup
+
+Запуск emergency cleanup для освобождения места.
+
+**Request Body**:
+```json
 {
   "force": false,
   "target_free_gb": 12.0
 }
+```
 
-# Детальная статистика
-GET /api/v1/storage/stats
+**Response 200**:
+```json
+{
+  "cleanup_started": true,
+  "target_free_gb": 12.0,
+  "estimated_duration_seconds": 300,
+  "message": "Cleanup task queued"
+}
+```
+
+#### GET /api/storage/stats
+
+Получение детальной статистики storage: метрики, история, тренды.
+
+**Response 200**:
+```json
+{
+  "current": {
+    "total_gb": 12.5,
+    "limit_gb": 15.0,
+    "usage_percent": 83.33,
+    "by_type": {
+      "media": 8.2,
+      "vision": 2.1,
+      "crawl": 2.2
+    }
+  },
+  "limits": {
+    "total_bucket_gb": 15.0,
+    "emergency_threshold_gb": 14.0,
+    "per_tenant_max_gb": 2.0,
+    "media_max_gb": 10.0,
+    "vision_max_gb": 2.0,
+    "crawl_max_gb": 2.0
+  },
+  "policies": {
+    "media_ttl_days": 30,
+    "vision_ttl_days": 14,
+    "crawl_ttl_days": 7,
+    "compression_required": true
+  },
+  "last_updated": "2025-01-28T12:00:00Z"
+}
 ```
 
 ## Diagnostic CLI

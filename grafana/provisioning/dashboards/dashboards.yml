@@ -7,3 +7,6 @@ providers:
     options:
       path: /etc/grafana/dashboards
       foldersFromFilesStructure: true
+      # allowUiUpdates: false  # По умолчанию false - файлы перезаписывают изменения из UI
+      # Если нужно разрешить изменения из UI: установите allowUiUpdates: true
+      # Тогда изменения из UI сохранятся, но при обновлении файла они перезапишутся

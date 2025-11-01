@@ -290,8 +290,8 @@ class TelegramIngestionService:
                 
             except Exception as e:
                 logger.error("Failed to fetch messages with retry, using fallback", error=str(e))
-                # Fallback к старому методу
-                async for message in client.iter_messages(entity, offset_date=since_date, limit=10000):
+                # Fallback к старому методу с лимитом
+                async for message in client.iter_messages(entity, offset_date=since_date, limit=5000):
                     # Клиентская фильтрация (Telethon не умеет >= серверно)
                     if message.date < since_date:
                         logger.debug(f"Reached since_date, stopping. message.date={message.date}, since_date={since_date}")
@@ -300,8 +300,8 @@ class TelegramIngestionService:
                     messages.append(message)
                     
                     # Ограничиваем по времени, а не по количеству
-                    if len(messages) >= 10000:  # Защита от бесконечного цикла
-                        logger.warning(f"Reached maximum messages limit (10000) for channel {channel_id}")
+                    if len(messages) >= 5000:  # Защита от бесконечного цикла
+                        logger.warning(f"Reached maximum messages limit (5000) for channel {channel_id}")
                         break
             
             logger.info("Found historical messages", 
