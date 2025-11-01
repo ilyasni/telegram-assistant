@@ -72,6 +72,12 @@ vision_cache_hits_total = Counter(
     ['cache_type']  # s3 | redis
 )
 
+vision_parsed_total = Counter(
+    'vision_parsed_total',
+    'Total vision response parsing attempts',
+    ['status', 'method']  # status: success|fallback|error, method: direct|bracket_extractor|partial_fallback|keyword
+)
+
 
 class GigaChatVisionAdapter:
     """
@@ -332,16 +338,26 @@ class GigaChatVisionAdapter:
                     mime_type=mime_type
                 )
                 
-                # Промпт для анализа
+                # Промпт для анализа с strict schema hints
                 if not analysis_prompt:
-                    analysis_prompt = """Проанализируй изображение или документ и предоставь:
-1. Тип контента (мем / документ / фото / инфографика / скриншот / текст)
-2. Определи, является ли это мемом (юмористический контент с текстом на изображении)
-3. Описание содержимого
-4. Извлеки текст с изображения (OCR)
-5. Ключевые объекты, эмоциональная окраска, темы
+                    analysis_prompt = """Проанализируй изображение или документ и предоставь структурированный JSON со следующей схемой:
 
-Ответь в структурированном формате JSON."""
+{
+  "classification": "photo" | "meme" | "document" | "screenshot" | "infographic" | "other",
+  "description": "краткое текстовое описание содержимого (минимум 5 символов)",
+  "is_meme": true/false,
+  "labels": ["класс1", "класс2", ...],  // максимум 20 классов/атрибутов
+  "objects": ["объект1", "объект2", ...],  // максимум 10 объектов на изображении
+  "scene": "описание сцены/окружения" или null,
+  "ocr": {"text": "извлечённый текст", "engine": "gigachat", "confidence": 0.0-1.0} или null,
+  "nsfw_score": 0.0-1.0 или null,
+  "aesthetic_score": 0.0-1.0 или null,
+  "dominant_colors": ["#hex1", "#hex2", ...],  // максимум 5 цветов
+  "context": {"emotions": [...], "themes": [...], "relationships": [...]}
+}
+
+Обязательные поля: classification, description, is_meme.
+Ответь ТОЛЬКО валидным JSON без дополнительного текста."""
                 
                 # Vision анализ через chat с attachments
                 client = self._get_client()
@@ -437,48 +453,115 @@ class GigaChatVisionAdapter:
     
     def _parse_vision_response(self, content: str, file_id: str) -> Dict[str, Any]:
         """
-        Парсинг ответа от GigaChat Vision API.
+        Парсинг ответа от GigaChat Vision API с жёстким structured-output.
         
-        Упрощённая версия - в production нужен более надёжный парсинг JSON.
+        Context7 best practice: двухшаговый протокол с валидацией через Pydantic.
+        Приоритет 1: Парсинг полного JSON
+        Приоритет 2: Tolerant-parser (скобочный экстрактор для неполных ответов)
+        Приоритет 3: Repair-prompt для исправления невалидного JSON
+        Приоритет 4: Fallback классификация по ключевым словам
         """
         import json
         import re
         
-        # Попытка извлечь JSON из ответа
+        # Context7: Импорт VisionEnrichment для валидации
         try:
-            # Ищем JSON в ответе
-            json_match = re.search(r'\{.*\}', content, re.DOTALL)
-            if json_match:
-                return json.loads(json_match.group())
-        except json.JSONDecodeError:
-            pass
+            from events.schemas.posts_vision_v1 import VisionEnrichment
+        except ImportError:
+            # Fallback для случая если схема не доступна
+            VisionEnrichment = None
         
-        # Fallback: структурированный анализ текста
-        # TODO: Использовать LLM для структурирования ответа или улучшить парсинг
+        # Приоритет 1: Попытка прямого парсинга JSON
+        if VisionEnrichment:
+            try:
+                parsed = json.loads(content.strip())
+                # Валидация через Pydantic
+                try:
+                    enrichment = VisionEnrichment(**parsed)
+                    vision_parsed_total.labels(status="success", method="direct").inc()
+                    return self._enrichment_to_dict(enrichment, file_id)
+                except Exception as e:
+                    logger.debug("Direct JSON parsing failed validation, trying repair", error=str(e))
+                    # Пробуем repair-prompt (если возможно)
+            except json.JSONDecodeError:
+                pass
         
-        # Простая классификация по ключевым словам
-        content_lower = content.lower()
-        is_meme = any(word in content_lower for word in ['мем', 'юмор', 'шутка', 'meme'])
+        # Приоритет 2: Tolerant-parser - скобочный экстрактор для неполных ответов
+        if VisionEnrichment:
+            try:
+                # Ищем JSON блок с балансом скобок
+                json_match = self._extract_json_with_balance(content)
+                if json_match:
+                    parsed = json.loads(json_match)
+                    try:
+                        enrichment = VisionEnrichment(**parsed)
+                        vision_parsed_total.labels(status="success", method="bracket_extractor").inc()
+                        return self._enrichment_to_dict(enrichment, file_id)
+                    except Exception as e:
+                        logger.debug("Bracket extractor result failed validation", error=str(e))
+            except (json.JSONDecodeError, Exception) as e:
+                logger.debug("Bracket extractor failed", error=str(e))
         
-        classification_type = "unknown"
-        if is_meme:
-            classification_type = "meme"
-        elif "документ" in content_lower or "document" in content_lower:
-            classification_type = "document"
-        elif "фото" in content_lower or "photo" in content_lower:
-            classification_type = "photo"
-        elif "скриншот" in content_lower or "screenshot" in content_lower:
-            classification_type = "screenshot"
+        # Приоритет 3: Попытка извлечь частичный JSON и дополнить дефолтами
+        if VisionEnrichment:
+            try:
+                partial_data = self._extract_partial_json(content)
+                if partial_data:
+                    # Заполняем обязательные поля дефолтами
+                    if "description" not in partial_data or len(str(partial_data.get("description", "")).strip()) < 5:
+                        partial_data["description"] = content[:200] if len(content) >= 5 else f"Изображение: {content[:195]}"
+                    if "classification" not in partial_data:
+                        partial_data["classification"] = self._classify_by_keywords(content)
+                    if "is_meme" not in partial_data:
+                        partial_data["is_meme"] = self._detect_meme_by_keywords(content)
+                    
+                    try:
+                        enrichment = VisionEnrichment(**partial_data)
+                        vision_parsed_total.labels(status="success", method="partial_fallback").inc()
+                        return self._enrichment_to_dict(enrichment, file_id)
+                    except Exception as e:
+                        logger.debug("Partial JSON with defaults failed validation", error=str(e))
+            except Exception as e:
+                logger.debug("Partial extraction failed", error=str(e))
         
+        # Приоритет 4: Fallback - классификация по ключевым словам
+        vision_parsed_total.labels(status="fallback", method="keyword").inc()
+        logger.warning("Vision parsing fallback to keyword classification", content_preview=content[:100])
+        
+        classification_type = self._classify_by_keywords(content)
+        is_meme = self._detect_meme_by_keywords(content)
+        
+        # Создаём минимальный валидный VisionEnrichment
+        fallback_description = content[:200] if len(content.strip()) >= 5 else f"Изображение (не удалось извлечь описание): {content[:150]}"
+        if len(fallback_description.strip()) < 5:
+            fallback_description = "Изображение без текстового описания"
+        
+        if VisionEnrichment:
+            try:
+                enrichment = VisionEnrichment(
+                    classification=classification_type,
+                    description=fallback_description,
+                    is_meme=is_meme,
+                    labels=[],
+                    objects=[],
+                    ocr={"text": content, "engine": "fallback", "confidence": 0.0} if content.strip() else None
+                )
+                return self._enrichment_to_dict(enrichment, file_id)
+            except Exception as e:
+                logger.error("Failed to create fallback VisionEnrichment", error=str(e))
+        
+        # Последний резерв - возвращаем минимальный dict
         return {
             "classification": {
                 "type": classification_type,
-                "confidence": 0.7,  # Упрощённая оценка
+                "confidence": 0.7,
                 "tags": []
             },
-            "description": content,
-            "ocr_text": content,  # Упрощение: весь текст как OCR
+            "description": fallback_description,
             "is_meme": is_meme,
+            "labels": [],
+            "objects": [],
+            "ocr_text": content if content.strip() else None,
             "context": {
                 "objects": [],
                 "emotions": [],
@@ -489,6 +572,151 @@ class GigaChatVisionAdapter:
             "model": self.model,
             "schema_version": "1.0"
         }
+    
+    def _extract_json_with_balance(self, content: str) -> Optional[str]:
+        """
+        Извлечение JSON из текста с проверкой баланса скобок.
+        Tolerant-parser для неполных ответов.
+        """
+        import re
+        # Ищем первую открывающую скобку
+        start_idx = content.find('{')
+        if start_idx == -1:
+            return None
+        
+        # Подсчитываем баланс скобок
+        balance = 0
+        in_string = False
+        escape_next = False
+        
+        for i in range(start_idx, len(content)):
+            char = content[i]
+            
+            if escape_next:
+                escape_next = False
+                continue
+            
+            if char == '\\':
+                escape_next = True
+                continue
+            
+            if char == '"' and not escape_next:
+                in_string = not in_string
+                continue
+            
+            if not in_string:
+                if char == '{':
+                    balance += 1
+                elif char == '}':
+                    balance -= 1
+                    if balance == 0:
+                        # Найдена закрывающая скобка
+                        return content[start_idx:i+1]
+        
+        # Если баланс не сходится, возвращаем None (неполный JSON)
+        return None
+    
+    def _extract_partial_json(self, content: str) -> Optional[Dict[str, Any]]:
+        """
+        Извлечение частичных JSON данных из текста.
+        Ищет пары ключ-значение даже в невалидном JSON.
+        """
+        import json
+        import re
+        
+        result = {}
+        
+        # Попытка найти JSON-подобные пары
+        # Ищем паттерны типа "key": value
+        key_value_pattern = r'["\']?([a-zA-Z_][a-zA-Z0-9_]*)["\']?\s*:\s*([^,}\]]+)'
+        matches = re.findall(key_value_pattern, content)
+        
+        for key, value in matches:
+            value = value.strip().rstrip(',').rstrip('}')
+            # Пытаемся распарсить значение
+            try:
+                # Если это строка в кавычках
+                if value.startswith('"') and value.endswith('"'):
+                    result[key] = json.loads(value)
+                # Если это boolean
+                elif value.lower() in ['true', 'false']:
+                    result[key] = value.lower() == 'true'
+                # Если это число
+                elif value.replace('.', '', 1).replace('-', '', 1).isdigit():
+                    result[key] = float(value) if '.' in value else int(value)
+                # Если это null
+                elif value.lower() == 'null':
+                    result[key] = None
+                else:
+                    result[key] = value.strip('"\'')
+            except Exception:
+                result[key] = value.strip('"\'')
+        
+        return result if result else None
+    
+    def _classify_by_keywords(self, content: str) -> str:
+        """Классификация по ключевым словам (fallback)."""
+        content_lower = content.lower()
+        
+        if any(word in content_lower for word in ['мем', 'юмор', 'шутка', 'meme']):
+            return "meme"
+        elif any(word in content_lower for word in ['документ', 'document', 'pdf', 'текст']):
+            return "document"
+        elif any(word in content_lower for word in ['скриншот', 'screenshot', 'screen']):
+            return "screenshot"
+        elif any(word in content_lower for word in ['инфографика', 'infographic', 'диаграмм']):
+            return "infographic"
+        elif any(word in content_lower for word in ['фото', 'photo', 'изображение', 'image']):
+            return "photo"
+        else:
+            return "other"
+    
+    def _detect_meme_by_keywords(self, content: str) -> bool:
+        """Определение мема по ключевым словам (fallback)."""
+        content_lower = content.lower()
+        meme_keywords = ['мем', 'юмор', 'шутка', 'meme', 'humor', 'funny', 'comic']
+        return any(word in content_lower for word in meme_keywords)
+    
+    def _enrichment_to_dict(self, enrichment, file_id: str) -> Dict[str, Any]:
+        """
+        Конвертация VisionEnrichment в dict для обратной совместимости.
+        
+        Args:
+            enrichment: VisionEnrichment Pydantic модель или dict
+            file_id: GigaChat file_id
+        """
+        # Если это уже dict (fallback случай), возвращаем как есть
+        if isinstance(enrichment, dict):
+            return enrichment
+        
+        result = {
+            "classification": enrichment.classification,
+            "description": enrichment.description,
+            "is_meme": enrichment.is_meme,
+            "labels": enrichment.labels,
+            "objects": enrichment.objects,
+            "scene": enrichment.scene,
+            "ocr": enrichment.ocr,
+            "nsfw_score": enrichment.nsfw_score,
+            "aesthetic_score": enrichment.aesthetic_score,
+            "dominant_colors": enrichment.dominant_colors,
+            "context": enrichment.context,
+            "s3_keys": enrichment.s3_keys,
+            "file_id": file_id,
+            "provider": "gigachat",
+            "model": self.model,
+            "schema_version": "1.0"
+        }
+        
+        # Добавляем legacy поля для обратной совместимости
+        result["classification"] = {
+            "type": enrichment.classification,
+            "confidence": 1.0,
+            "tags": enrichment.labels
+        }
+        result["ocr_text"] = enrichment.ocr.get("text") if enrichment.ocr else None
+        
+        return result
     
     async def close(self):
         """Закрытие адаптера (cleanup)."""

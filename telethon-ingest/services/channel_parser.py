@@ -1069,6 +1069,9 @@ class ChannelParser:
         # Извлечение URL
         urls = self._extract_urls(text)
         
+        # Context7: Генерация content_hash для идемпотентности
+        content_hash = self._create_content_hash(text)
+        
         # Context7 best practice: безопасная генерация ID на клиенте
         post_id = str(uuid.uuid4())
         
@@ -1093,6 +1096,8 @@ class ChannelParser:
             'telegram_message_id': message.id if hasattr(message, 'id') else int(time.time() * 1000),
             'content': text,
             'media_urls': json.dumps(urls) if urls else '[]',  # [C7-ID: dev-mode-014] Context7: JSONB формат (строка JSON, не список)
+            'urls': urls,  # Context7: Raw URLs список для events
+            'content_hash': content_hash,  # Context7: Hash для идемпотентности
             'posted_at': posted_at,
             'created_at': datetime.now(timezone.utc),
             'is_processed': False,
@@ -1305,7 +1310,7 @@ class ChannelParser:
                 
             # Context7: Если event_publisher=None, публикуем напрямую в Redis Streams
             if self.event_publisher is None:
-                stream_key = "posts.parsed"
+                stream_key = "stream:posts:parsed"  # Context7: Unified stream naming
                 for event in events_data:
                     # Context7: Публикация в Redis Streams через xadd()
                     # Конвертируем значения в строки для Redis

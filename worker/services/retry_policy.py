@@ -180,7 +180,8 @@ def create_retry_decorator(
         )
     
     # Retry condition: retryable exceptions
-    retry_condition = retry_if_exception_type(*config.retryable_exceptions)
+    # retry_if_exception_type принимает tuple напрямую (Union[Type, Tuple[Type, ...]])
+    retry_condition = retry_if_exception_type(config.retryable_exceptions)
     
     def log_before_sleep(retry_state: RetryCallState):
         """Логирование перед ожиданием retry."""

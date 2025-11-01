@@ -320,6 +320,28 @@ class TagPersistenceTask:
                     pass
             return
         
+        # Context7: Логирование для отладки потери тегов
+        logger.info("Processing tags event",
+                   post_id=event.post_id,
+                   tags_count=len(event.tags) if event.tags else 0,
+                   tags_sample=event.tags[:3] if event.tags else [],
+                   provider=event.provider)
+        
+        # Context7: Проверка существования поста перед сохранением тегов
+        post_exists = await self._check_post_exists(event.post_id)
+        if not post_exists:
+            logger.warning("Post not found in DB, skipping tag persistence",
+                         post_id=event.post_id,
+                         trace_id=(event.metadata or {}).get('trace_id') if event.metadata else None)
+            tags_persist_phase_total.labels(phase='pending', status='skip').inc()
+            tags_persisted_total.labels(status='skip').inc()
+            # ACK сообщение, чтобы оно не застревало в PEL
+            try:
+                await self.redis.xack(self.stream_key, self.consumer_group, msg_id)
+            except Exception:
+                pass
+            return
+        
         # Сохранение в БД
         start_time = time.time()
         await self._save_tags_to_db(
@@ -341,6 +363,15 @@ class TagPersistenceTask:
                    post_id=event.post_id,
                    tags_count=len(event.tags),
                    processing_time=processing_time)
+    
+    async def _check_post_exists(self, post_id: str) -> bool:
+        """Context7: Проверка существования поста в БД."""
+        async with self.pool.acquire() as conn:
+            result = await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM posts WHERE id = $1)",
+                post_id
+            )
+            return result is True
     
     async def _save_tags_to_db(
         self,
@@ -381,6 +412,13 @@ class TagPersistenceTask:
                     "trace_id": metadata.get("trace_id", str(uuid.uuid4())),
                     "metadata": {k: v for k, v in metadata.items() if k not in ["provider", "latency_ms", "tenant_id", "trace_id"]}
                 }
+                
+                # Context7: Логирование перед сохранением
+                logger.info("Saving tags to DB",
+                           post_id=post_id,
+                           tags_count=len(tags) if tags else 0,
+                           tags_sample=tags[:3] if tags else [],
+                           tags_data_count=len(tags_data.get('tags', [])))
                 
                 # Используем EnrichmentRepository (принимает asyncpg.Pool)
                 repo = EnrichmentRepository(self.pool)

@@ -243,6 +243,178 @@ class Neo4jClient:
                         error=str(e))
             return False
     
+    async def create_image_content_node(
+        self,
+        post_id: str,
+        sha256: str,
+        s3_key: Optional[str] = None,
+        mime_type: Optional[str] = None,
+        vision_classification: Optional[str] = None,
+        is_meme: bool = False,
+        labels: Optional[List[str]] = None,
+        provider: Optional[str] = None,
+        trace_id: Optional[str] = None
+    ) -> bool:
+        """
+        Создание узла ImageContent и связей с Post и Labels.
+        
+        Context7: Создаёт узлы (:Image {sha256, s3_key, ...}) и связи:
+        - (:Post)-[:HAS_IMAGE]->(:Image)
+        - (:Image)-[:HAS_LABEL]->(:Label)
+        """
+        try:
+            if not self._driver:
+                return False
+            
+            await self._ping()
+            
+            async with self._driver.session() as session:
+                # Создание узла ImageContent
+                query = """
+                MATCH (p:Post {post_id: $post_id})
+                MERGE (img:Image {sha256: $sha256})
+                SET img.s3_key = $s3_key,
+                    img.mime_type = $mime_type,
+                    img.classification = $vision_classification,
+                    img.is_meme = $is_meme,
+                    img.provider = $provider
+                MERGE (p)-[:HAS_IMAGE]->(img)
+                RETURN img.sha256 as sha256
+                """
+                
+                await session.run(
+                    query,
+                    post_id=post_id,
+                    sha256=sha256,
+                    s3_key=s3_key,
+                    mime_type=mime_type,
+                    vision_classification=vision_classification,
+                    is_meme=is_meme,
+                    provider=provider
+                )
+                
+                # Создание узлов Label и связей HAS_LABEL
+                if labels:
+                    await self.create_label_nodes(post_id, sha256, labels)
+                
+                logger.debug("ImageContent node created",
+                           post_id=post_id,
+                           sha256=sha256,
+                           labels_count=len(labels) if labels else 0,
+                           trace_id=trace_id)
+                return True
+                
+        except Exception as e:
+            logger.error("Error creating image content node",
+                        post_id=post_id,
+                        sha256=sha256,
+                        error=str(e),
+                        trace_id=trace_id)
+            return False
+    
+    async def create_label_nodes(
+        self,
+        post_id: str,
+        image_sha256: str,
+        labels: List[str]
+    ) -> bool:
+        """
+        Создание узлов Label и связей (:Image)-[:HAS_LABEL]->(:Label).
+        """
+        try:
+            if not self._driver or not labels:
+                return True
+            
+            await self._ping()
+            
+            async with self._driver.session() as session:
+                for label in labels:
+                    if not label or not str(label).strip():
+                        continue
+                    
+                    label_normalized = str(label).strip().lower()
+                    
+                    query = """
+                    MATCH (img:Image {sha256: $sha256})
+                    MERGE (l:Label {name: $label_name})
+                    MERGE (img)-[:HAS_LABEL]->(l)
+                    RETURN l.name as label_name
+                    """
+                    
+                    await session.run(
+                        query,
+                        sha256=image_sha256,
+                        label_name=label_normalized
+                    )
+                
+                logger.debug("Label nodes created",
+                           post_id=post_id,
+                           sha256=image_sha256,
+                           labels_count=len(labels))
+                return True
+                
+        except Exception as e:
+            logger.error("Error creating label nodes",
+                        post_id=post_id,
+                        sha256=image_sha256,
+                        error=str(e))
+            return False
+    
+    async def create_webpage_node(
+        self,
+        post_id: str,
+        url: str,
+        s3_html_key: Optional[str] = None,
+        url_hash: Optional[str] = None,
+        content_sha256: Optional[str] = None
+    ) -> bool:
+        """
+        Создание узла WebPage и связи (:Post)-[:REFERS_TO]->(:WebPage).
+        
+        Context7: Создаёт узлы (:WebPage {url, s3_html_key, ...}) и связи с Post.
+        """
+        try:
+            if not self._driver:
+                return False
+            
+            await self._ping()
+            
+            async with self._driver.session() as session:
+                # Используем url_hash или url в качестве уникального идентификатора
+                webpage_id = url_hash or url
+                
+                query = """
+                MATCH (p:Post {post_id: $post_id})
+                MERGE (wp:WebPage {url: $url})
+                SET wp.s3_html_key = $s3_html_key,
+                    wp.url_hash = $url_hash,
+                    wp.content_sha256 = $content_sha256
+                MERGE (p)-[:REFERS_TO]->(wp)
+                RETURN wp.url as url
+                """
+                
+                await session.run(
+                    query,
+                    post_id=post_id,
+                    url=url,
+                    s3_html_key=s3_html_key,
+                    url_hash=url_hash,
+                    content_sha256=content_sha256
+                )
+                
+                logger.debug("WebPage node created",
+                           post_id=post_id,
+                           url=url,
+                           s3_html_key=s3_html_key)
+                return True
+                
+        except Exception as e:
+            logger.error("Error creating webpage node",
+                        post_id=post_id,
+                        url=url,
+                        error=str(e))
+            return False
+    
     async def cleanup_orphan_tags(self) -> int:
         """
         [C7-ID: WORKER-ORPHAN-002] - Очистка висячих тегов без связей.

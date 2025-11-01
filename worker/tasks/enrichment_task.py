@@ -278,6 +278,12 @@ class EnrichmentWorker:
             
             logger.info("enrich_after_db_query", extra={"post_id": post_id, "post_context": bool(post_context)})
             
+            # Context7: Проверка существования поста перед обогащением
+            if not post_context:
+                logger.warning("Post not found in DB, skipping enrichment", post_id=post_id, trace_id=event_data.get('trace_id'))
+                posts_processed_total.labels(stage='enrichment', success='skip').inc()
+                return
+            
             # [C7-ID: ENRICH-DBG-011] Построение enriched_event с логами «между шагами»
             logger.info("enrich_build_start", extra={"post_id": post_id})
             
@@ -716,8 +722,10 @@ class EnrichmentWorker:
     async def _save_enrichment_data(self, post_id: str, enrichment_data: Dict[str, Any]):
         """
         Context7: Сохранение данных enrichment через EnrichmentRepository.
-        Использует единую модель с kind='crawl' и структурированное JSONB поле data.
-        Заменяет UPDATE на UPSERT для идемпотентности.
+        
+        Определяет kind по наличию crawl_results:
+        - kind='crawl' если есть crawl_results (результаты crawl4ai)
+        - kind='general' если нет crawl_results (простое обогащение через теги/URLs)
         """
         # Context7: Импорт shared репозитория
         import sys
@@ -733,13 +741,21 @@ class EnrichmentWorker:
             
             # Подготовка данных для сохранения
             crawl_results = enrichment_data.get('crawl_results', [])
+            
+            # Context7: Определяем kind и provider по наличию crawl_results
             if crawl_results:
+                # Crawl данные - используем kind='crawl'
+                kind = 'crawl'
+                provider = 'crawl4ai'
                 crawl_md = "\n\n---\n\n".join([
                     result.get('markdown', '') 
                     for result in crawl_results
                 ])
             else:
-                crawl_md = ""  # Пустая строка если нет результатов
+                # Общее обогащение - используем kind='general'
+                kind = 'general'
+                provider = 'enrichment_task'
+                crawl_md = ""
             
             logger.info(f"enrichment_crawl_md: length={len(crawl_md)}")
             
@@ -760,31 +776,34 @@ class EnrichmentWorker:
             logger.info(f"enrichment_data_cleaned: original_keys={list(enrichment_data.keys())}, cleaned_keys={list(cleaned_data.keys())}")
             
             # Структурируем данные для JSONB поля data
-            crawl_data = {
-                'crawl_md': crawl_md,
+            enrichment_payload = {
                 'enrichment_data': cleaned_data,
-                'urls': [r.get('url') for r in crawl_results if r.get('url')],
-                'word_count': sum(r.get('word_count', 0) or 0 for r in crawl_results),
+                'urls': [r.get('url') for r in crawl_results if r.get('url')] if crawl_results else enrichment_data.get('urls', []),
+                'word_count': sum(r.get('word_count', 0) or 0 for r in crawl_results) if crawl_results else enrichment_data.get('word_count', 0),
                 'latency_ms': enrichment_data.get('latency_ms', 0),
-                'crawled_at': datetime.now(timezone.utc).isoformat(),
-                'source': 'crawl4ai',
+                'created_at': datetime.now(timezone.utc).isoformat(),
+                'source': provider,
                 'metadata': {k: v for k, v in enrichment_data.items() if k not in ['crawl_results', 'latency_ms']}
             }
+            
+            # Добавляем crawl_md только для crawl kind
+            if kind == 'crawl':
+                enrichment_payload['crawl_md'] = crawl_md
             
             # Используем EnrichmentRepository (принимает SQLAlchemy AsyncSession)
             repo = EnrichmentRepository(self.db_session)
             await repo.upsert_enrichment(
                 post_id=post_id,
-                kind='crawl',
-                provider='crawl4ai',
-                data=crawl_data,
+                kind=kind,
+                provider=provider,
+                data=enrichment_payload,
                 params_hash=None,
                 status='ok',
                 error=None,
                 trace_id=enrichment_data.get('trace_id')
             )
             
-            logger.info(f"Enrichment data saved via EnrichmentRepository for post_id={post_id}")
+            logger.info(f"Enrichment data saved via EnrichmentRepository for post_id={post_id} kind={kind} provider={provider}")
             
         except Exception as e:
             logger.error(f"Failed to save enrichment data: {e}")
@@ -965,10 +984,16 @@ class EnrichmentTask:
         if self.worker is None:
             # Создание worker'а
             from config import settings
-            import asyncpg
+            from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
             
-            # Подключение к БД
-            db_session = await asyncpg.create_pool(settings.database_url)
+            # Context7: Используем SQLAlchemy AsyncSession для совместимости с EnrichmentRepository
+            db_url = settings.database_url
+            # Заменяем postgresql:// на postgresql+asyncpg:// для async драйвера
+            if db_url.startswith("postgresql://"):
+                db_url = db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+            
+            engine = create_async_engine(db_url, pool_pre_ping=True)
+            db_session = AsyncSession(engine)
             
             # Создание redis клиента
             from event_bus import RedisStreamsClient

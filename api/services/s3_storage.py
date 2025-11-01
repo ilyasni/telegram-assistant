@@ -253,13 +253,25 @@ class S3StorageService:
         """
         return f"vision/{tenant_id}/{sha256}_{provider}_{model}_v{schema_version}.json"
     
-    def build_crawl_key(self, tenant_id: str, url_hash: str, suffix: str = ".html") -> str:
+    def build_crawl_key(self, tenant_id: str, url_hash: str, suffix: str = ".html", post_id: Optional[str] = None) -> str:
         """
         Построение S3 ключа для Crawl результатов.
-        crawl/{tenant}/{urlhash[:2]}/{urlhash}{suffix}
+        
+        Формат:
+        - С post_id: crawl/{tenant}/{post_id}/{urlhash}{suffix}
+        - Без post_id: crawl/{tenant}/{urlhash[:2]}/{urlhash}{suffix}
+        
+        Args:
+            tenant_id: ID tenant
+            url_hash: SHA256 hash URL
+            suffix: Суффикс файла (.html, .md)
+            post_id: Опциональный ID поста для группировки по постам
         """
-        prefix = url_hash[:2]
-        return f"crawl/{tenant_id}/{prefix}/{url_hash}{suffix}"
+        if post_id:
+            return f"crawl/{tenant_id}/{post_id}/{url_hash}{suffix}"
+        else:
+            prefix = url_hash[:2]
+            return f"crawl/{tenant_id}/{prefix}/{url_hash}{suffix}"
     
     async def put_media(
         self,

@@ -58,13 +58,13 @@ class EnrichmentRepository:
         self.db_session = db_session
         
         # Context7: Определение типа подключения для правильного использования
-        # asyncpg.Pool имеет метод acquire()
-        # SQLAlchemy AsyncSession имеет метод execute()
+        # asyncpg.Pool имеет метод acquire() и не имеет commit()
+        # SQLAlchemy AsyncSession имеет метод commit()
         import asyncpg
         from sqlalchemy.ext.asyncio import AsyncSession
         
         self._is_asyncpg = isinstance(db_session, asyncpg.Pool)
-        self._is_sqlalchemy = isinstance(db_session, AsyncSession) or hasattr(db_session, 'execute')
+        self._is_sqlalchemy = isinstance(db_session, AsyncSession) or (hasattr(db_session, 'commit') and not hasattr(db_session, 'acquire'))
         
         logger.debug(
             "EnrichmentRepository initialized",
@@ -165,10 +165,10 @@ class EnrichmentRepository:
                     await conn.execute("""
                         INSERT INTO post_enrichment (
                             post_id, kind, provider, params_hash, data, status, error,
-                            updated_at, created_at
+                            updated_at, enriched_at
                         ) VALUES (
                             $1, $2, $3, $4, $5::jsonb, $6, $7, $8, COALESCE(
-                                (SELECT created_at FROM post_enrichment WHERE post_id = $1 AND kind = $2),
+                                (SELECT enriched_at FROM post_enrichment WHERE post_id = $1 AND kind = $2),
                                 $8
                             )
                         )
@@ -198,11 +198,11 @@ class EnrichmentRepository:
                     text("""
                         INSERT INTO post_enrichment (
                             post_id, kind, provider, params_hash, data, status, error,
-                            updated_at, created_at
+                            updated_at, enriched_at
                         ) VALUES (
                             :post_id, :kind, :provider, :params_hash, :data::jsonb, :status, :error,
                             :updated_at, COALESCE(
-                                (SELECT created_at FROM post_enrichment WHERE post_id = :post_id AND kind = :kind),
+                                (SELECT enriched_at FROM post_enrichment WHERE post_id = :post_id AND kind = :kind),
                                 :updated_at
                             )
                         )

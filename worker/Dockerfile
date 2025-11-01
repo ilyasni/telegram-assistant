@@ -21,6 +21,13 @@ RUN pip install -e /app/shared/python
 # [C7-ID: dev-mode-006] Копируем код ПОСЛЕ установки зависимостей
 COPY worker/ .
 
+# Context7: Копируем скрипты для pipeline health check
+RUN mkdir -p /app/scripts /app/config
+COPY scripts/check_pipeline_health.py /app/scripts/
+COPY scripts/reindex_neo4j_relationships.py /app/scripts/
+COPY scripts/pipeline_health_cron.sh /app/scripts/
+COPY config/slo_thresholds.json /app/config/
+
 # Создание пользователя для безопасности
 RUN useradd -m -u 1000 worker && chown -R worker:worker /app
 USER worker

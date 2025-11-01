@@ -1,0 +1,14 @@
+{
+  "posts_per_hour_min": 1,
+  "posts_per_30min_min": 0,
+  "redis_pending_max": 100,
+  "redis_lag_max": 1000,
+  "indexing_failed_max_pct": 20,
+  "indexing_pending_max_pct": 30,
+  "qdrant_gap_max_pct": 10,
+  "neo4j_gap_max_pct": 20,
+  "enrichment_tags_min_pct": 50,
+  "enrichment_vision_min_pct": 10,
+  "enrichment_crawl_min_pct": 10
+}
+

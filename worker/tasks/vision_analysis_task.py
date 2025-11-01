@@ -426,33 +426,67 @@ class VisionAnalysisTask:
             first_result = analysis_results[0]["analysis"]
             analyzed_at = datetime.now(timezone.utc)
             
-            # Структурируем данные для JSONB поля data
+            # Структурируем данные для JSONB поля data с использованием VisionEnrichment структуры
+            # Извлекаем classification type из classification dict или напрямую
+            classification = first_result.get("classification")
+            if isinstance(classification, dict):
+                classification_type = classification.get("type", "other")
+                labels_from_classification = classification.get("tags", [])
+            else:
+                classification_type = classification if classification else "other"
+                labels_from_classification = []
+            
+            # Формируем s3_keys для vision_data
+            s3_keys_dict = {}
+            s3_keys_list = []
+            for r in analysis_results:
+                sha256 = r.get("sha256")
+                s3_key = r.get("s3_key")
+                if sha256 and s3_key:
+                    s3_keys_dict["image"] = s3_key  # Основное изображение
+                    s3_keys_list.append({
+                        "sha256": sha256,
+                        "s3_key": s3_key,
+                        "analyzed_at": analyzed_at.isoformat()
+                    })
+            
+            # Используем новую структуру VisionEnrichment с обязательными полями
             vision_data = {
                 "model": first_result.get("model", "unknown"),
                 "model_version": None,  # TODO: добавить версию модели если доступна
                 "provider": first_result.get("provider", "unknown"),
                 "analyzed_at": analyzed_at.isoformat(),
-                "labels": first_result.get("classification", []),
-                "caption": first_result.get("description"),
+                # Обязательные поля VisionEnrichment
+                "classification": classification_type,
+                "description": first_result.get("description") or "Изображение без описания",
+                "is_meme": first_result.get("is_meme", False),
+                # Labels из classification.tags или напрямую из labels
+                "labels": labels_from_classification or first_result.get("labels", []),
+                # Objects и scene
+                "objects": first_result.get("objects", []),
+                "scene": first_result.get("scene"),
+                # OCR данные
                 "ocr": {
                     "text": first_result.get("ocr_text"),
-                    "engine": "tesseract" if first_result.get("provider") == "ocr_fallback" else None,
-                    "confidence": None  # TODO: добавить если доступно
-                },
-                "is_meme": first_result.get("is_meme", False),
+                    "engine": "tesseract" if first_result.get("provider") == "ocr_fallback" else "gigachat",
+                    "confidence": first_result.get("ocr", {}).get("confidence") if isinstance(first_result.get("ocr"), dict) else None
+                } if first_result.get("ocr_text") or first_result.get("ocr") else None,
+                # NSFW и aesthetic scores
+                "nsfw_score": first_result.get("nsfw_score"),
+                "aesthetic_score": first_result.get("aesthetic_score"),
+                # Dominant colors
+                "dominant_colors": first_result.get("dominant_colors", []),
+                # Context (emotions, themes, relationships)
                 "context": first_result.get("context", {}),
+                # S3 keys (новый формат)
+                "s3_keys": s3_keys_dict,
+                # Legacy поля для обратной совместимости
                 "file_id": first_result.get("file_id"),
                 "tokens_used": first_result.get("tokens_used", 0),
                 "cost_microunits": first_result.get("cost_microunits", 0),
                 "analysis_reason": first_result.get("analysis_reason", "new"),
-                "s3_keys": [
-                    {
-                        "sha256": r["sha256"],
-                        "s3_key": r["s3_key"],
-                        "analyzed_at": analyzed_at.isoformat()
-                    }
-                    for r in analysis_results
-                ]
+                # Legacy s3_keys как список для обратной совместимости
+                "s3_keys_list": s3_keys_list
             }
             
             # Вычисляем params_hash для идемпотентности
