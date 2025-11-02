@@ -13,6 +13,8 @@ import psycopg2
 from typing import Dict, Any, Optional
 from datetime import datetime, timezone, timedelta
 from prometheus_client import Counter
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+from sqlalchemy import text
 
 from event_bus import EventConsumer, RedisStreamsClient, EventPublisher
 from integrations.qdrant_client import QdrantClient
@@ -644,6 +646,7 @@ class IndexingTask:
         Context7 best practice: расширенный payload с enrichment данными для фильтрации:
         - tags, vision.is_meme, vision.labels, vision.scene, vision.nsfw_score, vision.aesthetic_score
         - crawl.has_crawl, crawl.html_key, crawl.word_count
+        - album_id (для постов из альбомов)
         
         В payload храним только фасеты/флаги (< 64KB), полные тексты (md/html) в S3.
         """
@@ -651,6 +654,9 @@ class IndexingTask:
             from config import settings
             
             vector_id = f"{post_id}"
+            
+            # Context7: Получаем album_id если пост принадлежит альбому
+            album_id = await self._get_album_id_for_post(post_id)
             
             # Базовый payload
             payload = {
@@ -660,6 +666,10 @@ class IndexingTask:
                 "telegram_message_id": post_data.get('telegram_message_id'),
                 "created_at": post_data.get('created_at').isoformat() if post_data.get('created_at') else None
             }
+            
+            # Context7: Добавляем album_id в payload если пост из альбома
+            if album_id:
+                payload["album_id"] = album_id
             
             # Tags enrichment
             tags_data = post_data.get('tags_data')
@@ -765,6 +775,9 @@ class IndexingTask:
                     "telegram_message_id": post_data.get('telegram_message_id'),
                     "created_at": payload["created_at"]
                 }
+                # Сохраняем album_id даже при усечении
+                if album_id:
+                    payload["album_id"] = album_id
                 # Добавляем только критичные флаги
                 if vision_data and isinstance(vision_data, dict):
                     payload["vision"] = {
@@ -803,10 +816,51 @@ class IndexingTask:
                         error=str(e))
             raise
     
+    async def _get_album_id_for_post(self, post_id: str) -> Optional[int]:
+        """Получает album_id для поста из media_group_items."""
+        try:
+            # Используем прямые SQL запросы через async БД
+            from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+            from sqlalchemy import text
+            import os
+            
+            db_url = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@supabase-db:5432/postgres")
+            # Преобразуем в asyncpg URL
+            if db_url.startswith("postgresql://"):
+                db_url = db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+            
+            engine = create_async_engine(db_url)
+            async_session = async_sessionmaker(engine, expire_on_commit=False)
+            
+            async with async_session() as session:
+                result = await session.execute(
+                    text("""
+                        SELECT mg.id as album_id
+                        FROM media_group_items mgi
+                        JOIN media_groups mg ON mgi.group_id = mg.id
+                        WHERE mgi.post_id = :post_id
+                        LIMIT 1
+                    """),
+                    {"post_id": post_id}
+                )
+                row = result.fetchone()
+                if row:
+                    return row[0]
+        except Exception as e:
+            logger.debug(
+                "Error getting album_id for post",
+                post_id=post_id,
+                error=str(e)
+            )
+        return None
+    
     async def _index_to_neo4j(self, post_id: str, post_data: Dict[str, Any]):
         """Индексация поста в Neo4j граф."""
         try:
             channel_id = post_data.get('channel_id')
+            
+            # Context7: Получаем album_id для создания связей в Neo4j
+            album_id = await self._get_album_id_for_post(post_id)
             if not channel_id:
                 logger.warning("No channel_id, skipping Neo4j indexing", extra={"post_id": post_id})
                 return
@@ -850,6 +904,15 @@ class IndexingTask:
                 enrichment_data=enrichment_data if enrichment_data else None,
                 indexed_at=datetime.now(timezone.utc).isoformat()
             )
+            
+            # Context7: Создаём узел альбома и связи если пост из альбома
+            if album_id and success:
+                await self.neo4j_client.create_album_node_and_relationships(
+                    album_id=album_id,
+                    post_id=post_id,
+                    channel_id=channel_id,
+                    tenant_id=post_data.get('tenant_id', 'default')
+                )
             
             if not success:
                 raise Exception("create_post_node returned False")

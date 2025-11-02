@@ -338,13 +338,15 @@ class AtomicDBSaver:
             
             if media_objects_params:
                 # Context7: Проверяем, какие медиа уже существуют (для метрик)
+                # Используем ANY для asyncpg - правильный синтаксис для массива
                 existing_check_sql = text("""
                     SELECT file_sha256 FROM media_objects 
-                    WHERE file_sha256 = ANY(:sha256_list::text[])
+                    WHERE file_sha256 = ANY(:sha256_list)
                 """)
+                sha256_list = [mf.sha256 for mf in media_files]
                 existing_result = await db_session.execute(
                     existing_check_sql,
-                    {"sha256_list": [mf.sha256 for mf in media_files]}
+                    {"sha256_list": sha256_list}
                 )
                 existing_sha256s = {row[0] for row in existing_result.fetchall()}
                 
@@ -395,11 +397,11 @@ class AtomicDBSaver:
                 # Context7: Проверяем существующие связи (для метрик)
                 existing_map_check_sql = text("""
                     SELECT file_sha256 FROM post_media_map 
-                    WHERE post_id = :post_id AND file_sha256 = ANY(:sha256_list::text[])
+                    WHERE post_id = :post_id AND file_sha256 IN :sha256_list
                 """)
                 existing_map_result = await db_session.execute(
                     existing_map_check_sql,
-                    {"post_id": post_id, "sha256_list": [mf.sha256 for mf in media_files]}
+                    {"post_id": post_id, "sha256_list": tuple(mf.sha256 for mf in media_files)}
                 )
                 existing_map_sha256s = {row[0] for row in existing_map_result.fetchall()}
                 
@@ -588,7 +590,7 @@ class AtomicDBSaver:
                 # Если уже строка - оставляем как есть (может быть уже JSON строка)
                 
                 prepared_post = {
-                    'id': str(uuid.uuid4()),
+                    'id': post.get('id') or str(uuid.uuid4()),
                     'channel_id': post.get('channel_id'),
                     'telegram_message_id': post.get('telegram_message_id'),
                     'content': post.get('content', ''),

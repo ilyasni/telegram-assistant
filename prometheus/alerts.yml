@@ -142,3 +142,113 @@ groups:
         annotations:
           summary: "Тегирование не обрабатывает события (pending: {{ $value }})"
           description: "Есть события в posts.parsed, но tagging не обрабатывает. Проверить AI провайдеры."
+
+  # Album Pipeline Alerts (Phase 4)
+  - name: album_pipeline
+    interval: 30s
+    rules:
+      # Context7: Album assembly lag > 5 минут (критичная задержка)
+      - alert: AlbumAssemblyLagHigh
+        expr: |
+          histogram_quantile(0.95, rate(album_assembly_lag_seconds_bucket[10m])) > 300
+        for: 10m
+        labels:
+          severity: warning
+          component: album_assembler
+        annotations:
+          summary: "Album assembly lag превышает 5 минут (p95: {{ $value | humanize }}s)"
+          description: "Высокая задержка между первым и последним vision анализом элементов альбома. Проверить vision_analysis_task и album_assembler_task."
+          runbook: "Проверить логи album_assembler_task и vision_analysis_task. Возможные причины: медленный vision анализ, проблемы с Redis state."
+      
+      # Context7: Album assembly lag критично > 10 минут
+      - alert: AlbumAssemblyLagCritical
+        expr: |
+          histogram_quantile(0.95, rate(album_assembly_lag_seconds_bucket[10m])) > 600
+        for: 5m
+        labels:
+          severity: critical
+          component: album_assembler
+        annotations:
+          summary: "Album assembly lag критично высокий (p95: {{ $value | humanize }}s)"
+          description: "Критическая задержка сборки альбомов. Требуется немедленное вмешательство."
+      
+      # Context7: Несоответствие количества элементов (items_analyzed < items_count)
+      - alert: AlbumItemsCountMismatch
+        expr: |
+          sum(album_items_count_gauge{status="analyzed"}) by (album_id) < 
+          sum(album_items_count_gauge{status="total"}) by (album_id) * 0.9
+        for: 30m
+        labels:
+          severity: warning
+          component: album_assembler
+        annotations:
+          summary: "Альбом не собрался полностью: проанализировано < 90% элементов"
+          description: "Album {{ $labels.album_id }}: проанализировано {{ $value }} элементов, ожидалось больше. Проверить vision_analysis_task."
+      
+      # Context7: Album assembler не обрабатывает события
+      - alert: AlbumAssemblerNoActivity
+        expr: |
+          sum(rate(albums_assembled_total[10m])) == 0
+          and
+          sum(rate(albums_parsed_total[10m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+          component: album_assembler
+        annotations:
+          summary: "Album assembler не собирает альбомы"
+          description: "События albums.parsed поступают, но album.assembled не эмитятся. Проверить album_assembler_task логи и Redis state."
+      
+      # Context7: Высокий backlog состояний альбомов в Redis
+      - alert: AlbumStateBacklogHigh
+        expr: |
+          count(album_items_count_gauge{status="pending"}) > 50
+        for: 10m
+        labels:
+          severity: warning
+          component: album_assembler
+        annotations:
+          summary: "Высокий backlog альбомов в процессе сборки ({{ $value }} альбомов)"
+          description: "Много альбомов ожидают завершения vision анализа. Проверить производительность vision_analysis_task."
+      
+      # Context7: Низкая скорость сборки альбомов
+      - alert: AlbumAssemblyRateLow
+        expr: |
+          rate(albums_assembled_total{status="ok"}[10m]) < 0.1
+          and
+          rate(albums_parsed_total[10m]) > 0.5
+        for: 15m
+        labels:
+          severity: warning
+          component: album_assembler
+        annotations:
+          summary: "Низкая скорость сборки альбомов ({{ $value | humanize }} albums/min)"
+          description: "Скорость сборки альбомов ниже ожидаемой при наличии входящих событий. Проверить vision_analysis_task."
+      
+      # Context7: Ошибки при сборке альбомов
+      - alert: AlbumAssemblyErrorRateHigh
+        expr: |
+          (
+            sum(rate(albums_assembled_total{status="error"}[5m]))
+            /
+            (sum(rate(albums_assembled_total[5m])) + 1e-6)
+          ) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          component: album_assembler
+        annotations:
+          summary: "Высокий процент ошибок сборки альбомов ({{ $value | humanizePercentage }})"
+          description: "Более 5% попыток сборки альбомов завершаются ошибкой. Проверить логи album_assembler_task."
+      
+      # Context7: Высокая длительность агрегации vision summary
+      - alert: AlbumAggregationDurationHigh
+        expr: |
+          histogram_quantile(0.95, rate(album_aggregation_duration_ms_bucket[10m])) > 5000
+        for: 10m
+        labels:
+          severity: warning
+          component: album_assembler
+        annotations:
+          summary: "Высокая длительность агрегации vision summary (p95: {{ $value | humanize }}ms)"
+          description: "Агрегация vision summary занимает слишком много времени. Проверить производительность _aggregate_vision_summary."

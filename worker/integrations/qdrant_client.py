@@ -182,11 +182,35 @@ class QdrantClient:
                                 match=models.MatchValue(value=value)
                             )
                         )
+                    elif isinstance(value, (int, float)):
+                        # Context7: Поддержка числовых значений (album_id, channel_id и т.д.)
+                        must_conditions.append(
+                            models.FieldCondition(
+                                key=key,
+                                match=models.MatchValue(value=value)
+                            )
+                        )
+                    elif isinstance(value, list):
+                        # Context7: Поддержка списков значений (например, tags)
+                        must_conditions.append(
+                            models.FieldCondition(
+                                key=key,
+                                match=models.MatchAny(any=value)
+                            )
+                        )
                     elif isinstance(value, dict) and 'range' in value:
                         must_conditions.append(
                             models.FieldCondition(
                                 key=key,
                                 range=models.Range(**value['range'])
+                            )
+                        )
+                    elif isinstance(value, bool):
+                        # Context7: Поддержка boolean значений (например, vision.is_meme)
+                        must_conditions.append(
+                            models.FieldCondition(
+                                key=key,
+                                match=models.MatchValue(value=value)
                             )
                         )
                 

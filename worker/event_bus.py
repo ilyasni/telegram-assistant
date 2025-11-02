@@ -77,6 +77,9 @@ STREAMS = {
     # Context7: Vision и Retagging стримы
     'posts.vision.uploaded': 'stream:posts:vision:uploaded',
     'posts.vision.analyzed': 'stream:posts:vision:analyzed',
+    # Context7: Album стримы (Phase 2)
+    'albums.parsed': 'stream:albums:parsed',
+    'album.assembled': 'stream:album:assembled',
     # DLQ алиасы
     'posts.parsed.dlq': 'stream:posts:parsed:dlq',
     'posts.tagged.dlq': 'stream:posts:tagged:dlq',
@@ -85,6 +88,8 @@ STREAMS = {
     'posts.crawl.dlq': 'stream:posts:crawl:dlq',
     'posts.deleted.dlq': 'stream:posts:deleted:dlq',
     'posts.vision.analyzed.dlq': 'stream:posts:vision:analyzed:dlq',
+    'albums.parsed.dlq': 'stream:albums:parsed:dlq',
+    'album.assembled.dlq': 'stream:album:assembled:dlq',
 }
 
 # DLQ стримы (legacy, для обратной совместимости)
@@ -96,6 +101,9 @@ DLQ_STREAMS = {
     'posts.deleted': 'stream:posts:deleted:dlq',
     # Context7: DLQ для Vision и Retagging
     'posts.vision.analyzed': 'stream:posts:vision:analyzed:dlq',
+    # Context7: DLQ для альбомов (Phase 2)
+    'albums.parsed': 'stream:albums:parsed:dlq',
+    'album.assembled': 'stream:album:assembled:dlq',
 }
 
 # ============================================================================

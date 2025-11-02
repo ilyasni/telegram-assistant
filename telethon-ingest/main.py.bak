@@ -432,8 +432,8 @@ async def run_ingest_loop():
         # Context7: Инициализация MediaProcessor для обработки медиа в real-time событиях
         media_processor = None
         try:
-            from api.services.s3_storage import S3StorageService
-            from api.services.storage_quota import StorageQuotaService
+            from api.services.s3_storage_service import S3StorageService
+            from api.services.storage_quota_service import StorageQuotaService
             from services.media_processor import MediaProcessor
             
             # Инициализация S3StorageService с параметрами из env

@@ -228,12 +228,12 @@ class ChannelParser:
                     logger.warning("Invalid tg_channel_id, skipping cooldown check", 
                                  channel_id=channel_id, tg_channel_id=tg_channel_id, error=str(e))
             
-            # Context7: Проверка rate limiting
-            if self.rate_limiter:
+            # Context7: Проверка rate limiting (используем tg_channel_id из БД)
+            if self.rate_limiter and tg_channel_id:
                 rate_result = await check_parsing_rate_limit(
                     self.rate_limiter,
                     int(user_id),
-                    int(channel_id)
+                    int(tg_channel_id)
                 )
                 
                 if not rate_result.get('allowed', True):
@@ -1125,36 +1125,9 @@ class ChannelParser:
                                has_text=bool(message.text),
                                has_media=bool(message.media))
                 
-                # Context7: Дедупликация альбомов по grouped_id
+                # Context7: Идемпотентность обеспечивается UNIQUE constraint (channel_id, telegram_message_id) в БД
+                # Дедупликация по grouped_id удалена - она вызывала race conditions и потерю альбомов
                 grouped_id = getattr(message, 'grouped_id', None)
-                if grouped_id:
-                    # Проверка в Redis: был ли уже обработан этот альбом
-                    redis_key = f"seen:group:{user_id}:{channel_id}:{grouped_id}"
-                    try:
-                        # Используем SETNX для атомарной проверки и установки
-                        if hasattr(self.redis_client, 'set'):
-                            # Для sync redis
-                            already_seen = not self.redis_client.set(redis_key, "1", ex=86400, nx=True)
-                        else:
-                            # Для async redis
-                            already_seen = not await self.redis_client.set(redis_key, "1", ex=86400, nx=True)
-                        
-                        if already_seen:
-                            skipped += 1
-                            logger.debug(
-                                "Album already processed, skipping",
-                                grouped_id=grouped_id,
-                                channel_id=channel_id,
-                                message_id=message.id
-                            )
-                            continue
-                    except Exception as e:
-                        logger.warning(
-                            "Failed to check album deduplication in Redis",
-                            grouped_id=grouped_id,
-                            error=str(e)
-                        )
-                        # Продолжаем обработку при ошибке Redis (graceful degradation)
                 
                 # Проверка идемпотентности
                 is_duplicate = await self._is_duplicate_message(message, channel_id, tenant_id)
@@ -1189,12 +1162,13 @@ class ChannelParser:
                                 self.media_processor.telegram_client = telegram_client
                                 
                                 # Обработка медиа
-                                # Передаем channel_entity для обработки альбомов
+                                # Передаем channel_entity и channel_id для обработки альбомов
                                 media_files = await self.media_processor.process_message_media(
                                     message=message,
                                     post_id=post_id,
                                     trace_id=trace_id,
-                                    tenant_id=tenant_id
+                                    tenant_id=tenant_id,
+                                    channel_id=channel_id
                                 )
                                 
                                 logger.debug(
@@ -1330,8 +1304,34 @@ class ChannelParser:
                             continue
                         
                         if grouped_id not in albums_data:
+                            # Context7: Получаем UUID пользователя из БД по telegram_id
+                            user_uuid = None
+                            try:
+                                result = await self.db_session.execute(
+                                    text("SELECT id FROM users WHERE telegram_id = :telegram_id LIMIT 1"),
+                                    {"telegram_id": int(user_id)}
+                                )
+                                row = result.fetchone()
+                                if row:
+                                    user_uuid = str(row.id)
+                                else:
+                                    logger.warning(
+                                        "User UUID not found for telegram_id, skipping album",
+                                        telegram_id=user_id,
+                                        grouped_id=grouped_id
+                                    )
+                                    continue
+                            except Exception as e:
+                                logger.warning(
+                                    "Failed to get user UUID, skipping album",
+                                    telegram_id=user_id,
+                                    grouped_id=grouped_id,
+                                    error=str(e)
+                                )
+                                continue
+                            
                             albums_data[grouped_id] = {
-                                'user_id': user_id,
+                                'user_id': user_uuid,  # Используем UUID вместо telegram_id
                                 'channel_id': channel_id,
                                 'grouped_id': grouped_id,
                                 'post_ids': [],
@@ -1385,6 +1385,27 @@ class ChannelParser:
                                     actual_post_ids.append(str(row.id))
                             
                             if len(actual_post_ids) > 1:  # Только для реальных альбомов
+                                # Получаем caption_text и posted_at из первого поста альбома
+                                caption_text = None
+                                posted_at = None
+                                if album_data.get('post_ids') and len(album_data['post_ids']) > 0:
+                                    first_post_uuid = album_data['post_ids'][0]
+                                    try:
+                                        result = await self.db_session.execute(
+                                            text("SELECT content, posted_at FROM posts WHERE id = :post_id LIMIT 1"),
+                                            {"post_id": first_post_uuid}
+                                        )
+                                        row = result.fetchone()
+                                        if row:
+                                            caption_text = row[0] if row[0] else None
+                                            posted_at = row[1] if row[1] else None
+                                    except Exception as e:
+                                        logger.debug(
+                                            "Failed to get caption_text/posted_at from first post",
+                                            post_id=first_post_uuid,
+                                            error=str(e)
+                                        )
+                                
                                 group_id = await save_media_group(
                                     db_session=self.db_session,
                                     user_id=album_data['user_id'],
@@ -1394,7 +1415,13 @@ class ChannelParser:
                                     media_types=album_data['media_types'][:len(actual_post_ids)],  # Обрезаем до нужной длины
                                     media_sha256s=album_data['media_sha256s'][:len(actual_post_ids)] if album_data['media_sha256s'] else None,
                                     media_bytes=album_data['media_bytes'][:len(actual_post_ids)] if album_data['media_bytes'] else None,
-                                    trace_id=f"{tenant_id}:{channel_id}:{grouped_id}"
+                                    caption_text=caption_text,
+                                    posted_at=posted_at,
+                                    media_kinds=album_data['media_types'][:len(actual_post_ids)],  # Используем media_types как media_kinds
+                                    trace_id=f"{tenant_id}:{channel_id}:{grouped_id}",
+                                    tenant_id=tenant_id,
+                                    event_publisher=self.event_publisher,
+                                    redis_client=self.redis_client
                                 )
                                 if group_id:
                                     logger.info(
@@ -1776,94 +1803,8 @@ class ChannelParser:
             reactions_count=post_data.get('reactions_count', 0)
         )
     
-    async def _bulk_insert_posts(self, posts_data: List[Dict[str, Any]]):
-        """
-        Context7: Делегирование к AtomicDBSaver для совместимости.
-        Этот метод теперь deprecated, используется atomic_saver.save_batch_atomic.
-        """
-        if not posts_data:
-            return
-            
-        logger.warning("_bulk_insert_posts is deprecated, use atomic_saver.save_batch_atomic instead")
-        
-        # Fallback к старому методу если atomic_saver недоступен
-        if not self.atomic_saver:
-            await self._legacy_bulk_insert_posts(posts_data)
-            return
-        
-        # Подготовка данных для AtomicDBSaver
-        user_data = {
-            'telegram_id': posts_data[0].get('user_id', 0),
-            'first_name': '',
-            'last_name': '',
-            'username': ''
-        }
-        
-        channel_data = {
-            'telegram_id': posts_data[0].get('channel_id', 0),
-            'title': '',
-            'username': '',
-            'description': '',
-            'participants_count': 0,
-            'is_broadcast': False,
-            'is_megagroup': False
-        }
-        
-        # Используем AtomicDBSaver
-        success, error, inserted_count = await self.atomic_saver.save_batch_atomic(
-            self.db_session,
-            user_data,
-            channel_data,
-            posts_data
-        )
-        
-        if not success:
-            logger.error("Atomic bulk insert failed", error=error)
-            raise Exception(f"Atomic bulk insert failed: {error}")
-    
-    async def _legacy_bulk_insert_posts(self, posts_data: List[Dict[str, Any]]):
-        """Legacy bulk insert для совместимости."""
-        # Context7: Используем только существующие колонки
-        required_columns = [
-            'id', 'channel_id', 'telegram_message_id', 'content', 'media_urls',
-            'posted_at', 'created_at', 'is_processed', 'has_media', 'yyyymm',
-            'views_count', 'forwards_count', 'reactions_count', 'replies_count',
-            'telegram_post_url'
-        ]
-        
-        # Фильтруем только существующие поля
-        filtered_data = [
-            {k: v for k, v in post.items() if k in required_columns}
-            for post in posts_data
-        ]
-        
-        # Подготовка SQL запроса
-        columns = list(filtered_data[0].keys())
-        placeholders = ', '.join([f':{col}' for col in columns])
-        
-        # Context7: Идемпотентность через уникальный индекс ux_posts_chan_msg
-        sql = f"""
-        INSERT INTO posts ({', '.join(columns)})
-        VALUES ({placeholders})
-        ON CONFLICT (channel_id, telegram_message_id) 
-        DO UPDATE SET
-            content = EXCLUDED.content,
-            media_urls = EXCLUDED.media_urls,
-            views_count = EXCLUDED.views_count,
-            forwards_count = EXCLUDED.forwards_count,
-            updated_at = NOW()
-        """
-        
-        try:
-            await self.db_session.execute(text(sql), filtered_data)
-            await self.db_session.commit()
-            
-            logger.info(f"Legacy bulk inserted {len(posts_data)} posts")
-            
-        except Exception as e:
-            await self.db_session.rollback()
-            logger.error(f"Legacy bulk insert failed: {e}")
-            raise
+    # Context7: Методы _bulk_insert_posts и _legacy_bulk_insert_posts удалены
+    # Используется atomic_saver.save_batch_atomic напрямую в _process_message_batch
     
     async def _publish_parsed_events(self, events_data: List[Dict[str, Any]]):  # PostParsedEventV1 - temporarily disabled
         """Публикация событий post.parsed."""

@@ -26,6 +26,7 @@ from tasks.tag_persistence_task import TagPersistenceTask
 from tasks.crawl_trigger_task import CrawlTriggerTask
 from tasks.post_persistence_task import PostPersistenceWorker
 from tasks.retagging_task import RetaggingTask
+from tasks.album_assembler_task import AlbumAssemblerTask
 from run_all_tasks_vision_helper import get_s3_config_from_env, get_vision_config_from_env
 
 async def create_tagging_task():
@@ -100,6 +101,67 @@ async def create_retagging_task():
             error_repr=repr(e),
             exc_info=True
         )
+        raise
+
+async def create_album_assembler_task():
+    """Context7: Создание и запуск Album Assembler Task (Phase 2-4)."""
+    try:
+        import redis.asyncio as redis
+        from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+        from event_bus import EventPublisher, RedisStreamsClient
+        from api.services.s3_storage import S3StorageService
+        from run_all_tasks_vision_helper import get_s3_config_from_env
+        
+        # Инициализация Redis
+        redis_url = os.getenv("REDIS_URL", "redis://redis:6379")
+        # Context7: AlbumAssemblerTask использует redis.asyncio.Redis напрямую
+        redis_client = redis.Redis.from_url(redis_url, decode_responses=False)
+        
+        # Инициализация БД
+        db_url = os.getenv("DATABASE_URL", "postgresql+asyncpg://postgres:postgres@supabase-db:5432/postgres")
+        if db_url.startswith("postgresql://") or db_url.startswith("postgres://"):
+            db_url = db_url.replace("postgresql://", "postgresql+asyncpg://", 1).replace("postgres://", "postgresql+asyncpg://", 1)
+        
+        engine = create_async_engine(db_url)
+        async_session = async_sessionmaker(engine, expire_on_commit=False)
+        db_session = async_session()
+        
+        # Инициализация EventPublisher
+        # Context7: EventPublisher требует RedisStreamsClient (обёртку над redis.Redis)
+        redis_streams_client = RedisStreamsClient(redis_url)
+        await redis_streams_client.connect()
+        event_publisher = EventPublisher(redis_streams_client)
+        
+        # Инициализация S3 (опционально, для сохранения vision summary)
+        s3_service = None
+        try:
+            s3_config = get_s3_config_from_env()
+            if s3_config and s3_config.get('access_key_id') and s3_config.get('secret_access_key'):
+                s3_service = S3StorageService(
+                    endpoint_url=s3_config['endpoint_url'],
+                    access_key_id=s3_config['access_key_id'],
+                    secret_access_key=s3_config['secret_access_key'],
+                    bucket_name=s3_config['bucket_name'],
+                    region=s3_config.get('region', 'ru-central-1')
+                )
+                logger.info("S3 service initialized for album assembler")
+        except Exception as e:
+            logger.warning(f"S3 service not available for album assembler: {e}")
+        
+        # Создание задачи
+        task = AlbumAssemblerTask(
+            redis_client=redis_client,
+            db_session=db_session,
+            event_publisher=event_publisher,
+            s3_service=s3_service
+        )
+        
+        logger.info("AlbumAssemblerTask created and starting...")
+        await task.start()
+        # Context7: Не возвращаемся из start() - задача работает в бесконечном цикле
+        
+    except Exception as e:
+        logger.error(f"Failed to create AlbumAssemblerTask: {e}", exc_info=True)
         raise
 
 async def create_vision_analysis_task():
@@ -180,6 +242,19 @@ async def main():
         )
     except ImportError:
         logger.debug("RetaggingTask metrics not available (module may not be loaded)")
+    
+    # Context7: Импорт метрик album assembler для регистрации (Phase 4)
+    try:
+        from tasks.album_assembler_task import (
+            albums_parsed_total,
+            albums_assembled_total,
+            album_assembly_lag_seconds,
+            album_items_count_gauge,
+            album_vision_summary_size_bytes,
+            album_aggregation_duration_ms
+        )
+    except ImportError:
+        logger.debug("AlbumAssemblerTask metrics not available (module may not be loaded)")
     
     # Context7: Инициализация метрик нулевыми значениями для экспорта в Prometheus
     # Метрики должны быть установлены хотя бы раз, чтобы Prometheus их увидел
@@ -298,6 +373,16 @@ async def main():
     supervisor.register_task(TaskConfig(
         name="retagging",
         task_func=create_retagging_task,
+        max_retries=5,
+        initial_backoff=1.0,
+        max_backoff=60.0,
+        backoff_multiplier=2.0
+    ))
+    
+    # Context7: Album Assembler Task (Phase 2-4)
+    supervisor.register_task(TaskConfig(
+        name="album_assembler",
+        task_func=create_album_assembler_task,
         max_retries=5,
         initial_backoff=1.0,
         max_backoff=60.0,

@@ -5,6 +5,7 @@ Context7 best practice: Rate limiting через Redis Lua script для ато�
 Поддержка различных типов лимитов: per-user, per-channel, global.
 """
 
+import asyncio
 import time
 from typing import Optional, Dict, Any
 import structlog

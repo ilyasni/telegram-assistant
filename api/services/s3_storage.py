@@ -273,6 +273,34 @@ class S3StorageService:
             prefix = url_hash[:2]
             return f"crawl/{tenant_id}/{prefix}/{url_hash}{suffix}"
     
+    def build_album_key(
+        self,
+        tenant_id: str,
+        album_id: int,
+        suffix: str = "_vision_summary",
+        schema_version: str = "v1"
+    ) -> str:
+        """
+        Построение S3 ключа для album-level данных.
+        
+        Context7: Структурированное хранение альбомов в S3 для долгосрочного хранения
+        и кэширования vision summary.
+        
+        Формат:
+        album/{tenant_id}/{album_id}{suffix}_{schema_version}.json
+        
+        Args:
+            tenant_id: ID tenant
+            album_id: ID альбома (group_id из media_groups)
+            suffix: Суффикс файла (например, "_vision_summary", "_enrichment")
+            schema_version: Версия схемы (например, "v1", "v1.0")
+            
+        Примеры:
+        - album/default/12345_vision_summary_v1.json
+        - album/tenant_456/67890_enrichment_v1.json
+        """
+        return f"album/{tenant_id}/{album_id}{suffix}_{schema_version}.json"
+    
     async def put_media(
         self,
         content: bytes,

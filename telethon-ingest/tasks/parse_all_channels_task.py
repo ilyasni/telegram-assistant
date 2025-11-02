@@ -140,13 +140,14 @@ interarrival_seconds = Histogram(
 class ParseAllChannelsTask:
     """Scheduler для периодического парсинга всех активных каналов."""
     
-    def __init__(self, config, db_url: str, redis_client: Optional[Any], parser=None, app_state: Optional[Dict] = None, telegram_client_manager: Optional[Any] = None):
+    def __init__(self, config, db_url: str, redis_client: Optional[Any], parser=None, app_state: Optional[Dict] = None, telegram_client_manager: Optional[Any] = None, media_processor: Optional[Any] = None):
         self.config = config
         self.db_url = db_url
         self.redis: Optional[redis.Redis] = None
         self.parser = parser  # Будет инициализирован при необходимости
         self.app_state = app_state
         self.telegram_client_manager = telegram_client_manager  # TelegramClientManager для парсинга
+        self.media_processor = media_processor  # MediaProcessor для обработки медиа
         self.interval_sec = int(os.getenv("PARSER_SCHEDULER_INTERVAL_SEC", "300"))
         self.enabled = os.getenv("FEATURE_INCREMENTAL_PARSING_ENABLED", "true").lower() == "true"
         
@@ -157,7 +158,9 @@ class ParseAllChannelsTask:
             "ParseAllChannelsTask initialized (simplified version for testing)",
             interval_sec=self.interval_sec,
             enabled=self.enabled,
-            max_concurrency=self.config.max_concurrency
+            max_concurrency=self.config.max_concurrency,
+            has_parser=parser is not None,
+            has_media_processor=media_processor is not None
         )
     
     async def run_forever(self):
@@ -195,7 +198,7 @@ class ParseAllChannelsTask:
     async def _acquire_lock(self) -> bool:
         """Try to acquire scheduler lock"""
         instance_id = os.getenv("HOSTNAME", "default")
-        lock_key = "scheduler:lock"
+        lock_key = "parse_all_channels:lock"
         ttl = self.interval_sec * 2
         
         try:
@@ -228,7 +231,7 @@ class ParseAllChannelsTask:
         """Release scheduler lock"""
         try:
             # Context7: async Redis - используем await для delete()
-            await self.redis.delete("scheduler:lock")
+            await self.redis.delete("parse_all_channels:lock")
             if self.app_state:
                 self.app_state["scheduler"]["lock_owner"] = None
         except Exception as e:
@@ -380,7 +383,8 @@ class ParseAllChannelsTask:
                             db_session=db_session,
                             event_publisher=None,
                             redis_client=self.redis,
-                            telegram_client_manager=self.telegram_client_manager
+                            telegram_client_manager=self.telegram_client_manager,
+                            media_processor=self.media_processor  # Context7: Передаём MediaProcessor
                         )
                     
                     # Call actual parser

@@ -202,6 +202,32 @@ class VisionAnalyzedEventV1(BaseEvent):
         return f"{tenant_id}:{post_id}:{sha256}"
 
 
+class VisionSkippedEventV1(BaseEvent):
+    """
+    Событие: Vision анализ пропущен для всех медиа.
+    
+    Публикуется Vision Worker когда все медиа файлы пропущены
+    (неподходящий формат, размер, квота и т.д.).
+    """
+    
+    event_type: Literal["posts.vision.skipped"] = "posts.vision.skipped"
+    schema_version: Literal["1.0"] = "1.0"
+    producer: str = Field(default="vision-worker")
+    
+    tenant_id: str = Field(..., description="ID tenant")
+    post_id: str = Field(..., description="ID поста")
+    
+    reasons: List[Dict[str, Any]] = Field(
+        ...,
+        description="Причины пропуска: [{media_id, reason, details}]"
+    )
+    
+    idempotency_key: str = Field(
+        ...,
+        description="Idempotency key для дедупликации события"
+    )
+
+
 class VisionUploadedEventV1(BaseEvent):
     """
     Событие: Медиа загружено и готово для Vision анализа.
