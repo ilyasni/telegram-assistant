@@ -101,8 +101,9 @@ class GigaChatEmbeddingProvider(EmbeddingProvider):
     def __init__(self, adapter):
         self.adapter = adapter
         self.model = settings.GIGACHAT_EMBEDDINGS_MODEL
-        # GigaChat EmbeddingsGigaR возвращает 2560 измерений
-        self.dimension = 2560
+        # Context7: GigaChat Giga-Embeddings-instruct возвращает 2048 измерений
+        # Источник: https://gitverse.ru/GigaTeam/GigaEmbeddings
+        self.dimension = 2048
         # Context7: [C7-ID: gigachat-resilience-001] Кэш для результата health check
         self._proxy_health_cache = None
         self._proxy_health_cache_ttl = 30  # секунд

@@ -194,16 +194,17 @@ class EnrichmentRepository:
                 # SQLAlchemy AsyncSession
                 from sqlalchemy import text
                 
+                # Context7: Используем CAST вместо :: для совместимости с SQLAlchemy
                 await self.db_session.execute(
                     text("""
                         INSERT INTO post_enrichment (
                             post_id, kind, provider, params_hash, data, status, error,
                             updated_at, enriched_at
                         ) VALUES (
-                            :post_id, :kind, :provider, :params_hash, :data::jsonb, :status, :error,
+                            :post_id, :kind, :provider, :params_hash, CAST(:data AS jsonb), :status, :error,
                             :updated_at, COALESCE(
-                                (SELECT enriched_at FROM post_enrichment WHERE post_id = :post_id AND kind = :kind),
-                                :updated_at
+                                (SELECT enriched_at FROM post_enrichment WHERE post_id = :post_id_sub AND kind = :kind_sub),
+                                :updated_at_sub
                             )
                         )
                         ON CONFLICT (post_id, kind) DO UPDATE SET
@@ -222,7 +223,10 @@ class EnrichmentRepository:
                         "data": data_jsonb,
                         "status": status,
                         "error": error,
-                        "updated_at": updated_at
+                        "updated_at": updated_at,
+                        "post_id_sub": post_id,  # Отдельные параметры для подзапроса
+                        "kind_sub": kind,
+                        "updated_at_sub": updated_at
                     }
                 )
                 await self.db_session.commit()

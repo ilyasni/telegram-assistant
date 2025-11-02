@@ -18,15 +18,14 @@
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
-  "id": null,
+  "id": 2,
   "links": [],
-  "liveNow": false,
   "panels": [
     {
       "datasource": {
+        "name": "Prometheus",
         "type": "prometheus",
-        "uid": "prometheus",
-        "name": "Prometheus"
+        "uid": "prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -39,7 +38,7 @@
             "steps": [
               {
                 "color": "green",
-                "value": null
+                "value": 0
               }
             ]
           },
@@ -49,7 +48,7 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 6,
+        "w": 5,
         "x": 0,
         "y": 0
       },
@@ -59,6 +58,7 @@
         "graphMode": "area",
         "justifyMode": "auto",
         "orientation": "auto",
+        "percentChangeColorMode": "standard",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
@@ -66,15 +66,17 @@
           "fields": "",
           "values": false
         },
-        "textMode": "auto"
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
       },
-      "pluginVersion": "11.0.0",
+      "pluginVersion": "12.2.1",
       "targets": [
         {
           "datasource": {
+            "name": "Prometheus",
             "type": "prometheus",
-            "uid": "prometheus",
-            "name": "Prometheus"
+            "uid": "prometheus"
           },
           "editorMode": "code",
           "expr": "sum(up)",
@@ -87,9 +89,9 @@
     },
     {
       "datasource": {
+        "name": "Prometheus",
         "type": "prometheus",
-        "uid": "prometheus",
-        "name": "Prometheus"
+        "uid": "prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -102,7 +104,7 @@
             "steps": [
               {
                 "color": "green",
-                "value": null
+                "value": 0
               }
             ]
           },
@@ -112,8 +114,8 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 6,
-        "x": 6,
+        "w": 5,
+        "x": 5,
         "y": 0
       },
       "id": 2,
@@ -122,6 +124,7 @@
         "graphMode": "area",
         "justifyMode": "auto",
         "orientation": "auto",
+        "percentChangeColorMode": "standard",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
@@ -129,15 +132,17 @@
           "fields": "",
           "values": false
         },
-        "textMode": "auto"
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
       },
-      "pluginVersion": "11.0.0",
+      "pluginVersion": "12.2.1",
       "targets": [
         {
           "datasource": {
+            "name": "Prometheus",
             "type": "prometheus",
-            "uid": "prometheus",
-            "name": "Prometheus"
+            "uid": "prometheus"
           },
           "editorMode": "code",
           "expr": "sum(rate(posts_processed_total[30m]))",
@@ -150,9 +155,9 @@
     },
     {
       "datasource": {
+        "name": "Prometheus",
         "type": "prometheus",
-        "uid": "prometheus",
-        "name": "Prometheus"
+        "uid": "prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -165,7 +170,7 @@
             "steps": [
               {
                 "color": "green",
-                "value": null
+                "value": 0
               }
             ]
           },
@@ -175,8 +180,8 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 6,
-        "x": 12,
+        "w": 5,
+        "x": 10,
         "y": 0
       },
       "id": 3,
@@ -185,6 +190,7 @@
         "graphMode": "area",
         "justifyMode": "auto",
         "orientation": "auto",
+        "percentChangeColorMode": "standard",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
@@ -192,15 +198,17 @@
           "fields": "",
           "values": false
         },
-        "textMode": "auto"
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
       },
-      "pluginVersion": "11.0.0",
+      "pluginVersion": "12.2.1",
       "targets": [
         {
           "datasource": {
+            "name": "Prometheus",
             "type": "prometheus",
-            "uid": "prometheus",
-            "name": "Prometheus"
+            "uid": "prometheus"
           },
           "editorMode": "code",
           "expr": "sum(posts_processed_total)",
@@ -213,9 +221,9 @@
     },
     {
       "datasource": {
+        "name": "Prometheus",
         "type": "prometheus",
-        "uid": "prometheus",
-        "name": "Prometheus"
+        "uid": "prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -228,7 +236,7 @@
             "steps": [
               {
                 "color": "green",
-                "value": null
+                "value": 0
               },
               {
                 "color": "yellow",
@@ -246,8 +254,8 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 6,
-        "x": 18,
+        "w": 3,
+        "x": 15,
         "y": 0
       },
       "id": 4,
@@ -256,6 +264,7 @@
         "graphMode": "area",
         "justifyMode": "auto",
         "orientation": "auto",
+        "percentChangeColorMode": "standard",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
@@ -263,15 +272,17 @@
           "fields": "",
           "values": false
         },
-        "textMode": "auto"
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
       },
-      "pluginVersion": "11.0.0",
+      "pluginVersion": "12.2.1",
       "targets": [
         {
           "datasource": {
+            "name": "Prometheus",
             "type": "prometheus",
-            "uid": "prometheus",
-            "name": "Prometheus"
+            "uid": "prometheus"
           },
           "editorMode": "code",
           "expr": "sum(rate(worker_errors_total[5m]))",
@@ -284,9 +295,9 @@
     },
     {
       "datasource": {
+        "name": "Prometheus",
         "type": "prometheus",
-        "uid": "prometheus",
-        "name": "Prometheus"
+        "uid": "prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -299,7 +310,7 @@
             "steps": [
               {
                 "color": "green",
-                "value": null
+                "value": 0
               },
               {
                 "color": "yellow",
@@ -322,8 +333,8 @@
       "gridPos": {
         "h": 4,
         "w": 6,
-        "x": 0,
-        "y": 4
+        "x": 18,
+        "y": 0
       },
       "id": 11,
       "options": {
@@ -331,6 +342,7 @@
         "graphMode": "area",
         "justifyMode": "auto",
         "orientation": "auto",
+        "percentChangeColorMode": "standard",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
@@ -338,15 +350,17 @@
           "fields": "",
           "values": false
         },
-        "textMode": "auto"
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
       },
-      "pluginVersion": "11.0.0",
+      "pluginVersion": "12.2.1",
       "targets": [
         {
           "datasource": {
+            "name": "Prometheus",
             "type": "prometheus",
-            "uid": "prometheus",
-            "name": "Prometheus"
+            "uid": "prometheus"
           },
           "editorMode": "code",
           "expr": "sum(posts_in_queue_total{status=\"total\"}) by (queue)",
@@ -359,9 +373,9 @@
     },
     {
       "datasource": {
+        "name": "Prometheus",
         "type": "prometheus",
-        "uid": "prometheus",
-        "name": "Prometheus"
+        "uid": "prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -369,17 +383,23 @@
             "mode": "palette-classic"
           },
           "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
             "axisLabel": "Requests/s",
             "axisPlacement": "auto",
             "barAlignment": 0,
+            "barWidthFactor": 0.6,
             "drawStyle": "line",
             "fillOpacity": 10,
             "gradientMode": "none",
             "hideFrom": {
               "legend": false,
               "tooltip": false,
-              "vis": false
+              "vis": false,
+              "viz": false
             },
+            "insertNulls": false,
             "lineInterpolation": "linear",
             "lineWidth": 1,
             "pointSize": 5,
@@ -387,6 +407,7 @@
               "type": "linear"
             },
             "showPoints": "never",
+            "showValues": false,
             "spanNulls": false,
             "stacking": {
               "group": "A",
@@ -402,7 +423,7 @@
             "steps": [
               {
                 "color": "green",
-                "value": null
+                "value": 0
               },
               {
                 "color": "yellow",
@@ -421,7 +442,7 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 6,
+        "x": 0,
         "y": 4
       },
       "id": 5,
@@ -436,17 +457,18 @@
           "showLegend": true
         },
         "tooltip": {
+          "hideZeros": false,
           "mode": "multi",
           "sort": "desc"
         }
       },
-      "pluginVersion": "11.0.0",
+      "pluginVersion": "12.2.1",
       "targets": [
         {
           "datasource": {
+            "name": "Prometheus",
             "type": "prometheus",
-            "uid": "prometheus",
-            "name": "Prometheus"
+            "uid": "prometheus"
           },
           "editorMode": "code",
           "expr": "sum(rate(http_requests_total[5m])) by (method, endpoint)",
@@ -459,9 +481,9 @@
     },
     {
       "datasource": {
+        "name": "Prometheus",
         "type": "prometheus",
-        "uid": "prometheus",
-        "name": "Prometheus"
+        "uid": "prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -469,17 +491,23 @@
             "mode": "palette-classic"
           },
           "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
             "axisLabel": "Seconds",
             "axisPlacement": "auto",
             "barAlignment": 0,
+            "barWidthFactor": 0.6,
             "drawStyle": "line",
             "fillOpacity": 10,
             "gradientMode": "none",
             "hideFrom": {
               "legend": false,
               "tooltip": false,
-              "vis": false
+              "vis": false,
+              "viz": false
             },
+            "insertNulls": false,
             "lineInterpolation": "linear",
             "lineWidth": 1,
             "pointSize": 5,
@@ -487,6 +515,7 @@
               "type": "linear"
             },
             "showPoints": "never",
+            "showValues": false,
             "spanNulls": false,
             "stacking": {
               "group": "A",
@@ -502,7 +531,7 @@
             "steps": [
               {
                 "color": "green",
-                "value": null
+                "value": 0
               },
               {
                 "color": "yellow",
@@ -521,7 +550,7 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 18,
+        "x": 12,
         "y": 4
       },
       "id": 6,
@@ -536,17 +565,18 @@
           "showLegend": true
         },
         "tooltip": {
+          "hideZeros": false,
           "mode": "multi",
           "sort": "desc"
         }
       },
-      "pluginVersion": "11.0.0",
+      "pluginVersion": "12.2.1",
       "targets": [
         {
           "datasource": {
+            "name": "Prometheus",
             "type": "prometheus",
-            "uid": "prometheus",
-            "name": "Prometheus"
+            "uid": "prometheus"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))",
@@ -555,9 +585,9 @@
         },
         {
           "datasource": {
+            "name": "Prometheus",
             "type": "prometheus",
-            "uid": "prometheus",
-            "name": "Prometheus"
+            "uid": "prometheus"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))",
@@ -570,9 +600,9 @@
     },
     {
       "datasource": {
+        "name": "Prometheus",
         "type": "prometheus",
-        "uid": "prometheus",
-        "name": "Prometheus"
+        "uid": "prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -580,17 +610,23 @@
             "mode": "palette-classic"
           },
           "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
             "axisLabel": "Posts/s",
             "axisPlacement": "auto",
             "barAlignment": 0,
+            "barWidthFactor": 0.6,
             "drawStyle": "line",
             "fillOpacity": 10,
             "gradientMode": "none",
             "hideFrom": {
               "legend": false,
               "tooltip": false,
-              "vis": false
+              "vis": false,
+              "viz": false
             },
+            "insertNulls": false,
             "lineInterpolation": "linear",
             "lineWidth": 1,
             "pointSize": 5,
@@ -598,6 +634,7 @@
               "type": "linear"
             },
             "showPoints": "never",
+            "showValues": false,
             "spanNulls": false,
             "stacking": {
               "group": "A",
@@ -613,7 +650,7 @@
             "steps": [
               {
                 "color": "green",
-                "value": null
+                "value": 0
               }
             ]
           },
@@ -639,17 +676,18 @@
           "showLegend": true
         },
         "tooltip": {
+          "hideZeros": false,
           "mode": "multi",
           "sort": "desc"
         }
       },
-      "pluginVersion": "11.0.0",
+      "pluginVersion": "12.2.1",
       "targets": [
         {
           "datasource": {
+            "name": "Prometheus",
             "type": "prometheus",
-            "uid": "prometheus",
-            "name": "Prometheus"
+            "uid": "prometheus"
           },
           "editorMode": "code",
           "expr": "sum(rate(posts_processed_total[5m])) by (stage, success)",
@@ -662,9 +700,9 @@
     },
     {
       "datasource": {
+        "name": "Prometheus",
         "type": "prometheus",
-        "uid": "prometheus",
-        "name": "Prometheus"
+        "uid": "prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -672,17 +710,23 @@
             "mode": "palette-classic"
           },
           "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
             "axisLabel": "Count",
             "axisPlacement": "auto",
             "barAlignment": 0,
+            "barWidthFactor": 0.6,
             "drawStyle": "line",
             "fillOpacity": 10,
             "gradientMode": "none",
             "hideFrom": {
               "legend": false,
               "tooltip": false,
-              "vis": false
+              "vis": false,
+              "viz": false
             },
+            "insertNulls": false,
             "lineInterpolation": "linear",
             "lineWidth": 1,
             "pointSize": 5,
@@ -690,6 +734,7 @@
               "type": "linear"
             },
             "showPoints": "never",
+            "showValues": false,
             "spanNulls": false,
             "stacking": {
               "group": "A",
@@ -705,7 +750,7 @@
             "steps": [
               {
                 "color": "green",
-                "value": null
+                "value": 0
               },
               {
                 "color": "yellow",
@@ -739,17 +784,18 @@
           "showLegend": true
         },
         "tooltip": {
+          "hideZeros": false,
           "mode": "multi",
           "sort": "desc"
         }
       },
-      "pluginVersion": "11.0.0",
+      "pluginVersion": "12.2.1",
       "targets": [
         {
           "datasource": {
+            "name": "Prometheus",
             "type": "prometheus",
-            "uid": "prometheus",
-            "name": "Prometheus"
+            "uid": "prometheus"
           },
           "editorMode": "code",
           "expr": "posts_in_queue_total{status!=\"total\"}",
@@ -762,9 +808,9 @@
     },
     {
       "datasource": {
+        "name": "Prometheus",
         "type": "prometheus",
-        "uid": "prometheus",
-        "name": "Prometheus"
+        "uid": "prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -772,17 +818,23 @@
             "mode": "palette-classic"
           },
           "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
             "axisLabel": "Count",
             "axisPlacement": "auto",
             "barAlignment": 0,
+            "barWidthFactor": 0.6,
             "drawStyle": "line",
             "fillOpacity": 10,
             "gradientMode": "none",
             "hideFrom": {
               "legend": false,
               "tooltip": false,
-              "vis": false
+              "vis": false,
+              "viz": false
             },
+            "insertNulls": false,
             "lineInterpolation": "linear",
             "lineWidth": 2,
             "pointSize": 5,
@@ -790,6 +842,7 @@
               "type": "linear"
             },
             "showPoints": "never",
+            "showValues": false,
             "spanNulls": false,
             "stacking": {
               "group": "A",
@@ -805,7 +858,7 @@
             "steps": [
               {
                 "color": "green",
-                "value": null
+                "value": 0
               },
               {
                 "color": "yellow",
@@ -840,17 +893,18 @@
           "showLegend": true
         },
         "tooltip": {
+          "hideZeros": false,
           "mode": "multi",
           "sort": "desc"
         }
       },
-      "pluginVersion": "11.0.0",
+      "pluginVersion": "12.2.1",
       "targets": [
         {
           "datasource": {
+            "name": "Prometheus",
             "type": "prometheus",
-            "uid": "prometheus",
-            "name": "Prometheus"
+            "uid": "prometheus"
           },
           "editorMode": "code",
           "expr": "posts_in_queue_total{queue=\"posts.enriched\", status=\"total\"}",
@@ -859,9 +913,9 @@
         },
         {
           "datasource": {
+            "name": "Prometheus",
             "type": "prometheus",
-            "uid": "prometheus",
-            "name": "Prometheus"
+            "uid": "prometheus"
           },
           "editorMode": "code",
           "expr": "sum(posts_processed_total{stage=\"enrichment\", success=\"true\"})",
@@ -870,9 +924,9 @@
         },
         {
           "datasource": {
+            "name": "Prometheus",
             "type": "prometheus",
-            "uid": "prometheus",
-            "name": "Prometheus"
+            "uid": "prometheus"
           },
           "editorMode": "code",
           "expr": "posts_in_queue_total{queue=\"posts.enriched\", status=\"pending\"}",
@@ -885,9 +939,9 @@
     },
     {
       "datasource": {
+        "name": "Prometheus",
         "type": "prometheus",
-        "uid": "prometheus",
-        "name": "Prometheus"
+        "uid": "prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -895,17 +949,23 @@
             "mode": "palette-classic"
           },
           "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
             "axisLabel": "Rate (posts/s)",
             "axisPlacement": "auto",
             "barAlignment": 0,
+            "barWidthFactor": 0.6,
             "drawStyle": "line",
             "fillOpacity": 10,
             "gradientMode": "none",
             "hideFrom": {
               "legend": false,
               "tooltip": false,
-              "vis": false
+              "vis": false,
+              "viz": false
             },
+            "insertNulls": false,
             "lineInterpolation": "linear",
             "lineWidth": 2,
             "pointSize": 5,
@@ -913,6 +973,7 @@
               "type": "linear"
             },
             "showPoints": "never",
+            "showValues": false,
             "spanNulls": false,
             "stacking": {
               "group": "A",
@@ -928,7 +989,7 @@
             "steps": [
               {
                 "color": "green",
-                "value": null
+                "value": 0
               }
             ]
           },
@@ -954,17 +1015,18 @@
           "showLegend": true
         },
         "tooltip": {
+          "hideZeros": false,
           "mode": "multi",
           "sort": "desc"
         }
       },
-      "pluginVersion": "11.0.0",
+      "pluginVersion": "12.2.1",
       "targets": [
         {
           "datasource": {
+            "name": "Prometheus",
             "type": "prometheus",
-            "uid": "prometheus",
-            "name": "Prometheus"
+            "uid": "prometheus"
           },
           "editorMode": "code",
           "expr": "sum(rate(posts_processed_total{stage=\"enrichment\"}[5m])) by (success)",
@@ -976,9 +1038,9 @@
       "type": "timeseries"
     }
   ],
+  "preload": false,
   "refresh": "30s",
-  "schemaVersion": 39,
-  "style": "dark",
+  "schemaVersion": 42,
   "tags": [
     "telegram-assistant",
     "system",
@@ -1010,6 +1072,5 @@
   "timezone": "browser",
   "title": "System Overview",
   "uid": "system-overview",
-  "version": 1,
-  "weekStart": ""
+  "version": 10
 }

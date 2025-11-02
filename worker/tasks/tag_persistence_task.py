@@ -321,11 +321,14 @@ class TagPersistenceTask:
             return
         
         # Context7: Логирование для отладки потери тегов
+        trigger = getattr(event, 'trigger', None)
         logger.info("Processing tags event",
                    post_id=event.post_id,
                    tags_count=len(event.tags) if event.tags else 0,
                    tags_sample=event.tags[:3] if event.tags else [],
-                   provider=event.provider)
+                   provider=event.provider,
+                   trigger=trigger,
+                   is_retagging=(trigger == "vision_retag"))
         
         # Context7: Проверка существования поста перед сохранением тегов
         post_exists = await self._check_post_exists(event.post_id)

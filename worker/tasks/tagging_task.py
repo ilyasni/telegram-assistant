@@ -167,7 +167,7 @@ class TaggingTask:
             )
                     
         except Exception as e:
-            logger.error(f"Failed to start TaggingTask: {e}")
+            logger.error("Failed to start TaggingTask", extra={"error": str(e)})
             raise
     
     async def stop(self):
@@ -211,23 +211,9 @@ class TaggingTask:
             else:
                 # Прямой формат
                 event_data = message
-            # Валидация входного события
-            parsed_event = PostParsedEventV1(**event_data)
             
-            # МЕТРИКА: попытка обработки
-            posts_processed_total.labels(stage='tagging', success='attempt').inc()
-            
-            # Проверка длины текста (частая причина пропуска!)
-            MIN_CHARS = int(os.getenv("TAGGING_MIN_CHARS", "80"))
-            if len(parsed_event.text) < MIN_CHARS:
-                logger.debug(f"Text too short: {len(parsed_event.text)} < {MIN_CHARS}")
-                tagging_requests_total.labels(provider="precheck", model="none", success="skip").inc()
-                # Публикуем событие с пустыми тегами (не блокируем пайплайн!)
-                await self._publish_tagged_event(parsed_event, [], 0, None)
-                posts_processed_total.labels(stage='tagging', success='skip_short').inc()
-                return
-            
-            # Нормализация urls (иногда могут прийти строкой)
+            # Context7: Нормализация полей, которые могут прийти как строки JSON (перед валидацией!)
+            # urls нормализация
             urls = event_data.get('urls')
             if isinstance(urls, str):
                 try:
@@ -240,6 +226,59 @@ class TaggingTask:
                         event_data['urls'] = []
                 except json.JSONDecodeError:
                     event_data['urls'] = [urls] if urls.strip() else []
+            
+            # media_sha256_list нормализация (может прийти как строка JSON)
+            media_sha256_list = event_data.get('media_sha256_list')
+            if isinstance(media_sha256_list, str):
+                # Обработка пустой строки или строки '[]'
+                if not media_sha256_list.strip() or media_sha256_list.strip() == '[]':
+                    event_data['media_sha256_list'] = []
+                else:
+                    try:
+                        loaded = json.loads(media_sha256_list)
+                        if isinstance(loaded, list):
+                            event_data['media_sha256_list'] = [m for m in loaded if isinstance(m, str) and m.strip()]
+                        else:
+                            event_data['media_sha256_list'] = []
+                    except json.JSONDecodeError:
+                        # Если не JSON, пытаемся как обычную строку (не должно быть, но на всякий случай)
+                        event_data['media_sha256_list'] = [media_sha256_list] if media_sha256_list.strip() else []
+            elif media_sha256_list is None:
+                event_data['media_sha256_list'] = []
+            
+            # Валидация входного события (после нормализации)
+            parsed_event = PostParsedEventV1(**event_data)
+            
+            # МЕТРИКА: попытка обработки
+            posts_processed_total.labels(stage='tagging', success='attempt').inc()
+            
+            # Проверка длины текста (частая причина пропуска!)
+            # Context7: НЕ пропускаем посты с медиа, даже если текст короткий
+            # Vision анализ может обогатить пост описанием и OCR текстом
+            MIN_CHARS = int(os.getenv("TAGGING_MIN_CHARS", "80"))
+            has_media = parsed_event.has_media and parsed_event.media_sha256_list
+            text_too_short = len(parsed_event.text) < MIN_CHARS
+            
+            if text_too_short and not has_media:
+                # Пропускаем только если текст короткий И нет медиа
+                logger.debug(
+                    f"Text too short and no media: {len(parsed_event.text)} < {MIN_CHARS}",
+                    post_id=parsed_event.post_id
+                )
+                tagging_requests_total.labels(provider="precheck", model="none", success="skip").inc()
+                # Публикуем событие с пустыми тегами (не блокируем пайплайн!)
+                await self._publish_tagged_event(parsed_event, [], 0, None)
+                posts_processed_total.labels(stage='tagging', success='skip_short').inc()
+                return
+            elif text_too_short and has_media:
+                # Текст короткий, но есть медиа - продолжим обработку
+                # Vision может обогатить пост описанием/OCR для улучшения тегов
+                logger.debug(
+                    "Text short but has media - will use Vision enrichment if available",
+                    post_id=parsed_event.post_id,
+                    text_length=len(parsed_event.text),
+                    media_count=len(parsed_event.media_sha256_list)
+                )
             
             # Проверка идемпотентности
             idempotency_key = f"{parsed_event.post_id}:{parsed_event.content_hash}"
@@ -291,8 +330,66 @@ class TaggingTask:
             # Не гасим ошибку: пусть consumer применит retry/DLQ
             raise
     
+    async def _get_vision_enrichment(self, post_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Получение Vision результатов из БД для обогащения текста при тегировании.
+        
+        Context7: Гибридный подход - если Vision уже готов, используем его для улучшения тегов.
+        Если Vision ещё не готов, тегируем только текст (не блокируем пайплайн).
+        """
+        try:
+            import asyncpg
+            import os
+            
+            db_url = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@supabase-db:5432/postgres")
+            conn = await asyncpg.connect(db_url)
+            
+            # Context7: Проверяем наличие Vision результатов в post_enrichment
+            row = await conn.fetchrow("""
+                SELECT 
+                    data->>'description' as vision_description,
+                    data->>'ocr_text' as vision_ocr_text,
+                    vision_description as legacy_vision_description,
+                    vision_ocr_text as legacy_vision_ocr_text
+                FROM post_enrichment
+                WHERE post_id = $1 AND kind = 'vision'
+                LIMIT 1
+            """, post_id)
+            
+            await conn.close()
+            
+            if not row:
+                return None
+            
+            # Используем новые поля из data или legacy поля
+            vision_description = row.get('vision_description') or row.get('legacy_vision_description')
+            vision_ocr_text = row.get('vision_ocr_text') or row.get('legacy_vision_ocr_text')
+            
+            if not vision_description and not vision_ocr_text:
+                return None
+            
+            return {
+                'description': vision_description,
+                'ocr_text': vision_ocr_text
+            }
+            
+        except Exception as e:
+            logger.debug(
+                "Failed to get vision enrichment",
+                post_id=post_id,
+                error=str(e)
+            )
+            return None
+    
     async def _tag_post(self, parsed_event: PostParsedEventV1) -> Optional[Any]:
-        """Тегирование поста через AI адаптер."""
+        """
+        Тегирование поста через AI адаптер с обогащением Vision результатами.
+        
+        Context7: Гибридный подход (Вариант C):
+        - Тегируем текст сразу
+        - Если Vision уже готов - добавляем его к тексту для улучшения тегов
+        - Если Vision не готов - тегируем только текст (не блокируем пайплайн)
+        """
         start_time = time.time()
         try:
             if not self.ai_adapter:
@@ -300,9 +397,38 @@ class TaggingTask:
                 tagging_requests_total.labels(provider="gigachain", model="gigachat", success="error").inc()
                 return None
             
-            # Тегирование
+            # Context7: Проверяем наличие Vision результатов для обогащения
+            text_for_tagging = parsed_event.text
+            vision_enrichment = None
+            
+            if parsed_event.has_media and parsed_event.media_sha256_list:
+                # Только если есть медиа - проверяем Vision результаты
+                vision_enrichment = await self._get_vision_enrichment(parsed_event.post_id)
+                
+                if vision_enrichment:
+                    # Обогащаем текст Vision данными
+                    enrichment_parts = []
+                    
+                    if vision_enrichment.get('description'):
+                        enrichment_parts.append(f"[Изображение: {vision_enrichment['description']}]")
+                    
+                    if vision_enrichment.get('ocr_text'):
+                        enrichment_parts.append(f"[Текст с изображения: {vision_enrichment['ocr_text']}]")
+                    
+                    if enrichment_parts:
+                        text_for_tagging = f"{parsed_event.text}\n\n{' '.join(enrichment_parts)}"
+                        logger.debug(
+                            "Tagging with vision enrichment",
+                            post_id=parsed_event.post_id,
+                            original_length=len(parsed_event.text),
+                            enriched_length=len(text_for_tagging),
+                            has_description=bool(vision_enrichment.get('description')),
+                            has_ocr=bool(vision_enrichment.get('ocr_text'))
+                        )
+            
+            # Тегирование (с обогащенным текстом, если Vision готов)
             results = await self.ai_adapter.generate_tags_batch(
-                [parsed_event.text],
+                [text_for_tagging],
                 force_immediate=True
             )
             
@@ -311,6 +437,12 @@ class TaggingTask:
             
             if results and len(results) > 0:
                 tagging_requests_total.labels(provider="gigachain", model="gigachat", success="success").inc()
+                if vision_enrichment:
+                    logger.info(
+                        "Post tagged with vision enrichment",
+                        post_id=parsed_event.post_id,
+                        used_vision=True
+                    )
                 return results[0]
             else:
                 logger.warning(f"No tagging results returned post_id={parsed_event.post_id}")

@@ -24,6 +24,7 @@ COPY worker/ .
 # Context7: Копируем скрипты для pipeline health check
 RUN mkdir -p /app/scripts /app/config
 COPY scripts/check_pipeline_health.py /app/scripts/
+COPY scripts/check_pipeline_e2e.py /app/check_pipeline_e2e.py
 COPY scripts/reindex_neo4j_relationships.py /app/scripts/
 COPY scripts/pipeline_health_cron.sh /app/scripts/
 COPY config/slo_thresholds.json /app/config/

@@ -48,10 +48,13 @@ vision_analysis_requests_total = Counter(
     ['status', 'provider', 'tenant_id', 'reason']
 )
 
+# Context7: Детализированные метрики Vision анализа
+# provider: gigachat, ocr (fallback)
+# has_ocr: true, false (есть ли OCR текст в результате)
 vision_analysis_duration_seconds = Histogram(
     'vision_analysis_duration_seconds',
     'Vision analysis latency',
-    ['provider', 'status']
+    ['provider', 'has_ocr']  # provider: gigachat|ocr, has_ocr: true|false
 )
 
 vision_tokens_used_total = Counter(
@@ -398,9 +401,11 @@ class GigaChatVisionAdapter:
                     )
                 
                 duration = time.time() - start_time
+                # Context7: Определяем has_ocr на основе результата
+                has_ocr = bool(analysis_result.get("ocr_text") or (analysis_result.get("ocr") and analysis_result["ocr"].get("text")))
                 vision_analysis_duration_seconds.labels(
                     provider="gigachat",
-                    status="success"
+                    has_ocr=str(has_ocr).lower()
                 ).observe(duration)
                 
                 vision_analysis_requests_total.labels(
@@ -428,9 +433,10 @@ class GigaChatVisionAdapter:
             
         except (GigaChatException, Exception) as e:
             duration = time.time() - start_time
+            # При ошибке has_ocr неизвестен, используем false
             vision_analysis_duration_seconds.labels(
                 provider="gigachat",
-                status="error"
+                has_ocr="false"
             ).observe(duration)
             
             error_type = type(e).__name__

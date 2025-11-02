@@ -280,7 +280,7 @@ class EnrichmentWorker:
             
             # Context7: Проверка существования поста перед обогащением
             if not post_context:
-                logger.warning("Post not found in DB, skipping enrichment", post_id=post_id, trace_id=event_data.get('trace_id'))
+                logger.warning("Post not found in DB, skipping enrichment", extra={"post_id": post_id, "trace_id": event_data.get('trace_id')})
                 posts_processed_total.labels(stage='enrichment', success='skip').inc()
                 return
             
@@ -329,6 +329,16 @@ class EnrichmentWorker:
                 posts_processed_total.labels(stage='enrichment', success='error').inc()
                 return
             
+            # Context7: Проверка trigger для observability
+            trigger = event_data.get('trigger')
+            is_retagging = (trigger == "vision_retag")
+            if is_retagging:
+                logger.debug(
+                    "Processing retagging event in EnrichmentTask",
+                    post_id=post_id,
+                    trace_id=event_data.get('trace_id')
+                )
+            
             # [C7-ID: ENRICH-DEV-FIX-003] Санитизация post_id перед сохранением в БД
             sanitized_post_id_for_save = str(normalize_post_id(post_id)) if os.getenv("FEATURE_ALLOW_NON_UUID_IDS", "false").lower() == "true" else post_id
             
@@ -368,8 +378,8 @@ class EnrichmentWorker:
                 
         except Exception as e:
             import traceback
-            logger.error(f"Error processing post {event_data.get('post_id', 'unknown')}: {e}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
+            logger.error("Error processing post", extra={"post_id": event_data.get('post_id', 'unknown'), "error": str(e)})
+            logger.error("Traceback", extra={"traceback": traceback.format_exc()})
             
             # Context7: Метрики для ошибок enrichment
             enrichment_requests_total.labels(
@@ -393,13 +403,13 @@ class EnrichmentWorker:
         logger.info("enrich_limits_check", extra={"env": skip_limits_env, "skip": skip_limits, "post_id": post_id})
         
         if skip_limits:
-            logger.warning(f"enrich_limits_skipped: feature_flag enabled for post_id={post_id}")
+            logger.warning("enrich_limits_skipped: feature_flag enabled", extra={"post_id": post_id})
             # Пропускаем проверку лимитов, возвращаем True для продолжения обогащения
             return True, None
         else:
             # Проверка лимитов пользователя
             if not await self._check_user_limits(post_id):
-                logger.warning(f"enrich_limits_exceeded: post_id={post_id}")
+                logger.warning("enrich_limits_exceeded", extra={"post_id": post_id})
                 return False, 'user_limits_exceeded'
         
         # Проверка триггерных тегов
@@ -803,7 +813,7 @@ class EnrichmentWorker:
                 trace_id=enrichment_data.get('trace_id')
             )
             
-            logger.info(f"Enrichment data saved via EnrichmentRepository for post_id={post_id} kind={kind} provider={provider}")
+            logger.info("Enrichment data saved via EnrichmentRepository", extra={"post_id": post_id, "kind": kind, "provider": provider})
             
         except Exception as e:
             logger.error(f"Failed to save enrichment data: {e}")
@@ -812,7 +822,7 @@ class EnrichmentWorker:
     async def _publish_enriched_event(self, original_event: Dict[str, Any], enrichment_data: Dict[str, Any]):
         """Публикация события posts.enriched."""
         try:
-            logger.info(f"enrichment_publish_start: post_id={original_event.get('post_id')}, enrichment_keys={list(enrichment_data.keys())}")
+            logger.info("enrichment_publish_start", extra={"post_id": original_event.get('post_id'), "enrichment_keys": list(enrichment_data.keys())})
             
             # Context7 best practice: очищаем None значения перед сериализацией
             def clean_none_values(obj):
@@ -830,7 +840,7 @@ class EnrichmentWorker:
             # Создание события (используем правильную схему)
             from events.schemas.posts_enriched_v1 import PostEnrichedEventV1
             
-            logger.info(f"enrichment_event_creation: post_id={original_event.get('post_id')}, idempotency_key={original_event.get('idempotency_key')}")
+            logger.info("enrichment_event_creation", extra={"post_id": original_event.get('post_id'), "idempotency_key": original_event.get('idempotency_key')})
             
             enriched_event = PostEnrichedEventV1(
                 idempotency_key=original_event['idempotency_key'],
@@ -841,7 +851,7 @@ class EnrichmentWorker:
                 skipped=False
             )
             
-            logger.info(f"enrichment_event_created: post_id={enriched_event.post_id}")
+            logger.info("enrichment_event_created", extra={"post_id": enriched_event.post_id})
             
             # Публикация через event publisher
             from event_bus import EventPublisher

@@ -35,6 +35,16 @@ class PostTaggedEventV1(BaseEvent):
     latency_ms: Optional[int] = Field(None, description="Латентность тегирования в миллисекундах")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Дополнительные метаданные")
     
+    # Context7: Версионирование и анти-петля для retagging
+    trigger: Optional[str] = Field(
+        default="initial",
+        description="Триггер тегирования: initial (начальное), vision_retag (ретеггинг после Vision), manual (ручное)"
+    )
+    vision_version: Optional[str] = Field(
+        default=None,
+        description="Версия Vision анализа, которая использовалась при тегировании (например, 'vision@2025-01-29#p3')"
+    )
+    
     @staticmethod
     def compute_hash(tags: List[str]) -> str:
         """Вычисление хеша тегов для дедупликации."""

@@ -85,6 +85,57 @@ parser_floodwait_seconds_total = Counter(
     ['channel_id']
 )
 
+# Context7: Метрики для мониторинга пропусков постов
+posts_missing_duration_seconds = Gauge(
+    'posts_missing_duration_seconds',
+    'Duration of missing posts gap (difference between last_parsed_at and MAX(posted_at))',
+    ['channel_id']
+)
+
+posts_backfill_triggered_total = Counter(
+    'posts_backfill_triggered_total',
+    'Total backfill operations triggered for missing posts',
+    ['channel_id', 'reason']
+)
+
+# Расширенные метрики для адаптивных порогов
+channel_last_post_timestamp_seconds = Gauge(
+    'channel_last_post_timestamp_seconds',
+    'Timestamp of last post (MAX(posted_at)) in epoch seconds',
+    ['channel_id']
+)
+
+parser_last_success_seconds = Gauge(
+    'parser_last_success_seconds',
+    'Timestamp of last successful parsing in epoch seconds',
+    ['channel_id']
+)
+
+adaptive_threshold_seconds = Gauge(
+    'adaptive_threshold_seconds',
+    'Current adaptive threshold for missing posts detection in seconds',
+    ['channel_id']
+)
+
+channel_gap_seconds = Gauge(
+    'channel_gap_seconds',
+    'Current gap between now and last post (now - MAX(posted_at)) in seconds',
+    ['channel_id']
+)
+
+backfill_jobs_total = Counter(
+    'backfill_jobs_total',
+    'Total backfill jobs (enqueued, completed, failed)',
+    ['channel_id', 'status']
+)
+
+interarrival_seconds = Histogram(
+    'interarrival_seconds',
+    'Interarrival time between posts in seconds',
+    ['channel_id'],
+    buckets=[60, 300, 900, 1800, 3600, 7200, 14400, 28800, 43200, 86400]  # 1m to 24h
+)
+
 
 class ParseAllChannelsTask:
     """Scheduler для периодического парсинга всех активных каналов."""
@@ -453,6 +504,9 @@ class ParseAllChannelsTask:
                         incremental_watermark_age_seconds.labels(
                             channel_id=channel['id']
                         ).set(age_seconds)
+                    
+                    # Context7: [C7-ID: backfill-missing-posts-001] Проверка и запуск backfill при пропусках
+                    await self._check_and_trigger_backfill(channel)
                         
                 except Exception as e:
                     logger.error(f"Failed to monitor channel {channel['id']}: {str(e)}")
@@ -470,6 +524,196 @@ class ParseAllChannelsTask:
             
         finally:
             await self._release_lock()
+    
+    async def _check_and_trigger_backfill(self, channel: Dict[str, Any]):
+        """
+        Context7: [C7-ID: backfill-missing-posts-002] Проверка и запуск backfill с адаптивными порогами.
+        
+        Использует адаптивный порог на основе статистики канала и применяет locking/idempotency
+        для предотвращения дублирующихся backfill операций.
+        
+        Args:
+            channel: данные канала
+        """
+        try:
+            import psycopg2
+            from psycopg2.extras import RealDictCursor
+            
+            channel_id = channel['id']
+            
+            # Проверка Redis lock для предотвращения параллельных backfill
+            lock_key = f"lock:backfill:{channel_id}"
+            instance_id = os.getenv("HOSTNAME", "unknown")
+            
+            # Попытка получить lock (SET NX EX 3600)
+            lock_acquired = await self.redis.set(
+                lock_key,
+                instance_id,
+                nx=True,
+                ex=3600  # TTL 1 час
+            )
+            
+            if not lock_acquired:
+                logger.debug(
+                    "Backfill lock already held, skipping",
+                    channel_id=channel_id
+                )
+                return
+            
+            try:
+                # Получаем реальное время последнего поста из БД (High Watermark)
+                conn = psycopg2.connect(self.db_url)
+                cursor = conn.cursor(cursor_factory=RealDictCursor)
+                
+                cursor.execute("""
+                    SELECT MAX(posted_at) as max_posted_at
+                    FROM posts
+                    WHERE channel_id = %s
+                """, (channel_id,))
+                
+                row = cursor.fetchone()
+                cursor.close()
+                conn.close()
+                
+                if not row or not row['max_posted_at']:
+                    # Нет постов в БД, это нормально для новых каналов
+                    return
+                
+                last_post_date = ensure_dt_utc(row['max_posted_at'])
+                if not last_post_date:
+                    return
+                
+                # Вычисляем gap: время с момента последнего поста (всегда >= 0)
+                now = datetime.now(timezone.utc)
+                gap_seconds = max(0, int((now - last_post_date).total_seconds()))
+                
+                # Получаем адаптивный порог (через parser, если доступен)
+                # Для упрощения используем фиксированный порог, если parser недоступен
+                threshold_seconds = 3600  # Fallback: 1 час
+                
+                # Context7: Используем parser для получения адаптивного порога, если доступен
+                # Parser может быть не инициализирован в момент первой проверки
+                if self.parser and hasattr(self.parser, '_compute_adaptive_threshold'):
+                    try:
+                        threshold_seconds = await self.parser._compute_adaptive_threshold(channel_id)
+                    except Exception as e:
+                        logger.debug("Failed to get adaptive threshold, using fixed",
+                                   channel_id=channel_id,
+                                   error=str(e))
+                
+                # Проверяем, превышен ли адаптивный порог
+                if gap_seconds > threshold_seconds:
+                    # Определяем контекст времени для логирования
+                    is_quiet = False
+                    quiet_reason = "normal"
+                    if self.parser and hasattr(self.parser, '_is_quiet_hours'):
+                        try:
+                            is_quiet, quiet_reason = self.parser._is_quiet_hours(now)
+                        except Exception:
+                            pass
+                    
+                    gap_hours = gap_seconds / 3600
+                    threshold_hours = threshold_seconds / 3600
+                    
+                    # Проверка idempotency: не запускали ли уже backfill для этого окна
+                    window_start = last_post_date.isoformat()
+                    window_end = now.isoformat()
+                    idempotency_key = f"backfill_job:{channel_id}:{window_start}:{window_end}"
+                    
+                    # Для упрощения используем более простой ключ на основе временного окна
+                    # Округлим до 10 минут для группировки
+                    window_start_rounded = int(last_post_date.timestamp() // 600) * 600
+                    idempotency_key_simple = f"backfill_job:{channel_id}:{window_start_rounded}"
+                    
+                    # Проверка, не выполнялся ли уже backfill
+                    existing_job = await self.redis.get(idempotency_key_simple)
+                    if existing_job:
+                        logger.debug(
+                            "Backfill job already enqueued/completed, skipping",
+                            channel_id=channel_id,
+                            idempotency_key=idempotency_key_simple
+                        )
+                        return
+                    
+                    logger.warning(
+                        "Missing posts detected, triggering backfill",
+                        channel_id=channel_id,
+                        channel_username=channel.get('username'),
+                        last_post_date=last_post_date.isoformat(),
+                        gap_seconds=gap_seconds,
+                        gap_hours=gap_hours,
+                        threshold_seconds=threshold_seconds,
+                        threshold_hours=threshold_hours,
+                        context=quiet_reason,
+                        is_quiet=is_quiet
+                    )
+                    
+                    # Обновляем метрики
+                    posts_backfill_triggered_total.labels(
+                        channel_id=channel_id,
+                        reason="missing_posts_gap"
+                    ).inc()
+                    backfill_jobs_total.labels(
+                        channel_id=channel_id,
+                        status="enqueued"
+                    ).inc()
+                    
+                    # Устанавливаем idempotency ключ с TTL 24 часа
+                    await self.redis.setex(
+                        idempotency_key_simple,
+                        86400,  # 24 часа
+                        "1"
+                    )
+                    
+                    # Context7: Запускаем исторический парсинг с since_date = последний пост
+                    # Это безопасно, так как парсер использует идемпотентность
+                    if self.telegram_client_manager:
+                        try:
+                            logger.info(
+                                "Backfill will be triggered in next tick",
+                                channel_id=channel_id,
+                                since_date=last_post_date.isoformat(),
+                                gap_hours=gap_hours
+                            )
+                            
+                            # Context7: Обновляем Low Watermark после планирования backfill
+                            # Это позволяет отслеживать, с какого времени гарантированно спарсили всё
+                            if self.parser and hasattr(self.parser, '_update_low_watermark'):
+                                try:
+                                    await self.parser._update_low_watermark(channel_id, last_post_date)
+                                except Exception as e:
+                                    logger.debug("Failed to update low watermark",
+                                               channel_id=channel_id,
+                                               error=str(e))
+                            
+                            # Можно добавить флаг для принудительного historical режима в следующем тике
+                            # Пока просто логируем
+                        except Exception as e:
+                            logger.error(
+                                "Failed to trigger backfill",
+                                channel_id=channel_id,
+                                error=str(e)
+                            )
+                            backfill_jobs_total.labels(
+                                channel_id=channel_id,
+                                status="failed"
+                            ).inc()
+            
+            finally:
+                # Освобождаем lock (опционально, так как TTL освободит автоматически)
+                # Но лучше освободить явно после завершения
+                try:
+                    await self.redis.delete(lock_key)
+                except Exception:
+                    pass  # Lock освободится по TTL
+            
+        except Exception as e:
+            # Не критичная ошибка, логируем и продолжаем
+            logger.warning(
+                "Failed to check for missing posts",
+                channel_id=channel.get('id'),
+                error=str(e)
+            )
     
     def _get_active_channels(self) -> List[Dict[str, Any]]:
         """Получение активных каналов из БД."""

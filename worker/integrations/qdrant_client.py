@@ -62,8 +62,13 @@ class QdrantClient:
             logger.error("Qdrant ping failed", error=str(e))
             raise
     
-    async def ensure_collection(self, collection_name: str, vector_size: int = 1536):
-        """Создание коллекции если не существует."""
+    async def ensure_collection(self, collection_name: str, vector_size: int = 2048):
+        """
+        Создание коллекции если не существует.
+        
+        Context7: Дефолт 2048 для GigaChat Giga-Embeddings-instruct
+        Источник: https://gitverse.ru/GigaTeam/GigaEmbeddings
+        """
         try:
             if collection_name in self._collections_cache:
                 return
