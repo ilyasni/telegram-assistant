@@ -614,7 +614,8 @@ class AtomicDBSaver:
                     'is_legacy': post.get('is_legacy', False),
                     'noforwards': post.get('noforwards', False),
                     'invert_media': post.get('invert_media', False),
-                    'telegram_post_url': post.get('telegram_post_url', '')
+                    'telegram_post_url': post.get('telegram_post_url', ''),
+                    'grouped_id': post.get('grouped_id')  # Context7: ID альбома для дедупликации
                 }
                 prepared_posts.append(prepared_post)
             
@@ -630,7 +631,7 @@ class AtomicDBSaver:
                     views_count, forwards_count, reactions_count, replies_count,
                     is_pinned, is_edited, edited_at, post_author,
                     reply_to_message_id, reply_to_chat_id, via_bot_id, via_business_bot_id,
-                    is_silent, is_legacy, noforwards, invert_media, telegram_post_url
+                    is_silent, is_legacy, noforwards, invert_media, telegram_post_url, grouped_id
                 )
                 VALUES (
                     :id, :channel_id, :telegram_message_id, :content, :media_urls,
@@ -638,7 +639,7 @@ class AtomicDBSaver:
                     :views_count, :forwards_count, :reactions_count, :replies_count,
                     :is_pinned, :is_edited, :edited_at, :post_author,
                     :reply_to_message_id, :reply_to_chat_id, :via_bot_id, :via_business_bot_id,
-                    :is_silent, :is_legacy, :noforwards, :invert_media, :telegram_post_url
+                    :is_silent, :is_legacy, :noforwards, :invert_media, :telegram_post_url, :grouped_id
                 )
                 ON CONFLICT (channel_id, telegram_message_id)
                 DO NOTHING

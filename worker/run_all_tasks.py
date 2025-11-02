@@ -25,6 +25,7 @@ from tasks.indexing_task import IndexingTask
 from tasks.tag_persistence_task import TagPersistenceTask
 from tasks.crawl_trigger_task import CrawlTriggerTask
 from tasks.post_persistence_task import PostPersistenceWorker
+from tasks.retagging_task import RetaggingTask
 from run_all_tasks_vision_helper import get_s3_config_from_env, get_vision_config_from_env
 
 async def create_tagging_task():
@@ -81,6 +82,25 @@ async def create_post_persistence_task():
     worker = PostPersistenceWorker(redis_url=redis_url, database_url=database_url)
     await worker.initialize()
     await worker.start()
+
+async def create_retagging_task():
+    """Context7: Создание и запуск Retagging Task."""
+    try:
+        redis_url = os.getenv("REDIS_URL", "redis://redis:6379")
+        logger.info("Creating RetaggingTask instance")
+        task = RetaggingTask(redis_url)
+        logger.info("RetaggingTask instance created, calling start()")
+        await task.start()
+        # Context7: Не возвращаемся из start() - задачи работают в бесконечном цикле
+    except Exception as e:
+        logger.warning(
+            "RetaggingTask skipped",
+            error=str(e),
+            error_type=type(e).__name__,
+            error_repr=repr(e),
+            exc_info=True
+        )
+        raise
 
 async def create_vision_analysis_task():
     """Context7: Создание и запуск Vision Analysis Task."""
@@ -150,6 +170,16 @@ async def main():
     from ai_providers.embedding_service import embedding_requests_total, embedding_latency_seconds
     from tasks.tagging_task import tagging_processed_total
     from tasks.indexing_task import indexing_processed_total
+    # Context7: Импорт метрик ретеггинга для регистрации
+    try:
+        from tasks.retagging_task import (
+            retagging_processed_total,
+            retagging_duration_seconds,
+            retagging_dlq_total,
+            retagging_skipped_total
+        )
+    except ImportError:
+        logger.debug("RetaggingTask metrics not available (module may not be loaded)")
     
     # Context7: Инициализация метрик нулевыми значениями для экспорта в Prometheus
     # Метрики должны быть установлены хотя бы раз, чтобы Prometheus их увидел
@@ -258,6 +288,16 @@ async def main():
     supervisor.register_task(TaskConfig(
         name="vision_analysis",
         task_func=create_vision_analysis_task,
+        max_retries=5,
+        initial_backoff=1.0,
+        max_backoff=60.0,
+        backoff_multiplier=2.0
+    ))
+    
+    # Context7: Retagging Task (подписан на posts.vision.analyzed)
+    supervisor.register_task(TaskConfig(
+        name="retagging",
+        task_func=create_retagging_task,
         max_retries=5,
         initial_backoff=1.0,
         max_backoff=60.0,

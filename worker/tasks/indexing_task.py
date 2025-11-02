@@ -147,7 +147,7 @@ class IndexingTask:
             await self.event_consumer.start_consuming("posts.enriched", self._process_single_message)
             
         except Exception as e:
-            logger.error("Failed to start IndexingTask", error=str(e))
+            logger.error("Failed to start IndexingTask", extra={"error": str(e)})
             raise
     
     async def _process_backlog_once(self, stream_name: str) -> int:
@@ -275,7 +275,7 @@ class IndexingTask:
                         
                         # Пропускаем уже обработанные (идемпотентность)
                         if row and row[0] in ('completed', 'processing'):
-                            logger.debug(f"Skipping already processed post", post_id=post_id, status=row[0])
+                            logger.debug("Skipping already processed post", extra={"post_id": post_id, "status": row[0]})
                             continue
                         
                         # Обработка сообщения
@@ -353,19 +353,38 @@ class IndexingTask:
                 graph_status='pending'
             )
             
-            # Получение данных поста
-            post_data = await self._get_post_data(post_id)
+            # Context7: Получение данных поста с retry для обработки race condition
+            # События индексации могут прийти раньше, чем пост сохранен в БД
+            post_data = None
+            max_retries = 3
+            retry_delay = 1  # секунды
+            
+            for attempt in range(max_retries):
+                post_data = await self._get_post_data(post_id)
+                if post_data:
+                    break
+                
+                if attempt < max_retries - 1:
+                    logger.debug(
+                        "Post not found, retrying (race condition)",
+                        post_id=post_id,
+                        attempt=attempt + 1,
+                        max_retries=max_retries
+                    )
+                    await asyncio.sleep(retry_delay * (attempt + 1))  # Exponential backoff
+            
             if not post_data:
                 # Context7: [C7-ID: indexing-graceful-001] Graceful degradation для удалённых постов
                 # Посты, удалённые после публикации события, помечаем как skipped, а не failed
-                logger.info("Post not found, skipping indexing", 
+                logger.info("Post not found after retries, skipping indexing", 
                           post_id=post_id,
-                          reason="post_deleted_or_race_condition")
+                          reason="post_deleted_or_race_condition",
+                          retries=max_retries)
                 await self._update_indexing_status(
                     post_id=post_id,
                     embedding_status='skipped',
                     graph_status='skipped',
-                    error_message='Post not found - likely deleted after event publication'
+                    error_message='Post not found - likely deleted after event publication or persistent race condition'
                 )
                 # Context7: Помечаем пост как обработанный для избежания повторных попыток
                 await self._update_post_processed(post_id)
@@ -419,7 +438,7 @@ class IndexingTask:
             })
             
             indexing_processed_total.labels(status='success').inc()
-            logger.info("Post indexed successfully", post_id=post_id, vector_id=vector_id)
+            logger.info("Post indexed successfully", extra={"post_id": post_id, "vector_id": vector_id})
             
         except Exception as e:
             error_str = str(e)
@@ -519,7 +538,7 @@ class IndexingTask:
             return None
             
         except Exception as e:
-            logger.error("Failed to get post data", post_id=post_id, error=str(e))
+            logger.error("Failed to get post data", extra={"post_id": post_id, "error": str(e)})
             return None
     
     async def _generate_embedding(self, post_data: Dict[str, Any]) -> list:
@@ -789,7 +808,7 @@ class IndexingTask:
         try:
             channel_id = post_data.get('channel_id')
             if not channel_id:
-                logger.warning("No channel_id, skipping Neo4j indexing", post_id=post_id)
+                logger.warning("No channel_id, skipping Neo4j indexing", extra={"post_id": post_id})
                 return
             
             # Context7: Используем create_post_node из Neo4jClient
@@ -1040,12 +1059,11 @@ class IndexingTask:
             cursor.close()
             conn.close()
             
-            logger.debug("Updated posts.is_processed", post_id=post_id)
+            logger.debug("Updated posts.is_processed", extra={"post_id": post_id})
             
         except Exception as e:
             logger.warning("Failed to update posts.is_processed", 
-                         post_id=post_id, 
-                         error=str(e))
+                         extra={"post_id": post_id, "error": str(e)})
             # Не пробрасываем ошибку - это не критично для работы пайплайна
     
     async def stop(self):
@@ -1067,7 +1085,7 @@ class IndexingTask:
             logger.info("IndexingTask stopped")
             
         except Exception as e:
-            logger.error("Error stopping IndexingTask", error=str(e))
+            logger.error("Error stopping IndexingTask", extra={"error": str(e)})
     
     async def health_check(self) -> Dict[str, Any]:
         """Проверка здоровья indexing task."""
@@ -1090,7 +1108,7 @@ class IndexingTask:
             return health
             
         except Exception as e:
-            logger.error("Error in health check", error=str(e))
+            logger.error("Error in health check", extra={"error": str(e)})
             return {
                 'status': 'unhealthy',
                 'error': str(e)

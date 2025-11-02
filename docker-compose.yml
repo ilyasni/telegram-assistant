@@ -5,7 +5,9 @@ services:
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_MAX_CONNECTIONS: 200
+      # Context7 best practice: увеличен лимит соединений для self-hosted без pgbouncer
+      # TODO: настроить pgbouncer для долгосрочного решения
+      POSTGRES_MAX_CONNECTIONS: 500
     volumes:
       - supabase_data:/var/lib/postgresql/data
       - ./supabase/volumes/db/init:/docker-entrypoint-initdb.d
@@ -46,6 +48,9 @@ services:
       PGRST_DB_ANON_ROLE: anon
       PGRST_JWT_SECRET: ${JWT_SECRET}
       PGRST_DB_USE_LEGACY_GUCS: "false"
+      # Context7 best practice: ограничение пула соединений PostgREST
+      # По умолчанию PostgREST использует 10 соединений, но лучше ограничить явно
+      PGRST_DB_POOL: 10
     depends_on:
       - supabase-db
     networks:
@@ -75,7 +80,10 @@ services:
   supabase-studio:
     image: supabase/studio:latest
     environment:
-      # Basic configuration
+      # Basic configuration - гарантируем прослушивание на всех интерфейсах
+      HOST: "0.0.0.0"
+      PORT: "3000"
+      NEXT_TELEMETRY_DISABLED: "1"
       SUPABASE_URL: http://kong:8000
       SUPABASE_API_URL: http://kong:8000
       # Explicit Studio URLs to avoid localhost fallbacks
@@ -119,11 +127,16 @@ services:
     networks:
       - telegram-network
     healthcheck:
-      # Context7: health check для Supabase Studio - проверка HTTP ответа на корневой endpoint
-      # Используем простую проверку доступности сервера
-      test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:3000', {timeout: 2000}, (r) => {process.exit(r.statusCode < 500 ? 0 : 1)}).on('error', () => process.exit(1)).on('timeout', () => process.exit(1))\" || exit 1"]
+      # Context7 best practice: упрощённый и устойчивый HEAD-запрос
+      # Используем hostname контейнера (из /etc/hostname) для проверки через сетевой интерфейс
+      # HEAD быстрее и не требует body, node - самый портативный вариант
+      # Альтернатива: проверяем через сетевой интерфейс, который всегда доступен
+      test: [
+        "CMD-SHELL",
+        "node -e \"const http=require('http');const os=require('os');const iface=Object.values(os.networkInterfaces()).flat().find(i=>!i.internal&&i.family==='IPv4');const host=iface?iface.address:'127.0.0.1';const req=http.request({host:host,port:3000,method:'HEAD',path:'/'},r=>process.exit(r.statusCode<500?0:1));req.setTimeout(2000,()=>{req.destroy();process.exit(1)});req.on('error',()=>process.exit(1));req.end();\""
+      ]
       interval: 30s
-      timeout: 10s
+      timeout: 5s
       retries: 5
       start_period: 90s
     profiles:
@@ -446,6 +459,9 @@ services:
       AWS_SIGNATURE_VERSION: ${AWS_SIGNATURE_VERSION:-s3v4}
     volumes:
       - ./worker/config:/app/config:ro
+      # Context7: Mount worker tasks для разработки (hot reload)
+      - ./worker/tasks:/app/tasks:ro
+      - ./worker/event_bus.py:/app/event_bus.py:ro
       # Context7 best practice: монтируем timezone данные хоста
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
@@ -500,6 +516,9 @@ services:
       PARSER_LPA_MAX_AGE_HOURS: ${PARSER_LPA_MAX_AGE_HOURS:-48}
       PARSER_MAX_CONCURRENCY: ${PARSER_MAX_CONCURRENCY:-4}
       PARSER_RETRY_MAX: ${PARSER_RETRY_MAX:-3}
+      # Context7: Адаптивные пороги для предотвращения пропусков постов
+      FEATURE_ADAPTIVE_THRESHOLDS_ENABLED: ${FEATURE_ADAPTIVE_THRESHOLDS_ENABLED:-true}
+      PARSER_STATS_WINDOW_DAYS: ${PARSER_STATS_WINDOW_DAYS:-14}
       # Context7 best practice: отладка и логи
       PYTHONUNBUFFERED: 1
       PYTHONASYNCIODEBUG: 1

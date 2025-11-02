@@ -159,8 +159,21 @@ class CrawlTriggerTask:
                 urls = []
         trace_id = payload.get('trace_id', msg_id)
         
+        # Context7: Проверка trigger - обрабатываем все события, включая vision_retag
+        trigger = payload.get('trigger')
+        is_retagging = (trigger == "vision_retag")
+        
         # Проверка триггерных тегов
         has_trigger = any(tag in self.trigger_tags for tag in tags)
+        
+        # Context7: Логируем если это retagging для observability
+        if is_retagging:
+            logger.debug(
+                "Processing retagging event in CrawlTriggerTask",
+                post_id=post_id,
+                has_trigger_tags=has_trigger,
+                trace_id=trace_id
+            )
         
         if has_trigger:
             # Если нет URLs, генерируем заглушку для тестирования

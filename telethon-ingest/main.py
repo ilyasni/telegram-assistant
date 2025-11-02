@@ -558,7 +558,14 @@ async def run_scheduler_loop():
         media_processor = None
         try:
             import sys
-            parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+            # Context7: В Docker контейнере api и worker монтируются в /opt/telegram-assistant/
+            # Добавляем корень проекта в sys.path для импорта модулей
+            project_root = '/opt/telegram-assistant'
+            if project_root not in sys.path:
+                sys.path.insert(0, project_root)
+            
+            # Также добавляем локальный путь на случай dev окружения
+            parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
             if parent_dir not in sys.path:
                 sys.path.insert(0, parent_dir)
             

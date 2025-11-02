@@ -30,6 +30,12 @@ class PostParsedEventV1(BaseEvent):
     urls: List[str] = Field(default_factory=list, description="URL из поста")
     posted_at: datetime = Field(..., description="Время публикации в Telegram")
     
+    # Context7: Медиа-метаданные для связи с обработанными медиа файлами
+    media_sha256_list: List[str] = Field(
+        default_factory=list,
+        description="Список SHA256 хешей обработанных медиа файлов (для связи с media_objects)"
+    )
+    
     # Метаданные для дедупликации и enrichment
     content_hash: Optional[str] = Field(None, description="SHA256 хеш контента")
     link_count: int = Field(default=0, description="Количество ссылок в посте")

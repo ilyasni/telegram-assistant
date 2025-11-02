@@ -5,6 +5,7 @@ Context7 best practice: quota enforcement, emergency cleanup, LRU eviction
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Optional, Tuple, List
 from dataclasses import dataclass
@@ -269,24 +270,42 @@ class StorageQuotaService:
     ) -> QuotaCheckResult:
         """
         Проверка квоты перед загрузкой.
+        Context7: детальное логирование блокировок с метриками.
         
         Returns:
             QuotaCheckResult с allowed=True/False и reason
         """
+        import structlog
+        logger = structlog.get_logger()
+        
         size_gb = size_bytes / (1024 ** 3)
         
         # Получаем текущее использование
         usage = await self.get_bucket_usage()
         total_gb = usage["total_gb"]
         
-        # Проверка 1: Общий лимит
+        # Context7: Проверка 1: Общий лимит с emergency cleanup
         if total_gb + size_gb > self.limits["emergency_threshold_gb"]:
             # Триггерим emergency cleanup
             if self.enable_emergency_cleanup:
+                logger.info(
+                    "Triggering emergency cleanup",
+                    current_usage_gb=total_gb,
+                    emergency_threshold_gb=self.limits["emergency_threshold_gb"],
+                    size_gb=size_gb,
+                    content_type=content_type
+                )
+                cleanup_start = time.time()
                 await self.trigger_emergency_cleanup()
+                cleanup_duration = time.time() - cleanup_start
                 # Пересчитываем после cleanup
                 usage = await self.get_bucket_usage(force_refresh=True)
                 total_gb = usage["total_gb"]
+                logger.info(
+                    "Emergency cleanup completed",
+                    duration_seconds=cleanup_duration,
+                    new_usage_gb=total_gb
+                )
             
             # Если всё ещё превышает — блокируем
             if total_gb + size_gb > self.limits["total_gb"]:
@@ -294,6 +313,16 @@ class StorageQuotaService:
                     tenant_id=tenant_id,
                     reason="bucket_full"
                 ).inc()
+                logger.warning(
+                    "Quota check blocked upload - bucket full",
+                    tenant_id=tenant_id,
+                    content_type=content_type,
+                    size_bytes=size_bytes,
+                    size_gb=size_gb,
+                    current_usage_gb=total_gb,
+                    total_limit_gb=self.limits["total_gb"],
+                    remaining_gb=self.limits["total_gb"] - total_gb
+                )
                 return QuotaCheckResult(
                     allowed=False,
                     reason="bucket_full",
@@ -303,7 +332,7 @@ class StorageQuotaService:
         # Проверка 2: Tenant квота (упрощённая, нужна БД для точного tracking)
         # TODO: Реализовать через БД при наличии tenant usage tracking
         
-        # Проверка 3: Type квота
+        # Context7: Проверка 3: Type квота с детальным логированием
         type_limit = self.limits["quotas_by_type"][content_type]["max_gb"]
         type_usage = usage["by_type"].get(content_type, 0.0)
         
@@ -312,6 +341,16 @@ class StorageQuotaService:
                 tenant_id=tenant_id,
                 reason="type_limit"
             ).inc()
+            logger.warning(
+                "Quota check blocked upload - type limit exceeded",
+                tenant_id=tenant_id,
+                content_type=content_type,
+                size_bytes=size_bytes,
+                size_gb=size_gb,
+                type_usage_gb=type_usage,
+                type_limit_gb=type_limit,
+                remaining_gb=type_limit - type_usage
+            )
             return QuotaCheckResult(
                 allowed=False,
                 reason=f"{content_type}_limit",

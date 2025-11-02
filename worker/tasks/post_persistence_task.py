@@ -60,7 +60,7 @@ class PostPersistenceWorker:
             logger.info("PostPersistenceWorker initialized successfully")
             
         except Exception as e:
-            logger.error("Failed to initialize PostPersistenceWorker", error=str(e))
+            logger.error("Failed to initialize PostPersistenceWorker", extra={"error": str(e)})
             raise
     
     async def _ensure_consumer_group(self):
@@ -82,7 +82,7 @@ class PostPersistenceWorker:
                 handler_func=self._handle_post_parsed
             )
         except Exception as e:
-            logger.error("PostPersistenceWorker error", error=str(e))
+            logger.error("PostPersistenceWorker error", extra={"error": str(e)})
             raise
     
     async def _handle_post_parsed(self, event_data: Dict[str, Any]):
@@ -100,9 +100,9 @@ class PostPersistenceWorker:
             post_data = self._map_flat_parsed_to_post(parsed)
             async with self.db_pool.acquire() as conn:
                 await self._upsert_post(conn, post_data)
-            logger.info("post_persist_ok", post_id=post_data.get('id'))
+            logger.info("post_persist_ok", extra={"post_id": post_data.get('id')})
         except Exception as e:
-            logger.error("post_persist_failed", error=str(e))
+            logger.error("post_persist_failed", extra={"error": str(e)})
     
     async def _process_batch(self, messages: List):
         """Context7: Обработка batch с идемпотентностью."""
@@ -168,7 +168,7 @@ class PostPersistenceWorker:
             )
             
         except Exception as e:
-            logger.error("Failed to process batch", error=str(e))
+            logger.error("Failed to process batch", extra={"error": str(e)})
     
     async def _upsert_post(self, conn: asyncpg.Connection, post_data: Dict[str, Any]):
         """Context7: UPSERT поста с идемпотентностью."""
@@ -227,7 +227,7 @@ class PostPersistenceWorker:
             )
             
         except Exception as e:
-            logger.error("Failed to upsert post", post_id=post_data.get('id'), error=str(e))
+            logger.error("Failed to upsert post", extra={"post_id": post_data.get('id'), "error": str(e)})
             raise
 
     def _map_flat_parsed_to_post(self, fields: Dict[str, Any]) -> Dict[str, Any]:
@@ -322,7 +322,7 @@ class PostPersistenceWorker:
             )
             
         except Exception as e:
-            logger.error("Failed to upsert channel", channel_id=channel_data.get('id'), error=str(e))
+            logger.error("Failed to upsert channel", extra={"channel_id": channel_data.get('id'), "error": str(e)})
             raise
     
     async def _send_to_dlq(self, message_id: str, fields: Dict, error: str):
@@ -344,7 +344,7 @@ class PostPersistenceWorker:
             logger.warning("Message sent to DLQ", message_id=message_id)
             
         except Exception as e:
-            logger.error("Failed to send to DLQ", message_id=message_id, error=str(e))
+            logger.error("Failed to send to DLQ", extra={"message_id": message_id, "error": str(e)})
     
     async def stop(self):
         """Context7: Остановка worker."""
@@ -381,7 +381,7 @@ class PostPersistenceWorker:
             }
             
         except Exception as e:
-            logger.error("Health check failed", error=str(e))
+            logger.error("Health check failed", extra={"error": str(e)})
             return {
                 "status": "unhealthy",
                 "error": str(e),

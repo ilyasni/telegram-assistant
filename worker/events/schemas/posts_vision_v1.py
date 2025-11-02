@@ -159,6 +159,7 @@ class VisionAnalyzedEventV1(BaseEvent):
     Событие: Vision анализ завершён.
     
     Публикуется Vision Worker после успешного анализа медиа.
+    Context7: Включает версионирование для retagging логики.
     """
     
     # Event metadata (в BaseEvent)
@@ -176,6 +177,20 @@ class VisionAnalyzedEventV1(BaseEvent):
     
     # Vision результаты
     vision: VisionAnalysisResult = Field(..., description="Результаты Vision анализа")
+    
+    # Context7: Версионирование для retagging
+    vision_version: Optional[str] = Field(
+        default=None,
+        description="Версия Vision анализа (например, 'vision@2025-01-29#p3')"
+    )
+    features_hash: Optional[str] = Field(
+        default=None,
+        description="SHA256 hash признаков Vision для отслеживания изменений"
+    )
+    media_summary: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Сводка по медиа: faces, text, nsfw, etc."
+    )
     
     # Метрики
     analysis_duration_ms: int = Field(..., description="Длительность анализа в мс", ge=0)

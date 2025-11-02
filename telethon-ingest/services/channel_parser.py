@@ -66,6 +66,10 @@ class ParserConfig:
     
     # База данных
     db_url: str = os.getenv("DATABASE_URL", "postgresql://user:pass@localhost/db")
+    
+    # Адаптивные пороги и статистика
+    stats_window_days: int = int(os.getenv("PARSER_STATS_WINDOW_DAYS", "14"))
+    adaptive_thresholds_enabled: bool = os.getenv("FEATURE_ADAPTIVE_THRESHOLDS_ENABLED", "false").lower() == "true"
 
 # ============================================================================
 # CHANNEL PARSER
@@ -303,6 +307,26 @@ class ChannelParser:
             # ВСЕГДА обновляем для отслеживания последней попытки парсинга
             await self._update_last_parsed_at(channel_id, messages_processed)
             
+            # Context7: [C7-ID: monitoring-missing-posts-002] Мониторинг пропусков постов
+            # Сравниваем last_parsed_at с реальным временем последнего поста
+            await self._monitor_missing_posts(channel_id)
+            
+            # Context7: [C7-ID: adaptive-thresholds-003] Асинхронное обновление статистики интервалов
+            # Не блокируем основной поток, запускаем в фоне
+            if self.config.adaptive_thresholds_enabled and messages_processed > 0:
+                # Инвалидируем кеш статистики для пересчета при следующем запросе
+                # Это безопаснее, чем пересчитывать сразу, так как не блокирует парсинг
+                cache_key = f"interarrival_stats:{channel_id}"
+                try:
+                    await self.redis_client.delete(cache_key)
+                    logger.debug("Invalidated interarrival stats cache after parsing",
+                               channel_id=channel_id,
+                               messages_processed=messages_processed)
+                except Exception as e:
+                    logger.warning("Failed to invalidate stats cache",
+                                 channel_id=channel_id,
+                                 error=str(e))
+            
             processing_time = time.time() - start_time
             
             result = {
@@ -437,13 +461,367 @@ class ChannelParser:
                 pass
             return None
     
+    async def _get_high_watermark(self, channel_id: str) -> Optional[datetime]:
+        """
+        Context7: High Watermark - максимальное время последнего поста из БД.
+        
+        Это источник истины о реальном времени последнего поста в канале.
+        
+        Args:
+            channel_id: ID канала в БД
+        
+        Returns:
+            datetime последнего поста в UTC или None, если постов нет
+        """
+        return await self._get_last_post_date(channel_id)
+    
+    async def _get_low_watermark(self, channel_id: str) -> Optional[datetime]:
+        """
+        Context7: Low Watermark - время, с которого гарантированно спарсили всё.
+        
+        Хранится в Redis как последний успешный since_date после backfill.
+        Используется для определения границ гарантированно обработанного диапазона.
+        
+        Args:
+            channel_id: ID канала в БД
+        
+        Returns:
+            datetime low watermark в UTC или None, если не установлен
+        """
+        try:
+            watermark_key = f"low_watermark:{channel_id}"
+            watermark_raw = await self.redis_client.get(watermark_key)
+            if watermark_raw:
+                watermark_dt = ensure_dt_utc(watermark_raw)
+                if watermark_dt:
+                    logger.debug("Retrieved low watermark from Redis",
+                               channel_id=channel_id,
+                               low_watermark=watermark_dt.isoformat())
+                    return watermark_dt
+            return None
+        except Exception as e:
+            logger.warning("Failed to get low watermark from Redis",
+                         channel_id=channel_id,
+                         error=str(e))
+            return None
+    
+    async def _update_low_watermark(self, channel_id: str, watermark_dt: datetime):
+        """
+        Context7: Обновление Low Watermark после успешного backfill.
+        
+        Args:
+            channel_id: ID канала в БД
+            watermark_dt: datetime для установки как low watermark (в UTC)
+        """
+        try:
+            watermark_key = f"low_watermark:{channel_id}"
+            await self.redis_client.setex(
+                watermark_key,
+                86400,  # TTL 24 часа
+                watermark_dt.isoformat()
+            )
+            logger.debug("Updated low watermark",
+                       channel_id=channel_id,
+                       low_watermark=watermark_dt.isoformat())
+        except Exception as e:
+            logger.warning("Failed to update low watermark",
+                         channel_id=channel_id,
+                         error=str(e))
+    
+    async def _get_last_post_date(self, channel_id: str) -> Optional[datetime]:
+        """
+        Context7 best practice: Получение реального времени последнего поста из БД.
+        
+        Это более надёжный источник истины, чем last_parsed_at, так как отражает
+        фактическое время последнего сохранённого поста.
+        
+        Args:
+            channel_id: ID канала в БД
+        
+        Returns:
+            datetime последнего поста в UTC или None, если постов нет
+        """
+        try:
+            result = await self.db_session.execute(
+                text("""
+                    SELECT MAX(posted_at) as max_posted_at
+                    FROM posts
+                    WHERE channel_id = :channel_id
+                """),
+                {"channel_id": channel_id}
+            )
+            row = result.fetchone()
+            if row and row.max_posted_at:
+                # Конвертируем в UTC, если нужно
+                max_posted = ensure_dt_utc(row.max_posted_at)
+                if max_posted:
+                    logger.debug("Retrieved last post date from DB",
+                               channel_id=channel_id,
+                               last_post_date=max_posted.isoformat())
+                    return max_posted
+            return None
+        except Exception as e:
+            logger.warning("Failed to get last post date from DB",
+                         channel_id=channel_id,
+                         error=str(e))
+            return None
+    
+    async def _calculate_interarrival_stats(
+        self, 
+        channel_id: str, 
+        window_days: Optional[int] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Context7: [C7-ID: adaptive-thresholds-001] Расчет статистики интервалов между постами.
+        
+        Гибридный подход: Redis кеш + PostgreSQL для долгосрочной истории.
+        Вычисляет median, p95 и EWMA интервалов между постами за указанный период.
+        
+        Args:
+            channel_id: ID канала в БД
+            window_days: Период истории в днях (если None - из config)
+        
+        Returns:
+            Dict с ключами: median, p95, ewma, sample_count, window_days, calculated_at
+            или None при ошибке
+        """
+        if not self.config.adaptive_thresholds_enabled:
+            return None
+        
+        window_days = window_days or self.config.stats_window_days
+        cache_key = f"interarrival_stats:{channel_id}"
+        
+        try:
+            # Проверка Redis кеша
+            cached = await self.redis_client.get(cache_key)
+            if cached:
+                try:
+                    stats = json.loads(cached)
+                    logger.debug("Using cached interarrival stats",
+                               channel_id=channel_id,
+                               window_days=stats.get('window_days'))
+                    return stats
+                except (json.JSONDecodeError, KeyError) as e:
+                    logger.warning("Failed to parse cached stats, recalculating",
+                                 channel_id=channel_id,
+                                 error=str(e))
+            
+            # Расчет из PostgreSQL
+            # Используем f-string для window_days, так как это безопасное целое число из конфига
+            result = await self.db_session.execute(
+                text(f"""
+                    WITH post_times AS (
+                        SELECT 
+                            posted_at,
+                            LAG(posted_at) OVER (ORDER BY posted_at) as prev_posted_at
+                        FROM posts
+                        WHERE channel_id = :channel_id
+                          AND posted_at >= NOW() - INTERVAL '{window_days} days'
+                          AND posted_at IS NOT NULL
+                        ORDER BY posted_at DESC
+                        LIMIT 200
+                    ),
+                    intervals AS (
+                        SELECT 
+                            EXTRACT(EPOCH FROM (posted_at - prev_posted_at)) as interval_seconds
+                        FROM post_times
+                        WHERE prev_posted_at IS NOT NULL
+                          AND posted_at > prev_posted_at
+                    )
+                    SELECT 
+                        COUNT(*) as sample_count,
+                        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY interval_seconds) as median,
+                        PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY interval_seconds) as p95,
+                        AVG(interval_seconds) as avg_interval
+                    FROM intervals
+                """),
+                {"channel_id": channel_id}
+            )
+            
+            row = result.fetchone()
+            if not row or not row.sample_count or row.sample_count < 3:
+                # Недостаточно данных для статистики
+                logger.debug("Insufficient data for interarrival stats",
+                           channel_id=channel_id,
+                           sample_count=row.sample_count if row else 0)
+                return None
+            
+            # Расчет EWMA (Exponentially Weighted Moving Average)
+            # Для простоты используем avg как приближение EWMA
+            # В будущем можно добавить более точный расчет
+            ewma = float(row.avg_interval) if row.avg_interval else float(row.median)
+            
+            stats = {
+                "median": float(row.median) if row.median else None,
+                "p95": float(row.p95) if row.p95 else None,
+                "ewma": ewma,
+                "sample_count": int(row.sample_count),
+                "window_days": window_days,
+                "calculated_at": datetime.now(timezone.utc).isoformat()
+            }
+            
+            # Сохранение в Redis кеш с TTL 1 час
+            try:
+                await self.redis_client.setex(
+                    cache_key,
+                    3600,  # 1 час
+                    json.dumps(stats)
+                )
+                logger.debug("Calculated and cached interarrival stats",
+                           channel_id=channel_id,
+                           median=stats["median"],
+                           p95=stats["p95"],
+                           sample_count=stats["sample_count"])
+            except Exception as e:
+                logger.warning("Failed to cache interarrival stats",
+                             channel_id=channel_id,
+                             error=str(e))
+            
+            # Context7: Обновление метрики interarrival_seconds histogram
+            # Экспортируем p95 и median для наблюдаемости
+            try:
+                from tasks.parse_all_channels_task import interarrival_seconds
+                # Обновляем histogram с медианным значением
+                if stats.get("median"):
+                    interarrival_seconds.labels(channel_id=channel_id).observe(stats["median"])
+            except ImportError:
+                pass  # Метрики недоступны в этом контексте
+            except Exception as e:
+                logger.warning("Failed to update interarrival_seconds metric",
+                             channel_id=channel_id,
+                             error=str(e))
+            
+            return stats
+            
+        except Exception as e:
+            logger.warning("Failed to calculate interarrival stats",
+                         channel_id=channel_id,
+                         error=str(e))
+            return None
+    
+    def _is_quiet_hours(self, dt: datetime) -> Tuple[bool, str]:
+        """
+        Context7: Определение "quiet hours" (выходные и ночное время).
+        
+        Args:
+            dt: datetime в UTC
+        
+        Returns:
+            (is_quiet, reason) где reason может быть "weekend", "night_hours" или "normal"
+        """
+        # Конвертация в MSK (UTC+3)
+        msk_tz = timezone(timedelta(hours=3))
+        msk_time = dt.astimezone(msk_tz)
+        
+        hour = msk_time.hour
+        weekday = msk_time.weekday()  # 0=Monday, 6=Sunday
+        
+        # Выходные (суббота=5, воскресенье=6)
+        if weekday >= 5:
+            return (True, "weekend")
+        
+        # Ночные часы (22:00-08:00 MSK)
+        if hour >= 22 or hour < 8:
+            return (True, "night_hours")
+        
+        return (False, "normal")
+    
+    async def _compute_adaptive_threshold(self, channel_id: str) -> int:
+        """
+        Context7: [C7-ID: adaptive-thresholds-002] Вычисление адаптивного порога для определения пропусков.
+        
+        Использует статистику интервалов между постами канала и применяет коэффициенты
+        для quiet hours (выходные/ночь).
+        
+        Args:
+            channel_id: ID канала в БД
+        
+        Returns:
+            Порог в секундах (int)
+        """
+        if not self.config.adaptive_thresholds_enabled:
+            # Fallback: фиксированный порог 1 час
+            return 3600
+        
+        # Коэффициенты для quiet hours
+        HOURLY_COEF = {
+            "night": 1.5,      # 22:00-08:00 MSK
+            "day": 1.0,        # 08:00-22:00 MSK
+            "evening": 1.3     # 22:00-23:00 MSK (уже учтено в night)
+        }
+        
+        WEEKDAY_COEF = {
+            "weekdays": 1.0,   # Понедельник-Пятница
+            "weekend": 1.8     # Суббота-Воскресенье
+        }
+        
+        try:
+            # Получение статистики интервалов
+            stats = await self._calculate_interarrival_stats(channel_id)
+            
+            if not stats or not stats.get('p95'):
+                # Недостаточно данных - используем фиксированный порог
+                logger.debug("Insufficient stats, using fixed threshold",
+                           channel_id=channel_id)
+                return 3600  # 1 час
+            
+            p95 = stats['p95']
+            
+            # Базовый порог: p95 * 1.5, ограниченный 30мин-12ч
+            base_threshold = max(1800, min(43200, p95 * 1.5))  # clamp(p95 * 1.5, 30m, 12h)
+            
+            # Применение коэффициентов по времени (MSK)
+            now = datetime.now(timezone.utc)
+            is_quiet, quiet_reason = self._is_quiet_hours(now)
+            
+            # Определение коэффициента дня недели
+            msk_tz = timezone(timedelta(hours=3))
+            msk_time = now.astimezone(msk_tz)
+            weekday_coef = WEEKDAY_COEF["weekend"] if msk_time.weekday() >= 5 else WEEKDAY_COEF["weekdays"]
+            
+            # Определение коэффициента часа
+            hour = msk_time.hour
+            if hour >= 22 or hour < 8:
+                hour_coef = HOURLY_COEF["night"]
+            else:
+                hour_coef = HOURLY_COEF["day"]
+            
+            # Итоговый порог
+            adaptive_threshold = int(base_threshold * weekday_coef * hour_coef)
+            
+            # Финальное ограничение (не больше 24 часов)
+            adaptive_threshold = min(adaptive_threshold, 86400)
+            
+            logger.debug("Computed adaptive threshold",
+                       channel_id=channel_id,
+                       base_threshold=base_threshold,
+                       weekday_coef=weekday_coef,
+                       hour_coef=hour_coef,
+                       final_threshold=adaptive_threshold,
+                       quiet_reason=quiet_reason,
+                       p95=p95)
+            
+            return adaptive_threshold
+            
+        except Exception as e:
+            logger.warning("Failed to compute adaptive threshold, using fixed",
+                         channel_id=channel_id,
+                         error=str(e))
+            return 3600  # Fallback: 1 час
+    
     async def _get_since_date(
         self,
         channel: Dict[str, Any],
         mode: str
     ) -> datetime:
         """
-        Context7 best practice: Определение since_date с учётом режима и HWM.
+        Context7 best practice: Определение since_date с учётом режима, HWM и адаптивного overlap.
+        
+        Улучшения:
+        1. Использование MAX(posted_at) из БД как приоритетного источника (High Watermark)
+        2. Адаптивный overlap на основе статистики канала (clamp(p95 * 0.5, 2m, 10m))
+        3. Fallback на фиксированный overlap (5 минут) при отсутствии статистики
+        4. Мониторинг пропусков через метрики
         
         Args:
             channel: данные канала с last_parsed_at
@@ -453,58 +831,99 @@ class ChannelParser:
             datetime с timezone UTC
         """
         now = datetime.now(timezone.utc)
+        channel_id = channel['id']
         
         # Получение HWM из Redis (устойчивость к сбоям)
-        hwm_key = f"parse_hwm:{channel['id']}"
+        hwm_key = f"parse_hwm:{channel_id}"
         # Context7: get() - асинхронная функция в redis.asyncio
         hwm_raw = await self.redis_client.get(hwm_key)
         redis_hwm = ensure_dt_utc(hwm_raw) if hwm_raw else None
         
         if mode == "incremental":
+            # Context7: [C7-ID: incremental-since-date-fix-002] Приоритет MAX(posted_at) из БД
+            # Это реальное время последнего поста, более надёжно, чем last_parsed_at
+            last_post_date = await self._get_last_post_date(channel_id)
+            
+            # Выбираем наиболее свежую дату из доступных источников
+            candidates = []
+            if last_post_date:
+                candidates.append(('last_post_date', last_post_date))
+            
             # Опора на last_parsed_at или Redis HWM
             base = channel.get('last_parsed_at') or redis_hwm
             if base:
-                # Context7: Нормализуем base к UTC перед вычислением возраста
                 base_utc = ensure_dt_utc(base)
-                if not base_utc:
-                    logger.warning(f"Failed to normalize last_parsed_at to UTC, using fallback",
-                                 channel_id=channel['id'],
-                                 base=base)
-                    return now - timedelta(minutes=self.config.incremental_minutes)
-                
-                # Safeguard: если last_parsed_at слишком старый, форсим historical
-                age_hours = (now - base_utc).total_seconds() / 3600
-                if age_hours > self.config.lpa_max_age_hours:
-                    logger.warning(
-                        f"last_parsed_at too old, forcing historical mode: channel_id={channel['id']}, age_hours={age_hours}"
-                    )
-                    return now - timedelta(hours=self.config.historical_hours)
-                
-                # Context7: [C7-ID: incremental-since-date-fix-001] Исправлена логика since_date
-                # В incremental режиме используем именно last_parsed_at, чтобы не пропускать сообщения
-                # Использование max(base, now - incremental_minutes) приводило к пропуску сообщений
-                # между last_parsed_at и (now - incremental_minutes)
-                
-                # base_utc уже нормализован выше
-                if base_utc and base_utc > now:
-                    # Если last_parsed_at в будущем (возможна ошибка timezone), используем текущее время
-                    logger.warning(f"last_parsed_at is in future, using now instead",
-                                 channel_id=channel['id'],
-                                 last_parsed_at=base_utc,
-                                 now=now)
-                    return now - timedelta(minutes=self.config.incremental_minutes)
-                
-                logger.debug(f"Using last_parsed_at as since_date for incremental mode",
-                           channel_id=channel['id'],
-                           since_date=base_utc,
-                           now=now,
-                           age_minutes=(now - base_utc).total_seconds() / 60 if base_utc else None)
-                
-                return base_utc
-            else:
-                # Fallback: если нет last_parsed_at, берём incremental окно
-                # incremental_minutes используется только как fallback, когда нет last_parsed_at
+                if base_utc:
+                    candidates.append(('last_parsed_at', base_utc))
+            
+            if not candidates:
+                # Fallback: если нет данных, берём incremental окно
                 return now - timedelta(minutes=self.config.incremental_minutes)
+            
+            # Используем максимальную дату из всех источников
+            base_utc = max(candidates, key=lambda x: x[1])[1]
+            
+            # Проверка валидности
+            if not base_utc:
+                logger.warning("Failed to normalize base date to UTC, using fallback",
+                             channel_id=channel_id)
+                return now - timedelta(minutes=self.config.incremental_minutes)
+            
+            # Safeguard: если базовая дата слишком старая, форсим historical
+            age_hours = (now - base_utc).total_seconds() / 3600
+            if age_hours > self.config.lpa_max_age_hours:
+                logger.warning(
+                    "Base date too old, forcing historical mode",
+                    channel_id=channel_id,
+                    age_hours=age_hours
+                )
+                return now - timedelta(hours=self.config.historical_hours)
+            
+            # Проверка на будущее время
+            if base_utc > now:
+                logger.warning("Base date is in future, using now instead",
+                             channel_id=channel_id,
+                             base_date=base_utc.isoformat(),
+                             now=now.isoformat())
+                return now - timedelta(minutes=self.config.incremental_minutes)
+            
+            # Context7: [C7-ID: incremental-overlap-001] Адаптивный overlap на основе статистики
+            # Предотвращает пропуски из-за:
+            # - Race conditions (пост появился между парсингами)
+            # - Временных расхождений между Telegram API и системным временем
+            # - Задержек обработки сообщений в Telegram
+            
+            if self.config.adaptive_thresholds_enabled:
+                # Получаем статистику для адаптивного overlap
+                stats = await self._calculate_interarrival_stats(channel_id)
+                if stats and stats.get('p95'):
+                    # Overlap = clamp(p95 * 0.5, min=120, max=600) секунд
+                    overlap_seconds = max(120, min(600, int(stats['p95'] * 0.5)))
+                    overlap_minutes = overlap_seconds / 60.0
+                    logger.debug("Using adaptive overlap",
+                               channel_id=channel_id,
+                               overlap_seconds=overlap_seconds,
+                               p95=stats['p95'])
+                else:
+                    overlap_minutes = 5  # Fallback
+            else:
+                overlap_minutes = 5  # Фиксированный overlap
+            
+            since_date = base_utc - timedelta(seconds=int(overlap_minutes * 60))
+            
+            # Не даём since_date уйти в слишком далёкое прошлое
+            min_since_date = now - timedelta(hours=self.config.historical_hours)
+            if since_date < min_since_date:
+                since_date = min_since_date
+            
+            logger.debug("Calculated since_date with overlap",
+                       channel_id=channel_id,
+                       base_date=base_utc.isoformat(),
+                       since_date=since_date.isoformat(),
+                       overlap_minutes=overlap_minutes,
+                       age_minutes=(now - base_utc).total_seconds() / 60)
+            
+            return since_date
         
         elif mode == "historical":
             return now - timedelta(hours=self.config.historical_hours)
@@ -706,6 +1125,37 @@ class ChannelParser:
                                has_text=bool(message.text),
                                has_media=bool(message.media))
                 
+                # Context7: Дедупликация альбомов по grouped_id
+                grouped_id = getattr(message, 'grouped_id', None)
+                if grouped_id:
+                    # Проверка в Redis: был ли уже обработан этот альбом
+                    redis_key = f"seen:group:{user_id}:{channel_id}:{grouped_id}"
+                    try:
+                        # Используем SETNX для атомарной проверки и установки
+                        if hasattr(self.redis_client, 'set'):
+                            # Для sync redis
+                            already_seen = not self.redis_client.set(redis_key, "1", ex=86400, nx=True)
+                        else:
+                            # Для async redis
+                            already_seen = not await self.redis_client.set(redis_key, "1", ex=86400, nx=True)
+                        
+                        if already_seen:
+                            skipped += 1
+                            logger.debug(
+                                "Album already processed, skipping",
+                                grouped_id=grouped_id,
+                                channel_id=channel_id,
+                                message_id=message.id
+                            )
+                            continue
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to check album deduplication in Redis",
+                            grouped_id=grouped_id,
+                            error=str(e)
+                        )
+                        # Продолжаем обработку при ошибке Redis (graceful degradation)
+                
                 # Проверка идемпотентности
                 is_duplicate = await self._is_duplicate_message(message, channel_id, tenant_id)
                 if is_duplicate:
@@ -728,6 +1178,7 @@ class ChannelParser:
                 
                 # Context7: Обработка медиа через MediaProcessor (если доступен и сообщение содержит медиа)
                 media_files = []
+                
                 if self.media_processor and message.media:
                     try:
                         # Получаем TelegramClient из telegram_client_manager для MediaProcessor
@@ -738,6 +1189,7 @@ class ChannelParser:
                                 self.media_processor.telegram_client = telegram_client
                                 
                                 # Обработка медиа
+                                # Передаем channel_entity для обработки альбомов
                                 media_files = await self.media_processor.process_message_media(
                                     message=message,
                                     post_id=post_id,
@@ -749,6 +1201,8 @@ class ChannelParser:
                                     "Media processed",
                                     post_id=post_id,
                                     media_count=len(media_files),
+                                    is_album=bool(grouped_id and len(media_files) > 1),
+                                    grouped_id=grouped_id,
                                     channel_id=channel_id
                                 )
                             else:
@@ -778,6 +1232,8 @@ class ChannelParser:
                 if media_files:
                     post_data['media_files'] = media_files
                     post_data['media_count'] = len(media_files)
+                    # Context7: Извлекаем SHA256 для передачи в событие
+                    post_data['media_sha256_list'] = [mf.sha256 for mf in media_files]
                 
                 posts_data.append(post_data)
                 
@@ -858,6 +1314,107 @@ class ChannelParser:
                 logger.info("Atomic batch save successful", 
                           channel_id=channel_id,
                           inserted_count=inserted_count)
+                
+                # Context7: Сохранение альбомов в media_groups/media_group_items
+                # Собираем все посты альбома по grouped_id из сохранённых постов
+                try:
+                    from services.media_group_saver import save_media_group
+                    
+                    # Context7: Группируем посты по grouped_id из сохранённых данных
+                    # Используем grouped_id из posts_data, так как альбом может быть разбит на несколько сообщений
+                    albums_data: Dict[int, Dict[str, Any]] = {}
+                    
+                    for post_data in posts_data:
+                        grouped_id = post_data.get('grouped_id')
+                        if not grouped_id:
+                            continue
+                        
+                        if grouped_id not in albums_data:
+                            albums_data[grouped_id] = {
+                                'user_id': user_id,
+                                'channel_id': channel_id,
+                                'grouped_id': grouped_id,
+                                'post_ids': [],
+                                'media_types': [],
+                                'media_sha256s': [],
+                                'media_bytes': []
+                            }
+                        
+                        # Добавляем пост в альбом
+                        post_id = post_data.get('id')
+                        if post_id:
+                            albums_data[grouped_id]['post_ids'].append(post_id)
+                            
+                            # Добавляем информацию о медиа из post_data
+                            media_files = post_data.get('media_files', [])
+                            if media_files:
+                                for mf in media_files:
+                                    # Определяем тип медиа
+                                    mime = getattr(mf, 'mime_type', '')
+                                    media_type = (
+                                        'photo' if 'image' in mime else
+                                        'video' if 'video' in mime else
+                                        'document'
+                                    )
+                                    albums_data[grouped_id]['media_types'].append(media_type)
+                                    
+                                    sha256 = getattr(mf, 'sha256', None)
+                                    if sha256:
+                                        albums_data[grouped_id]['media_sha256s'].append(sha256)
+                                    
+                                    size_bytes = getattr(mf, 'size_bytes', None)
+                                    if size_bytes:
+                                        albums_data[grouped_id]['media_bytes'].append(size_bytes)
+                    
+                    # Сохраняем альбомы в БД
+                    for grouped_id, album_data in albums_data.items():
+                        # Фильтруем альбомы с более чем одним элементом
+                        if len(album_data['post_ids']) <= 1:
+                            continue  # Одиночное медиа, не альбом
+                        
+                        try:
+                            # Получаем реальные post_id из БД
+                            actual_post_ids = []
+                            for post_uuid in album_data['post_ids']:
+                                result = await self.db_session.execute(
+                                    text("SELECT id FROM posts WHERE id = :post_id"),
+                                    {"post_id": post_uuid}
+                                )
+                                row = result.fetchone()
+                                if row:
+                                    actual_post_ids.append(str(row.id))
+                            
+                            if len(actual_post_ids) > 1:  # Только для реальных альбомов
+                                group_id = await save_media_group(
+                                    db_session=self.db_session,
+                                    user_id=album_data['user_id'],
+                                    channel_id=album_data['channel_id'],
+                                    grouped_id=album_data['grouped_id'],
+                                    post_ids=actual_post_ids,
+                                    media_types=album_data['media_types'][:len(actual_post_ids)],  # Обрезаем до нужной длины
+                                    media_sha256s=album_data['media_sha256s'][:len(actual_post_ids)] if album_data['media_sha256s'] else None,
+                                    media_bytes=album_data['media_bytes'][:len(actual_post_ids)] if album_data['media_bytes'] else None,
+                                    trace_id=f"{tenant_id}:{channel_id}:{grouped_id}"
+                                )
+                                if group_id:
+                                    logger.info(
+                                        "Media group saved to DB",
+                                        group_id=group_id,
+                                        grouped_id=grouped_id,
+                                        items_count=len(actual_post_ids)
+                                    )
+                        except Exception as e:
+                            logger.warning(
+                                "Failed to save media group to DB",
+                                grouped_id=grouped_id,
+                                error=str(e),
+                                exc_info=True
+                            )
+                            # Не прерываем транзакцию - альбом можно сохранить позже
+                except ImportError as e:
+                    logger.debug("media_group_saver not available", error=str(e))
+                except Exception as e:
+                    logger.warning("Failed to save albums to DB", error=str(e))
                 
                 # Context7: Сохранение деталей forwards/reactions/replies и медиа в CAS для каждого поста
                 try:
@@ -1090,6 +1647,9 @@ class ChannelParser:
         # Context7: Генерация telegram_post_url
         telegram_post_url = f"https://t.me/c/{abs(tg_channel_id)}/{message.id}" if hasattr(message, 'id') else None
         
+        # Context7: Извлечение grouped_id для поддержки альбомов
+        grouped_id = getattr(message, 'grouped_id', None)
+        
         return {
             'id': post_id,
             'channel_id': channel_id,  # Context7: глобальные каналы без tenant_id
@@ -1107,7 +1667,8 @@ class ChannelParser:
             'forwards_count': forwards_count,
             'reactions_count': reactions_count,
             'replies_count': replies_count,
-            'telegram_post_url': telegram_post_url
+            'telegram_post_url': telegram_post_url,
+            'grouped_id': grouped_id  # Context7: ID альбома для дедупликации
         }
     
     def _extract_urls(self, text: str) -> List[str]:
@@ -1200,6 +1761,8 @@ class ChannelParser:
             text=post_data['content'] or "",
             urls=post_data.get('urls', []),
             posted_at=posted_at_iso,
+            # Context7: Добавляем media_sha256_list для связи с обработанными медиа
+            media_sha256_list=post_data.get('media_sha256_list', []),
             content_hash=post_data.get('content_hash'),
             link_count=len(post_data.get('urls', [])),
             tg_message_id=post_data.get('tg_message_id') or post_data.get('telegram_message_id'),
@@ -1390,6 +1953,101 @@ class ChannelParser:
                             channel_id=channel_id,
                             error=str(rollback_error))
             raise
+    
+    async def _monitor_missing_posts(self, channel_id: str):
+        """
+        Context7: [C7-ID: monitoring-missing-posts-002] Мониторинг пропусков постов с адаптивными порогами.
+        
+        Сравнивает текущее время с реальным временем последнего поста (MAX(posted_at))
+        и использует адаптивный порог на основе статистики канала.
+        Обновляет метрики для наблюдаемости.
+        
+        Args:
+            channel_id: ID канала в БД
+        """
+        try:
+            # Импортируем метрики из scheduler task
+            # Используем try/except, так как метрики могут быть недоступны
+            try:
+                from tasks.parse_all_channels_task import (
+                    channel_gap_seconds,
+                    adaptive_threshold_seconds,
+                    channel_last_post_timestamp_seconds,
+                    parser_last_success_seconds
+                )
+            except ImportError:
+                # Метрики недоступны в этом контексте, пропускаем
+                return
+            
+            now = datetime.now(timezone.utc)
+            
+            # Получаем High Watermark (реальное время последнего поста)
+            last_post_date = await self._get_high_watermark(channel_id)
+            
+            if not last_post_date:
+                # Нет постов в БД, это нормально для новых каналов
+                return
+            
+            # Вычисляем gap: время с момента последнего поста (всегда >= 0)
+            gap_seconds = max(0, int((now - last_post_date).total_seconds()))
+            
+            # Получаем адаптивный порог
+            threshold_seconds = await self._compute_adaptive_threshold(channel_id)
+            
+            # Обновляем метрики
+            channel_gap_seconds.labels(channel_id=channel_id).set(gap_seconds)
+            adaptive_threshold_seconds.labels(channel_id=channel_id).set(threshold_seconds)
+            channel_last_post_timestamp_seconds.labels(channel_id=channel_id).set(
+                int(last_post_date.timestamp())
+            )
+            
+            # Получаем last_parsed_at для метрики parser_last_success_seconds
+            result = await self.db_session.execute(
+                text("SELECT last_parsed_at FROM channels WHERE id = :channel_id"),
+                {"channel_id": channel_id}
+            )
+            row = result.fetchone()
+            if row and row.last_parsed_at:
+                last_parsed_utc = ensure_dt_utc(row.last_parsed_at)
+                if last_parsed_utc:
+                    parser_last_success_seconds.labels(channel_id=channel_id).set(
+                        int(last_parsed_utc.timestamp())
+                    )
+            
+            # Проверяем, превышен ли адаптивный порог
+            if gap_seconds > threshold_seconds:
+                # Определяем контекст времени
+                is_quiet, quiet_reason = self._is_quiet_hours(now)
+                gap_hours = gap_seconds / 3600
+                threshold_hours = threshold_seconds / 3600
+                
+                logger.warning(
+                    "Potential missing posts detected",
+                    channel_id=channel_id,
+                    last_post_date=last_post_date.isoformat(),
+                    gap_seconds=gap_seconds,
+                    gap_hours=gap_hours,
+                    threshold_seconds=threshold_seconds,
+                    threshold_hours=threshold_hours,
+                    context=quiet_reason,
+                    is_quiet=is_quiet
+                )
+            elif gap_seconds > 3600:
+                # Gap больше часа, но не превышает адаптивный порог - это нормально для quiet hours
+                is_quiet, quiet_reason = self._is_quiet_hours(now)
+                logger.debug(
+                    "Gap within acceptable threshold",
+                    channel_id=channel_id,
+                    gap_seconds=gap_seconds,
+                    threshold_seconds=threshold_seconds,
+                    context=quiet_reason
+                )
+            
+        except Exception as e:
+            # Не критичная ошибка, логируем и продолжаем
+            logger.warning("Failed to monitor missing posts",
+                         channel_id=channel_id,
+                         error=str(e))
     
     async def _update_channel_stats(self, channel_id: str, messages_count: int):
         """Обновление статистики канала."""

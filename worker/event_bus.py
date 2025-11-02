@@ -74,6 +74,9 @@ STREAMS = {
     'posts.indexed': 'stream:posts:indexed',
     'posts.crawl': 'stream:posts:crawl',  # Новый stream для crawling задач
     'posts.deleted': 'stream:posts:deleted',
+    # Context7: Vision и Retagging стримы
+    'posts.vision.uploaded': 'stream:posts:vision:uploaded',
+    'posts.vision.analyzed': 'stream:posts:vision:analyzed',
     # DLQ алиасы
     'posts.parsed.dlq': 'stream:posts:parsed:dlq',
     'posts.tagged.dlq': 'stream:posts:tagged:dlq',
@@ -81,6 +84,7 @@ STREAMS = {
     'posts.indexed.dlq': 'stream:posts:indexed:dlq',
     'posts.crawl.dlq': 'stream:posts:crawl:dlq',
     'posts.deleted.dlq': 'stream:posts:deleted:dlq',
+    'posts.vision.analyzed.dlq': 'stream:posts:vision:analyzed:dlq',
 }
 
 # DLQ стримы (legacy, для обратной совместимости)
@@ -89,7 +93,9 @@ DLQ_STREAMS = {
     'posts.tagged': 'stream:posts:tagged:dlq',
     'posts.enriched': 'stream:posts:enriched:dlq', 
     'posts.indexed': 'stream:posts:indexed:dlq',
-    'posts.deleted': 'stream:posts:deleted:dlq'
+    'posts.deleted': 'stream:posts:deleted:dlq',
+    # Context7: DLQ для Vision и Retagging
+    'posts.vision.analyzed': 'stream:posts:vision:analyzed:dlq',
 }
 
 # ============================================================================
@@ -446,8 +452,14 @@ class EventConsumer:
     
     async def _ensure_consumer_group(self, stream_name: str):
         """Создание consumer group и DLQ (идемпотентно)."""
+        # Context7: Валидация stream_name и получение ключей
+        if stream_name not in STREAMS:
+            error_msg = f"Stream name '{stream_name}' not found in STREAMS. Available: {list(STREAMS.keys())}"
+            logger.error(error_msg)
+            raise KeyError(error_msg)
+        
         stream_key = STREAMS[stream_name]
-        dlq_key = DLQ_STREAMS[stream_name]
+        dlq_key = DLQ_STREAMS.get(stream_name)  # DLQ может отсутствовать, это OK
         
         # Создание consumer group (идемпотентно)
         try:
@@ -457,23 +469,30 @@ class EventConsumer:
                 id='0', 
                 mkstream=True
             )
-            logger.info(f"Created consumer group {self.config.group_name} for {stream_name}")
+            logger.info(f"Created consumer group {self.config.group_name} for {stream_name} (key: {stream_key})")
         except redis.ResponseError as e:
             if "BUSYGROUP" in str(e):
-                logger.info(f"Consumer group {self.config.group_name} already exists")
+                logger.info(f"Consumer group {self.config.group_name} already exists for {stream_name}")
             else:
+                logger.error(f"Failed to create consumer group for {stream_name}: {e}")
                 raise
         
-        # Создание DLQ группы
-        try:
-            await self.client.client.xgroup_create(
-                dlq_key,
-                f"{self.config.group_name}-dlq",
-                id='0',
-                mkstream=True
-            )
-        except redis.ResponseError:
-            pass  # DLQ группа уже существует
+        # Создание DLQ группы (опционально, если есть DLQ конфигурация)
+        if dlq_key:
+            try:
+                await self.client.client.xgroup_create(
+                    dlq_key,
+                    f"{self.config.group_name}-dlq",
+                    id='0',
+                    mkstream=True
+                )
+                logger.debug(f"Created DLQ consumer group for {stream_name} (key: {dlq_key})")
+            except redis.ResponseError as e:
+                if "BUSYGROUP" in str(e):
+                    logger.debug(f"DLQ consumer group already exists for {stream_name}")
+                else:
+                    logger.warning(f"Failed to create DLQ consumer group for {stream_name}: {e}")
+                    # DLQ не критично, продолжаем работу
 
     async def consume_batch(self, stream_name: str, handler_func) -> int:
         """
@@ -486,8 +505,14 @@ class EventConsumer:
         Returns:
             int: Количество обработанных сообщений
         """
+        # Context7: Валидация stream_name перед использованием
+        if stream_name not in STREAMS:
+            error_msg = f"Stream name '{stream_name}' not found in STREAMS. Available: {list(STREAMS.keys())}"
+            logger.error(error_msg)
+            raise KeyError(error_msg)
+        
         stream_key = STREAMS[stream_name]
-        dlq_key = DLQ_STREAMS[stream_name]
+        dlq_key = DLQ_STREAMS.get(stream_name)  # DLQ может отсутствовать
         
         try:
             processed = 0
@@ -520,8 +545,12 @@ class EventConsumer:
         Returns:
             int: Количество обработанных pending сообщений
         """
+        # Context7: Валидация stream_name
+        if stream_name not in STREAMS:
+            raise KeyError(f"Stream name '{stream_name}' not found in STREAMS")
+        
         stream_key = STREAMS[stream_name]
-        dlq_key = DLQ_STREAMS[stream_name]
+        dlq_key = DLQ_STREAMS.get(stream_name)  # DLQ может отсутствовать
         
         try:
             # XAUTOCLAIM для получения зависших сообщений
@@ -561,8 +590,12 @@ class EventConsumer:
         Returns:
             int: Количество обработанных новых сообщений
         """
+        # Context7: Валидация stream_name
+        if stream_name not in STREAMS:
+            raise KeyError(f"Stream name '{stream_name}' not found in STREAMS")
+        
         stream_key = STREAMS[stream_name]
-        dlq_key = DLQ_STREAMS[stream_name]
+        dlq_key = DLQ_STREAMS.get(stream_name)  # DLQ может отсутствовать
         
         try:
             # XREADGROUP для новых сообщений
@@ -631,12 +664,46 @@ class EventConsumer:
             stream_name: Имя стрима для потребления
             handler_func: Функция-обработчик события
         """
+        # Context7: Валидация stream_name перед началом работы
+        if stream_name not in STREAMS:
+            error_msg = f"Stream name '{stream_name}' not found in STREAMS. Available: {list(STREAMS.keys())}"
+            logger.error(error_msg)
+            raise KeyError(error_msg)
+        
         self.running = True
         
-        # Создание consumer group
-        await self._ensure_consumer_group(stream_name)
-        
-        logger.info(f"Started consuming {stream_name} with group {self.config.group_name}")
+        # Context7: Создание consumer group с обработкой ошибок
+        try:
+            await self._ensure_consumer_group(stream_name)
+            logger.info(
+                f"Started consuming {stream_name} with group {self.config.group_name}",
+                extra={
+                    "stream_name": stream_name,
+                    "stream_key": STREAMS[stream_name],
+                    "group_name": self.config.group_name
+                }
+            )
+        except KeyError as ke:
+            logger.error(
+                "Stream name not found in _ensure_consumer_group",
+                extra={
+                    "stream_name": stream_name,
+                    "error": str(ke)
+                },
+                exc_info=True
+            )
+            raise
+        except Exception as e:
+            logger.error(
+                "Failed to ensure consumer group in consume_forever",
+                extra={
+                    "stream_name": stream_name,
+                    "error": str(e),
+                    "error_type": type(e).__name__
+                },
+                exc_info=True
+            )
+            raise
         
         # Счётчик для периодического обновления метрик
         iteration_count = 0

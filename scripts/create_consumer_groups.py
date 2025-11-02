@@ -22,8 +22,9 @@ CONSUMER_GROUPS = {
     'stream:posts:indexed': 'indexing_workers',
     'stream:posts:crawl': 'crawl_workers',
     'stream:posts:deleted': 'cleanup_workers',
-    'stream:posts:vision:uploaded': 'vision_workers',
-    'stream:posts:vision:analyzed': 'vision_analysis_workers',
+    # Context7: Унифицированное именование - используем stream:posts:vision (без :uploaded суффикса)
+    'stream:posts:vision': 'vision_workers',
+    'stream:posts:vision:analyzed': 'retagging_workers',  # Context7: RetaggingTask использует этот стрим
 }
 
 async def create_consumer_groups():
@@ -38,15 +39,17 @@ async def create_consumer_groups():
                 # XGROUP CREATE с MKSTREAM
                 await redis_client.xgroup_create(stream, group, id='$', mkstream=True)
                 logger.info("Consumer group created", stream=stream, group=group)
-            except redis.exceptions.ResponseError as e:
-                if "BUSYGROUP" in str(e):
-                    logger.info("Consumer group already exists", stream=stream, group=group)
-                else:
-                    logger.error("Failed to create consumer group", stream=stream, group=group, error=str(e))
-                    raise
             except Exception as e:
-                logger.error("Failed to create consumer group", stream=stream, group=group, error=str(e))
-                raise
+                error_str = str(e)
+                # Context7: Обработка разных типов ошибок Redis
+                if "BUSYGROUP" in error_str or "Consumer Group name already exists" in error_str:
+                    logger.info("Consumer group already exists", stream=stream, group=group)
+                elif "no such key" in error_str.lower() or "NOGROUP" in error_str:
+                    # Stream не существует, но mkstream должен создать - это странно
+                    logger.warning("Stream may not exist yet", stream=stream, error=error_str)
+                else:
+                    logger.error("Failed to create consumer group", stream=stream, group=group, error=error_str)
+                    raise
         
         logger.info("All consumer groups created successfully")
         
@@ -54,7 +57,7 @@ async def create_consumer_groups():
         logger.error("Failed to create consumer groups", error=str(e))
         raise
     finally:
-        await redis_client.close()
+        await redis_client.aclose()  # Context7: используем aclose() вместо deprecated close()
 
 async def check_consumer_groups():
     """Проверка существования consumer groups."""
@@ -74,19 +77,18 @@ async def check_consumer_groups():
                 else:
                     logger.warning("Consumer group missing", stream=stream, group=group)
                     
-            except redis.exceptions.ResponseError as e:
-                if "no such key" in str(e).lower():
-                    logger.warning("Stream does not exist", stream=stream)
-                else:
-                    logger.error("Failed to check consumer group", stream=stream, group=group, error=str(e))
             except Exception as e:
-                logger.error("Failed to check consumer group", stream=stream, group=group, error=str(e))
+                error_str = str(e)
+                if "no such key" in error_str.lower() or "NOGROUP" in error_str:
+                    logger.warning("Stream does not exist or group not found", stream=stream, group=group)
+                else:
+                    logger.error("Failed to check consumer group", stream=stream, group=group, error=error_str)
         
     except Exception as e:
         logger.error("Failed to check consumer groups", error=str(e))
         raise
     finally:
-        await redis_client.close()
+        await redis_client.aclose()  # Context7: используем aclose() вместо deprecated close()
 
 async def main():
     """Главная функция."""
