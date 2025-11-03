@@ -184,8 +184,11 @@ class TelegramIngestionService:
                 for channel in channels:
                     try:
                         # Получение объекта канала по username или tg_channel_id
+                        # Context7: [C7-ID: username-normalization-002] Нормализация username перед использованием
+                        # Убираем @ из начала username, так как Telethon ожидает username без @
                         if channel['username']:
-                            entity = await self.client.get_entity(channel['username'])
+                            clean_username = channel['username'].lstrip('@')
+                            entity = await self.client.get_entity(clean_username)
                         elif channel['tg_channel_id']:
                             entity = await self.client.get_entity(int(channel['tg_channel_id']))
                         else:

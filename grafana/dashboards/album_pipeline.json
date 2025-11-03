@@ -1,7 +1,11 @@
 {
   "dashboard": {
     "title": "Album Pipeline Monitoring",
-    "tags": ["albums", "pipeline", "monitoring"],
+    "tags": [
+      "albums",
+      "pipeline",
+      "monitoring"
+    ],
     "timezone": "browser",
     "schemaVersion": 38,
     "version": 1,
@@ -11,11 +15,21 @@
         "id": 1,
         "title": "Albums Parsed Rate",
         "type": "stat",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus",
+          "name": "Prometheus"
+        },
         "targets": [
           {
             "expr": "rate(albums_parsed_total[5m])",
             "refId": "A",
-            "legendFormat": "{{status}}"
+            "legendFormat": "{{status}}",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "prometheus",
+              "name": "Prometheus"
+            }
           }
         ],
         "fieldConfig": {
@@ -24,17 +38,32 @@
             "decimals": 2
           }
         },
-        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 0,
+          "y": 0
+        }
       },
       {
         "id": 2,
         "title": "Albums Assembled Rate",
         "type": "stat",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus",
+          "name": "Prometheus"
+        },
         "targets": [
           {
             "expr": "rate(albums_assembled_total[5m])",
             "refId": "A",
-            "legendFormat": "{{status}}"
+            "legendFormat": "{{status}}",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "prometheus",
+              "name": "Prometheus"
+            }
           }
         ],
         "fieldConfig": {
@@ -43,22 +72,42 @@
             "decimals": 2
           }
         },
-        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 12,
+          "y": 0
+        }
       },
       {
         "id": 3,
         "title": "Album Assembly Lag (p95)",
         "type": "graph",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus",
+          "name": "Prometheus"
+        },
         "targets": [
           {
             "expr": "histogram_quantile(0.95, rate(album_assembly_lag_seconds_bucket[5m]))",
             "refId": "A",
-            "legendFormat": "p95 lag"
+            "legendFormat": "p95 lag",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "prometheus",
+              "name": "Prometheus"
+            }
           },
           {
             "expr": "histogram_quantile(0.50, rate(album_assembly_lag_seconds_bucket[5m]))",
             "refId": "B",
-            "legendFormat": "p50 lag"
+            "legendFormat": "p50 lag",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "prometheus",
+              "name": "Prometheus"
+            }
           }
         ],
         "fieldConfig": {
@@ -67,17 +116,32 @@
             "decimals": 1
           }
         },
-        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 0,
+          "y": 8
+        }
       },
       {
         "id": 4,
         "title": "Albums in Progress",
         "type": "stat",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus",
+          "name": "Prometheus"
+        },
         "targets": [
           {
             "expr": "count(album_items_count_gauge{status=\"pending\"})",
             "refId": "A",
-            "legendFormat": "Albums pending"
+            "legendFormat": "Albums pending",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "prometheus",
+              "name": "Prometheus"
+            }
           }
         ],
         "fieldConfig": {
@@ -86,17 +150,32 @@
             "decimals": 0
           }
         },
-        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8}
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 12,
+          "y": 8
+        }
       },
       {
         "id": 5,
         "title": "Album Items Count (by Status)",
         "type": "graph",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus",
+          "name": "Prometheus"
+        },
         "targets": [
           {
             "expr": "sum(album_items_count_gauge) by (status)",
             "refId": "A",
-            "legendFormat": "{{status}}"
+            "legendFormat": "{{status}}",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "prometheus",
+              "name": "Prometheus"
+            }
           }
         ],
         "fieldConfig": {
@@ -105,17 +184,32 @@
             "decimals": 0
           }
         },
-        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 16}
+        "gridPos": {
+          "h": 8,
+          "w": 24,
+          "x": 0,
+          "y": 16
+        }
       },
       {
         "id": 6,
         "title": "Album Aggregation Duration (p95)",
         "type": "graph",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus",
+          "name": "Prometheus"
+        },
         "targets": [
           {
             "expr": "histogram_quantile(0.95, rate(album_aggregation_duration_ms_bucket[5m]))",
             "refId": "A",
-            "legendFormat": "p95 aggregation duration"
+            "legendFormat": "p95 aggregation duration",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "prometheus",
+              "name": "Prometheus"
+            }
           }
         ],
         "fieldConfig": {
@@ -124,17 +218,32 @@
             "decimals": 0
           }
         },
-        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24}
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 0,
+          "y": 24
+        }
       },
       {
         "id": 7,
         "title": "Album Vision Summary Size",
         "type": "graph",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus",
+          "name": "Prometheus"
+        },
         "targets": [
           {
             "expr": "histogram_quantile(0.95, rate(album_vision_summary_size_bytes_bucket[5m]))",
             "refId": "A",
-            "legendFormat": "p95 size"
+            "legendFormat": "p95 size",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "prometheus",
+              "name": "Prometheus"
+            }
           }
         ],
         "fieldConfig": {
@@ -143,14 +252,24 @@
             "decimals": 0
           }
         },
-        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24}
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 12,
+          "y": 24
+        }
       },
       {
         "id": 8,
         "title": "Active Alerts",
         "type": "alertlist",
         "targets": [],
-        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 32}
+        "gridPos": {
+          "h": 8,
+          "w": 24,
+          "x": 0,
+          "y": 32
+        }
       }
     ],
     "time": {
@@ -161,13 +280,20 @@
       "list": [
         {
           "name": "Album Alerts",
-          "datasource": "Prometheus",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus",
+            "name": "Prometheus"
+          },
           "enable": true,
           "iconColor": "red",
-          "tags": ["album"]
+          "tags": [
+            "album"
+          ]
         }
       ]
-    }
+    },
+    "uid": "album-pipeline",
+    "id": null
   }
 }
-

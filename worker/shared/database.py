@@ -39,13 +39,30 @@ class Tenant(Base):
     # channels УДАЛЕНА - каналы теперь глобальные
 
 
+class Identity(Base):
+    """Глобальная личность (Telegram-пользователь)."""
+    __tablename__ = "identities"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    telegram_id = Column(BigInteger, unique=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    meta = Column(JSON, default={})
+
+    # Relationships
+    memberships = relationship("User", back_populates="identity")
+
+
 class User(Base):
     """Модель пользователя."""
     __tablename__ = "users"
     
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False)
-    telegram_id = Column(BigInteger, unique=True, nullable=False)
+    # Context7: telegram_id НЕ уникален в users (может повторяться в разных tenants)
+    # Уникальность гарантируется через identities.telegram_id + (tenant_id, identity_id) UNIQUE
+    telegram_id = Column(BigInteger, nullable=False)  # Dual-write для обратной совместимости
+    # Context7: переход к модели Membership — добавляем ссылку на Identity (dual-read/dual-write)
+    identity_id = Column(UUID(as_uuid=True), ForeignKey("identities.id"), nullable=False)
     username = Column(String(255))
     first_name = Column(String(255))
     last_name = Column(String(255))
@@ -56,8 +73,14 @@ class User(Base):
     
     # Relationships
     tenant = relationship("Tenant", back_populates="users")
+    identity = relationship("Identity", back_populates="memberships")
     channel_subscriptions = relationship("UserChannel", back_populates="user")
     group_subscriptions = relationship("UserGroup", back_populates="user")
+
+    __table_args__ = (
+        Index("ix_users_tenant", "tenant_id"),
+        Index("ix_users_identity", "identity_id"),
+    )
 
 
 class Channel(Base):

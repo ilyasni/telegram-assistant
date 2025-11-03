@@ -112,7 +112,7 @@ async def manual_parse_channel(
                     c.tg_channel_id,
                     c.last_parsed_at
                 FROM channels c
-                WHERE c.username = :username AND c.is_active = true
+                WHERE LTRIM(c.username, '@') = LTRIM(:username, '@') AND c.is_active = true
             """),
             {"username": username}
         )

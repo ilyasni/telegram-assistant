@@ -180,8 +180,8 @@ async def qr_start(body: QrStart, request: Request):
     AUTH_QR_START.labels(tenant_id=tenant_id).inc()
     token = body.session_token or issue_session_token(tenant_id)
 
-    # Создаём запись статуса в Redis (её подхватит telethon-ingest)
-    key = f"tg:qr:session:{tenant_id}"
+    # Context7: Создаём запись статуса в Redis с единым префиксом t:{tenant}:qr:session
+    key = f"t:{tenant_id}:qr:session"
     logger.info("Creating QR session key", key=key, tenant_id=tenant_id)
     
     session_data = {
@@ -235,7 +235,8 @@ async def qr_status_post(body: dict):
         logger.error("Failed to decode session token", error=str(e))
         raise HTTPException(status_code=400, detail="invalid token")
     
-    key = f"tg:qr:session:{tenant_id}"
+    # Context7: Единый префикс t:{tenant}:qr:session
+    key = f"t:{tenant_id}:qr:session"
     data = await redis_client.hgetall(key)
     if not data:
         raise HTTPException(status_code=404, detail="not found or expired")
@@ -259,7 +260,7 @@ async def qr_sse(token: str):
             try:
                 payload = decode_session_token(token)
                 tenant_id = _extract_tenant_id(payload)
-                key = f"tg:qr:session:{tenant_id}"
+                key = f"t:{tenant_id}:qr:session"
                 # Context7 best practice: используем async Redis операции
                 # с decode_responses=True все ключи и значения уже декодированы в строки
                 data = await redis_client.hgetall(key)
@@ -290,7 +291,8 @@ async def qr_cancel(token: str):
     except:
         raise HTTPException(status_code=400, detail="invalid token")
     
-    key = f"tg:qr:session:{tenant_id}"
+    # Context7: Единый префикс t:{tenant}:qr:session
+    key = f"t:{tenant_id}:qr:session"
     if not await redis_client.exists(key):
         raise HTTPException(status_code=404, detail="not found or expired")
     await redis_client.hset(key, mapping={"status": "cancelled"})
@@ -308,7 +310,8 @@ async def qr_png(session_id: str):
     except:
         raise HTTPException(status_code=400, detail="invalid session")
     
-    key = f"tg:qr:session:{tenant_id}"
+    # Context7: Единый префикс t:{tenant}:qr:session
+    key = f"t:{tenant_id}:qr:session"
     if not await redis_client.exists(key):
         raise HTTPException(status_code=404, detail="not found or expired")
     

@@ -20,11 +20,11 @@ from crypto_utils import encrypt_session
 
 logger = structlog.get_logger()
 
-# Context7 best practice: Prometheus метрики для QR-авторизации
-AUTH_QR_PUBLISHED = Counter("auth_qr_published_total", "QR URL published")
-AUTH_QR_EXPIRED = Counter("auth_qr_expired_total", "QR session expired")
-AUTH_QR_SUCCESS = Counter("auth_qr_success_total", "QR session authorized")
-AUTH_QR_FAIL = Counter("auth_qr_fail_total", "QR session failed")
+# Context7 best practice: Prometheus метрики для QR-авторизации (с multi-tenant лейблами)
+AUTH_QR_PUBLISHED = Counter("auth_qr_published_total", "QR URL published", ["tenant_id"])
+AUTH_QR_EXPIRED = Counter("auth_qr_expired_total", "QR session expired", ["tenant_id"])
+AUTH_QR_SUCCESS = Counter("auth_qr_success_total", "QR session authorized", ["tenant_id"])
+AUTH_QR_FAIL = Counter("auth_qr_fail_total", "QR session failed", ["tenant_id"])
 
 # Context7 best practice: Telethon метрики
 FLOODWAIT_TOTAL = Counter("telethon_floodwait_total", "FloodWait events", ["reason", "seconds"])
@@ -47,8 +47,9 @@ class QrAuthService:
         logger.info("QR auth loop started")
         while self.running:
             try:
-                # Найти pending сессии
-                keys_found = list(self._scan_keys("tg:qr:session:"))
+                # Context7: Сканируем QR сессии с единым префиксом t:{tenant}:qr:session
+                # Поддерживаем оба формата для обратной совместимости
+                keys_found = list(self._scan_keys("t:")) + list(self._scan_keys("tg:qr:session:"))
                 logger.debug("Scanning for QR sessions", keys_count=len(keys_found))
                 
                 for key in keys_found:
@@ -105,7 +106,8 @@ class QrAuthService:
                                     logger.debug("Skipping validation for recent session", key=key, tenant_id=tenant_id)
                                     # Context7: ensure backfill to ingest Redis key if missing
                                     try:
-                                        ingest_key = f"telegram:session:{tenant_id}"
+                                        # Context7: Ключ сессии для ingest с префиксом t:{tenant}:session
+                                        ingest_key = self._get_session_key(tenant_id)
                                         if not self.redis_client.exists(ingest_key):
                                             ss = self.redis_client.hget(key, "session_string")
                                             if ss:
@@ -133,7 +135,8 @@ class QrAuthService:
                     if not tenant_id:
                         logger.warning("Tenant id missing in session; skipping", key=key)
                         continue
-                    lock_key = f"tg:qr:lock:{tenant_id}"
+                    # Context7: Блокировка с единым префиксом t:{tenant}:lock:qr
+                    lock_key = self._get_lock_key(tenant_id)
                     got_lock = self.redis_client.set(lock_key, "1", nx=True, ex=600)
                     if not got_lock:
                         logger.debug("Lock busy, skipping", key=key, lock_key=lock_key)
@@ -159,6 +162,10 @@ class QrAuthService:
         self.running = False
 
     def _scan_keys(self, prefix: str):
+        """
+        Context7: Сканирование ключей с поддержкой multi-tenant префиксов.
+        Поддерживает как старый формат (tg:qr:session:*), так и новый (t:{tenant}:qr:session:*).
+        """
         cursor = 0
         while True:
             cursor, keys = self.redis_client.scan(cursor=cursor, match=f"{prefix}*")
@@ -166,6 +173,18 @@ class QrAuthService:
                 yield k.decode() if isinstance(k, (bytes, bytearray)) else k
             if cursor == 0:
                 break
+    
+    def _get_qr_session_key(self, tenant_id: str) -> str:
+        """Context7: Генерация ключа QR сессии с единым префиксом t:{tenant}:qr:session."""
+        return f"t:{tenant_id}:qr:session"
+    
+    def _get_session_key(self, tenant_id: str) -> str:
+        """Context7: Генерация ключа Telegram сессии для ingest с префиксом t:{tenant}:session."""
+        return f"t:{tenant_id}:session"
+    
+    def _get_lock_key(self, tenant_id: str) -> str:
+        """Context7: Генерация ключа блокировки с префиксом t:{tenant}:lock:qr."""
+        return f"t:{tenant_id}:lock:qr"
 
     async def _check_existing_session(self, tenant_id: str) -> Optional[dict]:
         """Context7 best practice: проверка существующей активной сессии с валидацией."""
@@ -337,21 +356,22 @@ class QrAuthService:
                     "telegram_user_id": str(telegram_user_id)
                 })
                 self.redis_client.expire(redis_key, 3600)
-                # Context7: публикуем StringSession в единый ключ для ingest
+                # Context7: публикуем StringSession в единый ключ для ingest с префиксом t:{tenant}:session
                 try:
-                    self.redis_client.set(f"telegram:session:{tenant_id}", session_string, ex=86400)
+                    session_key = self._get_session_key(tenant_id)
+                    self.redis_client.set(session_key, session_string, ex=86400)
                 except Exception:
                     pass
-                AUTH_QR_SUCCESS.inc()
+                AUTH_QR_SUCCESS.labels(tenant_id=tenant_id or "unknown").inc()
             else:
                 logger.error("Failed to save existing session_string", tenant_id=tenant_id)
                 self.redis_client.hset(redis_key, "status", "failed")
-                AUTH_QR_FAIL.inc()
+                AUTH_QR_FAIL.labels(tenant_id=tenant_id or "unknown").inc()
                 
         except Exception as e:
             logger.error("Failed to process existing session_string", tenant_id=tenant_id, error=str(e))
             self.redis_client.hset(redis_key, "status", "failed")
-            AUTH_QR_FAIL.inc()
+            AUTH_QR_FAIL.labels(tenant_id=tenant_id or "unknown").inc()
 
     async def _handle_qr_login(self, redis_key: str, tenant_id: str):
         logger.info("Starting QR login", tenant_id=tenant_id, key=redis_key)
@@ -377,13 +397,14 @@ class QrAuthService:
                 "session_string": session_string or ""
             })
             self.redis_client.expire(redis_key, 3600)
-            # Context7: публикуем StringSession в единый ключ для ingest
+            # Context7: публикуем StringSession в единый ключ для ingest с префиксом t:{tenant}:session
             try:
                 if session_string:
-                    self.redis_client.set(f"telegram:session:{tenant_id}", session_string, ex=86400)
+                    session_key = self._get_session_key(tenant_id)
+                    self.redis_client.set(session_key, session_string, ex=86400)
             except Exception:
                 pass
-            AUTH_QR_SUCCESS.inc()
+            AUTH_QR_SUCCESS.labels(tenant_id=tenant_id or "unknown").inc()
             return
         
         # Context7 best practice: обработка failed сессий с session_string
@@ -405,6 +426,8 @@ class QrAuthService:
         self.redis_client.hset(redis_key, "status", "in_progress")
         logger.debug("QR session marked as in_progress", tenant_id=tenant_id, key=redis_key)
         
+        # Context7: Используем единое мастер-приложение для всех пользователей
+        # Все tenants используют одну пару api_id/api_hash, сессии различаются по StringSession
         client = TelegramClient(
             StringSession(), 
             settings.master_api_id, 
@@ -445,7 +468,7 @@ class QrAuthService:
             self.redis_client.expire(redis_key, QR_TTL_SECONDS)
             
             logger.info("QR published", tenant_id=tenant_id, url=qr_login.url, ttl=QR_TTL_SECONDS)
-            AUTH_QR_PUBLISHED.inc()
+            AUTH_QR_PUBLISHED.labels(tenant_id=tenant_id or "unknown").inc()
             QR_SESSION_TOTAL.labels(status="created").inc()
             
             # Ожидание авторизации с timeout
@@ -454,7 +477,7 @@ class QrAuthService:
             except asyncio.TimeoutError:
                 self.redis_client.hset(redis_key, "status", "expired")
                 logger.warning("QR login timeout", tenant_id=tenant_id)
-                AUTH_QR_EXPIRED.inc()
+                AUTH_QR_EXPIRED.labels(tenant_id=tenant_id or "unknown").inc()
                 QR_SESSION_TOTAL.labels(status="expired").inc()
                 return
             except SessionPasswordNeededError:
@@ -463,7 +486,7 @@ class QrAuthService:
                     "reason": "password_required"
                 })
                 logger.warning("QR login requires 2FA", tenant_id=tenant_id)
-                AUTH_QR_FAIL.inc()
+                AUTH_QR_FAIL.labels(tenant_id=tenant_id or "unknown").inc()
                 QR_SESSION_TOTAL.labels(status="failed").inc()
                 return
             
@@ -479,7 +502,7 @@ class QrAuthService:
                     "status": "failed",
                     "reason": "invalid_telegram_user"
                 })
-                AUTH_QR_FAIL.inc()
+                AUTH_QR_FAIL.labels(tenant_id=tenant_id or "unknown").inc()
                 QR_SESSION_TOTAL.labels(status="failed").inc()
                 return
             
@@ -494,7 +517,7 @@ class QrAuthService:
                     "status": "failed",
                     "reason": "ownership_mismatch"
                 })
-                AUTH_QR_FAIL.inc()
+                AUTH_QR_FAIL.labels(tenant_id=tenant_id or "unknown").inc()
                 QR_SESSION_TOTAL.labels(status="failed").inc()
                 return
             
@@ -563,7 +586,7 @@ class QrAuthService:
                     "error_code": error_code,
                     "error_details": error_details or "Unknown error"
                 })
-                AUTH_QR_FAIL.inc()
+                AUTH_QR_FAIL.labels(tenant_id=tenant_id or "unknown").inc()
                 QR_SESSION_TOTAL.labels(status="failed").inc()
                 return
             
@@ -579,7 +602,7 @@ class QrAuthService:
             self.redis_client.expire(redis_key, 3600)  # продление для интеграции с инвайтами
             
             logger.info("QR login success", tenant_id=tenant_id, user_id=me.id, session_id=session_id)
-            AUTH_QR_SUCCESS.inc()
+            AUTH_QR_SUCCESS.labels(tenant_id=tenant_id or "unknown").inc()
             QR_SESSION_TOTAL.labels(status="authorized").inc()
             
             # Проверка invite-кода и публикация события для активации тарифа
@@ -628,11 +651,11 @@ class QrAuthService:
                 "status": "failed",
                 "reason": f"flood_wait_{e.seconds}s"
             })
-            AUTH_QR_FAIL.inc()
+            AUTH_QR_FAIL.labels(tenant_id=tenant_id or "unknown").inc()
         except Exception as e:
             logger.error("QR login error", error=str(e), tenant_id=tenant_id)
             self.redis_client.hset(redis_key, "status", "failed")
-            AUTH_QR_FAIL.inc()
+            AUTH_QR_FAIL.labels(tenant_id=tenant_id or "unknown").inc()
         finally:
             # Context7 best practice: гарантированная остановка клиента
             # [C7-ID: telethon-cleanup-003]

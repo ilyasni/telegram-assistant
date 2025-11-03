@@ -1,28 +1,80 @@
 """Модели базы данных."""
 
-from sqlalchemy import create_engine, Column, String, Integer, Boolean, DateTime, Text, JSON, BigInteger, ForeignKey, UniqueConstraint, Index, CheckConstraint, PrimaryKeyConstraint, func, text
+from sqlalchemy import create_engine, Column, String, Integer, Boolean, DateTime, Text, JSON, BigInteger, ForeignKey, UniqueConstraint, Index, CheckConstraint, PrimaryKeyConstraint, func, text, event
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship, Session
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 import uuid
 from datetime import datetime
-from typing import Generator
+from typing import Generator, Optional
+from contextvars import ContextVar
 from config import settings
 
 Base = declarative_base()
 
+# Context7: ContextVar для передачи request и tenant_id через dependency injection
+_request_context: Optional[ContextVar] = ContextVar('request_context', default=None)
+
 # Настройка подключения к БД
-engine = create_engine(settings.database_url)
+# Context7: Connection pooling для предотвращения переполнения подключений
+engine = create_engine(
+    settings.database_url,
+    pool_size=10,  # Размер пула соединений
+    max_overflow=20,  # Максимальное количество дополнительных соединений
+    pool_pre_ping=True,  # Проверка соединений перед использованием
+    pool_recycle=3600,  # Пересоздание соединений через час
+    connect_args={
+        "connect_timeout": 10,  # Таймаут подключения
+        "application_name": "telegram_api"
+    }
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
 def get_db() -> Generator[Session, None, None]:
-    """Dependency для получения сессии БД."""
+    """
+    Dependency для получения сессии БД.
+    Context7: Устанавливает app.tenant_id для RLS через ContextVar (устанавливается в RLSMiddleware).
+    """
+    from config import settings
+    from middleware.rls_middleware import set_tenant_id_in_session
+    
     db = SessionLocal()
     try:
+        # Context7: Получаем tenant_id из ContextVar (устанавливается RLSMiddleware)
+        if settings.feature_rls_enabled:
+            try:
+                request = _request_context.get(None)
+                if request and hasattr(request, 'state'):
+                    tenant_id = getattr(request.state, 'tenant_id', None)
+                    if tenant_id:
+                        set_tenant_id_in_session(db, tenant_id)
+            except LookupError:
+                pass  # ContextVar не установлен - это нормально для воркеров
+        
         yield db
     finally:
         db.close()
+
+
+# Context7: Event listener для установки app.tenant_id при начале транзакции
+# (fallback если tenant_id не был установлен в get_db)
+@event.listens_for(engine, "connect")
+def set_tenant_id_on_connect(dbapi_conn, connection_record):
+    """Context7: Устанавливает app.tenant_id при подключении (fallback)."""
+    from config import settings
+    if not settings.feature_rls_enabled:
+        return
+    
+    try:
+        request = _request_context.get(None)
+        if request and hasattr(request, 'state'):
+            tenant_id = getattr(request.state, 'tenant_id', None)
+            if tenant_id:
+                with dbapi_conn.cursor() as cursor:
+                    cursor.execute(f"SET LOCAL app.tenant_id = '{tenant_id}'")
+    except Exception:
+        pass
 
 
 class Tenant(Base):
@@ -39,13 +91,30 @@ class Tenant(Base):
     # channels УДАЛЕНА - каналы теперь глобальные
 
 
+class Identity(Base):
+    """Глобальная личность (Telegram-пользователь)."""
+    __tablename__ = "identities"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    telegram_id = Column(BigInteger, unique=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    meta = Column(JSON, default={})
+
+    # Relationships
+    memberships = relationship("User", back_populates="identity")
+
+
 class User(Base):
     """Модель пользователя."""
     __tablename__ = "users"
     
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False)
-    telegram_id = Column(BigInteger, unique=True, nullable=False)
+    # Context7: telegram_id НЕ уникален в users (может повторяться в разных tenants)
+    # Уникальность гарантируется через identities.telegram_id + (tenant_id, identity_id) UNIQUE
+    telegram_id = Column(BigInteger, nullable=False)  # Dual-write для обратной совместимости
+    # Context7: переход к модели Membership — добавляем ссылку на Identity (dual-read/dual-write)
+    identity_id = Column(UUID(as_uuid=True), ForeignKey("identities.id"), nullable=False)
     username = Column(String(255))
     first_name = Column(String(255))
     last_name = Column(String(255))
@@ -56,8 +125,15 @@ class User(Base):
     
     # Relationships
     tenant = relationship("Tenant", back_populates="users")
+    identity = relationship("Identity", back_populates="memberships")
     channel_subscriptions = relationship("UserChannel", back_populates="user")
     group_subscriptions = relationship("UserGroup", back_populates="user")
+
+    # Индексы/ограничения: окончательный UNIQUE(tenant_id, identity_id) накатывается миграцией
+    __table_args__ = (
+        Index("ix_users_tenant", "tenant_id"),
+        Index("ix_users_identity", "identity_id"),
+    )
 
 
 class Channel(Base):

@@ -393,23 +393,37 @@ class IndexingTask:
                 indexing_processed_total.labels(status='skipped').inc()
                 return
             
-            # [C7-ID: dev-mode-016] Context7 best practice: проверка текста перед индексацией
-            # Посты без текста (только медиа, стикеры) пропускаем с статусом skipped, а не failed
-            text = post_data.get('text', '')
-            if not text or not text.strip():
-                logger.info("Post text is empty, skipping indexing", 
-                          post_id=post_id,
-                          has_media=post_data.get('has_media', False))
-                await self._update_indexing_status(
-                    post_id=post_id,
-                    embedding_status='skipped',
-                    graph_status='skipped',
-                    error_message='Post text is empty - no content to index'
-                )
-                # Context7: Помечаем пост как обработанный даже при пропуске
-                await self._update_post_processed(post_id)
-                indexing_processed_total.labels(status='skipped').inc()
-                return
+            # Context7: [C7-ID: indexing-with-enrichment-001] Проверка текста ПОСЛЕ композиции с enrichment данными
+            # Если основной текст пуст, но есть vision/crawl данные - используем их для индексации
+            # Это позволяет индексировать посты только с медиа (vision description/OCR)
+            text_for_check = post_data.get('text', '')
+            has_vision = bool(post_data.get('vision_data'))
+            has_crawl = bool(post_data.get('crawl_data'))
+            
+            # Проверяем, есть ли хотя бы один источник текста для индексации
+            if not text_for_check or not text_for_check.strip():
+                if not has_vision and not has_crawl:
+                    # Нет ни текста, ни enrichment данных - пропускаем
+                    logger.info("Post text is empty and no enrichment data, skipping indexing", 
+                              post_id=post_id,
+                              has_media=post_data.get('has_media', False),
+                              has_vision=has_vision,
+                              has_crawl=has_crawl)
+                    await self._update_indexing_status(
+                        post_id=post_id,
+                        embedding_status='skipped',
+                        graph_status='skipped',
+                        error_message='Post text is empty and no enrichment data (vision/crawl) to index'
+                    )
+                    await self._update_post_processed(post_id)
+                    indexing_processed_total.labels(status='skipped').inc()
+                    return
+                else:
+                    # Есть enrichment данные - можем индексировать
+                    logger.debug("Post text is empty but has enrichment data, will use enrichment for indexing",
+                               post_id=post_id,
+                               has_vision=has_vision,
+                               has_crawl=has_crawl)
             
             # Context7: [C7-ID: retry-indexing-001] Генерация эмбеддинга с retry через EmbeddingService
             # Retry логика уже встроена в EmbeddingService
@@ -559,9 +573,18 @@ class IndexingTask:
         [C7-ID: dev-mode-016] Предполагается, что проверка на пустой текст уже выполнена в вызывающем коде.
         """
         try:
+            # Context7: Импорт normalize_text один раз для всех нормализаций
+            from ai_providers.embedding_service import normalize_text
+            
             # Базовый текст поста (приоритет 1)
-            post_text = post_data.get('text', '')[:2000]  # Лимит 2000 символов
-            text_parts = [post_text] if post_text.strip() else []
+            post_text_raw = post_data.get('text', '')
+            if post_text_raw and post_text_raw.strip():
+                # Context7: Нормализация основного текста для консистентности
+                post_text = normalize_text(post_text_raw)[:2000]  # Лимит 2000 символов
+                text_parts = [post_text]
+            else:
+                post_text = ''
+                text_parts = []
             
             # Vision enrichment данные (приоритет 2)
             vision_data = post_data.get('vision_data')
@@ -569,7 +592,9 @@ class IndexingTask:
                 # Vision description (caption)
                 vision_desc = vision_data.get('description', '')
                 if vision_desc and len(vision_desc.strip()) >= 5:
-                    text_parts.append(vision_desc[:500])  # Лимит 500 символов
+                    # Context7: Нормализация текста перед добавлением
+                    vision_desc_normalized = normalize_text(vision_desc)
+                    text_parts.append(vision_desc_normalized[:500])  # Лимит 500 символов
                 
                 # Vision OCR text
                 vision_ocr = vision_data.get('ocr')
@@ -580,7 +605,11 @@ class IndexingTask:
                         ocr_text = str(vision_ocr)
                     
                     if ocr_text and ocr_text.strip():
-                        text_parts.append(ocr_text[:300])  # Лимит 300 символов
+                        # Context7: [C7-ID: ocr-text-normalization-001] Нормализация OCR текста перед использованием
+                        # OCR текст часто содержит множественные переносы строк и плохое форматирование
+                        # Нормализация удаляет избыточные пробелы и переносы строк для улучшения качества эмбеддингов
+                        ocr_text_normalized = normalize_text(ocr_text)
+                        text_parts.append(ocr_text_normalized[:300])  # Лимит 300 символов
             
             # Crawl enrichment данные (приоритет 3)
             crawl_data = post_data.get('crawl_data')
@@ -588,8 +617,8 @@ class IndexingTask:
                 # Используем md_excerpt если доступен (первые ~1-2k символов), иначе полный markdown
                 crawl_md = crawl_data.get('md_excerpt') or crawl_data.get('markdown') or crawl_data.get('crawl_md', '')
                 if crawl_md and crawl_md.strip():
-                    # Ограничиваем до 1500 символов
-                    crawl_text = crawl_md[:1500]
+                    # Context7: Нормализация markdown текста перед добавлением
+                    crawl_text = normalize_text(crawl_md)[:1500]
                     text_parts.append(crawl_text)
                 
                 # Crawl OCR (если есть)
@@ -602,26 +631,38 @@ class IndexingTask:
                         ocr_text = str(crawl_ocr_texts[0]) if crawl_ocr_texts else ''
                     
                     if ocr_text and ocr_text.strip():
-                        text_parts.append(ocr_text[:300])  # Лимит 300 символов
+                        # Context7: Нормализация OCR текста из crawl данных
+                        ocr_text_normalized = normalize_text(ocr_text)
+                        text_parts.append(ocr_text_normalized[:300])  # Лимит 300 символов
             
             # Объединение всех частей с дедупликацией
-            # Простая дедупликация: убираем дубликаты (точные совпадения)
+            # Context7: [C7-ID: text-deduplication-001] Дедупликация с нормализацией для сравнения
+            # Все части уже нормализованы через normalize_text(), но дополнительно нормализуем для сравнения
             seen = set()
             unique_parts = []
             for part in text_parts:
-                part_normalized = part.strip().lower()
+                # Дополнительная нормализация для дедупликации (убираем регистр и лишние пробелы)
+                part_normalized = normalize_text(part).lower()
                 if part_normalized and part_normalized not in seen:
                     seen.add(part_normalized)
-                    unique_parts.append(part.strip())
+                    # Сохраняем оригинальную нормализованную версию (уже нормализована выше)
+                    unique_parts.append(part)
             
             # Финальный текст для эмбеддинга
-            final_text = '\n\n'.join(unique_parts) if unique_parts else post_text
+            # Context7: Объединяем через пробел (не двойной перенос строки) для компактности
+            # Все части уже нормализованы через normalize_text()
+            final_text = ' '.join(unique_parts) if unique_parts else (post_text if post_text else '')
+            
+            # Context7: Финальная нормализация для гарантии консистентности
+            # (на случай если объединение добавило какие-то проблемы)
+            final_text = normalize_text(final_text)
             
             # Защита на случай если проверка пропущена
             if not final_text or not final_text.strip():
                 raise ValueError("Post text is empty after enrichment composition - should be checked before calling this method")
             
             # Context7: Используем EmbeddingService для генерации эмбеддинга
+            # EmbeddingService также нормализует текст внутри себя, но нормализация здесь гарантирует консистентность
             embedding = await self.embedding_service.generate_embedding(final_text)
             
             logger.debug("Generated embedding with enrichment",
@@ -658,9 +699,18 @@ class IndexingTask:
             # Context7: Получаем album_id если пост принадлежит альбому
             album_id = await self._get_album_id_for_post(post_id)
             
-            # Базовый payload
+            # Context7: Получаем tenant_id из post_data (обязательно для multi-tenant)
+            tenant_id = post_data.get('tenant_id')
+            if not tenant_id:
+                # Fallback: получаем из БД по channel_id
+                tenant_id = await self._get_tenant_id_from_post(post_id)
+                if not tenant_id:
+                    raise ValueError(f"tenant_id not found for post {post_id}")
+            
+            # Базовый payload с tenant_id для фильтрации
             payload = {
                 "post_id": post_id,
+                "tenant_id": str(tenant_id),  # Context7: обязательное поле для multi-tenant изоляции
                 "channel_id": post_data.get('channel_id'),
                 "text_short": post_data.get('text', '')[:500],  # Превью для быстрого доступа
                 "telegram_message_id": post_data.get('telegram_message_id'),
@@ -670,6 +720,9 @@ class IndexingTask:
             # Context7: Добавляем album_id в payload если пост из альбома
             if album_id:
                 payload["album_id"] = album_id
+            
+            # Context7: Per-tenant коллекция: t{tenant_id}_posts
+            collection_name = f"t{tenant_id}_posts"
             
             # Tags enrichment
             tags_data = post_data.get('tags_data')
@@ -794,8 +847,14 @@ class IndexingTask:
                     truncated_size_kb=round(len(json.dumps(payload, default=str).encode('utf-8')) / 1024, 2)
                 )
             
+            # Context7: Создаём коллекцию если не существует
+            await self.qdrant_client.ensure_collection(
+                collection_name=collection_name,
+                vector_size=len(embedding)
+            )
+            
             await self.qdrant_client.upsert_vector(
-                collection_name=settings.qdrant_collection,
+                collection_name=collection_name,
                 vector_id=vector_id,
                 vector=embedding,
                 payload=payload
@@ -815,6 +874,42 @@ class IndexingTask:
                         post_id=post_id,
                         error=str(e))
             raise
+    
+    async def _get_tenant_id_from_post(self, post_id: str) -> Optional[str]:
+        """Получает tenant_id для поста из БД."""
+        try:
+            from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+            from sqlalchemy import text
+            import os
+            
+            db_url = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@supabase-db:5432/postgres")
+            if db_url.startswith("postgresql://"):
+                db_url = db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+            
+            engine = create_async_engine(db_url)
+            async_session = async_sessionmaker(engine, expire_on_commit=False)
+            
+            async with async_session() as session:
+                result = await session.execute(
+                    text("""
+                        SELECT c.tenant_id
+                        FROM posts p
+                        JOIN channels c ON p.channel_id = c.id
+                        WHERE p.id = :post_id
+                        LIMIT 1
+                    """),
+                    {"post_id": post_id}
+                )
+                row = result.fetchone()
+                if row:
+                    return str(row[0])
+        except Exception as e:
+            logger.debug(
+                "Error getting tenant_id for post",
+                post_id=post_id,
+                error=str(e)
+            )
+        return None
     
     async def _get_album_id_for_post(self, post_id: str) -> Optional[int]:
         """Получает album_id для поста из media_group_items."""

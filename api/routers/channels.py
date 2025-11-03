@@ -484,6 +484,9 @@ def _get_or_create_channel(
 ) -> Optional[Dict[str, Any]]:
     """Получение или создание канала."""
     try:
+        # Context7: Нормализация username - убираем @ из начала
+        normalized_username = username.lstrip('@') if username else None
+        
         # Поиск существующего канала
         if telegram_id:
             existing_result = db.execute(
@@ -494,16 +497,18 @@ def _get_or_create_channel(
             if existing_row:
                 return {"id": str(existing_row.id)}
         
-        if username:
+        if normalized_username:
+            # Context7: [C7-ID: username-search-normalization-001] Поиск с нормализацией username в SQL
+            # Используем LTRIM для поиска, чтобы найти каналы как с @, так и без @
             existing_result = db.execute(
-                text("SELECT id FROM channels WHERE username = :username"),
-                {"username": username}
+                text("SELECT id FROM channels WHERE LTRIM(username, '@') = :username"),
+                {"username": normalized_username}
             )
             existing_row = existing_result.fetchone()
             if existing_row:
                 return {"id": str(existing_row.id)}
         
-        # Создание нового канала
+        # Создание нового канала (username уже нормализован выше)
         channel_id = str(uuid.uuid4())
         
         db.execute(
@@ -514,8 +519,8 @@ def _get_or_create_channel(
             {
                 "id": channel_id,
                 "telegram_id": telegram_id,
-                "username": username,
-                "title": title or username or f"Channel {telegram_id}"
+                "username": normalized_username,
+                "title": title or normalized_username or f"Channel {telegram_id}"
             }
         )
         

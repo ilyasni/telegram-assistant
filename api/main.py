@@ -17,6 +17,7 @@ from bot.handlers import router as bot_handlers
 # Middleware imports
 from middleware.tracing import TracingMiddleware
 from middleware.rate_limiter import RateLimiterMiddleware, init_rate_limiter
+from middleware.rls_middleware import RLSMiddleware
 # from dependencies.event_bus import init_event_publisher, close_event_publisher
 
 # Настройка логирования
@@ -41,8 +42,9 @@ structlog.configure(
 logger = structlog.get_logger()
 
 # Prometheus метрики
-REQUEST_COUNT = Counter('http_requests_total', 'Total HTTP requests', ['method', 'endpoint', 'status'])
-REQUEST_DURATION = Histogram('http_request_duration_seconds', 'HTTP request duration', ['method', 'endpoint'])
+# Context7: Добавляем tenant_id и tier для multi-tenant мониторинга
+REQUEST_COUNT = Counter('http_requests_total', 'Total HTTP requests', ['method', 'endpoint', 'status', 'tenant_id', 'tier'])
+REQUEST_DURATION = Histogram('http_request_duration_seconds', 'HTTP request duration', ['method', 'endpoint', 'tenant_id'])
 
 # Новые метрики для SSL и Neo4j
 from prometheus_client import Gauge
@@ -130,7 +132,11 @@ async def log_requests(request: Request, call_next):
 
 # Middleware (порядок важен!)
 app.add_middleware(TracingMiddleware)  # Первым - генерирует trace_id
-app.add_middleware(RateLimiterMiddleware, redis_url=settings.redis_url)  # Вторым - проверяет лимиты
+# Context7: RLS middleware - устанавливает app.tenant_id для Row Level Security
+# Добавляем до rate limiter, чтобы tenant_id был доступен для rate limiting
+if settings.feature_rls_enabled:
+    app.add_middleware(RLSMiddleware)
+app.add_middleware(RateLimiterMiddleware, redis_url=settings.redis_url)  # Проверяет лимиты (использует tenant_id)
 
 # Context7 best practice: CORS whitelist из ENV
 # [C7-ID: fastapi-cors-001]
@@ -227,14 +233,40 @@ async def logging_middleware(request: Request, call_next):
     
     # Подсчёт метрик
     process_time = time.time() - start_time
+    
+    # Context7: Извлекаем tenant_id и tier из JWT для метрик
+    tenant_id = "unknown"
+    tier = "unknown"
+    try:
+        from dependencies.auth import extract_tenant_id_from_jwt
+        from middleware.rate_limiter import RateLimiterMiddleware
+        
+        tenant_id = extract_tenant_id_from_jwt(request) or "unknown"
+        
+        # Пытаемся получить tier из JWT
+        auth_header = request.headers.get('Authorization')
+        if auth_header and auth_header.startswith('Bearer '):
+            token = auth_header.split(' ', 1)[1]
+            try:
+                import jwt as jwt_lib
+                payload = jwt_lib.decode(token, settings.jwt_secret, algorithms=["HS256"], options={"verify_signature": False})
+                tier = payload.get('tier', 'unknown')
+            except Exception:
+                pass
+    except Exception:
+        pass  # Fallback к unknown если не удалось извлечь
+    
     REQUEST_COUNT.labels(
         method=request.method,
         endpoint=request.url.path,
-        status=response.status_code
+        status=response.status_code,
+        tenant_id=tenant_id,
+        tier=tier
     ).inc()
     REQUEST_DURATION.labels(
         method=request.method,
-        endpoint=request.url.path
+        endpoint=request.url.path,
+        tenant_id=tenant_id
     ).observe(process_time)
     
     # Логирование ответа

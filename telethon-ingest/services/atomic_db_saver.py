@@ -325,6 +325,9 @@ class AtomicDBSaver:
         
         try:
             # Context7: Batch insert для media_objects (UPSERT с инкрементом refs_count)
+            # Context7: asyncpg требует naive datetime для PostgreSQL TIMESTAMP
+            # Используем datetime.utcnow() вместо datetime.now(timezone.utc)
+            now_utc = datetime.utcnow()
             media_objects_params = []
             for media_file in media_files:
                 media_objects_params.append({
@@ -333,7 +336,7 @@ class AtomicDBSaver:
                     'size_bytes': media_file.size_bytes,
                     's3_key': media_file.s3_key,
                     's3_bucket': s3_bucket,
-                    'now': datetime.now(timezone.utc)
+                    'now': now_utc
                 })
             
             if media_objects_params:
@@ -383,6 +386,9 @@ class AtomicDBSaver:
                 )
             
             # Context7: Batch insert для post_media_map
+            # Context7: asyncpg требует naive datetime для PostgreSQL TIMESTAMP
+            # Используем datetime.utcnow() вместо datetime.now(timezone.utc)
+            uploaded_at_utc = datetime.utcnow()
             post_media_map_params = []
             for idx, media_file in enumerate(media_files):
                 post_media_map_params.append({
@@ -390,7 +396,7 @@ class AtomicDBSaver:
                     'file_sha256': media_file.sha256,
                     'position': idx,
                     'role': 'primary',
-                    'uploaded_at': datetime.now(timezone.utc)
+                    'uploaded_at': uploaded_at_utc
                 })
             
             if post_media_map_params:
@@ -464,48 +470,59 @@ class AtomicDBSaver:
     
     async def _upsert_user(self, db_session: AsyncSession, user_data: Dict[str, Any]) -> None:
         """
-        Context7: UPSERT пользователя с ON CONFLICT.
+        Context7: UPSERT identity + membership (users) через общую утилиту.
+        Избегаем дублирования логики с api/routers/users.py.
         """
         try:
             # Подготовка данных пользователя
             # [C7-ID: dev-mode-012] Context7 best practice: соответствие реальной схеме БД
-            # Таблица users имеет: id, tenant_id, telegram_id, username, created_at, last_active_at, first_name, last_name
-            # НЕТ: updated_at
-            # [C7-ID: dev-mode-013] telegram_id должен быть int (bigint в БД), не str
             telegram_id = user_data.get('telegram_id')
             if isinstance(telegram_id, str):
                 telegram_id = int(telegram_id)
             elif telegram_id is None:
                 raise ValueError("telegram_id is required")
+            tenant_id = user_data.get('tenant_id')
+            if not tenant_id:
+                raise ValueError("tenant_id is required for membership upsert")
             
-            user_record = {
-                'id': str(uuid.uuid4()),
-                'tenant_id': user_data.get('tenant_id') or str(uuid.uuid4()),  # Используем переданный tenant_id или создаем новый
-                'telegram_id': telegram_id,  # int для bigint в БД
-                'first_name': user_data.get('first_name', ''),
-                'last_name': user_data.get('last_name', ''),
-                'username': user_data.get('username', ''),
-                'created_at': datetime.now(timezone.utc),
-                'last_active_at': datetime.now(timezone.utc)
-            }
+            # Context7: Используем общую утилиту для избежания дублирования логики
+            # Импортируем напрямую из api модуля (монтируется в /opt/telegram-assistant/api)
+            import sys
+            import os
+            import importlib.util
             
-            # UPSERT через PostgreSQL ON CONFLICT (без updated_at)
-            sql = """
-            INSERT INTO users (id, tenant_id, telegram_id, first_name, last_name, username, created_at, last_active_at)
-            VALUES (:id, :tenant_id, :telegram_id, :first_name, :last_name, :username, :created_at, :last_active_at)
-            ON CONFLICT (telegram_id) 
-            DO UPDATE SET
-                first_name = EXCLUDED.first_name,
-                last_name = EXCLUDED.last_name,
-                username = EXCLUDED.username,
-                last_active_at = EXCLUDED.last_active_at
-            """
+            # Context7: Используем importlib для прямого импорта файла, так как обычный импорт не работает
+            api_path = '/opt/telegram-assistant/api'
+            utils_path = os.path.join(api_path, 'utils', 'identity_membership.py')
             
-            await db_session.execute(text(sql), user_record)
+            if os.path.exists(utils_path):
+                spec = importlib.util.spec_from_file_location("identity_membership", utils_path)
+                identity_membership_module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(identity_membership_module)
+                upsert_identity_and_membership_async = identity_membership_module.upsert_identity_and_membership_async
+            else:
+                # Fallback: попробуем обычный импорт
+                if api_path not in sys.path:
+                    sys.path.insert(0, api_path)
+                from utils.identity_membership import upsert_identity_and_membership_async
+            
+            identity_id, user_id = await upsert_identity_and_membership_async(
+                db_session=db_session,
+                tenant_id=str(tenant_id),
+                telegram_id=telegram_id,
+                username=user_data.get('username'),
+                first_name=user_data.get('first_name'),
+                last_name=user_data.get('last_name'),
+                tier=user_data.get('tier', 'free')
+            )
+            
             db_users_upserted_total.inc()
             
-            self.logger.debug("User upserted", 
-                            telegram_id=user_data.get('telegram_id'))
+            self.logger.debug("Membership upserted",
+                              tenant_id=str(tenant_id),
+                              identity_id=str(identity_id),
+                              user_id=str(user_id),
+                              telegram_id=telegram_id)
             
         except Exception as e:
             self.logger.error("Failed to upsert user", 
@@ -529,11 +546,16 @@ class AtomicDBSaver:
             elif tg_channel_id is None:
                 raise ValueError("telegram_id (tg_channel_id) is required for channel")
             
+            # Context7: [C7-ID: username-normalization-003] Нормализация username перед сохранением в БД
+            # Убираем @ из начала username для единообразия
+            username_raw = channel_data.get('username', '')
+            username_normalized = username_raw.lstrip('@') if username_raw else ''
+            
             channel_record = {
                 'id': str(uuid.uuid4()),
                 'tg_channel_id': tg_channel_id,  # int для bigint в БД
                 'title': channel_data.get('title', ''),
-                'username': channel_data.get('username', ''),
+                'username': username_normalized,  # Сохраняем нормализованный username (без @)
                 'is_active': True,
                 'created_at': datetime.now(timezone.utc)
             }

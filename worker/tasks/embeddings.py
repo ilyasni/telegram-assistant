@@ -129,8 +129,8 @@ class EmbeddingService:
     async def _save_to_qdrant(self, post_id: str, tenant_id: str, post_data: Dict[str, Any], embeddings: List[float]):
         """Сохранение embeddings в Qdrant."""
         try:
-            # Имя коллекции для пользователя
-            collection_name = f"user_{tenant_id}_posts"
+            # Context7: Per-tenant коллекция: t{tenant_id}_posts
+            collection_name = f"t{tenant_id}_posts"
             
             # Проверка существования коллекции
             collections = self.qdrant_client.get_collections()

@@ -178,7 +178,28 @@ class EnrichmentRepository:
                             data = EXCLUDED.data,
                             status = EXCLUDED.status,
                             error = EXCLUDED.error,
-                            updated_at = EXCLUDED.updated_at
+                            updated_at = EXCLUDED.updated_at,
+                            -- Context7: Синхронизация legacy полей для обратной совместимости (vision)
+                            vision_description = CASE 
+                                WHEN EXCLUDED.kind = 'vision' THEN COALESCE(EXCLUDED.data->>'description', EXCLUDED.data->>'caption', vision_description)
+                                ELSE vision_description
+                            END,
+                            vision_classification = CASE 
+                                WHEN EXCLUDED.kind = 'vision' THEN COALESCE((EXCLUDED.data->'labels')::jsonb, vision_classification)
+                                ELSE vision_classification
+                            END,
+                            vision_is_meme = CASE 
+                                WHEN EXCLUDED.kind = 'vision' THEN COALESCE((EXCLUDED.data->>'is_meme')::boolean, vision_is_meme)
+                                ELSE vision_is_meme
+                            END,
+                            vision_ocr_text = CASE 
+                                WHEN EXCLUDED.kind = 'vision' THEN COALESCE(EXCLUDED.data->'ocr'->>'text', vision_ocr_text)
+                                ELSE vision_ocr_text
+                            END,
+                            vision_analyzed_at = CASE 
+                                WHEN EXCLUDED.kind = 'vision' THEN COALESCE((EXCLUDED.data->>'analyzed_at')::timestamp, vision_analyzed_at, EXCLUDED.updated_at)
+                                ELSE vision_analyzed_at
+                            END
                     """,
                         post_id,
                         kind,
@@ -213,7 +234,36 @@ class EnrichmentRepository:
                             data = EXCLUDED.data,
                             status = EXCLUDED.status,
                             error = EXCLUDED.error,
-                            updated_at = EXCLUDED.updated_at
+                            updated_at = EXCLUDED.updated_at,
+                            -- Context7: Синхронизация legacy полей для обратной совместимости (vision)
+                            vision_description = CASE 
+                                WHEN EXCLUDED.kind = 'vision' THEN COALESCE(EXCLUDED.data->>'description', EXCLUDED.data->>'caption', post_enrichment.vision_description)
+                                ELSE post_enrichment.vision_description
+                            END,
+                            vision_classification = CASE 
+                                WHEN EXCLUDED.kind = 'vision' THEN COALESCE(EXCLUDED.data->'labels', post_enrichment.vision_classification)
+                                ELSE post_enrichment.vision_classification
+                            END,
+                            vision_is_meme = CASE 
+                                WHEN EXCLUDED.kind = 'vision' THEN COALESCE((EXCLUDED.data->>'is_meme')::boolean, post_enrichment.vision_is_meme)
+                                ELSE post_enrichment.vision_is_meme
+                            END,
+                            vision_ocr_text = CASE 
+                                WHEN EXCLUDED.kind = 'vision' THEN COALESCE(EXCLUDED.data->'ocr'->>'text', post_enrichment.vision_ocr_text)
+                                ELSE post_enrichment.vision_ocr_text
+                            END,
+                            vision_analyzed_at = CASE 
+                                WHEN EXCLUDED.kind = 'vision' THEN COALESCE(
+                                    CASE 
+                                        WHEN EXCLUDED.data->>'analyzed_at' IS NOT NULL 
+                                        THEN (EXCLUDED.data->>'analyzed_at')::timestamp 
+                                        ELSE NULL
+                                    END, 
+                                    post_enrichment.vision_analyzed_at, 
+                                    EXCLUDED.updated_at
+                                )
+                                ELSE post_enrichment.vision_analyzed_at
+                            END
                     """),
                     {
                         "post_id": post_id,

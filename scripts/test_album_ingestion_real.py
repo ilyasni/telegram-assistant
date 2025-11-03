@@ -35,7 +35,7 @@ async def check_channels():
         result = await async_session.execute(text("""
             SELECT 
                 id, 
-                telegram_channel_id,
+                tg_channel_id,
                 username, 
                 title, 
                 is_active, 

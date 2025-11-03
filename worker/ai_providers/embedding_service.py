@@ -39,13 +39,29 @@ embedding_latency_seconds = Histogram(
 def normalize_text(s: str) -> str:
     """
     [C7-ID: EMBEDDING-TEXT-NORM-001] Нормализация текста для эмбеддингов.
-    - NFC normalization
+    
+    Context7 best practice: нормализация OCR и плохоформатированного текста.
+    - NFC normalization (унификация Unicode символов)
     - Удаление zero-width символов
-    - Схлопывание последовательностей пробелов
+    - Схлопывание множественных пробелов и переносов строк в одиночные пробелы
+    - Удаление начальных/конечных пробелов
+    
+    Особенно важно для OCR текста, который часто содержит:
+    - Множественные переносы строк (\n\n\n)
+    - Неправильные пробелы и табуляции
+    - Zero-width символы
     """
-    s = unicodedata.normalize("NFC", s.replace("\u200b", ""))
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+    if not s:
+        return ""
+    # NFC normalization для унификации Unicode символов
+    s = unicodedata.normalize("NFC", s)
+    # Удаление zero-width символов
+    s = s.replace("\u200b", "").replace("\u200c", "").replace("\u200d", "")
+    # Context7: Схлопывание всех видов whitespace (пробелы, табы, переносы строк) в одиночные пробелы
+    # Используем \s+ который включает: пробелы, табы, переносы строк, non-breaking spaces и др.
+    s = re.sub(r"\s+", " ", s)
+    # Удаление начальных/конечных пробелов
+    return s.strip()
 
 def approx_tokens(s: str) -> int:
     """

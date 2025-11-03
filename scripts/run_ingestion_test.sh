@@ -9,14 +9,14 @@ echo "============================================================"
 # Проверка каналов
 echo ""
 echo "1️⃣ Проверка активных каналов..."
-CHANNEL_INFO=$(docker exec telegram-assistant-supabase-db-1 psql -U postgres -d postgres -t -c "
+CHANNEL_INFO=$(docker exec telegram-assistant-supabase-db-1 psql -U postgres -d postgres -t -A -c "
 SELECT username || '|' || id 
 FROM channels 
 WHERE is_active = true 
 LIMIT 1;
-" 2>&1 | grep -v WARNING | grep -v "^$" | head -1)
+" 2>&1 | grep -v WARNING | grep -v "^DETAIL:" | grep -v "^HINT:" | grep "|" | head -1)
 
-if [ -z "$CHANNEL_INFO" ]; then
+if [ -z "$CHANNEL_INFO" ] || [ -z "$(echo "$CHANNEL_INFO" | grep '|')" ]; then
     echo "   ❌ Нет активных каналов"
     exit 1
 fi
@@ -30,9 +30,9 @@ echo "   ✅ Найден канал: @$USERNAME (ID: $CHANNEL_ID)"
 echo ""
 echo "2️⃣ Проверка текущего состояния пайплайна..."
 
-ALBUMS_COUNT=$(docker exec telegram-assistant-supabase-db-1 psql -U postgres -d postgres -t -c "
+ALBUMS_COUNT=$(docker exec telegram-assistant-supabase-db-1 psql -U postgres -d postgres -t -A -c "
 SELECT COUNT(*) FROM media_groups;
-" 2>&1 | grep -v WARNING | xargs)
+" 2>&1 | grep -v WARNING | grep -v "^DETAIL:" | grep -v "^HINT:" | grep -E "^[0-9]+" | xargs)
 
 echo "   Альбомов в БД: $ALBUMS_COUNT"
 
@@ -58,15 +58,15 @@ echo ""
 echo "4️⃣ Запуск парсинга канала @$USERNAME..."
 echo "   (Это может занять несколько минут)"
 
-docker exec telegram-assistant-telethon-ingest-1 python -m scripts.manual_parse_channel "$USERNAME" incremental 2>&1 | tee /tmp/ingestion_test.log
+docker exec telegram-assistant-telethon-ingest-1 python -m scripts.manual_parse_channel --username "$USERNAME" --mode incremental 2>&1 | tee /tmp/ingestion_test.log
 
 echo ""
 echo "5️⃣ Проверка результатов..."
 
 # Проверка новых альбомов
-NEW_ALBUMS_COUNT=$(docker exec telegram-assistant-supabase-db-1 psql -U postgres -d postgres -t -c "
+NEW_ALBUMS_COUNT=$(docker exec telegram-assistant-supabase-db-1 psql -U postgres -d postgres -t -A -c "
 SELECT COUNT(*) FROM media_groups;
-" 2>&1 | grep -v WARNING | xargs)
+" 2>&1 | grep -v WARNING | grep -v "^DETAIL:" | grep -v "^HINT:" | grep -E "^[0-9]+" | xargs)
 
 echo "   Альбомов в БД (после парсинга): $NEW_ALBUMS_COUNT"
 
