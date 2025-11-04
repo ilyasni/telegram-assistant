@@ -22,7 +22,7 @@ from ai_providers.gigachain_adapter import tagging_requests_total, tagging_laten
 from ai_providers.gigachain_adapter import GigaChainAdapter, create_gigachain_adapter
 from event_bus import EventConsumer, RedisStreamsClient, EventPublisher, DLQ_STREAMS
 from events.schemas import PostTaggedEventV1
-from events.schemas.posts_vision_v1 import VisionAnalyzedEventV1
+from events.schemas.posts_vision_v1 import VisionAnalyzedEventV1, VisionSkippedEventV1
 from feature_flags import feature_flags
 
 logger = structlog.get_logger()
@@ -242,6 +242,20 @@ class RetaggingTask:
                 event_data = json.loads(message['data'])
             else:
                 event_data = message
+            
+            # Context7: Проверка типа события (analyzed vs skipped)
+            event_type = event_data.get('event_type', '')
+            if event_type == 'posts.vision.skipped':
+                # Обработка skipped события - просто логируем
+                skipped_event = VisionSkippedEventV1(**event_data)
+                logger.info(
+                    "Vision skipped event received, no retagging needed",
+                    post_id=skipped_event.post_id,
+                    trace_id=skipped_event.trace_id,
+                    reason_count=len(skipped_event.reasons)
+                )
+                retagging_skipped_total.labels(reason="vision_skipped").inc()
+                return
             
             # Валидация входного события
             analyzed_event = VisionAnalyzedEventV1(**event_data)

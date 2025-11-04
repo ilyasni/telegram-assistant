@@ -2,8 +2,9 @@
 
 import asyncio
 import logging
+import os
 import uuid
-from typing import List, Optional
+from typing import List, Optional, Any
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, AuthKeyError
@@ -21,11 +22,19 @@ logger = structlog.get_logger()
 
 
 class TelegramIngestionService:
-    """Сервис для парсинга Telegram каналов."""
+    """Сервис для парсинга Telegram каналов.
     
-    def __init__(self, client_manager=None):
+    Context7: Обрабатывает real-time события NewMessage через event handlers.
+    Используется для live-парсинга новых сообщений по мере их публикации в каналах.
+    
+    NOTE: Для historical/incremental парсинга используется ChannelParser через scheduler.
+    Этот сервис дополняет ChannelParser для real-time обработки.
+    """
+    
+    def __init__(self, client_manager=None, media_processor=None):
         self.client: Optional[TelegramClient] = None
         self.client_manager = client_manager  # Context7: TelegramClientManager
+        self.media_processor = media_processor  # Context7: MediaProcessor для обработки медиа
         # Context7 best practice: используем async Redis клиент для неблокирующих операций
         self.redis_client = redis.from_url(settings.redis_url, decode_responses=True)
         self.db_connection = None
@@ -175,8 +184,11 @@ class TelegramIngestionService:
                 for channel in channels:
                     try:
                         # Получение объекта канала по username или tg_channel_id
+                        # Context7: [C7-ID: username-normalization-002] Нормализация username перед использованием
+                        # Убираем @ из начала username, так как Telethon ожидает username без @
                         if channel['username']:
-                            entity = await self.client.get_entity(channel['username'])
+                            clean_username = channel['username'].lstrip('@')
+                            entity = await self.client.get_entity(clean_username)
                         elif channel['tg_channel_id']:
                             entity = await self.client.get_entity(int(channel['tg_channel_id']))
                         else:
@@ -197,7 +209,17 @@ class TelegramIngestionService:
             logger.error("Failed to load channels", error=str(e))
 
     async def _start_historical_parsing(self):
-        """Context7 best practice: исторический парсинг сообщений за последние 24 часа."""
+        """Context7 best practice: исторический парсинг сообщений за последние 24 часа.
+        
+        DEPRECATED: Используется ChannelParser через scheduler для historical парсинга.
+        Этот метод отключен по умолчанию, так как ChannelParser поддерживает MediaProcessor.
+        """
+        # Context7: Отключено - используем ChannelParser через scheduler для исторического парсинга
+        historical_enabled = os.getenv("TELEGRAM_INGEST_HISTORICAL_ENABLED", "false").lower() == "true"
+        if not historical_enabled:
+            logger.info("Historical parsing disabled - using ChannelParser via scheduler instead")
+            return
+        
         try:
             logger.info("Starting historical parsing for last 24 hours...")
             
@@ -336,23 +358,58 @@ class TelegramIngestionService:
             # Context7 best practice: извлекаем все доступные поля из Telegram сообщения
             message_data = await self._extract_message_data(message, channel_info['id'])
             
+            # Context7: Генерация post_id и trace_id (для совместимости)
+            tenant_id = message_data.get('tenant_id', 'default')
+            trace_id = f"{tenant_id}:{channel_info['id']}:{message.id}"
+            
+            # Context7: Обработка медиа через MediaProcessor (если доступен)
+            # NOTE: Исторический парсинг отключен по умолчанию, но если используется - медиа обрабатывается
+            media_files = []
+            if self.media_processor and message.media and self.client:
+                try:
+                    post_id = str(uuid.uuid4())
+                    message_data['id'] = post_id
+                    self.media_processor.telegram_client = self.client
+                    media_files = await self.media_processor.process_message_media(
+                        message=message,
+                        post_id=post_id,
+                        trace_id=trace_id,
+                        tenant_id=tenant_id
+                    )
+                    if media_files:
+                        message_data['media_files'] = media_files
+                        message_data['media_count'] = len(media_files)
+                        message_data['media_sha256_list'] = [mf.sha256 for mf in media_files]
+                        message_data['has_media'] = True
+                except Exception as e:
+                    logger.warning("Failed to process media in historical message", error=str(e), exc_info=True)
+            
             # Сохранение в БД
             post_id = await self._save_message(message_data)
+            
+            # Context7: Сохранение медиа в CAS (для исторического парсинга)
+            if media_files and post_id and self.media_processor:
+                try:
+                    await self._save_media_to_cas_sync(post_id, media_files, trace_id)
+                except Exception as e:
+                    logger.warning("Failed to save media to CAS in historical message", error=str(e))
             
             # Публикация события в Redis Streams в формате PostParsedEventV1
             event_data = {
                 'schema_version': 'v1',
-                'trace_id': str(uuid.uuid4()),
+                'trace_id': trace_id,  # Context7: Используем созданный trace_id
                 'occurred_at': datetime.now(timezone.utc).isoformat(),
-                'idempotency_key': f"139883458:{channel_info['id']}:{message.id}",
-                'user_id': '139883458',
+                'idempotency_key': f"{tenant_id}:{channel_info['id']}:{message.id}",
+                'user_id': tenant_id,  # Context7: Используем tenant_id
                 'channel_id': str(channel_info['id']),
                 'post_id': post_id,
-                'tenant_id': '139883458',
+                'tenant_id': tenant_id,
                 'text': message_data.get('content', ''),
                 'urls': json.loads(message_data.get('urls', '[]')),
                 'posted_at': message_data['created_at'],
                 'content_hash': message_data.get('content_hash', ''),
+                # Context7: Добавляем media_sha256_list для связи с обработанными медиа
+                'media_sha256_list': message_data.get('media_sha256_list', []),
                 'link_count': len(json.loads(message_data.get('urls', '[]'))),
                 'tg_message_id': message.id,
                 'telegram_message_id': message.id,
@@ -370,30 +427,38 @@ class TelegramIngestionService:
             event_data_json = {k: json.dumps(v) if isinstance(v, (list, dict)) else str(v) for k, v in event_data.items()}
             await self.redis_client.xadd(STREAM_POST_CREATED, event_data_json)
             
+            # Context7: Эмиссия VisionUploadedEventV1 для медиа (если обработано в историческом парсинге)
+            if self.media_processor and media_files:
+                try:
+                    await self.media_processor.emit_vision_uploaded_event(
+                        post_id=post_id,
+                        tenant_id=tenant_id,
+                        media_files=media_files,
+                        trace_id=trace_id
+                    )
+                    logger.debug(
+                        "Vision uploaded event emitted for historical message",
+                        post_id=post_id,
+                        media_count=len(media_files)
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Failed to emit vision uploaded event for historical message",
+                        post_id=post_id,
+                        error=str(e),
+                        exc_info=True
+                    )
+            
             logger.info("Historical message processed", 
                        post_id=post_id, 
                        channel_id=channel_info['id'],
-                       message_id=message.id)
+                       message_id=message.id,
+                       has_media=len(media_files) > 0)
             
         except Exception as e:
             logger.error("Failed to process historical message", 
                        message_id=message.id, 
                        error=str(e))
-
-    async def _extract_media_urls(self, message) -> List[str]:
-        """Извлечение URL медиа из сообщения."""
-        try:
-            media_urls = []
-            if message.photo:
-                media_urls.append("photo")
-            if message.video:
-                media_urls.append("video")
-            if message.document:
-                media_urls.append("document")
-            return media_urls
-        except Exception as e:
-            logger.error("Failed to extract media URLs", error=str(e))
-            return []
 
     async def _save_message(self, message_data: dict) -> str:
         """Context7 best practice: сохранение всех данных сообщения в БД."""
@@ -491,23 +556,88 @@ class TelegramIngestionService:
             # Context7 best practice: извлекаем все данные из сообщения
             message_data = await self._extract_message_data(message, channel_info['id'])
             
+            # Context7: Генерация post_id и trace_id для MediaProcessor
+            post_id = str(uuid.uuid4())
+            trace_id = f"{message_data.get('tenant_id', 'default')}:{channel_info['id']}:{message.id}"
+            message_data['id'] = post_id
+            
+            # Context7: Обработка медиа через MediaProcessor (если доступен)
+            media_files = []
+            if self.media_processor and message.media and self.client:
+                try:
+                    # Обновляем telegram_client в MediaProcessor
+                    self.media_processor.telegram_client = self.client
+                    
+                    # Обработка медиа
+                    media_files = await self.media_processor.process_message_media(
+                        message=message,
+                        post_id=post_id,
+                        trace_id=trace_id,
+                        tenant_id=message_data.get('tenant_id', 'default')
+                    )
+                    
+                    # Сохраняем информацию о медиа
+                    if media_files:
+                        message_data['media_files'] = media_files
+                        message_data['media_count'] = len(media_files)
+                        message_data['media_sha256_list'] = [mf.sha256 for mf in media_files]
+                        message_data['has_media'] = True
+                    
+                    logger.debug(
+                        "Media processed in real-time event",
+                        post_id=post_id,
+                        media_count=len(media_files),
+                        channel_id=channel_info['id']
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Failed to process media in real-time event",
+                        post_id=post_id,
+                        error=str(e),
+                        channel_id=channel_info['id'],
+                        exc_info=True
+                    )
+                    # Продолжаем обработку даже при ошибке медиа
+            
             # Сохранение в БД
             post_id = await self._save_message(message_data)
             
+            # Context7: Сохранение медиа в CAS таблицы (media_objects + post_media_map)
+            # Используем синхронный подход, так как TelegramIngestionService работает с psycopg2
+            if media_files and post_id and self.media_processor:
+                try:
+                    await self._save_media_to_cas_sync(post_id, media_files, trace_id)
+                    logger.debug(
+                        "Media saved to CAS for real-time message",
+                        post_id=post_id,
+                        media_count=len(media_files)
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Failed to save media to CAS for real-time message",
+                        post_id=post_id,
+                        error=str(e),
+                        exc_info=True
+                    )
+                    # Не прерываем обработку - медиа уже в S3, можно восстановить позже
+            
             # Публикация события в Redis Streams в формате PostParsedEventV1
+            tenant_id = message_data.get('tenant_id', 'default')
             event_data = {
                 'schema_version': 'v1',
-                'trace_id': str(uuid.uuid4()),
+                'trace_id': trace_id,  # Context7: Используем уже созданный trace_id
                 'occurred_at': datetime.now(timezone.utc).isoformat(),
-                'idempotency_key': f"139883458:{channel_info['id']}:{message.id}",
-                'user_id': '139883458',
+                'idempotency_key': f"{tenant_id}:{channel_info['id']}:{message.id}",
+                'user_id': tenant_id,  # Context7: Используем tenant_id как user_id
                 'channel_id': str(channel_info['id']),
                 'post_id': post_id,
-                'tenant_id': '139883458',
+                'tenant_id': tenant_id,
                 'text': message_data.get('content', ''),
                 'urls': json.loads(message_data.get('urls', '[]')),
                 'posted_at': message_data['created_at'],
                 'content_hash': message_data.get('content_hash', ''),
+                # Context7: Добавляем media_sha256_list для связи с обработанными медиа (для TaggingTask)
+                'media_sha256_list': message_data.get('media_sha256_list', []),
                 'link_count': len(json.loads(message_data.get('urls', '[]'))),
                 'tg_message_id': message.id,
                 'telegram_message_id': message.id,
@@ -525,10 +655,33 @@ class TelegramIngestionService:
             event_data_json = {k: json.dumps(v) if isinstance(v, (list, dict)) else str(v) for k, v in event_data.items()}
             await self.redis_client.xadd(STREAM_POST_CREATED, event_data_json)
             
+            # Context7: Эмиссия VisionUploadedEventV1 для медиа (если обработано)
+            if self.media_processor and media_files:
+                try:
+                    await self.media_processor.emit_vision_uploaded_event(
+                        post_id=post_id,
+                        tenant_id=message_data.get('tenant_id', 'default'),
+                        media_files=media_files,
+                        trace_id=trace_id
+                    )
+                    logger.debug(
+                        "Vision uploaded event emitted for real-time message",
+                        post_id=post_id,
+                        media_count=len(media_files)
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Failed to emit vision uploaded event for real-time message",
+                        post_id=post_id,
+                        error=str(e),
+                        exc_info=True
+                    )
+            
             logger.info("Message processed", 
                        post_id=post_id, 
                        channel_id=channel_info['id'],
-                       message_id=message.id)
+                       message_id=message.id,
+                       has_media=len(media_files) > 0)
             
         except FloodWaitError as e:
             logger.warning("FloodWait error", seconds=e.seconds)
@@ -679,6 +832,90 @@ class TelegramIngestionService:
         return media_urls
     
     # Публикация перенесена в services.events
+    
+    async def _save_media_to_cas_sync(self, post_id: str, media_files: List[Any], trace_id: str):
+        """
+        Context7: Сохранение медиа в CAS таблицы (media_objects + post_media_map).
+        
+        Использует синхронный psycopg2, так как TelegramIngestionService работает с синхронной БД.
+        TODO: [C7-ID: ARCH-REFACTOR-001] Рефакторинг на async БД для использования AtomicDBSaver.save_media_to_cas
+        
+        Args:
+            post_id: UUID поста
+            media_files: Список MediaFile объектов (sha256, s3_key, mime_type, size_bytes)
+            trace_id: Trace ID для логирования
+        """
+        if not media_files or not post_id:
+            return
+        
+        try:
+            s3_bucket = self.media_processor.s3_service.bucket_name if self.media_processor else None
+            if not s3_bucket:
+                logger.warning("S3 bucket not available for CAS save", post_id=post_id)
+                return
+            
+            with self.db_connection.cursor() as cursor:
+                # Context7: UPSERT в media_objects с инкрементом refs_count
+                for media_file in media_files:
+                    cursor.execute("""
+                        INSERT INTO media_objects (
+                            file_sha256, mime, size_bytes, s3_key, s3_bucket,
+                            first_seen_at, last_seen_at, refs_count
+                        ) VALUES (
+                            %s, %s, %s, %s, %s,
+                            NOW(), NOW(), 1
+                        )
+                        ON CONFLICT (file_sha256) DO UPDATE SET
+                            last_seen_at = NOW(),
+                            refs_count = media_objects.refs_count + 1,
+                            s3_key = EXCLUDED.s3_key,
+                            s3_bucket = EXCLUDED.s3_bucket
+                    """, (
+                        media_file.sha256,
+                        media_file.mime_type,
+                        media_file.size_bytes,
+                        media_file.s3_key,
+                        s3_bucket
+                    ))
+                
+                # Context7: INSERT в post_media_map с ON CONFLICT DO NOTHING
+                for idx, media_file in enumerate(media_files):
+                    cursor.execute("""
+                        INSERT INTO post_media_map (
+                            post_id, file_sha256, position, meta
+                        ) VALUES (
+                            %s, %s, %s, %s::jsonb
+                        )
+                        ON CONFLICT (post_id, file_sha256) DO NOTHING
+                    """, (
+                        post_id,
+                        media_file.sha256,
+                        idx,
+                        json.dumps({
+                            "s3_key": media_file.s3_key,
+                            "s3_bucket": s3_bucket,
+                            "mime_type": media_file.mime_type,
+                            "size_bytes": media_file.size_bytes
+                        })
+                    ))
+                
+                self.db_connection.commit()
+                logger.debug(
+                    "Media saved to CAS successfully",
+                    post_id=post_id,
+                    media_count=len(media_files),
+                    trace_id=trace_id
+                )
+        except Exception as e:
+            self.db_connection.rollback()
+            logger.error(
+                "Failed to save media to CAS",
+                post_id=post_id,
+                error=str(e),
+                trace_id=trace_id,
+                exc_info=True
+            )
+            raise
     
     async def stop(self):
         """Остановка сервиса."""

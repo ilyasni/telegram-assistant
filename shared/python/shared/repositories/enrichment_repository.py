@@ -179,6 +179,8 @@ class EnrichmentRepository:
                             status = EXCLUDED.status,
                             error = EXCLUDED.error,
                             updated_at = EXCLUDED.updated_at
+                            -- Context7: Legacy поля обновляются только для vision через отдельный UPDATE после INSERT
+                            -- Это избегает проблем с ambiguous column references в ON CONFLICT DO UPDATE SET
                     """,
                         post_id,
                         kind,
@@ -189,6 +191,25 @@ class EnrichmentRepository:
                         error,
                         updated_at
                     )
+                    
+                    # Context7: Обновление legacy полей для vision после основного upsert
+                    if kind == 'vision':
+                        await conn.execute("""
+                            UPDATE post_enrichment
+                            SET 
+                                vision_description = COALESCE($1::jsonb->>'description', $1::jsonb->>'caption', vision_description),
+                                vision_classification = COALESCE(($1::jsonb->'labels')::jsonb, vision_classification),
+                                vision_is_meme = COALESCE(($1::jsonb->>'is_meme')::boolean, vision_is_meme),
+                                vision_ocr_text = COALESCE($1::jsonb->'ocr'->>'text', vision_ocr_text),
+                                vision_analyzed_at = COALESCE(
+                                    CASE WHEN $1::jsonb->>'analyzed_at' IS NOT NULL 
+                                    THEN ($1::jsonb->>'analyzed_at')::timestamp 
+                                    ELSE NULL END,
+                                    vision_analyzed_at,
+                                    $2
+                                )
+                            WHERE post_id = $3 AND kind = 'vision'
+                        """, data_jsonb, updated_at, post_id)
             
             elif self._is_sqlalchemy:
                 # SQLAlchemy AsyncSession
@@ -213,7 +234,36 @@ class EnrichmentRepository:
                             data = EXCLUDED.data,
                             status = EXCLUDED.status,
                             error = EXCLUDED.error,
-                            updated_at = EXCLUDED.updated_at
+                            updated_at = EXCLUDED.updated_at,
+                            -- Context7: Синхронизация legacy полей для обратной совместимости (vision)
+                            vision_description = CASE 
+                                WHEN EXCLUDED.kind = 'vision' THEN COALESCE(EXCLUDED.data->>'description', EXCLUDED.data->>'caption', post_enrichment.vision_description)
+                                ELSE post_enrichment.vision_description
+                            END,
+                            vision_classification = CASE 
+                                WHEN EXCLUDED.kind = 'vision' THEN COALESCE(EXCLUDED.data->'labels', post_enrichment.vision_classification)
+                                ELSE post_enrichment.vision_classification
+                            END,
+                            vision_is_meme = CASE 
+                                WHEN EXCLUDED.kind = 'vision' THEN COALESCE((EXCLUDED.data->>'is_meme')::boolean, post_enrichment.vision_is_meme)
+                                ELSE post_enrichment.vision_is_meme
+                            END,
+                            vision_ocr_text = CASE 
+                                WHEN EXCLUDED.kind = 'vision' THEN COALESCE(EXCLUDED.data->'ocr'->>'text', post_enrichment.vision_ocr_text)
+                                ELSE post_enrichment.vision_ocr_text
+                            END,
+                            vision_analyzed_at = CASE 
+                                WHEN EXCLUDED.kind = 'vision' THEN COALESCE(
+                                    CASE 
+                                        WHEN EXCLUDED.data->>'analyzed_at' IS NOT NULL 
+                                        THEN (EXCLUDED.data->>'analyzed_at')::timestamp 
+                                        ELSE NULL
+                                    END, 
+                                    post_enrichment.vision_analyzed_at, 
+                                    EXCLUDED.updated_at
+                                )
+                                ELSE post_enrichment.vision_analyzed_at
+                            END
                     """),
                     {
                         "post_id": post_id,

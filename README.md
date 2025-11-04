@@ -139,6 +139,110 @@ redis-cli XINFO STREAM posts.tagged
 redis-cli XLEN posts.tagged
 ```
 
+## 🖼️ Пайплайн обработки альбомов
+
+### Обзор
+
+Система полностью поддерживает обработку Telegram альбомов (групп медиа-сообщений) с event-driven архитектурой, агрегацией vision analysis и интеграцией с RAG/Graph.
+
+### Основные возможности
+
+- ✅ **Album-aware ingestion** — Redis negative cache, `iter_messages()` для эффективного получения альбомов
+- ✅ **Event-driven сборка** — отслеживание состояния через Redis Streams
+- ✅ **Vision summary на уровне альбома** — агрегация результатов vision analysis всех элементов
+- ✅ **S3 и БД интеграция** — сохранение vision summary в S3 и обогащение в БД
+- ✅ **RAG/Graph интеграция** — индексация альбомов в Qdrant и создание узлов в Neo4j
+- ✅ **Мониторинг и алерты** — 6 метрик и 8 Prometheus алертов
+
+### Архитектура пайплайна
+
+```
+Telegram Album Messages
+         ↓
+MediaProcessor (iter_messages, Redis cache)
+         ↓
+save_media_group → albums.parsed event
+         ↓
+AlbumAssemblerTask (отслеживание состояния)
+         ↓
+posts.vision.analyzed events
+         ↓
+_assemble_album (агрегация vision summary)
+         ↓
+album.assembled event
+         ↓
+IndexingTask (Qdrant + Neo4j с album_id)
+```
+
+### Быстрый старт
+
+```bash
+# 1. Проверка готовности
+python3 scripts/check_album_pipeline_ready.py
+
+# 2. Применение миграции БД
+psql $DATABASE_URL -f telethon-ingest/migrations/004_add_album_fields.sql
+
+# 3. Автоматический старт (через worker)
+docker compose restart worker
+
+# 4. Проверка работы
+docker logs worker | grep -i "album"
+curl http://localhost:8001/metrics | grep album
+```
+
+### Метрики
+
+Доступны через `http://localhost:8001/metrics`:
+
+- `albums_parsed_total{status}` — события albums.parsed
+- `albums_assembled_total{status}` — собранные альбомы
+- `album_assembly_lag_seconds` — задержка сборки (histogram)
+- `album_items_count_gauge{album_id, status}` — количество элементов
+- `album_vision_summary_size_bytes` — размер summary в S3 (histogram)
+- `album_aggregation_duration_ms` — длительность агрегации (histogram)
+
+### Мониторинг
+
+```bash
+# Проверка метрик
+curl http://localhost:8001/metrics | grep album
+
+# Проверка health check
+curl http://localhost:8000/health/detailed | jq '.tasks.album_assembler'
+
+# Проверка Redis Streams
+redis-cli XLEN stream:albums:parsed
+redis-cli XLEN stream:album:assembled
+
+# Grafana Dashboard
+# Импортировать: grafana/dashboards/album_pipeline.json
+```
+
+### Документация
+
+- **Архитектура**: `docs/ALBUM_PIPELINE_ARCHITECTURE.md`
+- **Развёртывание**: `docs/ALBUM_PIPELINE_DEPLOYMENT.md`
+- **Готовность**: `docs/ALBUM_PIPELINE_READY.md`
+- **Финальная сводка**: `docs/ALBUM_PIPELINE_FINAL_SUMMARY.md`
+- **Примеры Qdrant**: `docs/examples/qdrant_album_filtering_example.py`
+
+### Тестирование
+
+```bash
+# Полное тестирование пайплайна
+python3 scripts/test_album_pipeline_full.py
+
+# E2E тесты
+pytest tests/e2e/test_album_pipeline_e2e.py -v
+
+# Создание тестового альбома
+python3 scripts/create_test_album.py
+
+# Тест фильтрации Qdrant
+python3 scripts/test_album_qdrant_filtering.py
+```
+
 ## 🛠️ Разработка
 
 ### Code Quality

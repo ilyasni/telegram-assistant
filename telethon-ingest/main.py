@@ -429,8 +429,57 @@ async def run_ingest_loop():
         rate_limiter = RateLimiter(redis_client)
         app_state["rate_limiter"] = rate_limiter
         
-        # Инициализация старого сервиса для совместимости с TelegramClientManager
-        ingest_service = TelegramIngestionService(client_manager=client_manager)
+        # Context7: Инициализация MediaProcessor для обработки медиа в real-time событиях
+        media_processor = None
+        try:
+            from api.services.s3_storage import S3StorageService
+            from api.services.storage_quota import StorageQuotaService
+            from services.media_processor import MediaProcessor
+            
+            # Инициализация S3StorageService с параметрами из env
+            s3_endpoint = os.getenv("S3_ENDPOINT_URL", "https://s3.cloud.ru")
+            s3_bucket = os.getenv("S3_BUCKET_NAME", "")
+            s3_access_key = os.getenv("S3_ACCESS_KEY_ID", "")
+            s3_secret_key = os.getenv("S3_SECRET_ACCESS_KEY", "")
+            s3_region = os.getenv("S3_REGION", "ru-central-1")
+            
+            if s3_endpoint and s3_bucket and s3_access_key and s3_secret_key:
+                s3_service = S3StorageService(
+                    endpoint_url=s3_endpoint,
+                    access_key_id=s3_access_key,
+                    secret_access_key=s3_secret_key,
+                    bucket_name=s3_bucket,
+                    region=s3_region
+                )
+                logger.info("S3StorageService initialized for TelegramIngestionService", bucket=s3_bucket)
+                
+                # Инициализация StorageQuotaService
+                storage_quota = StorageQuotaService(s3_service)
+                logger.info("StorageQuotaService initialized for TelegramIngestionService")
+                
+                # MediaProcessor будет инициализирован с TelegramClient при первом использовании
+                # Используем Redis без decode_responses для совместимости с MediaProcessor
+                redis_for_media = redis.from_url(settings.redis_url, decode_responses=False)
+                media_processor = MediaProcessor(
+                    telegram_client=None,  # Будет обновлён при обработке
+                    s3_service=s3_service,
+                    storage_quota=storage_quota,
+                    redis_client=redis_for_media
+                )
+                logger.info("MediaProcessor initialized for TelegramIngestionService")
+        except Exception as e:
+            logger.warning(
+                "Failed to initialize MediaProcessor for TelegramIngestionService, continuing without media processing",
+                error=str(e),
+                exc_info=True
+            )
+            # Продолжаем без MediaProcessor
+        
+        # Инициализация сервиса для совместимости с TelegramClientManager
+        ingest_service = TelegramIngestionService(
+            client_manager=client_manager,
+            media_processor=media_processor  # Context7: Передаём MediaProcessor
+        )
         app_state["telegram_service"] = ingest_service
         
         # Запуск сервиса в фоне (неблокирующий)
@@ -573,9 +622,25 @@ async def run_scheduler_loop():
             from worker.services.storage_quota import StorageQuotaService
             from services.media_processor import MediaProcessor
             
-            # Инициализация S3StorageService
-            s3_service = S3StorageService()
-            logger.info("S3StorageService initialized for MediaProcessor")
+            # Инициализация S3StorageService с параметрами из env
+            s3_endpoint = os.getenv("S3_ENDPOINT_URL", "https://s3.cloud.ru")
+            s3_bucket = os.getenv("S3_BUCKET_NAME", "")
+            s3_access_key = os.getenv("S3_ACCESS_KEY_ID", "")
+            s3_secret_key = os.getenv("S3_SECRET_ACCESS_KEY", "")
+            s3_region = os.getenv("S3_REGION", "ru-central-1")
+            
+            if s3_endpoint and s3_bucket and s3_access_key and s3_secret_key:
+                s3_service = S3StorageService(
+                    endpoint_url=s3_endpoint,
+                    access_key_id=s3_access_key,
+                    secret_access_key=s3_secret_key,
+                    bucket_name=s3_bucket,
+                    region=s3_region
+                )
+                logger.info("S3StorageService initialized for MediaProcessor", bucket=s3_bucket)
+            else:
+                logger.warning("S3 credentials not provided, continuing without MediaProcessor")
+                raise ValueError("S3 credentials required for MediaProcessor")
             
             # Инициализация StorageQuotaService
             storage_quota = StorageQuotaService(s3_service)
@@ -629,7 +694,8 @@ async def run_scheduler_loop():
             redis_client=shared_redis_client,  # Context7: Используем общий Redis клиент
             parser=parser,  # Передаём инициализированный parser
             app_state=app_state,  # Передаём app_state для обновления статуса
-            telegram_client_manager=client_manager  # Передаём TelegramClientManager если доступен
+            telegram_client_manager=client_manager,  # Передаём TelegramClientManager если доступен
+            media_processor=media_processor  # Context7: Передаём MediaProcessor
         )
         
         if client_manager:
@@ -639,7 +705,7 @@ async def run_scheduler_loop():
         
         # Запуск бесконечного цикла scheduler
         await scheduler.run_forever()
-            
+        
     except Exception as e:
         logger.error("Scheduler loop error", error=str(e))
 

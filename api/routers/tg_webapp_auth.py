@@ -14,6 +14,8 @@ from urllib.parse import parse_qsl
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 import structlog
+from sqlalchemy.orm import Session
+from models.database import get_db, User, Identity
 from config import settings
 
 logger = structlog.get_logger()
@@ -30,7 +32,16 @@ class WebAppAuthResponse(BaseModel):
     token_type: str = Field(default="bearer", description="Тип токена")
     expires_in: int = Field(default=600, description="Время жизни токена в секундах")
 
-def create_jwt(user_id: int, audience: str = "webapp", exp_minutes: int = 10) -> str:
+def create_jwt(
+    user_id: int,
+    tenant_id: Optional[str] = None,
+    membership_id: Optional[str] = None,
+    identity_id: Optional[str] = None,
+    tier: Optional[str] = None,
+    role: Optional[str] = None,
+    audience: str = "webapp",
+    exp_minutes: int = 10
+) -> str:
     """Создание JWT токена (упрощенная версия)."""
     # TODO: Реализовать полноценную JWT генерацию с подписью
     # Пока возвращаем простой токен
@@ -38,11 +49,25 @@ def create_jwt(user_id: int, audience: str = "webapp", exp_minutes: int = 10) ->
     
     header = {"alg": "HS256", "typ": "JWT"}
     payload = {
-        "sub": str(user_id),
+        "sub": str(user_id),  # telegram_id для обратной совместимости
         "aud": audience,
         "exp": int(time.time()) + (exp_minutes * 60),
         "iat": int(time.time())
     }
+    
+    # Context7: расширенный payload для multi-tenant
+    if tenant_id:
+        payload["tenant_id"] = str(tenant_id)
+    if membership_id:
+        payload["membership_id"] = str(membership_id)
+        payload["user_id"] = str(membership_id)  # Для обратной совместимости с get_admin_user
+    if identity_id:
+        payload["identity_id"] = str(identity_id)
+    if tier:
+        payload["tier"] = tier
+    # [C7-ID: security-admin-003] Добавляем role в JWT payload
+    # Context7: Всегда добавляем role, даже если это "user" (для безопасности)
+    payload["role"] = role or "user"
     
     # Простая кодировка (в production использовать jwt library)
     header_b64 = base64.urlsafe_b64encode(json.dumps(header).encode()).decode().rstrip('=')
@@ -60,10 +85,10 @@ def create_jwt(user_id: int, audience: str = "webapp", exp_minutes: int = 10) ->
     return f"{header_b64}.{payload_b64}.{signature_b64}"
 
 @router.post("/telegram-webapp", response_model=WebAppAuthResponse)
-async def verify_webapp_init_data(body: WebAppAuthRequest):
+async def verify_webapp_init_data(body: WebAppAuthRequest, db: Session = Depends(get_db)):
     """
     Верификация Telegram WebApp initData.
-    Возвращает короткоживущий JWT (5-10 мин).
+    Возвращает короткоживущий JWT (5-10 мин) с tenant_id, membership_id, identity_id, tier.
     """
     try:
         init_data = body.init_data
@@ -102,15 +127,17 @@ async def verify_webapp_init_data(body: WebAppAuthRequest):
                           calculated_hash=hash_calculated[:8] + "...")
             raise HTTPException(status_code=401, detail="Invalid signature")
         
-        # Проверка auth_date (не старше 5 минут)
+        # Проверка auth_date по конфигу (Context7): WEBAPP_AUTH_TTL_SECONDS (по умолчанию 900с)
         auth_date = int(parsed.get('auth_date', 0))
         current_time = int(time.time())
-        
-        if current_time - auth_date > 300:  # 5 минут
+
+        ttl_seconds = int(getattr(settings, 'webapp_auth_ttl_seconds', 900))
+        if current_time - auth_date > ttl_seconds:
             logger.warning("WebApp initData expired",
                           auth_date=auth_date,
                           current_time=current_time,
-                          age_seconds=current_time - auth_date)
+                          age_seconds=current_time - auth_date,
+                          ttl_seconds=ttl_seconds)
             raise HTTPException(status_code=401, detail="Init data expired")
         
         # Извлечение user данных
@@ -124,16 +151,46 @@ async def verify_webapp_init_data(body: WebAppAuthRequest):
         if not user_id:
             raise HTTPException(status_code=400, detail="Missing user ID")
         
-        # Генерация JWT
+        # Context7: Находим identity и membership для JWT payload
+        identity = db.query(Identity).filter(Identity.telegram_id == user_id).first()
+        membership = None
+        tenant_id = None
+        membership_id = None
+        tier = None
+        
+        # [C7-ID: security-admin-003] Извлекаем role из membership
+        role = None
+        if identity:
+            # Берём первую membership (в будущем можно выбирать по invite_code или другому критерию)
+            membership = db.query(User).filter(User.identity_id == identity.id).first()
+            if membership:
+                tenant_id = str(membership.tenant_id)
+                membership_id = str(membership.id)
+                tier = membership.tier or "free"
+                role = membership.role or "user"  # [C7-ID: security-admin-003]
+        
+        # Генерация JWT с расширенным payload
         jwt_token = create_jwt(
             user_id=user_id,
+            tenant_id=tenant_id,
+            membership_id=membership_id,
+            identity_id=str(identity.id) if identity else None,
+            tier=tier,
+            role=role,  # [C7-ID: security-admin-003]
             audience="webapp",
             exp_minutes=10
         )
         
+        # [C7-ID: security-admin-003] Логирование для отладки
         logger.info("WebApp authentication successful",
                    user_id=user_id,
-                   username=user_data.get('username'))
+                   tenant_id=tenant_id,
+                   membership_id=membership_id,
+                   identity_id=str(identity.id) if identity else None,
+                   tier=tier,
+                   role=role,  # [C7-ID: security-admin-003]
+                   username=user_data.get('username'),
+                   role_in_jwt=role)  # Дополнительное логирование для отладки
         
         return WebAppAuthResponse(
             access_token=jwt_token,

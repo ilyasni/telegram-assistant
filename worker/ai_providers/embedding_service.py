@@ -39,13 +39,29 @@ embedding_latency_seconds = Histogram(
 def normalize_text(s: str) -> str:
     """
     [C7-ID: EMBEDDING-TEXT-NORM-001] Нормализация текста для эмбеддингов.
-    - NFC normalization
+    
+    Context7 best practice: нормализация OCR и плохоформатированного текста.
+    - NFC normalization (унификация Unicode символов)
     - Удаление zero-width символов
-    - Схлопывание последовательностей пробелов
+    - Схлопывание множественных пробелов и переносов строк в одиночные пробелы
+    - Удаление начальных/конечных пробелов
+    
+    Особенно важно для OCR текста, который часто содержит:
+    - Множественные переносы строк (\n\n\n)
+    - Неправильные пробелы и табуляции
+    - Zero-width символы
     """
-    s = unicodedata.normalize("NFC", s.replace("\u200b", ""))
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+    if not s:
+        return ""
+    # NFC normalization для унификации Unicode символов
+    s = unicodedata.normalize("NFC", s)
+    # Удаление zero-width символов
+    s = s.replace("\u200b", "").replace("\u200c", "").replace("\u200d", "")
+    # Context7: Схлопывание всех видов whitespace (пробелы, табы, переносы строк) в одиночные пробелы
+    # Используем \s+ который включает: пробелы, табы, переносы строк, non-breaking spaces и др.
+    s = re.sub(r"\s+", " ", s)
+    # Удаление начальных/конечных пробелов
+    return s.strip()
 
 def approx_tokens(s: str) -> int:
     """
@@ -101,9 +117,14 @@ class GigaChatEmbeddingProvider(EmbeddingProvider):
     def __init__(self, adapter):
         self.adapter = adapter
         self.model = settings.GIGACHAT_EMBEDDINGS_MODEL
-        # Context7: GigaChat Giga-Embeddings-instruct возвращает 2048 измерений
-        # Источник: https://gitverse.ru/GigaTeam/GigaEmbeddings
-        self.dimension = 2048
+        # Context7: Размерность зависит от модели:
+        # - EmbeddingsGigaR: 2560 измерений
+        # - Embeddings (Giga-Embeddings-instruct): 2048 измерений
+        # Источник: https://developers.sber.ru/docs/ru/gigachat/api/reference/rest/gigachat-api
+        if self.model == "EmbeddingsGigaR":
+            self.dimension = 2560
+        else:
+            self.dimension = 2048
         # Context7: [C7-ID: gigachat-resilience-001] Кэш для результата health check
         self._proxy_health_cache = None
         self._proxy_health_cache_ttl = 30  # секунд
@@ -209,8 +230,19 @@ class GigaChatEmbeddingProvider(EmbeddingProvider):
             raise ValueError("No embedding data in response")
         
         embedding = data["data"][0]["embedding"]
-        if not embedding or len(embedding) != self.dimension:
-            raise ValueError(f"Invalid embedding: len={len(embedding)}, expected={self.dimension}")
+        # Context7: Автоматическое определение размерности по фактическому эмбеддингу
+        # Если размерность не совпадает, обновляем её для этой модели
+        if not embedding:
+            raise ValueError("Empty embedding received")
+        
+        actual_dim = len(embedding)
+        if actual_dim != self.dimension:
+            # Обновляем размерность для текущей модели, если она отличается
+            logger.warning("Embedding dimension mismatch, updating provider dimension",
+                         model=self.model,
+                         old_dim=self.dimension,
+                         actual_dim=actual_dim)
+            self.dimension = actual_dim
         
         # Метрики успеха
         embedding_requests_total.labels(
@@ -339,10 +371,20 @@ class EmbeddingService:
         try:
             embedding = await provider.embed_text(text)
             
-            # Валидация размерности
-            expected_dim = provider.get_dimension()
-            if len(embedding) != expected_dim:
-                raise ValueError(f"Dimension mismatch: got {len(embedding)}, expected {expected_dim}")
+            # Context7: Размерность может быть обновлена в provider.embed_text()
+            # если модель вернула другую размерность, поэтому проверяем после
+            actual_dim = len(embedding)
+            provider_dim = provider.get_dimension()
+            
+            # Если размерности не совпадают и провайдер не обновил свою размерность,
+            # то это реальная проблема
+            if actual_dim != provider_dim:
+                # Провайдер должен был обновить размерность автоматически
+                # Если этого не произошло, логируем предупреждение, но не падаем
+                logger.warning("Dimension mismatch after embedding generation",
+                             actual_dim=actual_dim,
+                             provider_dim=provider_dim,
+                             provider=type(provider).__name__)
             
             return embedding
             

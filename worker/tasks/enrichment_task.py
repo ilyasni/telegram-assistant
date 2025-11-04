@@ -476,7 +476,14 @@ class EnrichmentWorker:
         """Проверка лимитов пользователя."""
         try:
             # [C7-ID: WORKER-ENRICHMENT-001] SQLAlchemy 2.x совместимость + диагностика
-            sql = "SELECT tenant_id FROM posts WHERE id = :post_id LIMIT 1"
+            # Context7: tenant_id получаем из channels через JOIN, так как posts больше не содержит tenant_id
+            sql = """
+                SELECT c.tenant_id 
+                FROM posts p
+                JOIN channels c ON p.channel_id = c.id
+                WHERE p.id = :post_id 
+                LIMIT 1
+            """
             t0 = time.perf_counter()
             result = await self.db_session.execute(
                 text(sql),
@@ -494,12 +501,14 @@ class EnrichmentWorker:
             max_per_day = self.config.get('limits', {}).get('per_user', {}).get('max_enrichment_per_day', 100)
             
             today = datetime.now(timezone.utc).date()
+            # Context7: tenant_id получаем из channels через JOIN
             result = await self.db_session.execute(
                 text("""
                 SELECT COUNT(*) as count
                 FROM post_enrichment pe
                 JOIN posts p ON p.id = pe.post_id
-                WHERE p.tenant_id = :tenant_id
+                JOIN channels c ON p.channel_id = c.id
+                WHERE c.tenant_id = :tenant_id
                 AND DATE(pe.enriched_at) = :today
                 AND pe.crawl_md IS NOT NULL
                 """),

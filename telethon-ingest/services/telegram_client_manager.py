@@ -175,7 +175,13 @@ class TelegramClientManager:
         )
     
     async def _get_api_credentials(self) -> tuple:
-        """Получение API credentials мастер-приложения (Context7)."""
+        """
+        Получение API credentials мастер-приложения (Context7).
+        
+        ВАЖНО: Все пользователи используют единое Telegram приложение (master_api_id/api_hash).
+        Это позволяет масштабировать систему без создания отдельных приложений для каждого tenant.
+        Сессии Telegram различаются по StringSession, но используют одну пару api_id/api_hash.
+        """
         from config import settings
         return (settings.master_api_id, settings.master_api_hash)
     

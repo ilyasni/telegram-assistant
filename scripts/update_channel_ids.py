@@ -74,8 +74,15 @@ async def update_channel_ids():
                     try:
                         print(f"Обрабатываем канал: {channel['username']}")
                         
+                        # Context7: Нормализация username - убираем @ из начала
+                        # Telethon ожидает username без @
+                        clean_username = channel['username'].lstrip('@') if channel['username'] else None
+                        if not clean_username:
+                            print(f"  ❌ Пустой username для канала {channel['id']}")
+                            continue
+                        
                         # Получение entity канала
-                        entity = await client.get_entity(channel['username'])
+                        entity = await client.get_entity(clean_username)
                         
                         if hasattr(entity, 'id'):
                             tg_channel_id = entity.id

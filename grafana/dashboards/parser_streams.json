@@ -148,7 +148,7 @@
             "name": "Prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(rate(posts_parsed_total[5m]))",
+          "expr": "sum(rate(posts_parsed_total{mode=~\"$mode\"}[5m]))",
           "legendFormat": "Parsing Rate",
           "refId": "A"
         }
@@ -374,7 +374,7 @@
             "name": "Prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(rate(posts_parsed_total[5m])) by (mode, status)",
+          "expr": "sum(rate(posts_parsed_total{mode=~\"$mode\"}[5m])) by (mode, status)",
           "legendFormat": "{{mode}} - {{status}}",
           "refId": "A"
         },
@@ -485,7 +485,7 @@
             "name": "Prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum(rate(parsing_duration_seconds_bucket[5m])) by (le, mode))",
+          "expr": "histogram_quantile(0.95, sum(rate(parsing_duration_seconds_bucket{mode=~\"$mode\"}[5m])) by (le, mode))",
           "legendFormat": "p95 - {{mode}}",
           "refId": "A"
         },
@@ -496,7 +496,7 @@
             "name": "Prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum(rate(parsing_duration_seconds_bucket[5m])) by (le, mode))",
+          "expr": "histogram_quantile(0.50, sum(rate(parsing_duration_seconds_bucket{mode=~\"$mode\"}[5m])) by (le, mode))",
           "legendFormat": "p50 - {{mode}}",
           "refId": "B"
         },
@@ -801,7 +801,7 @@
             "name": "Prometheus"
           },
           "editorMode": "code",
-          "expr": "increase(parser_runs_total{status=\"ok\"}[1h]) - increase(posts_parsed_total{status=\"success\"}[1h])",
+          "expr": "increase(parser_runs_total{mode=~\"$mode\", status=\"ok\"}[1h]) - increase(posts_parsed_total{mode=~\"$mode\", status=\"success\"}[1h])",
           "legendFormat": "Empty ticks",
           "refId": "A"
         }
@@ -891,7 +891,38 @@
     "redis"
   ],
   "templating": {
-    "list": []
+    "list": [
+      {
+        "allValue": null,
+        "current": {
+          "selected": false,
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "definition": "label_values(posts_parsed_total, mode)",
+        "description": "Filter by parsing mode (historical/incremental)",
+        "error": null,
+        "hide": 0,
+        "includeAll": true,
+        "label": "Parsing Mode",
+        "multi": true,
+        "name": "mode",
+        "options": [],
+        "query": {
+          "query": "label_values(posts_parsed_total, mode)",
+          "refId": "StandardVariableQuery"
+        },
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      }
+    ]
   },
   "time": {
     "from": "now-6h",

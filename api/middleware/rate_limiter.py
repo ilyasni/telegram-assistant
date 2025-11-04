@@ -13,15 +13,17 @@ from fastapi import Request, HTTPException
 from fastapi.responses import JSONResponse
 import redis.asyncio as redis
 import structlog
+from sqlalchemy.orm import Session
+from models.database import get_db, User
 from prometheus_client import Counter
 
 logger = structlog.get_logger()
 
-# Метрики Prometheus
+# Метрики Prometheus (Context7: multi-tenant лейблы)
 rate_limit_exceeded_total = Counter(
     'api_rate_limit_exceeded_total',
     'Rate limit exceeded',
-    ['route', 'scope']
+    ['route', 'scope', 'tenant_id', 'tier']  # tenant_id и tier для multi-tenant мониторинга
 )
 
 # Матрица лимитов по endpoint и tier
@@ -79,8 +81,10 @@ class RateLimiter:
             # В случае ошибки - разрешаем запрос
             return True, {"limit": limit, "remaining": limit, "reset": int(time.time()) + 60}
     
-    def get_key(self, scope: str, identifier: str, route: str) -> str:
-        """Генерация ключа для Redis."""
+    def get_key(self, scope: str, identifier: str, route: str, tenant_id: Optional[str] = None) -> str:
+        """Генерация ключа для Redis с префиксом tenant (Context7)."""
+        if tenant_id:
+            return f"t:{tenant_id}:rl:{scope}:{identifier}:{route}"
         return f"rl:{scope}:{identifier}:{route}"
 
 class RateLimiterMiddleware:
@@ -161,7 +165,7 @@ class RateLimiterMiddleware:
             raise
     
     async def _check_rate_limit(self, request: Request) -> Tuple[bool, Dict[str, Any]]:
-        """Проверка rate limit для запроса."""
+        """Проверка rate limit для запроса (Context7: per-tenant + per-membership)."""
         route = f"{request.method} {request.url.path}"
         
         # Получение лимитов для маршрута
@@ -169,19 +173,39 @@ class RateLimiterMiddleware:
         if not route_limits:
             return True, {}  # Нет лимитов для этого маршрута
         
-        # Получение user_id и tier
-        user_id = self._extract_user_id(request)
-        user_tier = await self._get_user_tier(user_id)
+        # Извлечение данных из JWT (tenant_id, membership_id, tier)
+        jwt_payload = self._extract_jwt_payload(request)
+        tenant_id = jwt_payload.get("tenant_id") if jwt_payload else None
+        membership_id = jwt_payload.get("membership_id") if jwt_payload else None
+        user_tier = jwt_payload.get("tier", "free") if jwt_payload else "free"
         
-        # Проверка лимитов: user -> ip -> global
-        checks = [
-            ("user", user_id, route_limits.get(user_tier, route_limits["free"])),
-            ("ip", request.client.host, route_limits["ip"]),
-            ("global", "global", route_limits["global"])
-        ]
+        # Получение user_id (для обратной совместимости)
+        user_id = jwt_payload.get("sub") if jwt_payload else self._extract_user_id(request)
         
-        for scope, identifier, limit in checks:
-            key = self.rate_limiter.get_key(scope, identifier, route)
+        # Context7: Проверка лимитов в порядке: membership -> tenant -> ip -> global
+        # Используем минимум из двух ключей для tenant и membership
+        checks = []
+        
+        # Per-membership limit (если есть)
+        if membership_id and tenant_id:
+            checks.append(("membership", membership_id, route_limits.get(user_tier, route_limits["free"]), tenant_id))
+        
+        # Per-tenant limit (более мягкий)
+        if tenant_id:
+            checks.append(("tenant", tenant_id, route_limits.get(user_tier, route_limits["free"]) * 2, tenant_id))
+        
+        # Per-user limit (fallback, без tenant префикса)
+        if user_id:
+            checks.append(("user", user_id, route_limits.get(user_tier, route_limits["free"]), None))
+        
+        # Per-IP limit
+        checks.append(("ip", request.client.host, route_limits["ip"], None))
+        
+        # Global limit
+        checks.append(("global", "global", route_limits["global"], None))
+        
+        for scope, identifier, limit, tenant_prefix in checks:
+            key = self.rate_limiter.get_key(scope, identifier, route, tenant_prefix)
             allowed, rate_info = await self.rate_limiter.check(key, limit)
             
             if not allowed:
@@ -190,37 +214,85 @@ class RateLimiterMiddleware:
                              route=route,
                              scope=scope,
                              identifier=identifier,
+                             tenant_id=tenant_id,
+                             membership_id=membership_id,
                              limit=limit,
                              remaining=rate_info["remaining"])
                 
-                # Метрики
-                rate_limit_exceeded_total.labels(route=route, scope=scope).inc()
+                # Метрики с лейблами (Context7: tenant_id и tier для мониторинга)
+                rate_limit_exceeded_total.labels(
+                    route=route,
+                    scope=scope,
+                    tenant_id=tenant_id or "unknown",
+                    tier=user_tier
+                ).inc()
                 
                 return False, rate_info
         
         return True, {}
     
     def _extract_user_id(self, request: Request) -> Optional[str]:
-        """Извлечение user_id из запроса."""
+        """Извлечение user_id из запроса (legacy, для обратной совместимости)."""
         # Из path параметра
         if hasattr(request, 'path_params') and 'user_id' in request.path_params:
             return request.path_params['user_id']
         
         # Из JWT токена (если есть)
-        auth_header = request.headers.get('Authorization')
-        if auth_header and auth_header.startswith('Bearer '):
-            # TODO: Декодировать JWT и извлечь user_id
-            pass
+        jwt_payload = self._extract_jwt_payload(request)
+        if jwt_payload:
+            return jwt_payload.get('sub')
         
         return None
     
-    async def _get_user_tier(self, user_id: Optional[str]) -> str:
-        """Получение tier пользователя."""
+    def _extract_jwt_payload(self, request: Request) -> Optional[dict]:
+        """Извлечение полного JWT payload из запроса."""
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return None
+        
+        token = auth_header.split(' ', 1)[1]
+        try:
+            parts = token.split('.')
+            if len(parts) != 3:
+                return None
+            import base64, json
+            payload_b64 = parts[1]
+            payload_b64 += '=' * (4 - len(payload_b64) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+            
+            # Проверка времени истечения
+            if payload.get('exp', 0) < int(time.time()):
+                return None
+            
+            return payload
+        except Exception:
+            return None
+    
+    async def _get_user_tier(self, user_id: Optional[str], db: Optional[Session] = None) -> str:
+        """Получение tier пользователя из БД (Context7)."""
         if not user_id:
             return "free"
         
-        # TODO: Запрос к БД для получения tier
-        # Пока возвращаем "free" по умолчанию
+        # Попытка получить из БД (если сессия доступна)
+        if db:
+            try:
+                # Пытаемся найти по telegram_id (int) или по UUID membership_id
+                try:
+                    tg_id = int(user_id)
+                    user = db.query(User).filter(User.telegram_id == tg_id).first()
+                except (ValueError, TypeError):
+                    from uuid import UUID
+                    try:
+                        membership_uuid = UUID(user_id)
+                        user = db.query(User).filter(User.id == membership_uuid).first()
+                    except (ValueError, TypeError):
+                        user = None
+                
+                if user and user.tier:
+                    return user.tier
+            except Exception as e:
+                logger.debug("Failed to get tier from DB", user_id=user_id, error=str(e))
+        
         return "free"
 
 # Глобальная инициализация

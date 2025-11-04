@@ -145,8 +145,14 @@ services:
   # Redis Cache
   redis:
     image: redis:7-alpine
+    environment:
+      # Context7 best practice: timezone для корректной работы с временем
+      TZ: Europe/Moscow
     volumes:
       - redis_data:/data
+      # Context7 best practice: монтируем timezone данные хоста
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     networks:
       - telegram-network
     # Context7 best practice: health check для Redis
@@ -265,9 +271,9 @@ services:
     ports:
       - "8090:8090"
     environment:
-      # Базовые настройки (из документации)
-      PROXY_HOST: "0.0.0.0"
-      PROXY_PORT: "8090"
+      # Базовые настройки прокси (согласно документации gpt2giga)
+      GPT2GIGA_HOST: "0.0.0.0"
+      GPT2GIGA_PROXY_PORT: "8090"
       
       # GigaChat API (обязательные)
       GIGACHAT_CREDENTIALS: ${GIGACHAT_CREDENTIALS}
@@ -280,12 +286,21 @@ services:
       
       # Verbose logging для диагностики
       GPT2GIGA_VERBOSE: "True"
+      # Уровень логов (INFO, DEBUG, WARNING)
+      GPT2GIGA_LOG_LEVEL: "INFO"
       
       # Передача модели (из документации)
       GPT2GIGA_PASS_MODEL: "True"
       
       # SSL сертификаты (отключаем для dev/test)
+      # Context7: В переменных окружения по умолчанию False согласно документации gpt2giga
+      # Если не указано, используется False (в аргументах по умолчанию True)
       GIGACHAT_VERIFY_SSL_CERTS: "False"
+      # Отключение SSL на уровне Python/httpx
+      PYTHONHTTPSVERIFY: "0"
+      CURL_CA_BUNDLE: ""
+      REQUESTS_CA_BUNDLE: ""
+      SSL_CERT_FILE: ""
       
       # Embeddings модель
       GPT2GIGA_EMBEDDINGS: "EmbeddingsGigaR"
@@ -407,6 +422,8 @@ services:
       # Context7: GigaChat Vision API Credentials (для VisionAnalysisTask)
       GIGACHAT_CREDENTIALS: ${GIGACHAT_CREDENTIALS}
       GIGACHAT_SCOPE: ${GIGACHAT_SCOPE:-GIGACHAT_API_PERS}
+      # Context7: Модель для embeddings (EmbeddingsGigaR возвращает 2560 измерений)
+      GIGACHAT_EMBEDDINGS_MODEL: ${GIGACHAT_EMBEDDINGS_MODEL:-EmbeddingsGigaR}
       # Fallback: OpenRouter
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
       # DEV Feature Flags
@@ -432,7 +449,10 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-DEBUG}
       ENVIRONMENT: ${ENVIRONMENT:-production}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-hash-based}
-      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-128}
+      # Context7: Размерность эмбеддингов для EmbeddingsGigaR модели
+      # EmbeddingsGigaR возвращает 2560 измерений
+      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-2560}
+      EMBED_DIM: ${EMBED_DIM:-${EMBEDDING_DIMENSION:-2560}}
       # Dispatch smoke to validate routing before handler
       DISPATCH_SMOKE: ${DISPATCH_SMOKE:-false}
       # Force temporary handler for debugging
@@ -462,6 +482,10 @@ services:
       # Context7: Mount worker tasks для разработки (hot reload)
       - ./worker/tasks:/app/tasks:ro
       - ./worker/event_bus.py:/app/event_bus.py:ro
+      # Context7: Mount events schemas для разработки (hot reload)
+      - ./worker/events:/app/events:ro
+      # Context7: Mount scripts для E2E тестов
+      - ./scripts:/opt/telegram-assistant/scripts:ro
       # Context7 best practice: монтируем timezone данные хоста
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
@@ -528,6 +552,18 @@ services:
       HTTP_PROXY: ""
       HTTPS_PROXY: ""
       ALL_PROXY: ""
+      # S3 Storage Configuration (Cloud.ru) - Context7: для Vision + S3 Integration
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-https://s3.cloud.ru}
+      S3_BUCKET_NAME: ${S3_BUCKET_NAME}
+      S3_REGION: ${S3_REGION:-ru-central-1}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY}
+      S3_DEFAULT_TENANT_ID: ${S3_DEFAULT_TENANT_ID}
+      S3_USE_COMPRESSION: ${S3_USE_COMPRESSION:-true}
+      S3_COMPRESSION_LEVEL: ${S3_COMPRESSION_LEVEL:-6}
+      S3_MULTIPART_THRESHOLD_MB: ${S3_MULTIPART_THRESHOLD_MB:-5}
+      S3_ADDRESSING_STYLE: ${S3_ADDRESSING_STYLE:-path}
+      AWS_SIGNATURE_VERSION: ${AWS_SIGNATURE_VERSION:-s3v4}
     volumes:
       - ./telethon-ingest/sessions:/app/sessions  # персистентность сессий
       - ./telethon-ingest:/app:ro  # Context7: монтируем код для разработки (read-only для безопасности)

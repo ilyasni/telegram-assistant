@@ -8,7 +8,7 @@ import hashlib
 import io
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Any, Tuple
 
 import structlog
@@ -182,7 +182,8 @@ class MediaProcessor:
         message: Any,  # telethon.tl.types.Message
         post_id: str,
         trace_id: str,
-        tenant_id: Optional[str] = None
+        tenant_id: Optional[str] = None,
+        channel_id: Optional[str] = None
     ) -> List[MediaFile]:
         """
         Обработка всех медиа файлов из сообщения.
@@ -240,7 +241,7 @@ class MediaProcessor:
                 raw_media_type = "album"
                 channel_entity = getattr(message, 'peer_id', None)
                 album_files = await self._process_media_group(
-                    message, tenant_id, trace_id, channel_entity=channel_entity
+                    message, tenant_id, trace_id, channel_entity=channel_entity, channel_id=channel_id
                 )
                 media_files.extend(album_files)
                 normalized_media = normalize_media_type(raw_media_type)
@@ -306,13 +307,15 @@ class MediaProcessor:
         message: Any,
         tenant_id: str,
         trace_id: str,
-        channel_entity: Any = None
+        channel_entity: Any = None,
+        channel_id: Optional[str] = None
     ) -> List[MediaFile]:
         """
         Обработка медиа-альбома (MessageMediaGroup).
         
         Context7 best practice: 
-        - Получение всех сообщений альбома через client.get_messages()
+        - Negative cache для избежания повторных get_messages()
+        - Использование iter_messages() с окном по времени вместо пагинации min_id/max_id
         - Параллельное скачивание всех медиа через asyncio.gather()
         - Сохранение порядка элементов через message.id
         
@@ -321,6 +324,7 @@ class MediaProcessor:
             tenant_id: ID tenant
             trace_id: Trace ID для корреляции
             channel_entity: Telegram канал для получения всех сообщений альбома
+            channel_id: ID канала в системе (для Redis cache)
             
         Returns:
             Список MediaFile объектов с сохранением порядка
@@ -336,7 +340,31 @@ class MediaProcessor:
                 logger.warning("Media group without grouped_id", trace_id=trace_id)
                 return []
             
-            # Context7: Получаем все сообщения альбома через client.get_messages()
+            # Context7: Negative cache для избежания повторных get_messages()
+            # Если альбом уже в БД, пропускаем запрос к Telegram API
+            if channel_id and self.redis_client:
+                cache_key = f"album_seen:{channel_id}:{grouped_id}"
+                try:
+                    if await self.redis_client.exists(cache_key):
+                        # Альбом уже собран, пропускаем get_messages()
+                        # Восстановить message_ids можно из БД через media_group_items
+                        logger.debug(
+                            "Album already seen, skipping get_messages",
+                            grouped_id=grouped_id,
+                            channel_id=channel_id,
+                            trace_id=trace_id
+                        )
+                        return []  # Возвращаем пустой список, так как альбом уже обработан
+                except Exception as e:
+                    logger.warning(
+                        "Failed to check Redis cache",
+                        grouped_id=grouped_id,
+                        error=str(e),
+                        trace_id=trace_id
+                    )
+                    # Продолжаем обработку при ошибке кеша
+            
+            # Context7: Получаем все сообщения альбома через iter_messages()
             # Telethon возвращает сообщения с одинаковым grouped_id, но нужно получить их все
             # Используем channel_entity или peer из сообщения
             peer = getattr(message, 'peer_id', None) or channel_entity
@@ -349,33 +377,40 @@ class MediaProcessor:
                 )
                 return []
             
-            # Context7: Получаем все сообщения альбома
-            # Стратегия: получаем сообщения вокруг текущего, затем фильтруем по grouped_id
-            # Telethon не поддерживает прямой фильтр по grouped_id, поэтому:
-            # 1. Получаем диапазон сообщений вокруг текущего (например, ±20 сообщений)
-            # 2. Фильтруем по grouped_id
-            # 3. Сортируем по message.id для сохранения порядка
+            # Context7: Использование iter_messages() с окном по времени
+            # Telegram ограничивает медиагруппы до 10 элементов, они обычно лежат подряд
+            # Стратегия: limit=30, offset_date=msg.date±5 минут, фильтрация по grouped_id
+            # Прерывание: если собрали цепочку и следующее сообщение не из альбома
             
-            current_msg_id = message.id
-            # Получаем диапазон сообщений вокруг текущего
-            # Альбомы обычно содержат до 10 элементов, берем запас
-            min_id = max(0, current_msg_id - 20)
-            max_id = current_msg_id + 20
+            current_date = message.date
+            offset_date_min = current_date - timedelta(minutes=5)
+            offset_date_max = current_date + timedelta(minutes=5)
             
+            album_messages = []
             try:
-                # Получаем сообщения из канала
-                all_messages = await self.telegram_client.get_messages(
+                # Context7: Telethon iter_messages around message date
+                async for msg in self.telegram_client.iter_messages(
                     peer,
-                    min_id=min_id,
-                    max_id=max_id,
-                    limit=50
-                )
-                
-                # Фильтруем сообщения с тем же grouped_id и сортируем по id для порядка
-                album_messages = [
-                    msg for msg in all_messages
-                    if getattr(msg, 'grouped_id', None) == grouped_id
-                ]
+                    limit=30,
+                    offset_date=current_date,
+                    reverse=False
+                ):
+                    # Проверяем окно по дате
+                    if msg.date < offset_date_min or msg.date > offset_date_max:
+                        continue
+                    
+                    # Фильтруем по grouped_id
+                    if getattr(msg, 'grouped_id', None) == grouped_id:
+                        album_messages.append(msg)
+                        
+                        # Context7: Telegram ограничение - максимум 10 элементов
+                        if len(album_messages) >= 10:
+                            break
+                    
+                    # Если уже есть элементы и встретили сообщение без grouped_id или с другим
+                    # - прерываем (цепочка прервалась)
+                    if album_messages and getattr(msg, 'grouped_id', None) != grouped_id:
+                        break
                 
                 # Сортируем по message.id для сохранения порядка альбома
                 album_messages.sort(key=lambda m: m.id)
@@ -384,7 +419,7 @@ class MediaProcessor:
                     logger.warning(
                         "No messages found for media group",
                         grouped_id=grouped_id,
-                        current_msg_id=current_msg_id,
+                        current_msg_id=message.id,
                         trace_id=trace_id
                     )
                     return []
@@ -396,6 +431,19 @@ class MediaProcessor:
                     message_ids=[m.id for m in album_messages],
                     trace_id=trace_id
                 )
+                
+                # Context7: После успешного получения сообщений - кешируем факт обработки
+                if channel_id and self.redis_client:
+                    cache_key = f"album_seen:{channel_id}:{grouped_id}"
+                    try:
+                        await self.redis_client.setex(cache_key, 21600, "1")  # 6 часов TTL
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to set Redis cache",
+                            grouped_id=grouped_id,
+                            error=str(e),
+                            trace_id=trace_id
+                        )
                 
             except Exception as e:
                 logger.error(

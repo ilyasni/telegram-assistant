@@ -8,6 +8,14 @@
     <!-- Telegram WebApp SDK -->
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
     
+    <!-- [C7-ID: miniapp-admin-001] Загружаем модули админки в head для ранней доступности -->
+    <!-- Context7: Загружаем модули синхронно перед инициализацией -->
+    <script src="js/admin-utils.js"></script>
+    <script src="js/admin.js"></script>
+    <script src="js/admin-users.js"></script>
+    <script src="js/admin-invites.js"></script>
+    <script src="js/admin-subscriptions.js"></script>
+    
     <!-- Cache-busting для Mini App -->
     <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">
     <meta http-equiv="Pragma" content="no-cache">
@@ -222,10 +230,201 @@
                 padding: 16px;
             }
         }
+        
+        /* [C7-ID: miniapp-admin-001] Стили для админ-панели */
+        #admin-section {
+            display: none;
+        }
+        
+        #admin-section.active {
+            display: block;
+        }
+        
+        .admin-panel {
+            padding: 16px;
+            max-width: 100%;
+        }
+        
+        .admin-header {
+            margin-bottom: 20px;
+        }
+        
+        .admin-header h1 {
+            font-size: 24px;
+            margin: 0;
+        }
+        
+        .admin-tabs {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 20px;
+            border-bottom: 2px solid var(--tg-section-bg-color, #f0f0f0);
+        }
+        
+        .tab-btn {
+            padding: 12px 16px;
+            background: transparent;
+            border: none;
+            border-bottom: 2px solid transparent;
+            color: var(--tg-text-color, #000);
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.2s;
+        }
+        
+        .tab-btn:hover {
+            background: var(--tg-section-bg-color, #f0f0f0);
+        }
+        
+        .tab-btn.active {
+            border-bottom-color: var(--tg-button-color, #2481cc);
+            color: var(--tg-button-color, #2481cc);
+            font-weight: 600;
+        }
+        
+        .admin-content {
+            min-height: 400px;
+        }
+        
+        .admin-filters {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 16px;
+            flex-wrap: wrap;
+        }
+        
+        .filter-input, .filter-select {
+            flex: 1;
+            min-width: 150px;
+            padding: 8px 12px;
+            border: 1px solid var(--tg-hint-color, #ccc);
+            border-radius: 8px;
+            background: var(--tg-bg-color, #fff);
+            color: var(--tg-text-color, #000);
+            font-size: 14px;
+        }
+        
+        .admin-header-actions {
+            margin-bottom: 16px;
+        }
+        
+        .user-card, .invite-card, .subscription-card {
+            background: var(--tg-section-bg-color, #f8f8f8);
+            border-radius: 12px;
+            padding: 16px;
+            margin-bottom: 12px;
+        }
+        
+        .user-info, .invite-info, .subscription-info {
+            margin-bottom: 12px;
+        }
+        
+        .user-name, .invite-code {
+            font-size: 16px;
+            font-weight: 600;
+            margin-bottom: 8px;
+        }
+        
+        .user-meta, .invite-meta, .subscription-meta {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+            font-size: 12px;
+            color: var(--tg-hint-color, #666);
+            margin-bottom: 8px;
+        }
+        
+        .user-actions, .invite-actions, .subscription-actions {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        
+        .btn {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.2s;
+        }
+        
+        .btn-primary {
+            background: var(--tg-button-color, #2481cc);
+            color: var(--tg-button-text-color, #fff);
+        }
+        
+        .btn-secondary {
+            background: var(--tg-section-bg-color, #f0f0f0);
+            color: var(--tg-text-color, #000);
+        }
+        
+        .btn-warning {
+            background: #ffc107;
+            color: #000;
+        }
+        
+        .btn-danger {
+            background: var(--tg-destructive-color, #ff3b30);
+            color: #fff;
+        }
+        
+        .btn-sm {
+            padding: 6px 12px;
+            font-size: 12px;
+        }
+        
+        .btn:hover {
+            opacity: 0.8;
+        }
+        
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        
+        .loading, .empty-state, .error, .info-message {
+            text-align: center;
+            padding: 32px;
+            color: var(--tg-hint-color, #666);
+        }
+        
+        .pagination {
+            margin-top: 20px;
+        }
+        
+        .pagination-controls {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 12px;
+        }
+        
+        .detail-item {
+            margin-bottom: 12px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid var(--tg-section-bg-color, #f0f0f0);
+        }
+        
+        .detail-actions {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        
+        .admin-access-denied {
+            text-align: center;
+            padding: 48px 24px;
+        }
+        
+        .admin-access-denied h2 {
+            margin-bottom: 16px;
+        }
     </style>
 </head>
 <body>
-    <div class="container">
+    <!-- [C7-ID: miniapp-admin-001] Context7: QR секция скрыта по умолчанию, показывается только если не админ -->
+    <div id="qr-auth-section" class="container" style="display: none;">
         <div class="header">
             <h1>🔐 Авторизация</h1>
             <p>Войдите в систему через QR-код</p>
@@ -247,6 +446,11 @@
         <button id="cancel-btn" class="button" onclick="cancelAuth()">
             Отменить
         </button>
+    </div>
+    
+    <!-- [C7-ID: miniapp-admin-001] Админ-панель - скрыта по умолчанию -->
+    <div id="admin-section" class="admin-panel" style="display: none;">
+        <!-- Контент загружается динамически через admin.js -->
     </div>
 
     <script>
@@ -489,6 +693,70 @@
                 clearInterval(statusCheckInterval);
             }
             
+            // [C7-ID: miniapp-admin-001] Проверка роли и переключение между QR Auth и Admin
+            // Context7 best practice: JWT validation на клиенте с правильной обработкой ошибок
+            async function checkUserRole() {
+                try {
+                    const initData = window.Telegram?.WebApp?.initData;
+                    if (!initData) {
+                        console.log('[Admin Check] No initData available');
+                        return false;
+                    }
+                    
+                    // Context7: Аутентификация для получения JWT токена
+                    // Используем относительный путь для работы с текущим доменом
+                    const authUrl = API_BASE ? `${API_BASE}/api/auth/telegram-webapp` : '/api/auth/telegram-webapp';
+                    const authResponse = await fetch(authUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ init_data: initData })
+                    });
+                    
+                    if (!authResponse.ok) {
+                        console.log('[Admin Check] Auth failed:', authResponse.status);
+                        return false;
+                    }
+                    
+                    const authData = await authResponse.json();
+                    window.accessToken = authData.access_token;
+                    
+                    // Context7: Парсинг JWT для проверки роли с правильной обработкой base64
+                    try {
+                        const parts = authData.access_token.split('.');
+                        if (parts.length !== 3) {
+                            console.error('[Admin Check] Invalid JWT format');
+                            return false;
+                        }
+                        
+                        // Правильная обработка base64 padding
+                        let payloadBase64 = parts[1];
+                        payloadBase64 = payloadBase64.replace(/-/g, '+').replace(/_/g, '/');
+                        // Добавляем padding если нужно
+                        while (payloadBase64.length % 4) {
+                            payloadBase64 += '=';
+                        }
+                        
+                        const payload = JSON.parse(atob(payloadBase64));
+                        
+                        // Context7: Детальное логирование для отладки
+                        console.log('[Admin Check] JWT Payload:', JSON.stringify(payload, null, 2));
+                        console.log('[Admin Check] Role from payload:', payload.role);
+                        console.log('[Admin Check] Role type:', typeof payload.role);
+                        
+                        const isAdmin = payload.role === 'admin';
+                        console.log('[Admin Check] Is Admin:', isAdmin);
+                        
+                        return isAdmin;
+                    } catch (e) {
+                        console.error('[Admin Check] Failed to parse JWT:', e);
+                        return false;
+                    }
+                } catch (error) {
+                    console.error('[Admin Check] Role check error:', error);
+                    return false;
+                }
+            }
+            
             // Инициализация при загрузке
             document.addEventListener('DOMContentLoaded', async () => {
                 if (isInitialized) return;
@@ -496,20 +764,88 @@
                 
                 initTelegramWebApp();
                 
-                const urlParams = new URLSearchParams(location.search);
-                const existingSessionId = urlParams.get('session_id');
+                // Context7: Ждем инициализации Telegram WebApp SDK
+                if (window.Telegram && window.Telegram.WebApp) {
+                    // Ждем готовности WebApp
+                    await new Promise(resolve => {
+                        if (window.Telegram.WebApp.isReady) {
+                            resolve();
+                        } else {
+                            window.Telegram.WebApp.ready();
+                            setTimeout(resolve, 100);
+                        }
+                    });
+                }
                 
-                if (existingSessionId) {
-                    sessionToken = existingSessionId;
-                    updateStatus('Проверка сессии...', 'loading');
-                    showQR();
-                    statusCheckInterval = setInterval(checkStatus, 2000);
+                // [C7-ID: miniapp-admin-001] Проверка роли админа
+                // Context7: Проверяем роль перед инициализацией любого UI
+                console.log('[Admin Check] Starting role check...');
+                const isAdmin = await checkUserRole();
+                console.log('[Admin Check] Role check result:', isAdmin);
+                
+                if (isAdmin) {
+                    console.log('[Admin Check] User is admin, showing admin panel');
+                    // Показываем админ-панель
+                    const qrSection = document.getElementById('qr-auth-section');
+                    const adminSection = document.getElementById('admin-section');
+                    
+                    if (qrSection) qrSection.style.display = 'none';
+                    if (adminSection) {
+                        adminSection.style.display = 'block';
+                        adminSection.classList.add('active');
+                        // Context7: Явно вызываем инициализацию админки
+                        // Ждем немного, чтобы убедиться, что все модули загружены
+                        if (typeof window.initAdmin === 'function') {
+                            // Небольшая задержка для гарантии загрузки всех модулей
+                            setTimeout(async () => {
+                                await window.initAdmin();
+                            }, 100);
+                        } else {
+                            console.warn('[Admin Check] initAdmin function not available, waiting...');
+                            // Ждем загрузки функции
+                            let attempts = 0;
+                            const checkInitAdmin = setInterval(() => {
+                                attempts++;
+                                if (typeof window.initAdmin === 'function') {
+                                    clearInterval(checkInitAdmin);
+                                    window.initAdmin();
+                                } else if (attempts > 50) {
+                                    clearInterval(checkInitAdmin);
+                                    console.error('[Admin Check] initAdmin function not loaded after 5 seconds');
+                                    adminSection.innerHTML = '<div class="admin-panel"><div class="admin-header"><h1>👑 Админ-панель</h1></div><div class="admin-content"><p class="error">Ошибка загрузки модулей админки. Перезагрузите страницу.</p></div></div>';
+                                }
+                            }, 100);
+                        }
+                    }
                 } else {
-                    try {
-                        await createSession();
+                    console.log('[Admin Check] User is not admin, showing QR Auth');
+                    // Показываем QR Auth
+                    const qrSection = document.getElementById('qr-auth-section');
+                    const adminSection = document.getElementById('admin-section');
+                    
+                    if (adminSection) {
+                        adminSection.style.display = 'none';
+                        adminSection.classList.remove('active');
+                    }
+                    if (qrSection) {
+                        qrSection.style.display = 'block';
+                    }
+                    
+                    const urlParams = new URLSearchParams(location.search);
+                    const existingSessionId = urlParams.get('session_id');
+                    
+                    if (existingSessionId) {
+                        sessionToken = existingSessionId;
+                        updateStatus('Проверка сессии...', 'loading');
+                        showQR();
                         statusCheckInterval = setInterval(checkStatus, 2000);
-                    } catch (error) {
-                        console.error('Initialization error:', error);
+                    } else {
+                        try {
+                            await createSession();
+                            statusCheckInterval = setInterval(checkStatus, 2000);
+                        } catch (error) {
+                            console.error('Initialization error:', error);
+                        }
                     }
                 }
             });
@@ -519,5 +855,7 @@
             
         })();
     </script>
+    
+    <!-- Модули админки уже загружены в head -->
 </body>
 </html>

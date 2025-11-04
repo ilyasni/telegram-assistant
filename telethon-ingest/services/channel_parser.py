@@ -156,6 +156,15 @@ class ChannelParser:
                    mode=mode,
                    user_id=user_id)
         
+        # Context7: Проверка и очистка незакрытых транзакций перед началом парсинга
+        try:
+            if self.db_session.in_transaction():
+                logger.warning("Found open transaction before parsing, rolling back", channel_id=channel_id)
+                await self.db_session.rollback()
+        except Exception as e:
+            logger.warning("Failed to check/rollback session state before parsing", 
+                         channel_id=channel_id, error=str(e))
+        
         try:
             # Context7: Получение Telegram клиента из менеджера
             if not self.telegram_client_manager:
@@ -181,11 +190,30 @@ class ChannelParser:
             
             # Context7: Получение tg_channel_id для проверки cooldown
             logger.info("Fetching tg_channel_id from DB", channel_id=channel_id)
-            result = await self.db_session.execute(
-                text("SELECT tg_channel_id FROM channels WHERE id = :channel_id"),
-                {"channel_id": channel_id}
-            )
-            row = result.fetchone()
+            # Context7: Используем autocommit=True для SELECT запросов, чтобы избежать проблем с транзакциями
+            try:
+                result = await self.db_session.execute(
+                    text("SELECT tg_channel_id FROM channels WHERE id = :channel_id"),
+                    {"channel_id": channel_id}
+                )
+                row = result.fetchone()
+            except Exception as e:
+                # Context7: Если ошибка "invalid transaction", делаем rollback и повторяем запрос
+                if "invalid transaction" in str(e).lower() or "rollback" in str(e).lower():
+                    logger.warning("Invalid transaction detected, rolling back and retrying", 
+                                 channel_id=channel_id, error=str(e))
+                    try:
+                        await self.db_session.rollback()
+                    except Exception:
+                        pass
+                    # Повторяем запрос после rollback
+                    result = await self.db_session.execute(
+                        text("SELECT tg_channel_id FROM channels WHERE id = :channel_id"),
+                        {"channel_id": channel_id}
+                    )
+                    row = result.fetchone()
+                else:
+                    raise
             logger.info("tg_channel_id query result", 
                        channel_id=channel_id,
                        has_row=row is not None,
@@ -228,12 +256,12 @@ class ChannelParser:
                     logger.warning("Invalid tg_channel_id, skipping cooldown check", 
                                  channel_id=channel_id, tg_channel_id=tg_channel_id, error=str(e))
             
-            # Context7: Проверка rate limiting
-            if self.rate_limiter:
+            # Context7: Проверка rate limiting (используем tg_channel_id из БД)
+            if self.rate_limiter and tg_channel_id:
                 rate_result = await check_parsing_rate_limit(
                     self.rate_limiter,
                     int(user_id),
-                    int(channel_id)
+                    int(tg_channel_id)
                 )
                 
                 if not rate_result.get('allowed', True):
@@ -257,11 +285,29 @@ class ChannelParser:
             channel_entity, tg_channel_id = channel_result
             
             # Context7 best practice: Получение данных канала для определения since_date
-            result = await self.db_session.execute(
-                text("SELECT id, last_parsed_at FROM channels WHERE id = :channel_id"),
-                {"channel_id": channel_id}
-            )
-            channel_row = result.fetchone()
+            try:
+                result = await self.db_session.execute(
+                    text("SELECT id, last_parsed_at FROM channels WHERE id = :channel_id"),
+                    {"channel_id": channel_id}
+                )
+                channel_row = result.fetchone()
+            except Exception as e:
+                # Context7: Если ошибка "invalid transaction", делаем rollback и повторяем запрос
+                if "invalid transaction" in str(e).lower() or "rollback" in str(e).lower():
+                    logger.warning("Invalid transaction detected, rolling back and retrying", 
+                                 channel_id=channel_id, error=str(e))
+                    try:
+                        await self.db_session.rollback()
+                    except Exception:
+                        pass
+                    # Повторяем запрос после rollback
+                    result = await self.db_session.execute(
+                        text("SELECT id, last_parsed_at FROM channels WHERE id = :channel_id"),
+                        {"channel_id": channel_id}
+                    )
+                    channel_row = result.fetchone()
+                else:
+                    raise
             channel_data = {
                 'id': str(channel_row.id) if channel_row else channel_id,
                 'last_parsed_at': channel_row.last_parsed_at if channel_row and channel_row.last_parsed_at else None
@@ -271,7 +317,13 @@ class ChannelParser:
             since_date = await self._get_since_date(channel_data, mode)
             
             logger.info(
-                f"Starting to parse channel: channel_title={channel_entity.title}, mode={mode}, since_date={since_date.isoformat()}"
+                "Starting to parse channel",
+                channel_id=channel_id,
+                channel_title=channel_entity.title,
+                mode=mode,
+                since_date=since_date.isoformat(),
+                last_parsed_at=channel_data.get('last_parsed_at'),
+                is_new_channel=channel_data.get('last_parsed_at') is None
             )
             
             # Парсинг сообщений батчами
@@ -359,12 +411,37 @@ class ChannelParser:
         Context7 best practice: Автоматическое заполнение tg_channel_id при отсутствии.
         """
         try:
+            # Context7: Проверка и очистка транзакции перед запросом
+            try:
+                if self.db_session.in_transaction():
+                    await self.db_session.rollback()
+            except Exception:
+                pass
+            
             # Получение информации о канале из БД
-            result = await self.db_session.execute(
-                text("SELECT tg_channel_id, username, title FROM channels WHERE id = :channel_id"),
-                {"channel_id": channel_id}
-            )
-            channel_info = result.fetchone()
+            try:
+                result = await self.db_session.execute(
+                    text("SELECT tg_channel_id, username, title FROM channels WHERE id = :channel_id"),
+                    {"channel_id": channel_id}
+                )
+                channel_info = result.fetchone()
+            except Exception as e:
+                # Context7: Если ошибка "invalid transaction", делаем rollback и повторяем запрос
+                if "invalid transaction" in str(e).lower() or "rollback" in str(e).lower():
+                    logger.warning("Invalid transaction detected in _get_channel_entity, rolling back and retrying", 
+                                 channel_id=channel_id, error=str(e))
+                    try:
+                        await self.db_session.rollback()
+                    except Exception:
+                        pass
+                    # Повторяем запрос после rollback
+                    result = await self.db_session.execute(
+                        text("SELECT tg_channel_id, username, title FROM channels WHERE id = :channel_id"),
+                        {"channel_id": channel_id}
+                    )
+                    channel_info = result.fetchone()
+                else:
+                    raise
             
             if not channel_info:
                 logger.error("Channel not found in database", channel_id=channel_id)
@@ -379,9 +456,11 @@ class ChannelParser:
             tg_channel_id = None
             
             if username:
+                # Context7: Нормализация username - убираем @ из начала для корректного поиска
+                clean_username = username.lstrip('@')
                 # Приоритет: username (более надёжный способ)
                 try:
-                    entity = await client.get_entity(username)
+                    entity = await client.get_entity(clean_username)
                     # Context7: Для каналов (Channel) ID всегда отрицательный при сохранении в БД
                     # entity.id может быть положительным для приватных каналов, используем utils.get_peer_id
                     from telethon import utils
@@ -428,11 +507,12 @@ class ChannelParser:
             # Context7 best practice: Автоматическое заполнение tg_channel_id в БД, если отсутствует
             if entity and not tg_channel_id_db and tg_channel_id:
                 try:
-                    await self.db_session.execute(
-                        text("UPDATE channels SET tg_channel_id = :tg_id WHERE id = :channel_id"),
-                        {"tg_id": tg_channel_id, "channel_id": channel_id}
-                    )
-                    await self.db_session.commit()
+                    # Context7: Используем транзакцию через async with для безопасной обработки ошибок
+                    async with self.db_session.begin():
+                        await self.db_session.execute(
+                            text("UPDATE channels SET tg_channel_id = :tg_id WHERE id = :channel_id"),
+                            {"tg_id": tg_channel_id, "channel_id": channel_id}
+                        )
                     logger.info("Auto-populated tg_channel_id", 
                               channel_id=channel_id, 
                               username=username,
@@ -440,10 +520,7 @@ class ChannelParser:
                 except Exception as e:
                     logger.warning("Failed to update tg_channel_id in DB", 
                                  channel_id=channel_id, error=str(e))
-                    try:
-                        await self.db_session.rollback()
-                    except Exception:
-                        pass
+                    # Context7: Rollback уже выполнен автоматически через async with begin()
             
             if not entity or not tg_channel_id:
                 logger.error("Failed to resolve channel entity", 
@@ -840,28 +917,32 @@ class ChannelParser:
         redis_hwm = ensure_dt_utc(hwm_raw) if hwm_raw else None
         
         if mode == "incremental":
-            # Context7: [C7-ID: incremental-since-date-fix-002] Приоритет MAX(posted_at) из БД
-            # Это реальное время последнего поста, более надёжно, чем last_parsed_at
+            # Context7: [C7-ID: incremental-since-date-fix-003] КРИТИЧНО - для incremental режима используем ТОЛЬКО MAX(posted_at) из БД
+            # last_parsed_at может быть намного больше реального последнего поста, если парсинг не нашел новых постов
+            # Это приводит к неправильному расчету since_date и пропуску постов
             last_post_date = await self._get_last_post_date(channel_id)
             
-            # Выбираем наиболее свежую дату из доступных источников
-            candidates = []
             if last_post_date:
-                candidates.append(('last_post_date', last_post_date))
-            
-            # Опора на last_parsed_at или Redis HWM
-            base = channel.get('last_parsed_at') or redis_hwm
-            if base:
-                base_utc = ensure_dt_utc(base)
-                if base_utc:
-                    candidates.append(('last_parsed_at', base_utc))
-            
-            if not candidates:
-                # Fallback: если нет данных, берём incremental окно
-                return now - timedelta(minutes=self.config.incremental_minutes)
-            
-            # Используем максимальную дату из всех источников
-            base_utc = max(candidates, key=lambda x: x[1])[1]
+                # Context7: Используем ТОЛЬКО last_post_date (реальный последний пост в БД)
+                # НЕ используем last_parsed_at, так как он может быть неточным
+                base_utc = last_post_date
+                logger.debug("Using last_post_date as base for incremental mode",
+                           channel_id=channel_id,
+                           last_post_date=last_post_date.isoformat())
+            else:
+                # Fallback: если нет постов в БД, используем last_parsed_at или Redis HWM
+                base = channel.get('last_parsed_at') or redis_hwm
+                if base:
+                    base_utc = ensure_dt_utc(base)
+                    if not base_utc:
+                        # Если не удалось нормализовать, используем incremental окно
+                        return now - timedelta(minutes=self.config.incremental_minutes)
+                    logger.debug("Using last_parsed_at/HWM as fallback (no posts in DB)",
+                               channel_id=channel_id,
+                               base_date=base_utc.isoformat())
+                else:
+                    # Fallback: если нет данных, берём incremental окно
+                    return now - timedelta(minutes=self.config.incremental_minutes)
             
             # Проверка валидности
             if not base_utc:
@@ -926,7 +1007,16 @@ class ChannelParser:
             return since_date
         
         elif mode == "historical":
-            return now - timedelta(hours=self.config.historical_hours)
+            # Context7: Для historical режима (новые каналы или старые с пропусками)
+            # Парсим последние N часов (по умолчанию 24 часа)
+            # Используем исторический диапазон для полного покрытия
+            since_date = now - timedelta(hours=self.config.historical_hours)
+            logger.debug("Calculated since_date for historical mode",
+                       channel_id=channel_id,
+                       since_date=since_date.isoformat(),
+                       historical_hours=self.config.historical_hours,
+                       now=now.isoformat())
+            return since_date
         
         else:
             raise ValueError(f"Unknown parser mode: {mode}")
@@ -945,26 +1035,46 @@ class ChannelParser:
         
         # Context7: Использование retry обвязки вместо прямого iter_messages
         try:
-            # [C7-ID: dev-mode-017] Context7 best practice: для incremental режима получаем больше сообщений
-            # чтобы захватить все новые посты между last_parsed_at и now
-            # Важно: для incremental режима нужно получать достаточно сообщений,
-            # чтобы гарантированно захватить все новые после since_date
-            limit = batch_size * 100 if mode == "incremental" else batch_size
+            # [C7-ID: dev-mode-017] Context7 best practice: получаем достаточно сообщений
+            # чтобы гарантированно захватить все новые посты за нужный период
+            # - incremental: последние сообщения между last_parsed_at и now
+            # - historical: последние 24 часа (для новых каналов)
+            # Базовый лимит будет установлен ниже в зависимости от режима
+            limit = batch_size * 100 if mode == "incremental" else batch_size * 200
             
-            # Получаем сообщения через retry обвязку
-            # Context7: В incremental режиме НЕ используем offset_date, так как нам нужны последние сообщения
-            # (которые приходят от новых к старым), а фильтрация будет происходить в цикле ниже
-            # offset_date в incremental режиме может пропустить новые сообщения
+            # Context7: КРИТИЧНО - offset_date в Telethon возвращает сообщения ПРЕДШЕСТВУЮЩИЕ дате, а не ПОСЛЕ!
+            # Источник: Telethon docs: "offset_date: Offset date (messages *previous* to this date will be retrieved). Exclusive."
+            # 
+            # Для ОБОИХ режимов (incremental и historical) НЕ используем offset_date, потому что:
+            # - incremental: нужны сообщения НОВЕЕ since_date (последние сообщения)
+            # - historical: нужны сообщения НОВЕЕ since_date (последние 24 часа для новых каналов)
+            # 
+            # Используем подход: получаем последние сообщения БЕЗ offset_date, затем фильтруем локально
+            # Это гарантирует, что мы получим ВСЕ новые сообщения независимо от режима
+            offset_date_param = None
+            
+            # Context7: Для historical режима увеличиваем лимит, чтобы гарантированно захватить все сообщения за последние 24 часа
+            if mode == "historical":
+                limit = batch_size * 200  # Увеличиваем лимит для historical режима (новые каналы)
+            
+            logger.debug("Fetching messages batch",
+                        channel_id=channel_entity.id,
+                        mode=mode,
+                        limit=limit,
+                        since_date=since_date.isoformat(),
+                        offset_date=offset_date_param.isoformat() if offset_date_param else None)
+            
             messages = await fetch_messages_with_retry(
                 client,
                 channel_entity,
                 limit=limit,
                 redis_client=self.redis_client,
-                offset_date=None  # Не используем offset_date, получаем последние N сообщений
+                offset_date=offset_date_param  # Всегда None для обоих режимов (получаем последние сообщения)
             )
             
             # Диагностика: логируем первое и последнее сообщение для понимания диапазона
-            if messages and mode == "incremental":
+            # Context7: Логируем для обоих режимов, чтобы отслеживать правильность работы
+            if messages:
                 first_msg = messages[0] if messages else None
                 last_msg = messages[-1] if messages else None
                 first_msg_date = ensure_dt_utc(first_msg.date) if first_msg and first_msg.date else None
@@ -974,14 +1084,28 @@ class ChannelParser:
                 newer_count = sum(1 for msg in messages 
                                 if msg.date and ensure_dt_utc(msg.date) and ensure_dt_utc(msg.date) > since_date)
                 
-                logger.info(f"Fetched messages range for incremental mode",
+                # Context7: Для historical режима считаем сообщения >= since_date, для incremental > since_date
+                now_for_log = datetime.now(timezone.utc)
+                if mode == "historical":
+                    matching_count = sum(1 for msg in messages 
+                                       if msg.date and ensure_dt_utc(msg.date) and ensure_dt_utc(msg.date) >= since_date)
+                    # Дополнительная диагностика для historical режима
+                    age_hours = (now_for_log - since_date).total_seconds() / 3600 if since_date else None
+                else:
+                    matching_count = newer_count
+                    age_hours = None
+                
+                logger.info(f"Fetched messages range for {mode} mode",
                           channel_id=channel_entity.id,
+                          mode=mode,
                           count=len(messages),
-                          first_message_date=first_msg_date,
+                          first_message_date=first_msg_date.isoformat() if first_msg_date else None,
                           first_message_date_original=first_msg.date if first_msg else None,
-                          last_message_date=last_msg_date,
-                          since_date=since_date,
-                          messages_newer_than_since_date=newer_count)
+                          last_message_date=last_msg_date.isoformat() if last_msg_date else None,
+                          since_date=since_date.isoformat(),
+                          messages_matching_since_date=matching_count,
+                          historical_range_hours=age_hours,
+                          now=now_for_log.isoformat())
             
             # Обрабатываем полученные сообщения
             messages_filtered = 0
@@ -1033,17 +1157,11 @@ class ChannelParser:
                         channel_id=channel_entity.id,
                         error=str(e))
             # Fallback к старому методу при ошибке
-            # [C7-ID: dev-mode-017] Context7 best practice: устанавливаем разумный лимит для безопасности
-            if mode == "incremental":
-                # Для incremental: получаем новые сообщения (без offset_date, чтобы получить последние сообщения)
-                limit_fallback = batch_size * 10
-                iter_params = {"limit": limit_fallback}
-            else:
-                # Для historical: используем offset_date для получения сообщений до определенной даты
-                # Context7: Исправлено: установлен разумный лимит вместо None для предотвращения избыточной загрузки
-                # Используем лимит как в основном пути (batch_size * 100 для покрытия большого диапазона)
-                limit_fallback = batch_size * 100
-                iter_params = {"offset_date": since_date, "limit": limit_fallback}
+            # [C7-ID: dev-mode-017] Context7 best practice: для ОБОИХ режимов НЕ используем offset_date
+            # Получаем последние сообщения и фильтруем локально по date >= since_date (historical) или date > since_date (incremental)
+            # Это гарантирует, что мы получим ВСЕ новые сообщения независимо от режима
+            limit_fallback = batch_size * 200 if mode == "historical" else batch_size * 100
+            iter_params = {"limit": limit_fallback}
             
             async for message in client.iter_messages(channel_entity, **iter_params):
                 # [C7-ID: dev-mode-017] Context7: Унифицированная логика фильтрации (соответствует основному пути)
@@ -1125,36 +1243,9 @@ class ChannelParser:
                                has_text=bool(message.text),
                                has_media=bool(message.media))
                 
-                # Context7: Дедупликация альбомов по grouped_id
+                # Context7: Идемпотентность обеспечивается UNIQUE constraint (channel_id, telegram_message_id) в БД
+                # Дедупликация по grouped_id удалена - она вызывала race conditions и потерю альбомов
                 grouped_id = getattr(message, 'grouped_id', None)
-                if grouped_id:
-                    # Проверка в Redis: был ли уже обработан этот альбом
-                    redis_key = f"seen:group:{user_id}:{channel_id}:{grouped_id}"
-                    try:
-                        # Используем SETNX для атомарной проверки и установки
-                        if hasattr(self.redis_client, 'set'):
-                            # Для sync redis
-                            already_seen = not self.redis_client.set(redis_key, "1", ex=86400, nx=True)
-                        else:
-                            # Для async redis
-                            already_seen = not await self.redis_client.set(redis_key, "1", ex=86400, nx=True)
-                        
-                        if already_seen:
-                            skipped += 1
-                            logger.debug(
-                                "Album already processed, skipping",
-                                grouped_id=grouped_id,
-                                channel_id=channel_id,
-                                message_id=message.id
-                            )
-                            continue
-                    except Exception as e:
-                        logger.warning(
-                            "Failed to check album deduplication in Redis",
-                            grouped_id=grouped_id,
-                            error=str(e)
-                        )
-                        # Продолжаем обработку при ошибке Redis (graceful degradation)
                 
                 # Проверка идемпотентности
                 is_duplicate = await self._is_duplicate_message(message, channel_id, tenant_id)
@@ -1189,12 +1280,13 @@ class ChannelParser:
                                 self.media_processor.telegram_client = telegram_client
                                 
                                 # Обработка медиа
-                                # Передаем channel_entity для обработки альбомов
+                                # Передаем channel_entity и channel_id для обработки альбомов
                                 media_files = await self.media_processor.process_message_media(
                                     message=message,
                                     post_id=post_id,
                                     trace_id=trace_id,
-                                    tenant_id=tenant_id
+                                    tenant_id=tenant_id,
+                                    channel_id=channel_id
                                 )
                                 
                                 logger.debug(
@@ -1330,8 +1422,34 @@ class ChannelParser:
                             continue
                         
                         if grouped_id not in albums_data:
+                            # Context7: Получаем UUID пользователя из БД по telegram_id
+                            user_uuid = None
+                            try:
+                                result = await self.db_session.execute(
+                                    text("SELECT id FROM users WHERE telegram_id = :telegram_id LIMIT 1"),
+                                    {"telegram_id": int(user_id)}
+                                )
+                                row = result.fetchone()
+                                if row:
+                                    user_uuid = str(row.id)
+                                else:
+                                    logger.warning(
+                                        "User UUID not found for telegram_id, skipping album",
+                                        telegram_id=user_id,
+                                        grouped_id=grouped_id
+                                    )
+                                    continue
+                            except Exception as e:
+                                logger.warning(
+                                    "Failed to get user UUID, skipping album",
+                                    telegram_id=user_id,
+                                    grouped_id=grouped_id,
+                                    error=str(e)
+                                )
+                                continue
+                            
                             albums_data[grouped_id] = {
-                                'user_id': user_id,
+                                'user_id': user_uuid,  # Используем UUID вместо telegram_id
                                 'channel_id': channel_id,
                                 'grouped_id': grouped_id,
                                 'post_ids': [],
@@ -1385,6 +1503,27 @@ class ChannelParser:
                                     actual_post_ids.append(str(row.id))
                             
                             if len(actual_post_ids) > 1:  # Только для реальных альбомов
+                                # Получаем caption_text и posted_at из первого поста альбома
+                                caption_text = None
+                                posted_at = None
+                                if album_data.get('post_ids') and len(album_data['post_ids']) > 0:
+                                    first_post_uuid = album_data['post_ids'][0]
+                                    try:
+                                        result = await self.db_session.execute(
+                                            text("SELECT content, posted_at FROM posts WHERE id = :post_id LIMIT 1"),
+                                            {"post_id": first_post_uuid}
+                                        )
+                                        row = result.fetchone()
+                                        if row:
+                                            caption_text = row[0] if row[0] else None
+                                            posted_at = row[1] if row[1] else None
+                                    except Exception as e:
+                                        logger.debug(
+                                            "Failed to get caption_text/posted_at from first post",
+                                            post_id=first_post_uuid,
+                                            error=str(e)
+                                        )
+                                
                                 group_id = await save_media_group(
                                     db_session=self.db_session,
                                     user_id=album_data['user_id'],
@@ -1394,7 +1533,13 @@ class ChannelParser:
                                     media_types=album_data['media_types'][:len(actual_post_ids)],  # Обрезаем до нужной длины
                                     media_sha256s=album_data['media_sha256s'][:len(actual_post_ids)] if album_data['media_sha256s'] else None,
                                     media_bytes=album_data['media_bytes'][:len(actual_post_ids)] if album_data['media_bytes'] else None,
-                                    trace_id=f"{tenant_id}:{channel_id}:{grouped_id}"
+                                    caption_text=caption_text,
+                                    posted_at=posted_at,
+                                    media_kinds=album_data['media_types'][:len(actual_post_ids)],  # Используем media_types как media_kinds
+                                    trace_id=f"{tenant_id}:{channel_id}:{grouped_id}",
+                                    tenant_id=tenant_id,
+                                    event_publisher=self.event_publisher,
+                                    redis_client=self.redis_client
                                 )
                                 if group_id:
                                     logger.info(
@@ -1776,94 +1921,8 @@ class ChannelParser:
             reactions_count=post_data.get('reactions_count', 0)
         )
     
-    async def _bulk_insert_posts(self, posts_data: List[Dict[str, Any]]):
-        """
-        Context7: Делегирование к AtomicDBSaver для совместимости.
-        Этот метод теперь deprecated, используется atomic_saver.save_batch_atomic.
-        """
-        if not posts_data:
-            return
-            
-        logger.warning("_bulk_insert_posts is deprecated, use atomic_saver.save_batch_atomic instead")
-        
-        # Fallback к старому методу если atomic_saver недоступен
-        if not self.atomic_saver:
-            await self._legacy_bulk_insert_posts(posts_data)
-            return
-        
-        # Подготовка данных для AtomicDBSaver
-        user_data = {
-            'telegram_id': posts_data[0].get('user_id', 0),
-            'first_name': '',
-            'last_name': '',
-            'username': ''
-        }
-        
-        channel_data = {
-            'telegram_id': posts_data[0].get('channel_id', 0),
-            'title': '',
-            'username': '',
-            'description': '',
-            'participants_count': 0,
-            'is_broadcast': False,
-            'is_megagroup': False
-        }
-        
-        # Используем AtomicDBSaver
-        success, error, inserted_count = await self.atomic_saver.save_batch_atomic(
-            self.db_session,
-            user_data,
-            channel_data,
-            posts_data
-        )
-        
-        if not success:
-            logger.error("Atomic bulk insert failed", error=error)
-            raise Exception(f"Atomic bulk insert failed: {error}")
-    
-    async def _legacy_bulk_insert_posts(self, posts_data: List[Dict[str, Any]]):
-        """Legacy bulk insert для совместимости."""
-        # Context7: Используем только существующие колонки
-        required_columns = [
-            'id', 'channel_id', 'telegram_message_id', 'content', 'media_urls',
-            'posted_at', 'created_at', 'is_processed', 'has_media', 'yyyymm',
-            'views_count', 'forwards_count', 'reactions_count', 'replies_count',
-            'telegram_post_url'
-        ]
-        
-        # Фильтруем только существующие поля
-        filtered_data = [
-            {k: v for k, v in post.items() if k in required_columns}
-            for post in posts_data
-        ]
-        
-        # Подготовка SQL запроса
-        columns = list(filtered_data[0].keys())
-        placeholders = ', '.join([f':{col}' for col in columns])
-        
-        # Context7: Идемпотентность через уникальный индекс ux_posts_chan_msg
-        sql = f"""
-        INSERT INTO posts ({', '.join(columns)})
-        VALUES ({placeholders})
-        ON CONFLICT (channel_id, telegram_message_id) 
-        DO UPDATE SET
-            content = EXCLUDED.content,
-            media_urls = EXCLUDED.media_urls,
-            views_count = EXCLUDED.views_count,
-            forwards_count = EXCLUDED.forwards_count,
-            updated_at = NOW()
-        """
-        
-        try:
-            await self.db_session.execute(text(sql), filtered_data)
-            await self.db_session.commit()
-            
-            logger.info(f"Legacy bulk inserted {len(posts_data)} posts")
-            
-        except Exception as e:
-            await self.db_session.rollback()
-            logger.error(f"Legacy bulk insert failed: {e}")
-            raise
+    # Context7: Методы _bulk_insert_posts и _legacy_bulk_insert_posts удалены
+    # Используется atomic_saver.save_batch_atomic напрямую в _process_message_batch
     
     async def _publish_parsed_events(self, events_data: List[Dict[str, Any]]):  # PostParsedEventV1 - temporarily disabled
         """Публикация событий post.parsed."""

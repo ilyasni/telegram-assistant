@@ -56,6 +56,19 @@ stream_pending_size = Gauge(
     ['stream']
 )
 
+# Context7: Метрики lag и pending из XINFO GROUPS (для всех стримов)
+stream_consumer_lag = Gauge(
+    'stream_consumer_lag',
+    'Consumer group lag (messages not yet delivered to any consumer)',
+    ['stream', 'group']
+)
+
+stream_consumer_pending = Gauge(
+    'stream_consumer_pending',
+    'Number of pending messages in PEL (Pending Entry List)',
+    ['stream', 'group']
+)
+
 posts_in_queue_total = Gauge(
     'posts_in_queue_total',
     'Current posts in queue',
@@ -77,6 +90,9 @@ STREAMS = {
     # Context7: Vision и Retagging стримы
     'posts.vision.uploaded': 'stream:posts:vision:uploaded',
     'posts.vision.analyzed': 'stream:posts:vision:analyzed',
+    # Context7: Album стримы (Phase 2)
+    'albums.parsed': 'stream:albums:parsed',
+    'album.assembled': 'stream:album:assembled',
     # DLQ алиасы
     'posts.parsed.dlq': 'stream:posts:parsed:dlq',
     'posts.tagged.dlq': 'stream:posts:tagged:dlq',
@@ -85,6 +101,8 @@ STREAMS = {
     'posts.crawl.dlq': 'stream:posts:crawl:dlq',
     'posts.deleted.dlq': 'stream:posts:deleted:dlq',
     'posts.vision.analyzed.dlq': 'stream:posts:vision:analyzed:dlq',
+    'albums.parsed.dlq': 'stream:albums:parsed:dlq',
+    'album.assembled.dlq': 'stream:album:assembled:dlq',
 }
 
 # DLQ стримы (legacy, для обратной совместимости)
@@ -96,6 +114,9 @@ DLQ_STREAMS = {
     'posts.deleted': 'stream:posts:deleted:dlq',
     # Context7: DLQ для Vision и Retagging
     'posts.vision.analyzed': 'stream:posts:vision:analyzed:dlq',
+    # Context7: DLQ для альбомов (Phase 2)
+    'albums.parsed': 'stream:albums:parsed:dlq',
+    'album.assembled': 'stream:album:assembled:dlq',
 }
 
 # ============================================================================
@@ -624,7 +645,7 @@ class EventConsumer:
 
     async def _update_queue_metrics(self, stream_name: str):
         """
-        Context7: Обновление метрик размера очереди на основе реальных данных Redis.
+        Context7: Обновление метрик размера очереди, lag и pending из XINFO GROUPS.
         Вызывается периодически для актуальных метрик.
         """
         try:
@@ -638,20 +659,44 @@ class EventConsumer:
             # Обновляем метрику posts_in_queue_total
             posts_in_queue_total.labels(queue=stream_name, status='total').set(stream_length)
             
-            # Получаем pending сообщения через XPENDING
+            # Context7: Обновляем метрики lag и pending из XINFO GROUPS
             try:
-                pending_info = await self.client.client.xpending_range(
-                    stream_key,
-                    self.config.group_name,
-                    min='-',
-                    max='+',
-                    count=1000
-                )
-                pending_count = len(pending_info) if pending_info else 0
-                stream_pending_size.labels(stream=stream_name).set(pending_count)
-                posts_in_queue_total.labels(queue=stream_name, status='pending').set(pending_count)
+                groups_info = await self.client.client.xinfo_groups(stream_key)
+                for group_info in groups_info:
+                    group_name_bytes = group_info.get(b'name', b'')
+                    if group_name_bytes:
+                        group_name = group_name_bytes.decode() if isinstance(group_name_bytes, bytes) else str(group_name_bytes)
+                        
+                        # Context7: Lag - количество сообщений, не доставленных ни одному consumer
+                        lag_bytes = group_info.get(b'lag', 0)
+                        lag = lag_bytes if isinstance(lag_bytes, int) else (int(lag_bytes.decode()) if isinstance(lag_bytes, bytes) else 0)
+                        stream_consumer_lag.labels(stream=stream_name, group=group_name).set(lag)
+                        
+                        # Context7: Pending - количество сообщений в PEL
+                        pending_bytes = group_info.get(b'pending', 0)
+                        pending = pending_bytes if isinstance(pending_bytes, int) else (int(pending_bytes.decode()) if isinstance(pending_bytes, bytes) else 0)
+                        stream_consumer_pending.labels(stream=stream_name, group=group_name).set(pending)
+                        
+                        # Совместимость: также обновляем старую метрику stream_pending_size
+                        stream_pending_size.labels(stream=stream_name).set(pending)
+                        posts_in_queue_total.labels(queue=stream_name, status='pending').set(pending)
             except Exception as e:
-                logger.debug(f"Could not get pending info for {stream_name}: {e}")
+                logger.debug(f"Could not get groups info for {stream_name}: {e}")
+                
+                # Fallback: получаем pending через XPENDING для обратной совместимости
+                try:
+                    pending_info = await self.client.client.xpending_range(
+                        stream_key,
+                        self.config.group_name,
+                        min='-',
+                        max='+',
+                        count=1000
+                    )
+                    pending_count = len(pending_info) if pending_info else 0
+                    stream_pending_size.labels(stream=stream_name).set(pending_count)
+                    posts_in_queue_total.labels(queue=stream_name, status='pending').set(pending_count)
+                except Exception as e2:
+                    logger.debug(f"Could not get pending info for {stream_name}: {e2}")
                 
         except Exception as e:
             logger.debug(f"Error updating queue metrics for {stream_name}: {e}")
@@ -708,11 +753,46 @@ class EventConsumer:
         # Счётчик для периодического обновления метрик
         iteration_count = 0
         
+        # Context7: Периодическая обработка подвисших сообщений (PEL) через XAUTOCLAIM
+        pel_reclaim_interval = int(os.getenv("PEL_RECLAIM_INTERVAL", "30"))  # XAUTOCLAIM каждые N секунд
+        pel_min_idle_ms = int(os.getenv("PEL_MIN_IDLE_MS", "60000"))  # Минимальное время простоя для XAUTOCLAIM (60 сек)
+        last_pel_reclaim_time = time.time()
+        
         while self.running:
             try:
                 processed = 0
                 
-                # Context7: Фаза 1: pending (reclaim зависших)
+                # Context7: Периодическая обработка подвисших сообщений (PEL) через XAUTOCLAIM
+                # Выполняем независимо от основного цикла для гарантированной обработки зависших сообщений
+                current_time = time.time()
+                if current_time - last_pel_reclaim_time >= pel_reclaim_interval:
+                    # Context7: Дополнительный XAUTOCLAIM для обработки зависших сообщений
+                    # Это гарантирует, что даже если в основном цикле нет pending, мы всё равно проверяем
+                    try:
+                        stream_key = STREAMS[stream_name]
+                        result = await self.client.client.xautoclaim(
+                            stream_key,
+                            self.config.group_name,
+                            self.config.consumer_name,
+                            min_idle_time=pel_min_idle_ms,
+                            start_id="0-0",
+                            count=self.config.batch_size,
+                            justid=False
+                        )
+                        
+                        if result and len(result) > 1:
+                            messages = result[1] if result[1] else []
+                            if messages:
+                                logger.debug(f"Periodic XAUTOCLAIM claimed {len(messages)} pending messages from {stream_name}")
+                                dlq_key = DLQ_STREAMS.get(stream_name)
+                                await self._process_messages(stream_key, dlq_key, [(stream_key, messages)], handler_func)
+                                processed += len(messages)
+                    except Exception as e:
+                        logger.debug(f"Periodic XAUTOCLAIM failed for {stream_name}: {e}")
+                    
+                    last_pel_reclaim_time = current_time
+                
+                # Context7: Фаза 1: pending (reclaim зависших) - основной цикл
                 processed += await self.claim_pending(stream_name, handler_func)
                 
                 # Context7: Фаза 2: новые (>)

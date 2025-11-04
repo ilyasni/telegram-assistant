@@ -59,6 +59,15 @@ async def get_unprocessed_posts(db_session: AsyncSession) -> List[Dict[str, Any]
     posts = []
     
     for row in result:
+        # Context7: Получаем media_sha256_list из post_media_map
+        media_sha256_query = text("""
+            SELECT file_sha256 
+            FROM post_media_map 
+            WHERE post_id = :post_id 
+            ORDER BY position ASC
+        """)
+        media_result = await db_session.execute(media_sha256_query, {"post_id": row.post_id})
+        media_sha256_list = [r[0] for r in media_result.fetchall()]
         # Извлечение URL из media_urls
         media_urls = row.media_urls if row.media_urls else []
         urls = []
@@ -95,7 +104,9 @@ async def get_unprocessed_posts(db_session: AsyncSession) -> List[Dict[str, Any]
             'invert_media': row.invert_media,
             'telegram_channel_id': row.telegram_channel_id,
             'tenant_id': str(row.tenant_id),
-            'user_id': str(row.tenant_id)  # Используем tenant_id как user_id
+            'user_id': str(row.tenant_id),  # Используем tenant_id как user_id
+            # Context7: Добавляем media_sha256_list для связи с обработанными медиа
+            'media_sha256_list': media_sha256_list
         }
         posts.append(post_data)
     
@@ -113,6 +124,8 @@ async def create_parsed_event(post_data: Dict[str, Any]) -> PostParsedEventV1:
         urls=post_data['urls'],
         posted_at=post_data['posted_at'],
         content_hash=post_data['content_hash'],
+        # Context7: Добавляем media_sha256_list для связи с обработанными медиа (для TaggingTask)
+        media_sha256_list=post_data.get('media_sha256_list', []),
         link_count=len(post_data['urls']),
         tg_message_id=post_data['telegram_message_id'],
         telegram_message_id=post_data['telegram_message_id'],

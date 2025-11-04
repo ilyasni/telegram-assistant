@@ -82,6 +82,14 @@ class Settings(BaseSettings):
     s3_cleanup_check_interval_hours: int = 6
     s3_target_after_cleanup_gb: float = 12.0
     
+    # Context7: Feature flags для multi-tenant rollout
+    feature_rls_enabled: bool = False  # Row Level Security (включать поэтапно)
+    feature_identity_enabled: bool = True  # Использование identities вместо прямого telegram_id
+    feature_rate_limit_per_user: bool = True  # Per-user/membership rate limiting
+    
+    # WebApp auth TTL (Context7)
+    webapp_auth_ttl_seconds: int = 900  # 15 минут по умолчанию
+    
     class Config:
         env_file = ".env"
         case_sensitive = False

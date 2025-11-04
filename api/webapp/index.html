@@ -183,6 +183,8 @@
     function handleSSEMessage(data) {
       console.log('SSE message:', data);
       
+      // Context7 best practice: показываем QR-код при получении qr_url или статусе awaiting_scan
+      // Это гарантирует отображение QR-кода даже если статус изменился
       if (data.qr_url && !qrCode) {
         // Show QR code
         qrContainerEl.classList.remove('hidden');
@@ -196,6 +198,26 @@
           correctLevel: QRCode.CorrectLevel.H
         });
         updateStatus('Отсканируйте QR-код в Telegram', 'pending');
+      }
+      
+      // Context7: обрабатываем статус "awaiting_scan" - QR-код готов к сканированию
+      if (data.status === 'awaiting_scan' && data.qr_url && !qrCode) {
+        qrContainerEl.classList.remove('hidden');
+        qrEl.innerHTML = '';
+        qrCode = new QRCode(qrEl, {
+          text: data.qr_url,
+          width: 200,
+          height: 200,
+          colorDark: '#000000',
+          colorLight: '#ffffff',
+          correctLevel: QRCode.CorrectLevel.H
+        });
+        updateStatus('Отсканируйте QR-код в Telegram', 'pending');
+      }
+      
+      // Context7: обрабатываем статус "pending" - показываем загрузку
+      if (data.status === 'pending' && !data.qr_url) {
+        updateStatus('Ожидание QR-кода...', 'loading');
       }
       
       if (data.status === 'authorized') {
@@ -225,15 +247,70 @@
         btnRetryEl.classList.add('hidden');
         
         // Get initData from Telegram WebApp
-        const initData = window.Telegram?.WebApp?.initData || '';
-        console.log('initData length:', initData.length);
+        // Context7: проверяем все возможные источники initData
+        let initData = '';
+        if (window.Telegram?.WebApp?.initData) {
+          initData = window.Telegram.WebApp.initData;
+          console.log('initData from Telegram.WebApp.initData, length:', initData.length);
+        } else if (window.Telegram?.WebApp?.initDataUnsafe) {
+          // Fallback для некоторых версий Telegram WebApp
+          console.log('Using initDataUnsafe as fallback');
+          initData = JSON.stringify(window.Telegram.WebApp.initDataUnsafe);
+        } else {
+          console.error('initData NOT FOUND! window.Telegram:', !!window.Telegram, 
+                       'WebApp:', !!window.Telegram?.WebApp,
+                       'initData:', !!window.Telegram?.WebApp?.initData);
+          updateStatus('Ошибка: не удалось получить данные Telegram WebApp', 'error');
+          btnRetryEl.classList.remove('hidden');
+          return;
+        }
         
-        // Initialize Mini App
-        const initResponse = await callApi('/tg/miniapp/init', 'POST', { init_data: initData });
-        console.log('init response:', initResponse);
+        if (!initData || initData.length === 0) {
+          console.error('initData is empty!');
+          updateStatus('Ошибка: пустые данные Telegram WebApp', 'error');
+          btnRetryEl.classList.remove('hidden');
+          return;
+        }
         
-        // Get tenant_id from initData or use default
-        const tenantId = '550e8400-e29b-41d4-a716-446655440000'; // TODO: extract from initData
+        console.log('initData extracted, length:', initData.length, 'first 50 chars:', initData.substring(0, 50));
+        
+        // Context7: Извлекаем telegram_user_id и tenant_id из initData
+        let telegramUserId = null;
+        let tenantId = null;
+        if (initData) {
+          try {
+            // Парсим initData для извлечения user_id
+            const params = new URLSearchParams(initData);
+            const userParam = params.get('user');
+            if (userParam) {
+              const userData = JSON.parse(decodeURIComponent(userParam));
+              telegramUserId = userData.id;
+              console.log('Extracted telegram_user_id:', telegramUserId);
+              // Context7: для новых пользователей используем telegram_id как tenant_id
+              // В будущем tenant_id будет извлекаться из БД через /tg/miniapp/init
+              tenantId = String(telegramUserId);
+            }
+          } catch (e) {
+            console.error('Failed to parse initData:', e);
+          }
+        }
+        
+        // Если не удалось извлечь из initData, пробуем через /tg/miniapp/init
+        if (!tenantId) {
+          const initResponse = await callApi('/tg/miniapp/init', 'POST', { init_data: initData });
+          console.log('init response:', initResponse);
+          // TODO: extract tenant_id from initResponse if available
+        }
+        
+        // Fallback: используем telegram_user_id как tenant_id для новых пользователей
+        if (!tenantId && telegramUserId) {
+          tenantId = String(telegramUserId);
+          console.log('Using telegram_user_id as tenant_id:', tenantId);
+        }
+        
+        if (!tenantId) {
+          throw new Error('Cannot determine tenant_id from initData');
+        }
         
         // Link Mini App
         const linkResponse = await callApi('/tg/miniapp/link', 'POST', { 
@@ -244,10 +321,22 @@
         console.log('session_token:', sessionToken.substring(0, 24) + '...');
         
         // Start QR session
-        const startResponse = await callApi('/tg/qr/start', 'POST', { 
+        // Context7 best practice: передаем initData для извлечения telegram_user_id
+        const qrStartPayload = { 
           tenant_id: tenantId,
-          invite_code: 'DEMO123' // TODO: get from URL params or initData
-        });
+          invite_code: 'DEMO123', // TODO: get from URL params or initData
+        };
+        
+        // Context7: ВАЖНО - всегда передаем init_data если он есть
+        if (initData && initData.length > 0) {
+          qrStartPayload.init_data = initData;
+          console.log('Sending init_data to /tg/qr/start, length:', initData.length);
+        } else {
+          console.error('WARNING: initData is empty, will not send to /tg/qr/start!');
+        }
+        
+        console.log('QR start payload:', { ...qrStartPayload, init_data: qrStartPayload.init_data ? `[${qrStartPayload.init_data.length} chars]` : 'missing' });
+        const startResponse = await callApi('/tg/qr/start', 'POST', qrStartPayload);
         console.log('qr start response:', startResponse);
         
         // Parse expiration time

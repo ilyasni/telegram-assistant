@@ -117,18 +117,23 @@ class Neo4jClient:
             async with self._driver.session() as session:
                 # [C7-ID: WORKER-NEO4J-PROVIDER-001] - MERGE с параметрами (никогда f-strings)
                 # Context7: Сериализация enrichment_data в JSON для Neo4j
+                # Context7: ensure_ascii=False для корректного сохранения кириллицы и специальных символов
                 import json
-                enrichment_json = json.dumps(enrichment_data) if enrichment_data else None
+                enrichment_json = json.dumps(enrichment_data, ensure_ascii=False, default=str) if enrichment_data else None
+                
+                # Context7: Обработка null user_id - используем 'system' как fallback
+                # Neo4j не поддерживает null в ключевых свойствах для MERGE
+                effective_user_id = user_id if user_id else 'system'
                 
                 query = """
                 MERGE (p:Post {post_id: $post_id})
-                SET p.user_id = $user_id,
+                SET p.user_id = $effective_user_id,
                     p.tenant_id = $tenant_id,
                     p.channel_id = $channel_id,
                     p.expires_at = $expires_at,
                     p.indexed_at = $indexed_at,
                     p.enrichment_data = $enrichment_data
-                MERGE (u:User {user_id: $user_id})
+                MERGE (u:User {user_id: $effective_user_id})
                 SET u.tenant_id = $tenant_id
                 MERGE (c:Channel {channel_id: $channel_id})
                 SET c.tenant_id = $tenant_id
@@ -140,7 +145,7 @@ class Neo4jClient:
                 result = await session.run(
                     query,
                     post_id=post_id,
-                    user_id=user_id,
+                    effective_user_id=effective_user_id,
                     tenant_id=tenant_id,
                     channel_id=channel_id,
                     expires_at=expires_at,
@@ -360,6 +365,226 @@ class Neo4jClient:
                         error=str(e))
             return False
     
+    async def create_album_node(
+        self,
+        album_id: int,
+        grouped_id: int,
+        channel_id: str,
+        tenant_id: str,
+        album_kind: Optional[str] = None,
+        items_count: int = 0,
+        caption_text: Optional[str] = None,
+        posted_at: Optional[str] = None
+    ) -> bool:
+        """
+        Создание узла альбома в Neo4j.
+        
+        Context7: Создаёт узел (:Album {album_id, grouped_id, ...}) и связи:
+        - (:Channel)-[:HAS_ALBUM]->(:Album)
+        """
+        try:
+            if not self._driver:
+                return False
+            
+            await self._ping()
+            
+            async with self._driver.session() as session:
+                query = """
+                MATCH (c:Channel {channel_id: $channel_id})
+                MERGE (alb:Album {album_id: $album_id})
+                SET alb.grouped_id = $grouped_id,
+                    alb.tenant_id = $tenant_id,
+                    alb.album_kind = $album_kind,
+                    alb.items_count = $items_count,
+                    alb.caption_text = $caption_text,
+                    alb.posted_at = $posted_at
+                MERGE (c)-[:HAS_ALBUM]->(alb)
+                RETURN alb.album_id as album_id
+                """
+                
+                result = await session.run(
+                    query,
+                    album_id=str(album_id),
+                    grouped_id=grouped_id,
+                    channel_id=channel_id,
+                    tenant_id=tenant_id,
+                    album_kind=album_kind,
+                    items_count=items_count,
+                    caption_text=caption_text,
+                    posted_at=posted_at
+                )
+                
+                record = await result.single()
+                if record and record["album_id"] == str(album_id):
+                    logger.debug("Album node created/updated successfully", album_id=album_id)
+                    return True
+                else:
+                    logger.error("Failed to create album node", album_id=album_id)
+                    return False
+                    
+        except Exception as e:
+            logger.error("Error creating album node",
+                        album_id=album_id,
+                        error=str(e))
+            return False
+    
+    async def create_album_item_relationships(
+        self,
+        album_id: int,
+        post_id: str,
+        position: Optional[int] = None
+    ) -> bool:
+        """
+        Создание связи между альбомом и постом (элементом альбома).
+        
+        Context7: Создаёт связь (:Album)-[:CONTAINS {position}]->(:Post)
+        """
+        try:
+            if not self._driver:
+                return False
+            
+            await self._ping()
+            
+            async with self._driver.session() as session:
+                query = """
+                MATCH (alb:Album {album_id: $album_id})
+                MATCH (p:Post {post_id: $post_id})
+                MERGE (alb)-[r:CONTAINS]->(p)
+                SET r.position = $position
+                RETURN alb.album_id as album_id, p.post_id as post_id
+                """
+                
+                result = await session.run(
+                    query,
+                    album_id=str(album_id),
+                    post_id=post_id,
+                    position=position
+                )
+                
+                record = await result.single()
+                if record:
+                    logger.debug(
+                        "Album-item relationship created",
+                        album_id=album_id,
+                        post_id=post_id,
+                        position=position
+                    )
+                    return True
+                else:
+                    logger.warning(
+                        "Failed to create album-item relationship",
+                        album_id=album_id,
+                        post_id=post_id
+                    )
+                    return False
+                    
+        except Exception as e:
+            logger.error(
+                "Error creating album-item relationship",
+                album_id=album_id,
+                post_id=post_id,
+                error=str(e)
+            )
+            return False
+    
+    async def create_album_node_and_relationships(
+        self,
+        album_id: int,
+        post_id: str,
+        channel_id: str,
+        tenant_id: str,
+        position: Optional[int] = None
+    ) -> bool:
+        """
+        Создание узла альбома и связи с постом (удобный метод для indexing_task).
+        
+        Context7: Создаёт узел альбома (если ещё не существует) и связь CONTAINS.
+        Получает метаданные альбома из БД.
+        """
+        try:
+            if not self._driver:
+                return False
+            
+            # Получаем метаданные альбома из БД
+            from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+            from sqlalchemy import text
+            import os
+            
+            db_url = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@supabase-db:5432/postgres")
+            if db_url.startswith("postgresql://"):
+                db_url = db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+            
+            engine = create_async_engine(db_url)
+            async_session = async_sessionmaker(engine, expire_on_commit=False)
+            
+            async with async_session() as session:
+                # Получаем метаданные альбома
+                result = await session.execute(
+                    text("""
+                        SELECT 
+                            mg.grouped_id,
+                            mg.album_kind,
+                            mg.items_count,
+                            mg.caption_text,
+                            mg.posted_at,
+                            mgi.position
+                        FROM media_groups mg
+                        JOIN media_group_items mgi ON mg.id = mgi.group_id
+                        WHERE mg.id = :album_id
+                        AND mgi.post_id = :post_id
+                        LIMIT 1
+                    """),
+                    {"album_id": album_id, "post_id": post_id}
+                )
+                row = result.fetchone()
+                
+                if row:
+                    grouped_id = row[0]
+                    album_kind = row[1]
+                    items_count = row[2] if row[2] else 0
+                    caption_text = row[3]
+                    posted_at = row[4].isoformat() if row[4] else None
+                    position = row[5] if row[5] is not None else position
+                    
+                    await engine.dispose()
+                    
+                    # Создаём узел альбома
+                    album_created = await self.create_album_node(
+                        album_id=album_id,
+                        grouped_id=grouped_id,
+                        channel_id=channel_id,
+                        tenant_id=tenant_id,
+                        album_kind=album_kind,
+                        items_count=items_count,
+                        caption_text=caption_text,
+                        posted_at=posted_at
+                    )
+                    
+                    if album_created:
+                        # Создаём связь с постом
+                        return await self.create_album_item_relationships(
+                            album_id=album_id,
+                            post_id=post_id,
+                            position=position
+                        )
+                else:
+                    await engine.dispose()
+                    logger.debug(
+                        "Album metadata not found in DB",
+                        album_id=album_id,
+                        post_id=post_id
+                    )
+                    return False
+                    
+        except Exception as e:
+            logger.error(
+                "Error creating album node and relationships",
+                album_id=album_id,
+                post_id=post_id,
+                error=str(e)
+            )
+            return False
+    
     async def create_webpage_node(
         self,
         post_id: str,
@@ -523,6 +748,138 @@ class Neo4jClient:
         except Exception as e:
             logger.error("Error getting post stats", error=str(e))
             return {}
+    
+    async def find_albums_by_channel(self, channel_id: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """
+        Поиск альбомов по каналу.
+        
+        Context7: Типовой запрос для работы с альбомами в Neo4j.
+        """
+        try:
+            if not self._driver:
+                return []
+            
+            await self._ping()
+            
+            async with self._driver.session() as session:
+                query = """
+                MATCH (c:Channel {channel_id: $channel_id})-[:HAS_ALBUM]->(alb:Album)
+                OPTIONAL MATCH (alb)-[:CONTAINS]->(p:Post)
+                WITH alb, count(p) as items_count
+                RETURN alb.album_id as album_id,
+                       alb.grouped_id as grouped_id,
+                       alb.album_kind as album_kind,
+                       alb.items_count as expected_items,
+                       items_count as actual_items,
+                       alb.caption_text as caption_text,
+                       alb.posted_at as posted_at
+                ORDER BY alb.posted_at DESC
+                LIMIT $limit
+                """
+                
+                result = await session.run(query, channel_id=channel_id, limit=limit)
+                albums = []
+                async for record in result:
+                    albums.append({
+                        'album_id': record['album_id'],
+                        'grouped_id': record['grouped_id'],
+                        'album_kind': record['album_kind'],
+                        'expected_items': record['expected_items'],
+                        'actual_items': record['actual_items'],
+                        'caption_text': record['caption_text'],
+                        'posted_at': record['posted_at']
+                    })
+                
+                return albums
+                
+        except Exception as e:
+            logger.error("Error finding albums by channel", channel_id=channel_id, error=str(e))
+            return []
+    
+    async def find_albums_by_tags(self, tag_names: List[str], limit: int = 10) -> List[Dict[str, Any]]:
+        """
+        Поиск альбомов по тегам постов.
+        
+        Context7: Поиск альбомов, содержащих посты с указанными тегами.
+        """
+        try:
+            if not self._driver or not tag_names:
+                return []
+            
+            await self._ping()
+            
+            async with self._driver.session() as session:
+                query = """
+                MATCH (t:Tag)
+                WHERE t.name IN $tag_names
+                MATCH (t)<-[:TAGGED_AS]-(p:Post)<-[:CONTAINS]-(alb:Album)
+                WITH alb, count(DISTINCT t.name) as matching_tags
+                WHERE matching_tags >= size($tag_names)
+                RETURN alb.album_id as album_id,
+                       alb.grouped_id as grouped_id,
+                       alb.album_kind as album_kind,
+                       alb.items_count as items_count,
+                       matching_tags,
+                       alb.caption_text as caption_text
+                ORDER BY matching_tags DESC, alb.posted_at DESC
+                LIMIT $limit
+                """
+                
+                result = await session.run(query, tag_names=[t.lower() for t in tag_names], limit=limit)
+                albums = []
+                async for record in result:
+                    albums.append({
+                        'album_id': record['album_id'],
+                        'grouped_id': record['grouped_id'],
+                        'album_kind': record['album_kind'],
+                        'items_count': record['items_count'],
+                        'matching_tags': record['matching_tags'],
+                        'caption_text': record['caption_text']
+                    })
+                
+                return albums
+                
+        except Exception as e:
+            logger.error("Error finding albums by tags", tag_names=tag_names, error=str(e))
+            return []
+    
+    async def get_album_posts(self, album_id: int, ordered: bool = True) -> List[Dict[str, Any]]:
+        """
+        Получение постов альбома с сохранением порядка.
+        
+        Context7: Возвращает все посты альбома в порядке position.
+        """
+        try:
+            if not self._driver:
+                return []
+            
+            await self._ping()
+            
+            async with self._driver.session() as session:
+                query = """
+                MATCH (alb:Album {album_id: $album_id})-[r:CONTAINS]->(p:Post)
+                RETURN p.post_id as post_id,
+                       p.user_id as user_id,
+                       p.channel_id as channel_id,
+                       r.position as position
+                ORDER BY r.position ASC
+                """
+                
+                result = await session.run(query, album_id=str(album_id))
+                posts = []
+                async for record in result:
+                    posts.append({
+                        'post_id': record['post_id'],
+                        'user_id': record['user_id'],
+                        'channel_id': record['channel_id'],
+                        'position': record['position']
+                    })
+                
+                return posts
+                
+        except Exception as e:
+            logger.error("Error getting album posts", album_id=album_id, error=str(e))
+            return []
     
     async def health_check(self) -> bool:
         """Health check для Neo4j."""

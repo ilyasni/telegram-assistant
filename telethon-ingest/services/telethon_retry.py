@@ -32,13 +32,16 @@ cooldown_channels_total = Gauge(
 )
 
 # Context7: Классификация ошибок для retry
+# Context7: Добавляем RPCError и ValueError для обработки "Request was unsuccessful"
 RETRIABLE_ERRORS = (
     errors.FloodWaitError,
-    errors.RpcCallFailError, 
+    errors.RpcCallFailError,
+    errors.RPCError,  # Context7: Базовый RPCError для общих RPC ошибок (правильное имя в Telethon)
     errors.ServerError,
     TimeoutError,
     OSError,
-    asyncio.TimeoutError
+    asyncio.TimeoutError,
+    ValueError,  # Context7: ValueError может возникать при временных сетевых проблемах
 )
 
 NON_RETRIABLE_ERRORS = (
@@ -89,24 +92,36 @@ async def fetch_messages_with_retry(
                           channel_id=channel_id)
                 return []
             
-            # Context7: Используем iter_messages для правильного получения сообщений
-            # iter_messages() гарантирует порядок от новых к старым
-            # Если указан offset_date, получаем сообщения после этой даты
+            # Context7: КРИТИЧНО - offset_date в Telethon возвращает сообщения ПРЕДШЕСТВУЮЩИЕ дате!
+            # Если offset_date указан - получаем сообщения СТАРШЕ этой даты (для historical режима)
+            # Если offset_date НЕ указан - получаем последние сообщения (для incremental режима)
             messages = []
             iter_params = {"limit": limit}
             if offset_date:
+                # Context7: offset_date используется только для historical режима
+                # Он возвращает сообщения ПРЕДШЕСТВУЮЩИЕ указанной дате (exclusive)
                 iter_params["offset_date"] = offset_date
+            
+            logger.debug("Fetching messages with iter_messages",
+                        channel_id=channel_id,
+                        limit=limit,
+                        offset_date=offset_date.isoformat() if offset_date else None,
+                        attempt=attempt + 1)
             
             async for msg in client.iter_messages(channel, **iter_params):
                 messages.append(msg)
+                # Context7: Защита от получения слишком большого количества сообщений
+                if len(messages) >= limit:
+                    break
             
             # Сброс backoff после успешного запроса
             backoff = 0.5
             
-            logger.debug("Messages fetched successfully", 
+            logger.info("Messages fetched successfully", 
                         channel_id=channel_id,
                         count=len(messages),
-                        offset_date=offset_date)
+                        offset_date=offset_date.isoformat() if offset_date else None,
+                        attempt=attempt + 1)
             return messages
             
         except errors.FloodWaitError as e:
@@ -156,10 +171,35 @@ async def fetch_messages_with_retry(
             backoff *= 2
             
         except Exception as e:
+            # Context7: Улучшенное логирование для диагностики
+            error_msg = str(e)
+            error_type = type(e).__name__
+            
+            # Context7: Проверяем, является ли это известной retriable ошибкой, но не попавшей в список
+            is_retriable_network_error = any(
+                keyword in error_msg.lower() 
+                for keyword in ['request was unsuccessful', 'network', 'connection', 'timeout', 'unavailable']
+            )
+            
+            if is_retriable_network_error and attempt < max_retries - 1:
+                # Context7: Retry для сетевых ошибок, которые не попали в RETRIABLE_ERRORS
+                delay = min(backoff * (0.8 + random.random() * 0.4), 30)
+                logger.warning("Network-like error, retrying",
+                              channel_id=channel_id,
+                              error=error_msg,
+                              error_type=error_type,
+                              delay=delay,
+                              attempt=attempt + 1)
+                await asyncio.sleep(delay)
+                backoff *= 2
+                continue
+            
             logger.error("Unexpected error", 
                         channel_id=channel_id,
-                        error=str(e),
-                        error_type=type(e).__name__)
+                        error=error_msg,
+                        error_type=error_type,
+                        attempt=attempt + 1,
+                        max_retries=max_retries)
             return []
             
     return []

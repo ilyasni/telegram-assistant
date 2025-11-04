@@ -62,13 +62,18 @@ class QdrantClient:
             logger.error("Qdrant ping failed", error=str(e))
             raise
     
-    async def ensure_collection(self, collection_name: str, vector_size: int = 2048):
+    async def ensure_collection(self, collection_name: str, vector_size: int = None):
         """
         Создание коллекции если не существует.
         
-        Context7: Дефолт 2048 для GigaChat Giga-Embeddings-instruct
-        Источник: https://gitverse.ru/GigaTeam/GigaEmbeddings
+        Context7: Размерность берется из переданного параметра или из настроек
+        - EmbeddingsGigaR: 2560 измерений
+        - Embeddings (Giga-Embeddings-instruct): 2048 измерений
+        Если не указана, используется значение из EMBEDDING_DIMENSION или 2560 по умолчанию
         """
+        import os
+        if vector_size is None:
+            vector_size = int(os.getenv("EMBEDDING_DIMENSION", os.getenv("EMBED_DIM", "2560")))
         try:
             if collection_name in self._collections_cache:
                 return
@@ -166,20 +171,51 @@ class QdrantClient:
         collection_name: str, 
         query_vector: List[float], 
         limit: int = 10,
-        filter_conditions: Optional[Dict[str, Any]] = None
+        filter_conditions: Optional[Dict[str, Any]] = None,
+        tenant_id: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        """Поиск векторов в коллекции."""
+        """
+        Поиск векторов в коллекции.
+        
+        Context7: Обязательная фильтрация по tenant_id для multi-tenant изоляции.
+        """
         try:
             # Подготовка фильтра
-            search_filter = None
+            must_conditions = []
+            
+            # Context7: Обязательная фильтрация по tenant_id
+            if tenant_id:
+                must_conditions.append(
+                    models.FieldCondition(
+                        key="tenant_id",
+                        match=models.MatchValue(value=str(tenant_id))
+                    )
+                )
+            
+            # Добавляем дополнительные фильтры
             if filter_conditions:
-                must_conditions = []
                 for key, value in filter_conditions.items():
                     if isinstance(value, str):
                         must_conditions.append(
                             models.FieldCondition(
                                 key=key,
                                 match=models.MatchValue(value=value)
+                            )
+                        )
+                    elif isinstance(value, (int, float)):
+                        # Context7: Поддержка числовых значений (album_id, channel_id и т.д.)
+                        must_conditions.append(
+                            models.FieldCondition(
+                                key=key,
+                                match=models.MatchValue(value=value)
+                            )
+                        )
+                    elif isinstance(value, list):
+                        # Context7: Поддержка списков значений (например, tags)
+                        must_conditions.append(
+                            models.FieldCondition(
+                                key=key,
+                                match=models.MatchAny(any=value)
                             )
                         )
                     elif isinstance(value, dict) and 'range' in value:
@@ -189,9 +225,17 @@ class QdrantClient:
                                 range=models.Range(**value['range'])
                             )
                         )
-                
-                if must_conditions:
-                    search_filter = models.Filter(must=must_conditions)
+                    elif isinstance(value, bool):
+                        # Context7: Поддержка boolean значений (например, vision.is_meme)
+                        must_conditions.append(
+                            models.FieldCondition(
+                                key=key,
+                                match=models.MatchValue(value=value)
+                            )
+                        )
+            
+            # Создаём фильтр только если есть условия
+            search_filter = models.Filter(must=must_conditions) if must_conditions else None
             
             # Поиск
             search_results = self.client.search(
@@ -290,9 +334,11 @@ class QdrantClient:
         try:
             # Получение списка коллекций
             collections = self.client.get_collections()
+            # Context7: Поддержка нового формата t{tenant_id}_posts и старого user_{tenant_id}_posts
             user_collections = [
                 col.name for col in collections.collections 
-                if col.name.startswith('user_') and col.name.endswith('_posts')
+                if (col.name.startswith('t') and col.name.endswith('_posts')) or
+                   (col.name.startswith('user_') and col.name.endswith('_posts'))
             ]
             
             sweep_results = {}
@@ -341,7 +387,9 @@ class QdrantClient:
             
             for collection in collections.collections:
                 collection_name = collection.name
-                if collection_name.startswith('user_') and collection_name.endswith('_posts'):
+                # Context7: Поддержка нового формата t{tenant_id}_posts и старого user_{tenant_id}_posts
+                if (collection_name.startswith('t') and collection_name.endswith('_posts')) or \
+                   (collection_name.startswith('user_') and collection_name.endswith('_posts')):
                     stats[collection_name] = await self.get_collection_stats(collection_name)
             
             return stats
@@ -363,9 +411,11 @@ class QdrantClient:
         """Получение общей статистики Qdrant."""
         try:
             collections = self.client.get_collections()
+            # Context7: Поддержка нового формата t{tenant_id}_posts и старого user_{tenant_id}_posts
             user_collections = [
                 col.name for col in collections.collections 
-                if col.name.startswith('user_') and col.name.endswith('_posts')
+                if (col.name.startswith('t') and col.name.endswith('_posts')) or
+                   (col.name.startswith('user_') and col.name.endswith('_posts'))
             ]
             
             total_vectors = 0

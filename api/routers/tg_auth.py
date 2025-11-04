@@ -50,6 +50,7 @@ class QrStart(BaseModel):
     tenant_id: str
     session_token: str | None = None
     invite_code: str | None = None
+    init_data: str | None = None  # Telegram MiniApp initData для извлечения telegram_user_id
 
 
 def verify_telegram_init_data(init_data: str, bot_token: str) -> bool:
@@ -180,9 +181,50 @@ async def qr_start(body: QrStart, request: Request):
     AUTH_QR_START.labels(tenant_id=tenant_id).inc()
     token = body.session_token or issue_session_token(tenant_id)
 
-    # Создаём запись статуса в Redis (её подхватит telethon-ingest)
-    key = f"tg:qr:session:{tenant_id}"
-    logger.info("Creating QR session key", key=key, tenant_id=tenant_id)
+    # Context7: Извлекаем telegram_user_id из initData если предоставлен
+    # Context7 best practice: это необходимо для корректной проверки существующих сессий для новых пользователей
+    telegram_user_id = None
+    
+    # Context7: детальное логирование для отладки
+    logger.info("QR start request received", 
+               tenant_id=tenant_id,
+               has_init_data=bool(body.init_data),
+               init_data_length=len(body.init_data) if body.init_data else 0,
+               init_data_preview=body.init_data[:100] if body.init_data and len(body.init_data) > 0 else None)
+    
+    if body.init_data:
+        bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+        logger.info("Processing init_data", 
+                   tenant_id=tenant_id, 
+                   init_data_length=len(body.init_data),
+                   has_bot_token=bool(bot_token))
+        
+        # Context7: пытаемся извлечь telegram_user_id даже если verify_telegram_init_data fails
+        # Это важно для новых пользователей, где проверка может не пройти
+        try:
+            # Парсим initData для извлечения user_id
+            # Context7: декодируем URL-encoded строку user
+            from urllib.parse import unquote
+            parsed = dict(kv.split("=", 1) for kv in body.init_data.split("&") if "=" in kv)
+            logger.debug("Parsed init_data keys", keys=list(parsed.keys())[:5], tenant_id=tenant_id)
+            
+            user_data_str = parsed.get("user", "{}")
+            if user_data_str and user_data_str != "{}":
+                user_data_str = unquote(user_data_str)
+                user_data = json.loads(user_data_str)
+                telegram_user_id = user_data.get("id")
+                logger.info("Extracted telegram_user_id from initData", 
+                          telegram_user_id=telegram_user_id, 
+                          tenant_id=tenant_id,
+                          verified=bool(bot_token and verify_telegram_init_data(body.init_data, bot_token)))
+        except Exception as e:
+            logger.error("Failed to extract telegram_user_id from initData", 
+                        error=str(e), 
+                        tenant_id=tenant_id,
+                        exception_type=type(e).__name__)
+
+    # Context7: Создаём запись статуса в Redis с единым префиксом t:{tenant}:qr:session
+    key = f"t:{tenant_id}:qr:session"
     
     session_data = {
         "tenant_id": tenant_id,
@@ -191,20 +233,52 @@ async def qr_start(body: QrStart, request: Request):
         "created_at": str(int(time.time()))
     }
     
+    # Context7 best practice: сохраняем telegram_user_id в сессию для проверки существующих сессий
+    # ВАЖНО: всегда сохраняем telegram_user_id если он был извлечен
+    if telegram_user_id:
+        session_data["telegram_user_id"] = str(telegram_user_id)
+        logger.info("Creating QR session with telegram_user_id", 
+                   key=key, 
+                   tenant_id=tenant_id, 
+                   telegram_user_id=telegram_user_id)
+    else:
+        logger.warning("Creating QR session WITHOUT telegram_user_id", 
+                      key=key, 
+                      tenant_id=tenant_id,
+                      has_init_data=bool(body.init_data))
+    
+    logger.info("Creating QR session key", key=key, tenant_id=tenant_id, telegram_user_id=telegram_user_id)
+    
     # Добавляем invite_code если передан
     if body.invite_code:
         session_data["invite_code"] = body.invite_code
         logger.info("QR session with invite code", tenant_id=tenant_id, invite_code=body.invite_code)
     
     # Context7 best practice: используем async Redis операции
+    # ВАЖНО: удаляем старую сессию перед созданием новой, чтобы не было конфликтов
+    # Context7: проверяем и удаляем существующую failed/expired сессию
+    existing_data = await redis_client.hgetall(key)
+    if existing_data and existing_data.get("status") in ["failed", "expired"]:
+        logger.info("Deleting old failed/expired session before creating new one", 
+                   key=key, 
+                   old_status=existing_data.get("status"),
+                   old_telegram_user_id=existing_data.get("telegram_user_id"))
+        await redis_client.delete(key)
+    
     await redis_client.hset(key, mapping=session_data)
     # Context7 best practice: увеличиваем TTL для QR-сессий до 20 минут
     # (временно, пока чиним telethon-ingest)
     QR_TTL_SECONDS = int(os.getenv("QR_TTL_SECONDS", "1200"))  # 20 минут
     await redis_client.expire(key, QR_TTL_SECONDS)
     
-    exists = await redis_client.exists(key)
-    logger.info("QR session key created", key=key, exists=bool(exists))
+    # Context7: проверяем что telegram_user_id действительно сохранен
+    saved_telegram_user_id = await redis_client.hget(key, "telegram_user_id")
+    logger.info("QR session key created", 
+               key=key, 
+               tenant_id=tenant_id,
+               telegram_user_id=telegram_user_id,
+               saved_telegram_user_id=saved_telegram_user_id,
+               match=(str(telegram_user_id) == saved_telegram_user_id if telegram_user_id and saved_telegram_user_id else False))
 
     expires_at = int(time.time()) + QR_TTL_SECONDS
     
@@ -235,7 +309,8 @@ async def qr_status_post(body: dict):
         logger.error("Failed to decode session token", error=str(e))
         raise HTTPException(status_code=400, detail="invalid token")
     
-    key = f"tg:qr:session:{tenant_id}"
+    # Context7: Единый префикс t:{tenant}:qr:session
+    key = f"t:{tenant_id}:qr:session"
     data = await redis_client.hgetall(key)
     if not data:
         raise HTTPException(status_code=404, detail="not found or expired")
@@ -259,7 +334,7 @@ async def qr_sse(token: str):
             try:
                 payload = decode_session_token(token)
                 tenant_id = _extract_tenant_id(payload)
-                key = f"tg:qr:session:{tenant_id}"
+                key = f"t:{tenant_id}:qr:session"
                 # Context7 best practice: используем async Redis операции
                 # с decode_responses=True все ключи и значения уже декодированы в строки
                 data = await redis_client.hgetall(key)
@@ -290,7 +365,8 @@ async def qr_cancel(token: str):
     except:
         raise HTTPException(status_code=400, detail="invalid token")
     
-    key = f"tg:qr:session:{tenant_id}"
+    # Context7: Единый префикс t:{tenant}:qr:session
+    key = f"t:{tenant_id}:qr:session"
     if not await redis_client.exists(key):
         raise HTTPException(status_code=404, detail="not found or expired")
     await redis_client.hset(key, mapping={"status": "cancelled"})
@@ -308,7 +384,8 @@ async def qr_png(session_id: str):
     except:
         raise HTTPException(status_code=400, detail="invalid session")
     
-    key = f"tg:qr:session:{tenant_id}"
+    # Context7: Единый префикс t:{tenant}:qr:session
+    key = f"t:{tenant_id}:qr:session"
     if not await redis_client.exists(key):
         raise HTTPException(status_code=404, detail="not found or expired")
     
