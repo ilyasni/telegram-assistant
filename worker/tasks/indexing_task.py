@@ -12,7 +12,7 @@ import structlog
 import psycopg2
 from typing import Dict, Any, Optional
 from datetime import datetime, timezone, timedelta
-from prometheus_client import Counter
+from prometheus_client import Counter, Gauge, Histogram
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from sqlalchemy import text
 
@@ -28,6 +28,53 @@ indexing_processed_total = Counter(
     'indexing_processed_total',
     'Total posts indexed',
     ['status']
+)
+
+# Context7: Метрики для мониторинга очереди и операций очистки
+indexing_queue_size = Gauge(
+    'indexing_queue_size',
+    'Current size of posts.enriched stream',
+    ['stream']
+)
+
+indexing_trim_operations_total = Counter(
+    'indexing_trim_operations_total',
+    'Total number of XTRIM operations performed',
+    ['stream', 'status']
+)
+
+indexing_processing_duration_seconds = Histogram(
+    'indexing_processing_duration_seconds',
+    'Time taken to process a single post for indexing',
+    ['status']
+)
+
+# Context7: Метрика lag по consumer groups (из XINFO GROUPS)
+indexing_consumer_lag = Gauge(
+    'indexing_consumer_lag',
+    'Consumer group lag (messages not yet delivered to any consumer)',
+    ['stream', 'group']
+)
+
+# Context7: Метрика pending сообщений в PEL
+indexing_pending_messages = Gauge(
+    'indexing_pending_messages',
+    'Number of pending messages in PEL (Pending Entry List)',
+    ['stream', 'group']
+)
+
+# Context7: Метрика операций XAUTOCLAIM
+indexing_autoclaim_operations_total = Counter(
+    'indexing_autoclaim_operations_total',
+    'Total number of XAUTOCLAIM operations performed',
+    ['stream', 'status']
+)
+
+# Context7: Метрика количества сообщений, возвращённых XAUTOCLAIM
+indexing_autoclaim_messages_total = Counter(
+    'indexing_autoclaim_messages_total',
+    'Total number of messages claimed via XAUTOCLAIM',
+    ['stream']
 )
 
 
@@ -60,6 +107,20 @@ class IndexingTask:
         self.embedding_service: Optional[EmbeddingService] = None
         self.publisher: Optional[EventPublisher] = None
         
+        # Context7: Отслеживание последнего обработанного ID для XTRIM
+        self.last_processed_id: Optional[str] = None
+        self.processed_count_since_trim: int = 0
+        self.trim_interval: int = int(os.getenv("INDEXING_TRIM_INTERVAL", "50"))  # Trim каждые N сообщений (уменьшено для более частой очистки)
+        
+        # Context7: Параллелизм для обработки сообщений
+        self.max_concurrent_processing: int = int(os.getenv("INDEXING_CONCURRENCY", "4"))  # Максимум параллельных обработок
+        self.processing_semaphore: Optional[asyncio.Semaphore] = None
+        
+        # Context7: Периодическая обработка подвисших сообщений (PEL) через XAUTOCLAIM
+        self.pel_reclaim_interval: int = int(os.getenv("INDEXING_PEL_RECLAIM_INTERVAL", "30"))  # XAUTOCLAIM каждые N секунд
+        self.pel_min_idle_ms: int = int(os.getenv("INDEXING_PEL_MIN_IDLE_MS", "60000"))  # Минимальное время простоя для XAUTOCLAIM (60 сек)
+        self.last_pel_reclaim_time: float = 0.0
+        
         logger.info("IndexingTask initialized",
                    redis_url=redis_url[:50],
                    qdrant_url=qdrant_url,
@@ -74,11 +135,18 @@ class IndexingTask:
             
             # Инициализация EventConsumer
             from event_bus import ConsumerConfig
+            # Context7: Увеличиваем batch_size для ускорения обработки
+            # Поддержка INDEXING_BATCH_SIZE через env переменную
+            batch_size = int(os.getenv("INDEXING_BATCH_SIZE", "50"))
             consumer_config = ConsumerConfig(
                 group_name="indexing_workers",
-                consumer_name="indexing_worker_1"
+                consumer_name="indexing_worker_1",
+                batch_size=batch_size
             )
             self.event_consumer = EventConsumer(self.redis_client, consumer_config)
+            logger.info("EventConsumer initialized with batch_size",
+                       batch_size=batch_size,
+                       group_name=consumer_config.group_name)
             
             # Инициализация Qdrant
             self.qdrant_client = QdrantClient(self.qdrant_url)
@@ -101,6 +169,11 @@ class IndexingTask:
             
             # Инициализация Publisher
             self.publisher = EventPublisher(self.redis_client)
+            
+            # Context7: Инициализация Semaphore для параллельной обработки
+            self.processing_semaphore = asyncio.Semaphore(self.max_concurrent_processing)
+            logger.info("Processing semaphore initialized",
+                       max_concurrent=self.max_concurrent_processing)
             
             # Context7: Создание consumer group перед обработкой backlog
             await self.event_consumer._ensure_consumer_group("posts.enriched")
@@ -145,8 +218,8 @@ class IndexingTask:
             if backlog_processed > 0:
                 logger.info(f"Processed {backlog_processed} backlog messages from stream")
             
-            # Запуск потребления событий
-            await self.event_consumer.start_consuming("posts.enriched", self._process_single_message)
+            # Context7: Запуск потребления событий с отслеживанием message_id для XTRIM
+            await self._consume_with_trim("posts.enriched", self._process_single_message)
             
         except Exception as e:
             logger.error("Failed to start IndexingTask", extra={"error": str(e)})
@@ -476,7 +549,6 @@ class IndexingTask:
             indexing_processed_total.labels(status='error').inc()
             
             # Context7: Обновляем статус failed при ошибке
-            # Для retryable ошибок оставляем возможность ретрая через process_pending_indexing
             await self._update_indexing_status(
                 post_id=post_id,
                 embedding_status='failed',
@@ -484,9 +556,27 @@ class IndexingTask:
                 error_message=f"[{error_category.value}] {error_str}"
             )
             
-            # Context7: Для retryable ошибок не пробрасываем исключение дальше,
-            # чтобы сообщение осталось в stream для последующего ретрая
-            # Для non-retryable ошибок также не пробрасываем, чтобы не блокировать обработку других сообщений
+            # Context7: Правильная обработка ошибок для ACK/DLQ flow
+            # Для retryable ошибок: пробрасываем исключение, чтобы EventConsumer НЕ ACK'ил сообщение
+            # Сообщение останется в PEL для повторной обработки через XAUTOCLAIM
+            # Для non-retryable ошибок: НЕ пробрасываем исключение, чтобы EventConsumer ACK'ил
+            # EventConsumer сам отправит в DLQ если настроено через _handle_failed_message
+            
+            if is_retryable:
+                # Retryable ошибки - пробрасываем исключение для предотвращения ACK
+                # Сообщение останется в PEL для повторной обработки
+                logger.warning("Retryable error, message will remain in PEL for retry",
+                             post_id=post_id,
+                             error_category=error_category.value,
+                             error=error_str)
+                raise  # Пробрасываем для предотвращения ACK в EventConsumer
+            else:
+                # Non-retryable ошибки - не пробрасываем, EventConsumer ACK'ит и отправляет в DLQ
+                logger.error("Non-retryable error, message will be ACKed and sent to DLQ",
+                           post_id=post_id,
+                           error_category=error_category.value,
+                           error=error_str)
+                # Не пробрасываем исключение - EventConsumer обработает через _handle_failed_message
     
     async def _get_post_data(self, post_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -508,6 +598,8 @@ class IndexingTask:
             cursor = conn.cursor(cursor_factory=RealDictCursor)
             
             # Context7: JOIN с post_enrichment для загрузки всех enrichment данных
+            # Context7: tenant_id получаем из channels, так как posts больше не содержит tenant_id
+            # Context7: Явное приведение типа для tenant_id через CAST для избежания ошибки "COALESCE types text[] and jsonb cannot be matched"
             cursor.execute("""
                 SELECT 
                     p.id,
@@ -515,12 +607,13 @@ class IndexingTask:
                     p.content as text,
                     p.telegram_message_id,
                     p.created_at,
-                    p.tenant_id,
-                    p.user_id,
+                    CAST(c.settings->>'tenant_id' AS text) as tenant_id,
+                    NULL as user_id,
                     pe_vision.data as vision_data,
                     pe_crawl.data as crawl_data,
                     pe_tags.data as tags_data
                 FROM posts p
+                JOIN channels c ON p.channel_id = c.id
                 LEFT JOIN post_enrichment pe_vision 
                     ON pe_vision.post_id = p.id AND pe_vision.kind = 'vision'
                 LEFT JOIN post_enrichment pe_crawl 
@@ -892,7 +985,7 @@ class IndexingTask:
             async with async_session() as session:
                 result = await session.execute(
                     text("""
-                        SELECT c.tenant_id
+                        SELECT CAST(c.settings->>'tenant_id' AS text) as tenant_id
                         FROM posts p
                         JOIN channels c ON p.channel_id = c.id
                         WHERE p.id = :post_id
@@ -1223,6 +1316,645 @@ class IndexingTask:
             logger.warning("Failed to update posts.is_processed", 
                          extra={"post_id": post_id, "error": str(e)})
             # Не пробрасываем ошибку - это не критично для работы пайплайна
+    
+    async def _trim_processed_messages(self, stream_name: str, last_id: Optional[str] = None) -> int:
+        """
+        Context7 best practice: периодическая очистка обработанных сообщений через XTRIM.
+        
+        Redis Streams не удаляют сообщения автоматически после XACK. Нужен периодический XTRIM
+        для предотвращения роста стрима до бесконечности.
+        
+        Args:
+            stream_name: Имя стрима для очистки
+            last_id: Последний обработанный ID (если None, используется self.last_processed_id)
+            
+        Returns:
+            int: Количество удалённых сообщений
+        """
+        try:
+            from event_bus import STREAMS
+            
+            if stream_name not in STREAMS:
+                logger.warning(f"Stream name '{stream_name}' not found in STREAMS mapping")
+                return 0
+            
+            stream_key = STREAMS[stream_name]
+            trim_id = last_id or self.last_processed_id
+            
+            if not trim_id:
+                logger.debug("No last processed ID available for trimming")
+                return 0
+            
+            # Context7: XTRIM с MINID для удаления всех сообщений до указанного ID
+            # Context7 best practice: XTRIM MINID удаляет все сообщения с ID < minid (строго меньше, не включительно)
+            # Для безопасности используем консервативный подход - используем минимальный гарантированно ACK'нутый ID
+            try:
+                # Context7: Проверяем текущий размер стрима перед XTRIM
+                current_length = await self.redis_client.client.xlen(stream_key)
+                
+                if current_length == 0:
+                    logger.debug("Stream is empty, nothing to trim", stream=stream_name)
+                    return 0
+                
+                # Context7: Проверяем, есть ли сообщения старше trim_id для удаления
+                # Используем XRANGE для проверки первого сообщения в стриме
+                first_messages = await self.redis_client.client.xrange(stream_key, min='-', max='+', count=1)
+                first_id = first_messages[0][0] if first_messages else None
+                
+                if not first_id:
+                    logger.debug("Stream is empty, nothing to trim", stream=stream_name)
+                    return 0
+                
+                # Context7: Сравниваем первый ID с trim_id
+                # Если первый ID >= trim_id, значит все сообщения новее и ничего не нужно удалять
+                compare_result = self._compare_message_ids(first_id, trim_id)
+                if compare_result >= 0:
+                    logger.debug("All messages are newer than or equal to trim_id, nothing to trim",
+                               stream=stream_name,
+                               first_id=first_id,
+                               trim_id=trim_id,
+                               current_length=current_length)
+                    return 0
+                
+                logger.debug("Before XTRIM",
+                            stream=stream_name,
+                            current_length=current_length,
+                            first_id=first_id,
+                            trim_id=trim_id)
+                
+                # Context7: Безопасный XTRIM - проверяем, что сообщения ACK'нуты
+                # Context7 best practice: не триммируем основной стрим "вслепую" по MAXLEN,
+                # пока не подтвердили, что записи ACK'нуты всеми группами
+                # Используем стратегию "min-id after last-ack-per-group"
+                
+                # Проверяем pending сообщения в группе перед XTRIM
+                groups_info = await self.redis_client.client.xinfo_groups(stream_key)
+                min_pending_id = None
+                for group_info in groups_info:
+                    group_name_bytes = group_info.get(b'name', b'')
+                    if group_name_bytes:
+                        group_name = group_name_bytes.decode() if isinstance(group_name_bytes, bytes) else str(group_name_bytes)
+                        
+                        # Context7: Получаем минимальный ID из pending сообщений
+                        try:
+                            pending_info = await self.redis_client.client.xpending_range(
+                                stream_key,
+                                group_name,
+                                min='-',
+                                max='+',
+                                count=1
+                            )
+                            if pending_info:
+                                pending_id = pending_info[0].get('message_id')
+                                if pending_id:
+                                    pending_id_str = pending_id.decode() if isinstance(pending_id, bytes) else str(pending_id)
+                                    if not min_pending_id or self._compare_message_ids(pending_id_str, min_pending_id) < 0:
+                                        min_pending_id = pending_id_str
+                        except Exception as e:
+                            logger.debug("Failed to get pending info", group=group_name, error=str(e))
+                
+                # Context7: Если есть pending сообщения, используем минимальный pending ID вместо last-delivered-id
+                # Это гарантирует, что мы не удалим ещё недоставленные сообщения
+                safe_trim_id = min_pending_id if min_pending_id and self._compare_message_ids(min_pending_id, trim_id) < 0 else trim_id
+                
+                if safe_trim_id != trim_id:
+                    logger.debug("Using safe trim_id based on pending messages",
+                               original_trim_id=trim_id,
+                               safe_trim_id=safe_trim_id,
+                               min_pending_id=min_pending_id)
+                
+                # Context7: XTRIM с MINID - удаляет все сообщения с ID < minid (строго меньше)
+                # approximate=True для лучшей производительности
+                # Используем safe_trim_id - Redis удалит все сообщения до этого ID (не включительно)
+                trimmed_count = await self.redis_client.client.xtrim(
+                    stream_key,
+                    minid=safe_trim_id,
+                    approximate=True
+                )
+                
+                # Context7: Проверяем результат после XTRIM
+                new_length = await self.redis_client.client.xlen(stream_key)
+                
+                if trimmed_count > 0:
+                    indexing_trim_operations_total.labels(stream=stream_name, status='success').inc()
+                    indexing_queue_size.labels(stream=stream_name).set(new_length)
+                    logger.info("Trimmed processed messages from stream",
+                              stream=stream_name,
+                              stream_key=stream_key,
+                              trimmed_count=trimmed_count,
+                              before_length=current_length,
+                              after_length=new_length,
+                              last_id=trim_id)
+                else:
+                    # Context7: Логируем даже если ничего не удалено для диагностики
+                    logger.debug("No messages trimmed (possibly all messages are newer than trim_id)",
+                               stream=stream_name,
+                               trim_id=trim_id,
+                               current_length=current_length)
+                
+                return trimmed_count if trimmed_count else 0
+                
+            except Exception as e:
+                error_str = str(e)
+                # Redis может не поддерживать MINID в старых версиях - используем MAXLEN как fallback
+                if "MINID" in error_str or "syntax" in error_str.lower():
+                    logger.warning("XTRIM MINID not supported, using MAXLEN fallback",
+                                 stream=stream_name,
+                                 error=error_str)
+                    # Fallback: получаем текущий размер и оставляем последние N сообщений
+                    current_length = await self.redis_client.client.xlen(stream_key)
+                    if current_length > 1000:  # Trim только если больше 1000 сообщений
+                        keep_count = 500  # Оставляем последние 500
+                        trimmed_count = await self.redis_client.client.xtrim(
+                            stream_key,
+                            maxlen=keep_count,
+                            approximate=True
+                        )
+                        if trimmed_count > 0:
+                            indexing_trim_operations_total.labels(stream=stream_name, status='fallback').inc()
+                            indexing_queue_size.labels(stream=stream_name).set(
+                                await self.redis_client.client.xlen(stream_key)
+                            )
+                            logger.info("Trimmed stream using MAXLEN fallback",
+                                      stream=stream_name,
+                                      trimmed_count=trimmed_count)
+                        return trimmed_count
+                    return 0
+                else:
+                    indexing_trim_operations_total.labels(stream=stream_name, status='error').inc()
+                    logger.error("Failed to trim processed messages",
+                               stream=stream_name,
+                               error=error_str,
+                               error_type=type(e).__name__)
+                    return 0
+                    
+        except Exception as e:
+            logger.error("Error in _trim_processed_messages",
+                       stream=stream_name,
+                       error=str(e),
+                       error_type=type(e).__name__)
+            return 0
+    
+    async def _reclaim_pending_messages(self, stream_name: str) -> int:
+        """
+        Context7 best practice: периодическая обработка подвисших сообщений (PEL) через XAUTOCLAIM.
+        
+        XAUTOCLAIM возвращает сообщения, которые были прочитаны, но не ACK'нуты из-за:
+        - Падений воркеров
+        - Таймаутов обработки
+        - Ошибок обработки
+        
+        Без этого lag не уйдёт, а новые батчи будут отставать.
+        
+        Args:
+            stream_name: Имя стрима для обработки
+            
+        Returns:
+            int: Количество сообщений, возвращённых XAUTOCLAIM
+        """
+        try:
+            from event_bus import STREAMS
+            
+            if stream_name not in STREAMS:
+                logger.warning(f"Stream name '{stream_name}' not found in STREAMS mapping")
+                return 0
+            
+            stream_key = STREAMS[stream_name]
+            
+            # Context7: XAUTOCLAIM с JUSTID для лучшей производительности
+            # Используем min_idle_time для фильтрации только старых сообщений
+            try:
+                result = await self.redis_client.client.xautoclaim(
+                    stream_key,
+                    self.event_consumer.config.group_name,
+                    self.event_consumer.config.consumer_name,
+                    min_idle_time=self.pel_min_idle_ms,
+                    start_id="0-0",
+                    count=self.event_consumer.config.batch_size,
+                    justid=False  # Нужны данные для обработки
+                )
+                
+                # Context7: XAUTOCLAIM возвращает [next_id, messages] или [next_id, messages, deleted_ids]
+                if not result or len(result) < 2:
+                    indexing_autoclaim_operations_total.labels(stream=stream_name, status='no_messages').inc()
+                    return 0
+                
+                messages = result[1] if result[1] else []
+                
+                if not messages:
+                    indexing_autoclaim_operations_total.labels(stream=stream_name, status='no_messages').inc()
+                    return 0
+                
+                # Context7: Обрабатываем возвращённые сообщения
+                reclaimed_count = len(messages)
+                indexing_autoclaim_operations_total.labels(stream=stream_name, status='success').inc()
+                indexing_autoclaim_messages_total.labels(stream=stream_name).inc(reclaimed_count)
+                
+                logger.debug("XAUTOCLAIM returned messages",
+                           stream=stream_name,
+                           count=reclaimed_count,
+                           min_idle_ms=self.pel_min_idle_ms)
+                
+                # Context7: Обрабатываем сообщения через основной handler
+                # Используем параллельную обработку, если доступна
+                for msg_id, fields in messages:
+                    try:
+                        # Парсинг события
+                        event_data = self.event_consumer._parse_event_data(fields)
+                        
+                        # Обработка события
+                        await self._process_single_message(event_data)
+                        
+                        # ACK сообщения
+                        await self.redis_client.client.xack(
+                            stream_key,
+                            self.event_consumer.config.group_name,
+                            msg_id
+                        )
+                        
+                        logger.debug("Reclaimed and processed pending message",
+                                   stream=stream_name,
+                                   message_id=msg_id)
+                        
+                    except Exception as e:
+                        logger.warning("Failed to process reclaimed message",
+                                     stream=stream_name,
+                                     message_id=msg_id,
+                                     error=str(e))
+                        # Не ACK'им - сообщение останется в PEL для повторной обработки
+                
+                return reclaimed_count
+                
+            except Exception as e:
+                error_str = str(e)
+                indexing_autoclaim_operations_total.labels(stream=stream_name, status='error').inc()
+                logger.error("XAUTOCLAIM failed",
+                           stream=stream_name,
+                           error=error_str,
+                           error_type=type(e).__name__)
+                return 0
+                
+        except Exception as e:
+            logger.error("Error in _reclaim_pending_messages",
+                       stream=stream_name,
+                       error=str(e),
+                       error_type=type(e).__name__)
+            return 0
+    
+    def _compare_message_ids(self, id1: str, id2: str) -> int:
+        """
+        Context7: Сравнение двух message ID для определения какая новее.
+        
+        Returns:
+            -1 если id1 < id2, 0 если равны, 1 если id1 > id2
+        """
+        try:
+            # Формат ID: timestamp-counter
+            parts1 = id1.split('-')
+            parts2 = id2.split('-')
+            
+            if len(parts1) != 2 or len(parts2) != 2:
+                return 0
+            
+            ts1, cnt1 = int(parts1[0]), int(parts1[1])
+            ts2, cnt2 = int(parts2[0]), int(parts2[1])
+            
+            if ts1 < ts2:
+                return -1
+            elif ts1 > ts2:
+                return 1
+            else:
+                # Если timestamp равны, сравниваем counter
+                if cnt1 < cnt2:
+                    return -1
+                elif cnt1 > cnt2:
+                    return 1
+                else:
+                    return 0
+        except (ValueError, IndexError):
+            return 0
+    
+    async def _consume_with_trim(self, stream_name: str, handler_func):
+        """
+        Context7 best practice: потребление событий с периодической очисткой через XTRIM.
+        
+        Обёртка над EventConsumer.consume_forever с отслеживанием последнего обработанного ID
+        и периодическим вызовом XTRIM для уменьшения размера стрима.
+        
+        Args:
+            stream_name: Имя стрима для потребления
+            handler_func: Функция-обработчик события
+        """
+        from event_bus import STREAMS
+        
+        if stream_name not in STREAMS:
+            raise KeyError(f"Stream name '{stream_name}' not found in STREAMS")
+        
+        stream_key = STREAMS[stream_name]
+        
+        # Context7: Обновляем метрики очереди, lag и pending
+        async def update_queue_metrics():
+            try:
+                queue_size = await self.redis_client.client.xlen(stream_key)
+                indexing_queue_size.labels(stream=stream_name).set(queue_size)
+                
+                # Context7: Обновляем метрики lag и pending из XINFO GROUPS
+                groups_info = await self.redis_client.client.xinfo_groups(stream_key)
+                for group_info in groups_info:
+                    group_name_bytes = group_info.get(b'name', b'')
+                    if group_name_bytes:
+                        group_name = group_name_bytes.decode() if isinstance(group_name_bytes, bytes) else str(group_name_bytes)
+                        
+                        # Context7: Lag - количество сообщений, не доставленных ни одному consumer
+                        lag_bytes = group_info.get(b'lag', 0)
+                        lag = lag_bytes if isinstance(lag_bytes, int) else (int(lag_bytes.decode()) if isinstance(lag_bytes, bytes) else 0)
+                        indexing_consumer_lag.labels(stream=stream_name, group=group_name).set(lag)
+                        
+                        # Context7: Pending - количество сообщений в PEL
+                        pending_bytes = group_info.get(b'pending', 0)
+                        pending = pending_bytes if isinstance(pending_bytes, int) else (int(pending_bytes.decode()) if isinstance(pending_bytes, bytes) else 0)
+                        indexing_pending_messages.labels(stream=stream_name, group=group_name).set(pending)
+                        
+            except Exception as e:
+                logger.debug("Failed to update queue metrics", error=str(e))
+        
+        await update_queue_metrics()
+        
+        # Context7: Основной цикл потребления с периодической очисткой
+        iteration = 0
+        while self.event_consumer.running:
+            try:
+                # Context7: Обрабатываем батч сообщений с параллелизмом
+                processed = await self._consume_batch_with_parallelism(stream_name, handler_func)
+                logger.debug("Consume batch completed",
+                           stream=stream_name,
+                           processed_count=processed,
+                           processed_count_since_trim=self.processed_count_since_trim,
+                           last_processed_id=self.last_processed_id,
+                           iteration=iteration)
+                
+                # Context7: Получаем last-delivered-id из consumer group для XTRIM
+                # Context7: processed_count_since_trim уже обновлён в _consume_batch_with_parallelism
+                # (там учитываются все ACK'нутые сообщения, включая пропущенные без post_id)
+                if processed > 0 or self.processed_count_since_trim > 0:
+                    try:
+                        groups_info = await self.redis_client.client.xinfo_groups(stream_key)
+                        for group_info in groups_info:
+                            if group_info.get(b'name', b'').decode() == self.event_consumer.config.group_name:
+                                last_id_bytes = group_info.get(b'last-delivered-id', b'0-0')
+                                if last_id_bytes:
+                                    last_id_str = last_id_bytes.decode() if isinstance(last_id_bytes, bytes) else str(last_id_bytes)
+                                    if last_id_str and last_id_str != '0-0':
+                                        # Context7: Используем last-delivered-id как fallback, если last_processed_id не установлен
+                                        if not self.last_processed_id or self._compare_message_ids(last_id_str, self.last_processed_id) > 0:
+                                            self.last_processed_id = last_id_str
+                                            logger.debug("Updated last_processed_id from consumer group",
+                                                       last_id=self.last_processed_id)
+                                    break
+                    except Exception as e:
+                        logger.debug("Failed to get last-delivered-id", error=str(e))
+                    
+                    # Context7: Периодическая очистка после обработки (не ждём 10 итераций)
+                    # Проверяем каждую итерацию, если достигли интервала
+                    if self.processed_count_since_trim >= self.trim_interval and self.last_processed_id:
+                        trimmed = await self._trim_processed_messages(stream_name, self.last_processed_id)
+                        if trimmed > 0:
+                            logger.info("Periodic trim after processing batch",
+                                      stream=stream_name,
+                                      trimmed_count=trimmed,
+                                      processed_since_trim=self.processed_count_since_trim,
+                                      last_id=self.last_processed_id)
+                        self.processed_count_since_trim = 0
+                
+                # Context7: Периодическая обработка подвисших сообщений (PEL) через XAUTOCLAIM
+                current_time = time.time()
+                if current_time - self.last_pel_reclaim_time >= self.pel_reclaim_interval:
+                    reclaimed = await self._reclaim_pending_messages(stream_name)
+                    if reclaimed > 0:
+                        logger.info("Reclaimed pending messages via XAUTOCLAIM",
+                                  stream=stream_name,
+                                  reclaimed_count=reclaimed)
+                    self.last_pel_reclaim_time = current_time
+                
+                # Обновляем метрики каждые 10 итераций
+                iteration += 1
+                if iteration % 10 == 0:
+                    await update_queue_metrics()
+                    
+                    # Context7: Дополнительная проверка на очистку каждые 10 итераций
+                    # Используем last-delivered-id из consumer group как fallback
+                    if not self.last_processed_id:
+                        try:
+                            groups_info = await self.redis_client.client.xinfo_groups(stream_key)
+                            for group_info in groups_info:
+                                if group_info.get(b'name', b'').decode() == self.event_consumer.config.group_name:
+                                    last_id_bytes = group_info.get(b'last-delivered-id', b'0-0')
+                                    if last_id_bytes:
+                                        last_id_str = last_id_bytes.decode() if isinstance(last_id_bytes, bytes) else str(last_id_bytes)
+                                        if last_id_str and last_id_str != '0-0':
+                                            self.last_processed_id = last_id_str
+                                            logger.debug("Updated last_processed_id from consumer group (fallback)",
+                                                       last_id=self.last_processed_id)
+                                            break
+                        except Exception as e:
+                            logger.debug("Failed to get last-delivered-id (fallback)", error=str(e))
+                    
+                    # Context7: Периодическая очистка каждые 10 итераций (даже если не достигли интервала)
+                    # Это гарантирует, что очистка будет происходить регулярно
+                    if self.last_processed_id:
+                        trimmed = await self._trim_processed_messages(stream_name, self.last_processed_id)
+                        if trimmed > 0:
+                            logger.info("Periodic trim on metrics update (every 10 iterations)",
+                                      stream=stream_name,
+                                      trimmed_count=trimmed,
+                                      last_id=self.last_processed_id,
+                                      processed_since_trim=self.processed_count_since_trim)
+                
+                if processed == 0:
+                    await asyncio.sleep(0.2)
+                    
+            except asyncio.CancelledError:
+                logger.info("Consume loop cancelled")
+                break
+            except Exception as e:
+                logger.error("Error in consume loop", error=str(e))
+                await asyncio.sleep(5)
+    
+    async def _consume_batch_with_parallelism(self, stream_name: str, handler_func) -> int:
+        """
+        Context7 best practice: обработка батча сообщений с ограниченным параллелизмом.
+        
+        Использует Semaphore для ограничения количества одновременных обработок,
+        что предотвращает перегрузку внешних сервисов (GigaChat, Neo4j, Qdrant).
+        
+        Args:
+            stream_name: Имя стрима для потребления
+            handler_func: Функция-обработчик события
+            
+        Returns:
+            int: Количество обработанных сообщений
+        """
+        from event_bus import STREAMS
+        
+        if stream_name not in STREAMS:
+            raise KeyError(f"Stream name '{stream_name}' not found in STREAMS")
+        
+        stream_key = STREAMS[stream_name]
+        
+        # Context7: Читаем новые сообщения через XREADGROUP
+        try:
+            messages = await self.redis_client.client.xreadgroup(
+                self.event_consumer.config.group_name,
+                self.event_consumer.config.consumer_name,
+                {stream_key: '>'},
+                count=self.event_consumer.config.batch_size,
+                block=self.event_consumer.config.block_time
+            )
+            
+            if not messages:
+                return 0
+            
+            # Обрабатываем pending сообщения через XAUTOCLAIM
+            try:
+                pending_result = await self.redis_client.client.xautoclaim(
+                    stream_key,
+                    self.event_consumer.config.group_name,
+                    self.event_consumer.config.consumer_name,
+                    min_idle_time=60000,  # 60 секунд
+                    count=self.event_consumer.config.batch_size
+                )
+                
+                pending_messages = []
+                if pending_result and len(pending_result) > 1:
+                    pending_messages = pending_result[1] if pending_result[1] else []
+                
+                logger.debug("XAUTOCLAIM result",
+                           stream=stream_name,
+                           pending_count=len(pending_messages))
+                
+                # Объединяем pending и новые сообщения
+                all_messages = []
+                if messages:
+                    for stream, stream_messages in messages:
+                        if stream == stream_key:
+                            all_messages.extend([(msg_id, fields) for msg_id, fields in stream_messages])
+                
+                if pending_messages:
+                    all_messages.extend([(msg_id, fields) for msg_id, fields in pending_messages])
+                
+                if not all_messages:
+                    logger.debug("No messages to process after merging", stream=stream_name)
+                    return 0
+                
+                logger.debug("Total messages to process",
+                           stream=stream_name,
+                           total_count=len(all_messages),
+                           new_messages=len([m for m in all_messages if messages and any(stream == stream_key for stream, _ in messages)]),
+                           pending_messages=len(pending_messages))
+                
+                # Context7: Параллельная обработка с ограничением через Semaphore
+                async def process_single_with_semaphore(message_id: str, fields: Dict):
+                    """Обработка одного сообщения с контролем параллелизма."""
+                    async with self.processing_semaphore:
+                        try:
+                            # Парсинг события
+                            from event_bus import EventConsumer
+                            parsed_event = self.event_consumer._parse_event_data(fields)
+                            
+                            # Context7: Проверяем post_id до обработки
+                            # Если post_id отсутствует, ACK'им сообщение и пропускаем
+                            event_data = parsed_event.get('payload') if isinstance(parsed_event, dict) and 'payload' in parsed_event else parsed_event
+                            post_id = event_data.get('post_id') if isinstance(event_data, dict) else None
+                            
+                            if not post_id:
+                                # Context7: Сообщения без post_id ACK'им, чтобы они не блокировали очередь
+                                logger.debug("Skipping message without post_id, ACKing", message_id=message_id)
+                                await self.redis_client.client.xack(
+                                    stream_key,
+                                    self.event_consumer.config.group_name,
+                                    message_id
+                                )
+                                # Обновляем last_processed_id даже для пропущенных сообщений
+                                if message_id:
+                                    self.last_processed_id = message_id
+                                return True  # Считаем как обработанное для счётчика
+                            
+                            # Context7: _process_single_message ожидает структуру с payload или прямой формат
+                            await handler_func(parsed_event)
+                            
+                            # ACK сообщения только если обработка прошла успешно
+                            await self.redis_client.client.xack(
+                                stream_key,
+                                self.event_consumer.config.group_name,
+                                message_id
+                            )
+                            
+                            # Context7: Обновляем last_processed_id для XTRIM
+                            if message_id:
+                                self.last_processed_id = message_id
+                            
+                            return True
+                        except Exception as e:
+                            # Context7: Если исключение проброшено, это retryable ошибка
+                            # Не ACK'им сообщение, оно останется в PEL для повторной обработки
+                            logger.warning("Retryable error in parallel processing, message will remain in PEL",
+                                         message_id=message_id,
+                                         error=str(e))
+                            return False
+                
+                # Context7: Параллельная обработка всех сообщений
+                tasks = [
+                    process_single_with_semaphore(msg_id, fields)
+                    for msg_id, fields in all_messages
+                ]
+                
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                processed_count = sum(1 for r in results if r is True)
+                
+                # Context7: Обновляем счётчик для XTRIM - считаем все ACK'нутые сообщения
+                # Context7: Все сообщения, которые вернули True (включая пропущенные без post_id), уже ACK'нуты
+                acked_count = sum(1 for r in results if r is True)
+                self.processed_count_since_trim += acked_count
+                
+                # Context7: Обновляем last_processed_id на максимальный ID из всех ACK'нутых сообщений
+                # Все сообщения до этого ID уже ACK'нуты (успешно обработаны или пропущены)
+                if all_messages and acked_count > 0:
+                    # Находим максимальный ID из всех ACK'нутых сообщений
+                    acked_ids = []
+                    for i, result in enumerate(results):
+                        if result is True and i < len(all_messages):
+                            acked_ids.append(all_messages[i][0])
+                    
+                    if acked_ids:
+                        # Используем максимальный ACK'нутый ID для безопасного XTRIM
+                        # Сортируем по timestamp-counter для нахождения максимума
+                        acked_ids.sort(key=lambda x: (int(x.split('-')[0]), int(x.split('-')[1])))
+                        max_acked_id = acked_ids[-1]
+                        
+                        # Обновляем last_processed_id только если новый ID больше текущего
+                        if not self.last_processed_id or self._compare_message_ids(max_acked_id, self.last_processed_id) > 0:
+                            self.last_processed_id = max_acked_id
+                            logger.debug("Updated last_processed_id from ACKed batch",
+                                       last_id=self.last_processed_id,
+                                       acked_count=len(acked_ids),
+                                       batch_size=len(all_messages),
+                                       processed_count=processed_count)
+                
+                return processed_count
+                
+            except Exception as e:
+                logger.error("Error in parallel processing",
+                           stream=stream_name,
+                           error=str(e),
+                           error_type=type(e).__name__)
+                return 0
+                
+        except Exception as e:
+            logger.error("Error reading messages",
+                       stream=stream_name,
+                       error=str(e),
+                       error_type=type(e).__name__)
+            return 0
     
     async def stop(self):
         """Остановка indexing task."""

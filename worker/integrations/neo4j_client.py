@@ -117,18 +117,23 @@ class Neo4jClient:
             async with self._driver.session() as session:
                 # [C7-ID: WORKER-NEO4J-PROVIDER-001] - MERGE с параметрами (никогда f-strings)
                 # Context7: Сериализация enrichment_data в JSON для Neo4j
+                # Context7: ensure_ascii=False для корректного сохранения кириллицы и специальных символов
                 import json
-                enrichment_json = json.dumps(enrichment_data) if enrichment_data else None
+                enrichment_json = json.dumps(enrichment_data, ensure_ascii=False, default=str) if enrichment_data else None
+                
+                # Context7: Обработка null user_id - используем 'system' как fallback
+                # Neo4j не поддерживает null в ключевых свойствах для MERGE
+                effective_user_id = user_id if user_id else 'system'
                 
                 query = """
                 MERGE (p:Post {post_id: $post_id})
-                SET p.user_id = $user_id,
+                SET p.user_id = $effective_user_id,
                     p.tenant_id = $tenant_id,
                     p.channel_id = $channel_id,
                     p.expires_at = $expires_at,
                     p.indexed_at = $indexed_at,
                     p.enrichment_data = $enrichment_data
-                MERGE (u:User {user_id: $user_id})
+                MERGE (u:User {user_id: $effective_user_id})
                 SET u.tenant_id = $tenant_id
                 MERGE (c:Channel {channel_id: $channel_id})
                 SET c.tenant_id = $tenant_id
@@ -140,7 +145,7 @@ class Neo4jClient:
                 result = await session.run(
                     query,
                     post_id=post_id,
-                    user_id=user_id,
+                    effective_user_id=effective_user_id,
                     tenant_id=tenant_id,
                     channel_id=channel_id,
                     expires_at=expires_at,

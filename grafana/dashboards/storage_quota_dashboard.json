@@ -81,7 +81,7 @@
             "name": "Prometheus"
           },
           "editorMode": "code",
-          "expr": "storage_bucket_usage_gb{content_type=\"media\"}",
+          "expr": "storage_bucket_usage_gb{tenant_id=~\"$tenant_id\", content_type=\"media\"}",
           "legendFormat": "Media",
           "refId": "A"
         },
@@ -92,7 +92,7 @@
             "name": "Prometheus"
           },
           "editorMode": "code",
-          "expr": "storage_bucket_usage_gb{content_type=\"vision\"}",
+          "expr": "storage_bucket_usage_gb{tenant_id=~\"$tenant_id\", content_type=\"vision\"}",
           "legendFormat": "Vision Cache",
           "refId": "B"
         },
@@ -103,7 +103,7 @@
             "name": "Prometheus"
           },
           "editorMode": "code",
-          "expr": "storage_bucket_usage_gb{content_type=\"crawl\"}",
+          "expr": "storage_bucket_usage_gb{tenant_id=~\"$tenant_id\", content_type=\"crawl\"}",
           "legendFormat": "Crawl Cache",
           "refId": "C"
         }
@@ -175,7 +175,7 @@
             "name": "Prometheus"
           },
           "editorMode": "code",
-          "expr": "storage_bucket_usage_gb",
+          "expr": "storage_bucket_usage_gb{tenant_id=~\"$tenant_id\"}",
           "legendFormat": "{{content_type}}",
           "refId": "A"
         }
@@ -353,7 +353,7 @@
             "name": "Prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(rate(storage_lru_evictions_total[5m])) by (tenant_id, content_type)",
+          "expr": "sum(rate(storage_lru_evictions_total{tenant_id=~\"$tenant_id\"}[5m])) by (tenant_id, content_type)",
           "legendFormat": "Evictions - {{tenant_id}} ({{content_type}})",
           "refId": "A"
         }
@@ -561,7 +561,38 @@
     "s3"
   ],
   "templating": {
-    "list": []
+    "list": [
+      {
+        "allValue": null,
+        "current": {
+          "selected": false,
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "definition": "label_values(storage_lru_evictions_total, tenant_id)",
+        "description": "Filter by tenant ID",
+        "error": null,
+        "hide": 0,
+        "includeAll": true,
+        "label": "Tenant ID",
+        "multi": true,
+        "name": "tenant_id",
+        "options": [],
+        "query": {
+          "query": "label_values(storage_lru_evictions_total, tenant_id)",
+          "refId": "StandardVariableQuery"
+        },
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      }
+    ]
   },
   "time": {
     "from": "now-6h",

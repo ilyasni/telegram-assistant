@@ -23,6 +23,8 @@ engine = create_engine(
     max_overflow=20,  # Максимальное количество дополнительных соединений
     pool_pre_ping=True,  # Проверка соединений перед использованием
     pool_recycle=3600,  # Пересоздание соединений через час
+    # Context7: Явная изоляция транзакций для предотвращения задержек
+    isolation_level="READ COMMITTED",  # Уровень изоляции для немедленного отражения изменений
     connect_args={
         "connect_timeout": 10,  # Таймаут подключения
         "application_name": "telegram_api"
@@ -122,17 +124,56 @@ class User(Base):
     last_active_at = Column(DateTime)
     settings = Column(JSON, default={})
     tier = Column(String(20), default="free")
+    # [C7-ID: db-admin-001] Роль пользователя для админ-панели
+    role = Column(String(20), default="user", server_default="user")
+    # Context7: Версионирование для оптимистичной блокировки (OCC)
+    version = Column(Integer, default=1, server_default='1', nullable=False)
+    # Context7: Автоматическое обновление timestamp при изменении записи
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
     
     # Relationships
     tenant = relationship("Tenant", back_populates="users")
     identity = relationship("Identity", back_populates="memberships")
     channel_subscriptions = relationship("UserChannel", back_populates="user")
     group_subscriptions = relationship("UserGroup", back_populates="user")
+    # Context7: Явно указываем foreign_keys для избежания AmbiguousForeignKeysError
+    # (UserAuditLog имеет два FK на users: user_id и changed_by)
+    # Используем строковое имя колонки через lambda, так как класс UserAuditLog определен ниже
+    audit_logs = relationship(
+        "UserAuditLog",
+        foreign_keys="UserAuditLog.user_id",
+        back_populates="user",
+        cascade="all, delete-orphan"
+    )
 
     # Индексы/ограничения: окончательный UNIQUE(tenant_id, identity_id) накатывается миграцией
     __table_args__ = (
         Index("ix_users_tenant", "tenant_id"),
         Index("ix_users_identity", "identity_id"),
+    )
+
+
+class UserAuditLog(Base):
+    """История изменений пользователя (tier, role) для аудита [Context7: OCC audit]."""
+    __tablename__ = "user_audit_log"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    action = Column(String(50), nullable=False)  # role_changed|tier_changed|upgraded|downgraded
+    old_value = Column(String(255))
+    new_value = Column(String(255))
+    changed_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"))  # admin user_id
+    changed_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    notes = Column(Text)
+    
+    # Relationships
+    user = relationship("User", back_populates="audit_logs", foreign_keys=[user_id])
+    changed_by_user = relationship("User", foreign_keys=[changed_by])
+    
+    __table_args__ = (
+        Index("ix_user_audit_log_user_id", "user_id"),
+        Index("ix_user_audit_log_changed_at", "changed_at"),
+        Index("ix_user_audit_log_action", "action"),
     )
 
 

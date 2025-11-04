@@ -126,7 +126,9 @@ def upsert_membership_sync(
             user.first_name = first_name
         if last_name is not None:
             user.last_name = last_name
-        user.tier = tier
+        # Context7: НЕ перезаписываем tier при обновлении существующего пользователя
+        # tier обновляется только при создании нового пользователя
+        # user.tier = tier  # УДАЛЕНО: защита от сброса tier при обновлении
         # Context7: Используем utcnow() для совместимости с asyncpg
         user.last_active_at = datetime.utcnow()
         db.flush()
@@ -177,7 +179,8 @@ async def upsert_membership_async(
             first_name = EXCLUDED.first_name,
             last_name = EXCLUDED.last_name,
             username = EXCLUDED.username,
-            tier = EXCLUDED.tier,
+            -- Context7: НЕ обновляем tier при конфликте (при обновлении существующего пользователя)
+            -- tier = EXCLUDED.tier,  -- УДАЛЕНО: защита от сброса tier
             last_active_at = EXCLUDED.last_active_at,
             telegram_id = EXCLUDED.telegram_id  -- Ensure telegram_id is updated for dual-write
         RETURNING id

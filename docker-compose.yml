@@ -145,8 +145,14 @@ services:
   # Redis Cache
   redis:
     image: redis:7-alpine
+    environment:
+      # Context7 best practice: timezone для корректной работы с временем
+      TZ: Europe/Moscow
     volumes:
       - redis_data:/data
+      # Context7 best practice: монтируем timezone данные хоста
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     networks:
       - telegram-network
     # Context7 best practice: health check для Redis
@@ -265,9 +271,9 @@ services:
     ports:
       - "8090:8090"
     environment:
-      # Базовые настройки (из документации)
-      PROXY_HOST: "0.0.0.0"
-      PROXY_PORT: "8090"
+      # Базовые настройки прокси (согласно документации gpt2giga)
+      GPT2GIGA_HOST: "0.0.0.0"
+      GPT2GIGA_PROXY_PORT: "8090"
       
       # GigaChat API (обязательные)
       GIGACHAT_CREDENTIALS: ${GIGACHAT_CREDENTIALS}
@@ -280,12 +286,21 @@ services:
       
       # Verbose logging для диагностики
       GPT2GIGA_VERBOSE: "True"
+      # Уровень логов (INFO, DEBUG, WARNING)
+      GPT2GIGA_LOG_LEVEL: "INFO"
       
       # Передача модели (из документации)
       GPT2GIGA_PASS_MODEL: "True"
       
       # SSL сертификаты (отключаем для dev/test)
+      # Context7: В переменных окружения по умолчанию False согласно документации gpt2giga
+      # Если не указано, используется False (в аргументах по умолчанию True)
       GIGACHAT_VERIFY_SSL_CERTS: "False"
+      # Отключение SSL на уровне Python/httpx
+      PYTHONHTTPSVERIFY: "0"
+      CURL_CA_BUNDLE: ""
+      REQUESTS_CA_BUNDLE: ""
+      SSL_CERT_FILE: ""
       
       # Embeddings модель
       GPT2GIGA_EMBEDDINGS: "EmbeddingsGigaR"
@@ -407,6 +422,8 @@ services:
       # Context7: GigaChat Vision API Credentials (для VisionAnalysisTask)
       GIGACHAT_CREDENTIALS: ${GIGACHAT_CREDENTIALS}
       GIGACHAT_SCOPE: ${GIGACHAT_SCOPE:-GIGACHAT_API_PERS}
+      # Context7: Модель для embeddings (EmbeddingsGigaR возвращает 2560 измерений)
+      GIGACHAT_EMBEDDINGS_MODEL: ${GIGACHAT_EMBEDDINGS_MODEL:-EmbeddingsGigaR}
       # Fallback: OpenRouter
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
       # DEV Feature Flags
@@ -432,7 +449,10 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-DEBUG}
       ENVIRONMENT: ${ENVIRONMENT:-production}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-hash-based}
-      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-128}
+      # Context7: Размерность эмбеддингов для EmbeddingsGigaR модели
+      # EmbeddingsGigaR возвращает 2560 измерений
+      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-2560}
+      EMBED_DIM: ${EMBED_DIM:-${EMBEDDING_DIMENSION:-2560}}
       # Dispatch smoke to validate routing before handler
       DISPATCH_SMOKE: ${DISPATCH_SMOKE:-false}
       # Force temporary handler for debugging

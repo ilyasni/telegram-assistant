@@ -31,10 +31,12 @@ class Settings:
     webhook_retry_count: int = int(os.getenv("WEBHOOK_RETRY_COUNT", "3"))
     
     # Embeddings Configuration
-    # Context7: GigaChat Giga-Embeddings-instruct возвращает 2048 измерений
-    # Источник: https://gitverse.ru/GigaTeam/GigaEmbeddings
+    # Context7: Размерность зависит от модели:
+    # - EmbeddingsGigaR: 2560 измерений (используется по умолчанию)
+    # - Embeddings (Giga-Embeddings-instruct): 2048 измерений
+    # Источник: https://developers.sber.ru/docs/ru/gigachat/api/reference/rest/gigachat-api
     EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "gigachat-embeddings")
-    EMBED_DIM: int = int(os.getenv("EMBED_DIM", os.getenv("EMBEDDING_DIMENSION", "2048")))
+    EMBED_DIM: int = int(os.getenv("EMBED_DIM", os.getenv("EMBEDDING_DIMENSION", "2560")))
     INDEXER_EMBED_IF_MISSING: bool = os.getenv("INDEXER_EMBED_IF_MISSING", "true").lower() == "true"
     
     # GigaChat

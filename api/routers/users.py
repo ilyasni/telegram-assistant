@@ -29,6 +29,7 @@ class UserResponse(BaseModel):
     first_name: Optional[str] = None
     last_name: Optional[str] = None
     created_at: str
+    role: Optional[str] = None  # Context7: Добавляем role для проверки прав доступа
 
 
 class SubscriptionInfo(BaseModel):
@@ -49,17 +50,28 @@ async def get_user_by_telegram_id(
     """
     Получить пользователя по telegram_id.
     Context7: Если есть tenant_id в JWT - фильтруем по tenant, иначе возвращаем первый найденный.
+    Для запросов из бота (без JWT) возвращаем первого найденного пользователя.
     """
     from dependencies.auth import get_current_tenant_id_optional
     
-    # Context7: Извлекаем tenant_id из JWT если доступен
-    tenant_id = get_current_tenant_id_optional(request)
+    # Context7: Извлекаем tenant_id из JWT если доступен (опционально)
+    # Если JWT отсутствует (запрос из бота) - tenant_id будет None
+    tenant_id = None
+    try:
+        tenant_id = get_current_tenant_id_optional(request)
+    except Exception as e:
+        # Context7: Игнорируем ошибки извлечения JWT (для запросов из бота без токена)
+        logger.debug("Failed to extract tenant_id from JWT (non-blocking)", error=str(e))
     
     query = db.query(User)
     
     if tenant_id:
         # Context7: Фильтруем по tenant_id для изоляции данных
-        query = query.filter(User.tenant_id == uuid.UUID(tenant_id))
+        try:
+            query = query.filter(User.tenant_id == uuid.UUID(tenant_id))
+        except (ValueError, TypeError):
+            # Context7: Если tenant_id невалиден - игнорируем фильтрацию
+            logger.debug("Invalid tenant_id format, skipping filter", tenant_id=tenant_id)
     
     # Ищем через identity для корректной работы с multi-tenant
     identity = db.query(Identity).filter(Identity.telegram_id == telegram_id).first()
@@ -79,7 +91,8 @@ async def get_user_by_telegram_id(
         username=user.username,
         first_name=user.first_name,
         last_name=user.last_name,
-        created_at=user.created_at.isoformat()
+        created_at=user.created_at.isoformat(),
+        role=user.role or "user"  # Context7: Возвращаем role для проверки прав доступа
     )
 
 
@@ -89,14 +102,33 @@ async def create_user(user_data: UserCreate, db: Session = Depends(get_db)):
     # TODO: Валидация инвайт-кода (пока пропускаем)
 
     # 1) Определяем/создаём tenant
+    # Context7: проверяем валидность default_tenant_id как UUID
     tenant_id_cfg = settings.default_tenant_id
+    tenant = None
+    
     if tenant_id_cfg:
-        tenant = db.query(Tenant).filter(Tenant.id == tenant_id_cfg).first()
-        if not tenant:
-            tenant = Tenant(id=tenant_id_cfg, name="Default Tenant")
+        try:
+            import uuid as _uuid
+            # Пробуем преобразовать в UUID
+            tenant_uuid = _uuid.UUID(tenant_id_cfg)
+            tenant = db.query(Tenant).filter(Tenant.id == tenant_uuid).first()
+            if not tenant:
+                tenant = Tenant(id=tenant_uuid, name="Default Tenant")
+                db.add(tenant)
+                db.flush()
+        except (ValueError, AttributeError, TypeError):
+            # Context7: если default_tenant_id не валидный UUID, создаем нового tenant
+            logger.warning(
+                "Invalid default_tenant_id format, creating new tenant",
+                default_tenant_id=tenant_id_cfg,
+                telegram_id=user_data.telegram_id
+            )
+            tenant_name = f"Tenant {user_data.username}" if user_data.username else f"Tenant {user_data.telegram_id}"
+            tenant = Tenant(name=tenant_name)
             db.add(tenant)
             db.flush()
-    else:
+    
+    if not tenant:
         # fallback: создаём отдельного tenant
         tenant_name = f"Tenant {user_data.username}" if user_data.username else f"Tenant {user_data.telegram_id}"
         tenant = Tenant(name=tenant_name)
@@ -130,7 +162,7 @@ async def create_user(user_data: UserCreate, db: Session = Depends(get_db)):
         "Membership created",
         user_id=str(user.id),
         tenant_id=str(tenant.id),
-        identity_id=str(identity.id),
+        identity_id=str(identity_id),
         telegram_id=user_data.telegram_id,
     )
 
@@ -141,6 +173,65 @@ async def create_user(user_data: UserCreate, db: Session = Depends(get_db)):
         first_name=user.first_name,
         last_name=user.last_name,
         created_at=user.created_at.isoformat(),
+        role=user.role or "user"  # Context7: Возвращаем role для проверки прав доступа
+    )
+
+
+@router.put("/{telegram_id}", response_model=UserResponse)
+async def update_user(
+    telegram_id: int,
+    user_data: UserCreate,
+    db: Session = Depends(get_db)
+):
+    """
+    Обновить данные пользователя по telegram_id.
+    Context7: Обновляет username, first_name, last_name существующего пользователя.
+    """
+    # Ищем пользователя через identity
+    identity = db.query(Identity).filter(Identity.telegram_id == telegram_id).first()
+    if not identity:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Ищем user по identity_id
+    user = db.query(User).filter(User.identity_id == identity.id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Context7: Обновляем данные пользователя
+    if user_data.username is not None:
+        user.username = user_data.username
+    if user_data.first_name is not None:
+        user.first_name = user_data.first_name
+    if user_data.last_name is not None:
+        user.last_name = user_data.last_name
+    
+    # Обновляем last_active_at
+    from datetime import datetime
+    user.last_active_at = datetime.utcnow()
+    
+    try:
+        db.commit()
+        db.refresh(user)
+    except Exception as e:
+        db.rollback()
+        logger.error("Failed to update user", error=str(e), telegram_id=telegram_id)
+        raise HTTPException(status_code=500, detail="Failed to update user")
+    
+    logger.info(
+        "User updated",
+        user_id=str(user.id),
+        telegram_id=telegram_id,
+        username=user_data.username,
+        first_name=user_data.first_name
+    )
+    
+    return UserResponse(
+        id=user.id,
+        telegram_id=user.telegram_id,
+        username=user.username,
+        first_name=user.first_name,
+        last_name=user.last_name,
+        created_at=user.created_at.isoformat()
     )
 
 

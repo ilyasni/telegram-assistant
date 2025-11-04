@@ -317,7 +317,13 @@ class ChannelParser:
             since_date = await self._get_since_date(channel_data, mode)
             
             logger.info(
-                f"Starting to parse channel: channel_title={channel_entity.title}, mode={mode}, since_date={since_date.isoformat()}"
+                "Starting to parse channel",
+                channel_id=channel_id,
+                channel_title=channel_entity.title,
+                mode=mode,
+                since_date=since_date.isoformat(),
+                last_parsed_at=channel_data.get('last_parsed_at'),
+                is_new_channel=channel_data.get('last_parsed_at') is None
             )
             
             # Парсинг сообщений батчами
@@ -1001,7 +1007,16 @@ class ChannelParser:
             return since_date
         
         elif mode == "historical":
-            return now - timedelta(hours=self.config.historical_hours)
+            # Context7: Для historical режима (новые каналы или старые с пропусками)
+            # Парсим последние N часов (по умолчанию 24 часа)
+            # Используем исторический диапазон для полного покрытия
+            since_date = now - timedelta(hours=self.config.historical_hours)
+            logger.debug("Calculated since_date for historical mode",
+                       channel_id=channel_id,
+                       since_date=since_date.isoformat(),
+                       historical_hours=self.config.historical_hours,
+                       now=now.isoformat())
+            return since_date
         
         else:
             raise ValueError(f"Unknown parser mode: {mode}")
@@ -1020,24 +1035,27 @@ class ChannelParser:
         
         # Context7: Использование retry обвязки вместо прямого iter_messages
         try:
-            # [C7-ID: dev-mode-017] Context7 best practice: для incremental режима получаем больше сообщений
-            # чтобы захватить все новые посты между last_parsed_at и now
-            # Важно: для incremental режима нужно получать достаточно сообщений,
-            # чтобы гарантированно захватить все новые после since_date
-            limit = batch_size * 100 if mode == "incremental" else batch_size
+            # [C7-ID: dev-mode-017] Context7 best practice: получаем достаточно сообщений
+            # чтобы гарантированно захватить все новые посты за нужный период
+            # - incremental: последние сообщения между last_parsed_at и now
+            # - historical: последние 24 часа (для новых каналов)
+            # Базовый лимит будет установлен ниже в зависимости от режима
+            limit = batch_size * 100 if mode == "incremental" else batch_size * 200
             
             # Context7: КРИТИЧНО - offset_date в Telethon возвращает сообщения ПРЕДШЕСТВУЮЩИЕ дате, а не ПОСЛЕ!
-            # Для incremental режима НЕ используем offset_date, а получаем последние сообщения и фильтруем локально
             # Источник: Telethon docs: "offset_date: Offset date (messages *previous* to this date will be retrieved). Exclusive."
+            # 
+            # Для ОБОИХ режимов (incremental и historical) НЕ используем offset_date, потому что:
+            # - incremental: нужны сообщения НОВЕЕ since_date (последние сообщения)
+            # - historical: нужны сообщения НОВЕЕ since_date (последние 24 часа для новых каналов)
+            # 
+            # Используем подход: получаем последние сообщения БЕЗ offset_date, затем фильтруем локально
+            # Это гарантирует, что мы получим ВСЕ новые сообщения независимо от режима
+            offset_date_param = None
             
-            if mode == "incremental":
-                # Context7: Для incremental режима получаем последние сообщения БЕЗ offset_date
-                # Затем фильтруем их локально по date > since_date
-                # Это гарантирует, что мы получим ВСЕ новые сообщения
-                offset_date_param = None
-            else:
-                # Для historical режима используем offset_date для получения сообщений до определенной даты
-                offset_date_param = since_date
+            # Context7: Для historical режима увеличиваем лимит, чтобы гарантированно захватить все сообщения за последние 24 часа
+            if mode == "historical":
+                limit = batch_size * 200  # Увеличиваем лимит для historical режима (новые каналы)
             
             logger.debug("Fetching messages batch",
                         channel_id=channel_entity.id,
@@ -1051,11 +1069,12 @@ class ChannelParser:
                 channel_entity,
                 limit=limit,
                 redis_client=self.redis_client,
-                offset_date=offset_date_param  # None для incremental, since_date для historical
+                offset_date=offset_date_param  # Всегда None для обоих режимов (получаем последние сообщения)
             )
             
             # Диагностика: логируем первое и последнее сообщение для понимания диапазона
-            if messages and mode == "incremental":
+            # Context7: Логируем для обоих режимов, чтобы отслеживать правильность работы
+            if messages:
                 first_msg = messages[0] if messages else None
                 last_msg = messages[-1] if messages else None
                 first_msg_date = ensure_dt_utc(first_msg.date) if first_msg and first_msg.date else None
@@ -1065,14 +1084,28 @@ class ChannelParser:
                 newer_count = sum(1 for msg in messages 
                                 if msg.date and ensure_dt_utc(msg.date) and ensure_dt_utc(msg.date) > since_date)
                 
-                logger.info(f"Fetched messages range for incremental mode",
+                # Context7: Для historical режима считаем сообщения >= since_date, для incremental > since_date
+                now_for_log = datetime.now(timezone.utc)
+                if mode == "historical":
+                    matching_count = sum(1 for msg in messages 
+                                       if msg.date and ensure_dt_utc(msg.date) and ensure_dt_utc(msg.date) >= since_date)
+                    # Дополнительная диагностика для historical режима
+                    age_hours = (now_for_log - since_date).total_seconds() / 3600 if since_date else None
+                else:
+                    matching_count = newer_count
+                    age_hours = None
+                
+                logger.info(f"Fetched messages range for {mode} mode",
                           channel_id=channel_entity.id,
+                          mode=mode,
                           count=len(messages),
-                          first_message_date=first_msg_date,
+                          first_message_date=first_msg_date.isoformat() if first_msg_date else None,
                           first_message_date_original=first_msg.date if first_msg else None,
-                          last_message_date=last_msg_date,
-                          since_date=since_date,
-                          messages_newer_than_since_date=newer_count)
+                          last_message_date=last_msg_date.isoformat() if last_msg_date else None,
+                          since_date=since_date.isoformat(),
+                          messages_matching_since_date=matching_count,
+                          historical_range_hours=age_hours,
+                          now=now_for_log.isoformat())
             
             # Обрабатываем полученные сообщения
             messages_filtered = 0
@@ -1124,17 +1157,11 @@ class ChannelParser:
                         channel_id=channel_entity.id,
                         error=str(e))
             # Fallback к старому методу при ошибке
-            # [C7-ID: dev-mode-017] Context7 best practice: устанавливаем разумный лимит для безопасности
-            if mode == "incremental":
-                # Context7: Для incremental НЕ используем offset_date (он возвращает старые сообщения)
-                # Получаем последние сообщения и фильтруем локально
-                limit_fallback = batch_size * 100  # Увеличиваем лимит для покрытия большого диапазона новых постов
-                iter_params = {"limit": limit_fallback}
-            else:
-                # Для historical: используем offset_date для получения сообщений до определенной даты
-                # Context7: Исправлено: установлен разумный лимит вместо None для предотвращения избыточной загрузки
-                limit_fallback = batch_size * 100
-                iter_params = {"offset_date": since_date, "limit": limit_fallback}
+            # [C7-ID: dev-mode-017] Context7 best practice: для ОБОИХ режимов НЕ используем offset_date
+            # Получаем последние сообщения и фильтруем локально по date >= since_date (historical) или date > since_date (incremental)
+            # Это гарантирует, что мы получим ВСЕ новые сообщения независимо от режима
+            limit_fallback = batch_size * 200 if mode == "historical" else batch_size * 100
+            iter_params = {"limit": limit_fallback}
             
             async for message in client.iter_messages(channel_entity, **iter_params):
                 # [C7-ID: dev-mode-017] Context7: Унифицированная логика фильтрации (соответствует основному пути)

@@ -38,6 +38,7 @@ def create_jwt(
     membership_id: Optional[str] = None,
     identity_id: Optional[str] = None,
     tier: Optional[str] = None,
+    role: Optional[str] = None,
     audience: str = "webapp",
     exp_minutes: int = 10
 ) -> str:
@@ -59,10 +60,14 @@ def create_jwt(
         payload["tenant_id"] = str(tenant_id)
     if membership_id:
         payload["membership_id"] = str(membership_id)
+        payload["user_id"] = str(membership_id)  # Для обратной совместимости с get_admin_user
     if identity_id:
         payload["identity_id"] = str(identity_id)
     if tier:
         payload["tier"] = tier
+    # [C7-ID: security-admin-003] Добавляем role в JWT payload
+    # Context7: Всегда добавляем role, даже если это "user" (для безопасности)
+    payload["role"] = role or "user"
     
     # Простая кодировка (в production использовать jwt library)
     header_b64 = base64.urlsafe_b64encode(json.dumps(header).encode()).decode().rstrip('=')
@@ -153,6 +158,8 @@ async def verify_webapp_init_data(body: WebAppAuthRequest, db: Session = Depends
         membership_id = None
         tier = None
         
+        # [C7-ID: security-admin-003] Извлекаем role из membership
+        role = None
         if identity:
             # Берём первую membership (в будущем можно выбирать по invite_code или другому критерию)
             membership = db.query(User).filter(User.identity_id == identity.id).first()
@@ -160,6 +167,7 @@ async def verify_webapp_init_data(body: WebAppAuthRequest, db: Session = Depends
                 tenant_id = str(membership.tenant_id)
                 membership_id = str(membership.id)
                 tier = membership.tier or "free"
+                role = membership.role or "user"  # [C7-ID: security-admin-003]
         
         # Генерация JWT с расширенным payload
         jwt_token = create_jwt(
@@ -168,17 +176,21 @@ async def verify_webapp_init_data(body: WebAppAuthRequest, db: Session = Depends
             membership_id=membership_id,
             identity_id=str(identity.id) if identity else None,
             tier=tier,
+            role=role,  # [C7-ID: security-admin-003]
             audience="webapp",
             exp_minutes=10
         )
         
+        # [C7-ID: security-admin-003] Логирование для отладки
         logger.info("WebApp authentication successful",
                    user_id=user_id,
                    tenant_id=tenant_id,
                    membership_id=membership_id,
                    identity_id=str(identity.id) if identity else None,
                    tier=tier,
-                   username=user_data.get('username'))
+                   role=role,  # [C7-ID: security-admin-003]
+                   username=user_data.get('username'),
+                   role_in_jwt=role)  # Дополнительное логирование для отладки
         
         return WebAppAuthResponse(
             access_token=jwt_token,

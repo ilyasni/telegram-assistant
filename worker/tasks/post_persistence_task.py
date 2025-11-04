@@ -173,8 +173,12 @@ class PostPersistenceWorker:
     async def _upsert_post(self, conn: asyncpg.Connection, post_data: Dict[str, Any]):
         """Context7: UPSERT поста с идемпотентностью."""
         try:
-            # Страховка: конвертируем входные даты в UTC-дататайп
+            # Context7: Конвертируем входные даты в UTC-дататайп с fallback на текущее время
             created_at = self._parse_iso_dt_utc(post_data.get('created_at'))
+            if created_at is None:
+                # Context7 best practice: используем CURRENT_TIMESTAMP как fallback
+                created_at = datetime.now(timezone.utc)
+            
             posted_at = self._parse_iso_dt_utc(post_data.get('posted_at'))
             media_urls_json = json.dumps(post_data.get('media_urls') or [])
             await conn.execute(

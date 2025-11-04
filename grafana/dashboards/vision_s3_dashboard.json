@@ -85,7 +85,7 @@
             "name": "Prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(storage_bucket_usage_gb) by (tenant_id)",
+          "expr": "sum(storage_bucket_usage_gb{tenant_id=~\"$tenant_id\"}) by (tenant_id)",
           "legendFormat": "Used: {{tenant_id}}",
           "refId": "A"
         }
@@ -263,7 +263,7 @@
             "name": "Prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(rate(vision_tokens_used_total[5m])) by (provider, tenant_id)",
+          "expr": "sum(rate(vision_tokens_used_total{tenant_id=~\"$tenant_id\"}[5m])) by (provider, tenant_id)",
           "legendFormat": "{{provider}} - {{tenant_id}}",
           "refId": "A"
         }
@@ -463,7 +463,7 @@
             "name": "Prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(rate(storage_quota_violations_total[5m])) by (tenant_id, reason)",
+          "expr": "sum(rate(storage_quota_violations_total{tenant_id=~\"$tenant_id\"}[5m])) by (tenant_id, reason)",
           "legendFormat": "{{tenant_id}} - {{reason}}",
           "refId": "A"
         }
@@ -571,7 +571,38 @@
     "storage"
   ],
   "templating": {
-    "list": []
+    "list": [
+      {
+        "allValue": null,
+        "current": {
+          "selected": false,
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "definition": "label_values(storage_bucket_usage_gb, tenant_id)",
+        "description": "Filter by tenant ID",
+        "error": null,
+        "hide": 0,
+        "includeAll": true,
+        "label": "Tenant ID",
+        "multi": true,
+        "name": "tenant_id",
+        "options": [],
+        "query": {
+          "query": "label_values(storage_bucket_usage_gb, tenant_id)",
+          "refId": "StandardVariableQuery"
+        },
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      }
+    ]
   },
   "time": {
     "from": "now-6h",

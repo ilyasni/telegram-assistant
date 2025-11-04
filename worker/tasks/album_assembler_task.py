@@ -783,7 +783,8 @@ class AlbumAssemblerTask:
                 }
                 
                 # Context7: Используем правильный синтаксис для asyncpg (CAST вместо ::)
-                enrichment_json = json.dumps(enrichment_meta)
+                # Context7: ensure_ascii=False для корректного сохранения кириллицы и специальных символов
+                enrichment_json = json.dumps(enrichment_meta, ensure_ascii=False, default=str)
                 await self.db.execute(
                     text("""
                         UPDATE media_groups

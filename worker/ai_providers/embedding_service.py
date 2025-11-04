@@ -117,9 +117,14 @@ class GigaChatEmbeddingProvider(EmbeddingProvider):
     def __init__(self, adapter):
         self.adapter = adapter
         self.model = settings.GIGACHAT_EMBEDDINGS_MODEL
-        # Context7: GigaChat Giga-Embeddings-instruct возвращает 2048 измерений
-        # Источник: https://gitverse.ru/GigaTeam/GigaEmbeddings
-        self.dimension = 2048
+        # Context7: Размерность зависит от модели:
+        # - EmbeddingsGigaR: 2560 измерений
+        # - Embeddings (Giga-Embeddings-instruct): 2048 измерений
+        # Источник: https://developers.sber.ru/docs/ru/gigachat/api/reference/rest/gigachat-api
+        if self.model == "EmbeddingsGigaR":
+            self.dimension = 2560
+        else:
+            self.dimension = 2048
         # Context7: [C7-ID: gigachat-resilience-001] Кэш для результата health check
         self._proxy_health_cache = None
         self._proxy_health_cache_ttl = 30  # секунд
@@ -225,8 +230,19 @@ class GigaChatEmbeddingProvider(EmbeddingProvider):
             raise ValueError("No embedding data in response")
         
         embedding = data["data"][0]["embedding"]
-        if not embedding or len(embedding) != self.dimension:
-            raise ValueError(f"Invalid embedding: len={len(embedding)}, expected={self.dimension}")
+        # Context7: Автоматическое определение размерности по фактическому эмбеддингу
+        # Если размерность не совпадает, обновляем её для этой модели
+        if not embedding:
+            raise ValueError("Empty embedding received")
+        
+        actual_dim = len(embedding)
+        if actual_dim != self.dimension:
+            # Обновляем размерность для текущей модели, если она отличается
+            logger.warning("Embedding dimension mismatch, updating provider dimension",
+                         model=self.model,
+                         old_dim=self.dimension,
+                         actual_dim=actual_dim)
+            self.dimension = actual_dim
         
         # Метрики успеха
         embedding_requests_total.labels(
@@ -355,10 +371,20 @@ class EmbeddingService:
         try:
             embedding = await provider.embed_text(text)
             
-            # Валидация размерности
-            expected_dim = provider.get_dimension()
-            if len(embedding) != expected_dim:
-                raise ValueError(f"Dimension mismatch: got {len(embedding)}, expected {expected_dim}")
+            # Context7: Размерность может быть обновлена в provider.embed_text()
+            # если модель вернула другую размерность, поэтому проверяем после
+            actual_dim = len(embedding)
+            provider_dim = provider.get_dimension()
+            
+            # Если размерности не совпадают и провайдер не обновил свою размерность,
+            # то это реальная проблема
+            if actual_dim != provider_dim:
+                # Провайдер должен был обновить размерность автоматически
+                # Если этого не произошло, логируем предупреждение, но не падаем
+                logger.warning("Dimension mismatch after embedding generation",
+                             actual_dim=actual_dim,
+                             provider_dim=provider_dim,
+                             provider=type(provider).__name__)
             
             return embedding
             

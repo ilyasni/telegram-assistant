@@ -81,16 +81,22 @@ def _kb_confirm_delete(channel_id: str):
 async def cmd_start(msg: Message):
     """Обработчик команды /start."""
     try:
-        # 1) Попытка проверить/создать пользователя — но UX не блокируем
+        # 1) Попытка проверить/создать/обновить пользователя — но UX не блокируем
         try:
             async with httpx.AsyncClient(timeout=5) as client:
                 r = await client.get(f"{API_BASE}/api/users/{msg.from_user.id}")
+                user_data = {
+                    "telegram_id": msg.from_user.id,
+                    "username": msg.from_user.username,
+                    "first_name": msg.from_user.first_name,
+                    "last_name": msg.from_user.last_name
+                }
                 if r.status_code == 404:
-                    user_data = {
-                        "telegram_id": msg.from_user.id,
-                        "username": msg.from_user.username
-                    }
+                    # Пользователь не найден - создаем
                     await client.post(f"{API_BASE}/api/users/", json=user_data)
+                elif r.status_code == 200:
+                    # Пользователь существует - обновляем данные
+                    await client.put(f"{API_BASE}/api/users/{msg.from_user.id}", json=user_data)
         except Exception as e:
             logger.warning("User bootstrap failed (non-blocking)", error=str(e))
 
@@ -248,6 +254,79 @@ async def cmd_subscription(msg: Message):
     await _show_subscription(msg)
 
 
+@router.message(Command("admin"))
+async def cmd_admin(msg: Message):
+    """Обработчик команды /admin для доступа к админ-панели."""
+    try:
+        # Проверяем, является ли пользователь админом
+        async with httpx.AsyncClient(timeout=5) as client:
+            # Получаем пользователя
+            r = await client.get(f"{API_BASE}/api/users/{msg.from_user.id}")
+            if r.status_code == 404:
+                await msg.answer(
+                    "❌ <b>Пользователь не найден</b>\n\n"
+                    "Используйте /start для регистрации."
+                )
+                return
+            
+            if r.status_code != 200:
+                # Context7: Детальное логирование для диагностики
+                logger.error(
+                    "Failed to get user for admin check",
+                    telegram_id=msg.from_user.id,
+                    status_code=r.status_code,
+                    response_text=r.text[:200] if hasattr(r, 'text') else str(r.content[:200])
+                )
+                await msg.answer(
+                    f"❌ <b>Ошибка проверки прав доступа</b>\n\n"
+                    f"Статус: {r.status_code}\n"
+                    f"Попробуйте позже или обратитесь к администратору."
+                )
+                return
+            
+            user = r.json()
+            
+            # Проверяем роль админа
+            user_role = user.get('role', 'user')
+            is_admin = user_role == 'admin'
+            
+            # Context7: Логирование для отладки
+            webapp_url = "https://produman.studio/tg/app/"
+            logger.info(
+                "Admin panel access requested",
+                telegram_id=msg.from_user.id,
+                user_role=user_role,
+                is_admin=is_admin,
+                webapp_url=webapp_url
+            )
+            
+            if not is_admin:
+                await msg.answer(
+                    "❌ <b>Доступ запрещён</b>\n\n"
+                    "Только администраторы могут использовать админ-панель."
+                )
+                return
+            
+            await msg.answer(
+                "👑 <b>Админ-панель</b>\n\n"
+                "Откройте Mini App для доступа к админ-панели.\n"
+                "Доступ будет предоставлен только администраторам.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="👑 Открыть админ-панель", web_app={"url": webapp_url})]
+                ])
+            )
+            
+    except Exception as e:
+        logger.error("Error in cmd_admin", error=str(e))
+        await msg.answer(
+            "❌ <b>Ошибка</b>\n\n"
+            "Произошла ошибка при открытии админ-панели.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data="admin:retry")]
+            ])
+        )
+
+
 # Callback handlers
 
 @router.callback_query(F.data == "qr:start")
@@ -271,6 +350,20 @@ async def on_login_retry(cb: CallbackQuery):
         "<code>/login INVITE_CODE</code>\n\n"
         "Или нажмите кнопку ниже для входа через Mini App:",
         reply_markup=_kb_login()
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data == "admin:retry")
+async def on_admin_retry(cb: CallbackQuery):
+    """Фолбэк: повторная попытка открытия админ-панели."""
+    await cb.message.edit_text(
+        "👑 <b>Админ-панель</b>\n\n"
+        "Откройте Mini App для доступа к админ-панели.\n"
+        "Доступ будет предоставлен только администраторам.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="👑 Открыть админ-панель", web_app={"url": "https://produman.studio/tg/app/"})]
+        ])
     )
     await cb.answer()
 

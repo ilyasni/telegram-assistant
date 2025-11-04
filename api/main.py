@@ -297,6 +297,8 @@ async def global_exception_handler(request: Request, exc: Exception):
 # Подключаем критичные роутеры
 from routers import health, channels, tg_auth, tg_webapp_auth, users, sessions, session_management, posts
 from routers import storage  # Context7: Storage Quota Management API
+from routers import admin  # [C7-ID: api-admin-001] Admin panel API
+from routers import admin_invites  # Admin invites management
 app.include_router(health.router, prefix="/api")
 app.include_router(channels.router, prefix="/api")
 app.include_router(tg_auth.router)  # QR auth endpoints
@@ -306,6 +308,8 @@ app.include_router(sessions.router, prefix="/api")
 app.include_router(posts.router, prefix="/api")
 app.include_router(session_management.router)  # Session management API
 app.include_router(storage.router, prefix="/api")  # Context7: Storage Quota Management API
+app.include_router(admin.router)  # [C7-ID: api-admin-001] Admin panel API
+app.include_router(admin_invites.router)  # Admin invites management
 app.include_router(bot_router, prefix="/tg")
 
 # Диагностический код временно убран

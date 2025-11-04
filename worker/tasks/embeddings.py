@@ -70,13 +70,14 @@ class EmbeddingService:
         """Получение данных поста из БД."""
         try:
             with self.db_connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                # Context7: tenant_id получаем из channels, так как posts больше не содержит tenant_id
                 cursor.execute("""
-                    SELECT p.id, p.tenant_id, p.channel_id, p.telegram_message_id,
+                    SELECT p.id, c.tenant_id, p.channel_id, p.telegram_message_id,
                            p.content, p.media_urls, p.created_at,
                            c.username as channel_username, c.title as channel_title
                     FROM posts p
                     JOIN channels c ON p.channel_id = c.id
-                    WHERE p.id = %s AND p.tenant_id = %s
+                    WHERE p.id = %s AND c.tenant_id = %s
                 """, (post_id, tenant_id))
                 
                 row = cursor.fetchone()
@@ -92,7 +93,7 @@ class EmbeddingService:
         """Создание embeddings для текста."""
         if not content or not content.strip():
             # Пустой контент - создаём нулевой вектор
-            return [0.0] * settings.embedding_dimension
+            return [0.0] * settings.EMBED_DIM
         
         try:
             # Используем простой хеш-эмбеддинг для демонстрации
@@ -109,11 +110,11 @@ class EmbeddingService:
                 embeddings.append(int(hex_pair, 16) / 255.0 - 0.5)  # нормализация в [-0.5, 0.5]
             
             # Дополняем до нужной размерности
-            while len(embeddings) < settings.embedding_dimension:
+            while len(embeddings) < settings.EMBED_DIM:
                 embeddings.append(0.0)
             
             # Обрезаем до нужной размерности
-            embeddings = embeddings[:settings.embedding_dimension]
+            embeddings = embeddings[:settings.EMBED_DIM]
             
             logger.debug("Created hash-based embeddings", 
                         content_length=len(content),
@@ -124,7 +125,7 @@ class EmbeddingService:
         except Exception as e:
             logger.error("Failed to create embeddings", error=str(e))
             # Возвращаем нулевой вектор в случае ошибки
-            return [0.0] * settings.embedding_dimension
+            return [0.0] * settings.EMBED_DIM
     
     async def _save_to_qdrant(self, post_id: str, tenant_id: str, post_data: Dict[str, Any], embeddings: List[float]):
         """Сохранение embeddings в Qdrant."""
@@ -139,7 +140,7 @@ class EmbeddingService:
                 self.qdrant_client.create_collection(
                     collection_name=collection_name,
                     vectors_config=VectorParams(
-                        size=settings.embedding_dimension,
+                        size=settings.EMBED_DIM,
                         distance=Distance.COSINE
                     )
                 )

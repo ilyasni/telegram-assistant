@@ -401,13 +401,15 @@ class AtomicDBSaver:
             
             if post_media_map_params:
                 # Context7: Проверяем существующие связи (для метрик)
+                # Context7 best practice: asyncpg требует ANY() для IN с параметрами
+                sha256_list = [mf.sha256 for mf in media_files]
                 existing_map_check_sql = text("""
                     SELECT file_sha256 FROM post_media_map 
-                    WHERE post_id = :post_id AND file_sha256 IN :sha256_list
+                    WHERE post_id = :post_id AND file_sha256 = ANY(:sha256_list::text[])
                 """)
                 existing_map_result = await db_session.execute(
                     existing_map_check_sql,
-                    {"post_id": post_id, "sha256_list": tuple(mf.sha256 for mf in media_files)}
+                    {"post_id": post_id, "sha256_list": sha256_list}
                 )
                 existing_map_sha256s = {row[0] for row in existing_map_result.fetchall()}
                 

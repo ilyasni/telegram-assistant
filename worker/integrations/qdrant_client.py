@@ -62,13 +62,18 @@ class QdrantClient:
             logger.error("Qdrant ping failed", error=str(e))
             raise
     
-    async def ensure_collection(self, collection_name: str, vector_size: int = 2048):
+    async def ensure_collection(self, collection_name: str, vector_size: int = None):
         """
         Создание коллекции если не существует.
         
-        Context7: Дефолт 2048 для GigaChat Giga-Embeddings-instruct
-        Источник: https://gitverse.ru/GigaTeam/GigaEmbeddings
+        Context7: Размерность берется из переданного параметра или из настроек
+        - EmbeddingsGigaR: 2560 измерений
+        - Embeddings (Giga-Embeddings-instruct): 2048 измерений
+        Если не указана, используется значение из EMBEDDING_DIMENSION или 2560 по умолчанию
         """
+        import os
+        if vector_size is None:
+            vector_size = int(os.getenv("EMBEDDING_DIMENSION", os.getenv("EMBED_DIM", "2560")))
         try:
             if collection_name in self._collections_cache:
                 return

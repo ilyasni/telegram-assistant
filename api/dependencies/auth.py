@@ -10,6 +10,9 @@ import jwt
 import base64
 import json
 from config import settings
+from sqlalchemy.orm import Session
+from models.database import get_db, User, Identity
+import uuid
 
 logger = structlog.get_logger()
 
@@ -84,4 +87,75 @@ def get_current_tenant_id_optional(request: Request) -> Optional[str]:
         tenant_id = getattr(request.state, 'tenant_id', None)
     
     return tenant_id
+
+
+def extract_user_id_from_jwt(request: Request) -> Optional[str]:
+    """
+    [C7-ID: security-admin-002] Извлечение user_id из JWT токена.
+    
+    Returns:
+        user_id из JWT payload или None, если токен отсутствует/невалиден
+    """
+    auth_header = request.headers.get('Authorization')
+    if not auth_header or not auth_header.startswith('Bearer '):
+        return None
+    
+    token = auth_header.split(' ', 1)[1]
+    try:
+        parts = token.split('.')
+        if len(parts) != 3:
+            return None
+        
+        payload_b64 = parts[1]
+        payload_b64 += '=' * (4 - len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        
+        # Проверка времени истечения
+        import time
+        if payload.get('exp', 0) < int(time.time()):
+            return None
+        
+        return payload.get('user_id') or payload.get('membership_id')
+    except Exception as e:
+        logger.debug("Failed to extract user_id from JWT", error=str(e))
+        return None
+
+
+def get_admin_user(request: Request, db: Session = Depends(get_db)) -> User:
+    """
+    [C7-ID: security-admin-002] Dependency для получения текущего админа из JWT.
+    
+    Raises:
+        HTTPException 401: если токен отсутствует или невалиден
+        HTTPException 403: если пользователь не является админом
+    """
+    user_id = extract_user_id_from_jwt(request)
+    
+    if not user_id:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required: user_id not found in JWT token"
+        )
+    
+    try:
+        user = db.query(User).filter(User.id == uuid.UUID(user_id)).first()
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=401, detail="Invalid user_id format")
+    
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # [C7-ID: security-admin-002] Проверка роли админа
+    if user.role != 'admin':
+        logger.warning(
+            "Non-admin user attempted admin access",
+            user_id=str(user.id),
+            role=user.role
+        )
+        raise HTTPException(
+            status_code=403,
+            detail="Admin access required"
+        )
+    
+    return user
 

@@ -199,75 +199,143 @@ class SessionStorageService:
                   AND status = 'authorized'
             """, (resolved_tenant_id, user_id))
             
-            # Получаем UUID tenant_id и user_id из БД
+            # Context7: Получаем user_id из БД (если существует)
+            # Context7 best practice: tenant_id в telegram_sessions - это character varying, не UUID
+            # Используем строковое значение resolved_tenant_id напрямую
+            db_user_id = None
             cursor.execute("""
-                SELECT t.id, u.id 
-                FROM tenants t
-                LEFT JOIN users u ON u.telegram_id = %s AND u.tenant_id = t.id
-                WHERE t.id::text = %s OR t.id IS NULL
+                SELECT id::text
+                FROM users
+                WHERE telegram_id = %s
                 LIMIT 1
-            """, (telegram_user_id, resolved_tenant_id))
-            tenant_user_result = cursor.fetchone()
+            """, (telegram_user_id,))
+            user_result = cursor.fetchone()
+            if user_result:
+                db_user_id = user_result[0]
             
-            db_tenant_uuid = None
-            db_user_uuid = None
-            if tenant_user_result:
-                db_tenant_uuid = tenant_user_result[0]
-                db_user_uuid = tenant_user_result[1]
-            else:
-                # Fallback: создаем UUID из строки или используем NULL
-                try:
-                    import uuid as _uuid
-                    db_tenant_uuid = _uuid.UUID(resolved_tenant_id) if resolved_tenant_id else None
-                except:
-                    db_tenant_uuid = None
-            
-            # Context7: UPSERT в telegram_sessions с уникальным ограничением
+            # Context7: INSERT в telegram_sessions (после отзыва старых сессий)
+            # Context7 best practice: используем простой INSERT, так как старые сессии уже отозваны
+            # Context7: tenant_id хранится как character varying (строка), не UUID
             cursor.execute("""
                 INSERT INTO telegram_sessions (
                     id, tenant_id, user_id, session_string_enc, key_id, status, created_at, updated_at
                 ) VALUES (
                     %s, %s, %s, %s, %s, 'authorized', NOW(), NOW()
                 )
-                ON CONFLICT (tenant_id, user_id, status) 
-                WHERE status = 'authorized'
-                DO UPDATE SET
-                    session_string_enc = EXCLUDED.session_string_enc,
-                    key_id = EXCLUDED.key_id,
-                    updated_at = NOW()
-            """, (session_id, db_tenant_uuid, db_user_uuid, encrypted_session, key_id))
+            """, (session_id, resolved_tenant_id, db_user_id, encrypted_session, key_id))
             
-            # Context7 best practice: обновление users для обратной совместимости
+            # Context7 best practice: получаем или создаем tenant_id UUID для users
+            db_tenant_uuid_for_users = None
+            if resolved_tenant_id:
+                # Пробуем найти существующий tenant
+                cursor.execute("""
+                    SELECT id FROM tenants WHERE id::text = %s LIMIT 1
+                """, (resolved_tenant_id,))
+                tenant_result = cursor.fetchone()
+                if tenant_result:
+                    db_tenant_uuid_for_users = tenant_result[0]
+                else:
+                    # Context7: если tenant не найден, создаем его (для новых пользователей)
+                    # Используем resolved_tenant_id как UUID или создаем новый
+                    try:
+                        import uuid as _uuid
+                        # Пробуем использовать resolved_tenant_id как UUID
+                        db_tenant_uuid_for_users = _uuid.UUID(resolved_tenant_id)
+                    except (ValueError, AttributeError):
+                        # Если не UUID, создаем новый tenant
+                        new_tenant_id = _uuid.uuid4()
+                        cursor.execute("""
+                            INSERT INTO tenants (id, name, created_at, updated_at)
+                            VALUES (%s, %s, NOW(), NOW())
+                            ON CONFLICT (id) DO NOTHING
+                        """, (new_tenant_id, f"Tenant {telegram_user_id}"))
+                        db_tenant_uuid_for_users = new_tenant_id
+            
+            # Context7 best practice: создаем или обновляем пользователя
+            # Context7: сначала проверяем, существует ли пользователь
             cursor.execute("""
-                UPDATE users 
-                SET 
-                    telegram_session_enc = %s,
-                    telegram_session_key_id = %s,
-                    telegram_auth_status = 'authorized',
-                    telegram_auth_created_at = NOW(),
-                    telegram_auth_updated_at = NOW(),
-                    telegram_auth_error = NULL,
-                    first_name = COALESCE(%s, first_name),
-                    last_name = COALESCE(%s, last_name),
-                    username = COALESCE(%s, username),
-                    tenant_id = COALESCE(%s, tenant_id),
-                    role = COALESCE(%s, role)
-                WHERE telegram_id = %s
-            """, (encrypted_session, key_id, first_name, last_name, username, db_tenant_uuid, resolved_role, telegram_user_id))
+                SELECT id FROM users WHERE telegram_id = %s LIMIT 1
+            """, (telegram_user_id,))
+            existing_user = cursor.fetchone()
+            
+            if existing_user:
+                # Обновляем существующего пользователя
+                cursor.execute("""
+                    UPDATE users 
+                    SET 
+                        telegram_session_enc = %s,
+                        telegram_session_key_id = %s,
+                        telegram_auth_status = 'authorized',
+                        telegram_auth_created_at = NOW(),
+                        telegram_auth_updated_at = NOW(),
+                        telegram_auth_error = NULL,
+                        first_name = COALESCE(%s, first_name),
+                        last_name = COALESCE(%s, last_name),
+                        username = COALESCE(%s, username),
+                        tenant_id = COALESCE(%s, tenant_id),
+                        role = COALESCE(%s, role)
+                    WHERE telegram_id = %s
+                """, (encrypted_session, key_id, first_name, last_name, username, db_tenant_uuid_for_users, resolved_role, telegram_user_id))
+            else:
+                # Context7: создаем нового пользователя, если его нет
+                import uuid as _uuid
+                new_user_id = _uuid.uuid4()
+                cursor.execute("""
+                    INSERT INTO users (
+                        id, telegram_id, username, first_name, last_name,
+                        telegram_session_enc, telegram_session_key_id,
+                        telegram_auth_status, telegram_auth_created_at, telegram_auth_updated_at,
+                        tenant_id, role, created_at, updated_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s,
+                        %s, %s,
+                        'authorized', NOW(), NOW(),
+                        %s, %s, NOW(), NOW()
+                    )
+                """, (
+                    new_user_id, telegram_user_id, username, first_name, last_name,
+                    encrypted_session, key_id,
+                    db_tenant_uuid_for_users, resolved_role or 'user'
+                ))
+                logger.info(
+                    "Created new user during QR auth",
+                    user_id=str(new_user_id),
+                    telegram_id=telegram_user_id,
+                    tenant_id=str(db_tenant_uuid_for_users) if db_tenant_uuid_for_users else None
+                )
             
             # Context7 best practice: логирование события авторизации
+            # Context7: получаем user_id для события (теперь пользователь точно создан)
+            event_user_id = None
             cursor.execute("""
-                INSERT INTO telegram_auth_events (
-                    id, user_id, event, reason, at, meta
-                ) VALUES (
-                    %s, (SELECT id FROM users WHERE telegram_id = %s), 'qr_authorized', %s, NOW(), %s
+                SELECT id::text FROM users WHERE telegram_id = %s LIMIT 1
+            """, (telegram_user_id,))
+            user_result = cursor.fetchone()
+            if user_result:
+                event_user_id = user_result[0]
+            
+            # Context7: вставляем событие только если user_id найден
+            # Для новых пользователей событие может быть пропущено, но это не критично
+            if event_user_id:
+                cursor.execute("""
+                    INSERT INTO telegram_auth_events (
+                        id, user_id, event, reason, at, meta
+                    ) VALUES (
+                        %s, %s, 'qr_authorized', %s, NOW(), %s
+                    )
+                """, (
+                    str(uuid.uuid4()),
+                    event_user_id,
+                    f"telegram_user_id={telegram_user_id}",
+                    Json({"invite_code": invite_code} if invite_code else {})
+                ))
+            else:
+                # Context7: логируем, что событие не было создано (не критично)
+                logger.warning(
+                    "Cannot create auth event - user not found",
+                    telegram_user_id=telegram_user_id,
+                    tenant_id=tenant_id
                 )
-            """, (
-                str(uuid.uuid4()),
-                telegram_user_id,  # Используем telegram_user_id (bigint), а не tenant_id (uuid)
-                f"telegram_user_id={telegram_user_id}",
-                Json({"invite_code": invite_code} if invite_code else {})
-            ))
             
             self.db_connection.commit()
     

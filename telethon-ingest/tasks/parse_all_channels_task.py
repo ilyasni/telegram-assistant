@@ -461,7 +461,15 @@ class ParseAllChannelsTask:
             
             # Получение активных каналов
             channels = self._get_active_channels()
-            logger.info(f"Found {len(channels)} active channels")
+            logger.info(
+                "Starting scheduler tick",
+                channels_count=len(channels),
+                tick_interval_sec=self.interval_sec
+            )
+            
+            if not channels:
+                logger.warning("No active channels found for parsing")
+                return
             
             for channel in channels:
                 try:
@@ -479,10 +487,20 @@ class ParseAllChannelsTask:
                     # Определение режима
                     mode = self._decide_mode(channel)
                     
-                    # Логирование статуса с безопасной обработкой last_parsed_at
+                    # Context7: Логирование для новых каналов с диагностикой
+                    is_new_channel = channel.get('last_parsed_at') is None
                     lpa = channel.get('last_parsed_at')
                     lpa_str = lpa.isoformat() if isinstance(lpa, datetime) else 'null'
-                    logger.info(f"Channel {channel['id']} status: {channel.get('title')} ({channel.get('username')}) - mode={mode}, last_parsed_at={lpa_str}")
+                    logger.info(
+                        "Channel parsing status",
+                        channel_id=channel['id'],
+                        channel_title=channel.get('title'),
+                        channel_username=channel.get('username'),
+                        mode=mode,
+                        is_new_channel=is_new_channel,
+                        last_parsed_at=lpa_str,
+                        has_telegram_id=bool(channel.get('tg_channel_id'))
+                    )
                     
                     # Call actual parser if telegram_client_manager is available
                     if self.telegram_client_manager:
@@ -720,27 +738,48 @@ class ParseAllChannelsTask:
             )
     
     def _get_active_channels(self) -> List[Dict[str, Any]]:
-        """Получение активных каналов из БД."""
+        """Получение активных каналов из БД.
+        
+        Context7 best practice: 
+        - Приоритет новым каналам (NULLS FIRST для last_parsed_at)
+        - Без жесткого лимита для поддержки всех активных каналов
+        - Настраиваемый лимит через PARSER_MAX_CHANNELS_PER_TICK (по умолчанию 100)
+        """
         try:
+            # Context7: Настраиваемый лимит для контроля нагрузки
+            max_channels = int(os.getenv("PARSER_MAX_CHANNELS_PER_TICK", "100"))
+            
             conn = psycopg2.connect(self.db_url)
             cursor = conn.cursor(cursor_factory=RealDictCursor)
             
+            # Context7: Получаем все активные каналы, приоритет новым (без last_parsed_at)
             cursor.execute("""
                 SELECT id, tg_channel_id, username, title, last_parsed_at, is_active
                 FROM channels
                 WHERE is_active = true
-                ORDER BY last_parsed_at NULLS FIRST
-                LIMIT 10
-            """)
+                ORDER BY last_parsed_at NULLS FIRST, created_at DESC
+                LIMIT %s
+            """, (max_channels,))
             
             channels = cursor.fetchall()
             cursor.close()
             conn.close()
             
-            return [dict(ch) for ch in channels]
+            channels_list = [dict(ch) for ch in channels]
+            
+            # Context7: Логируем статистику для диагностики
+            new_channels_count = sum(1 for ch in channels_list if ch.get('last_parsed_at') is None)
+            logger.info(
+                "Active channels retrieved",
+                total=len(channels_list),
+                new_channels=new_channels_count,
+                max_channels_limit=max_channels
+            )
+            
+            return channels_list
             
         except Exception as e:
-            logger.error(f"Failed to get active channels: {str(e)}")
+            logger.error(f"Failed to get active channels: {str(e)}", error=str(e), exc_info=True)
             return []
     
     def _decide_mode(self, channel: Dict[str, Any]) -> str:
