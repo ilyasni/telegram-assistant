@@ -34,8 +34,9 @@ routing:
 
 # Fallback стратегии
 fallback:
-  ocr_engine: "tesseract"  # tesseract | rapidocr
-  classification_model: "zero-shot-local"  # Лёгкий классификатор
+  ocr_engine: "openrouter"  # openrouter | tesseract | rapidocr
+  openrouter_model: "qwen/qwen2.5-vl-32b-instruct:free"  # Модель для OpenRouter Vision
+  classification_model: "zero-shot-local"  # Лёгкий классификатор (не используется для OpenRouter)
   
 # Allowed MIME types для GigaChat Vision
 allowed_mime_types:

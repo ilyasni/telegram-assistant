@@ -129,7 +129,9 @@ class RAGService:
             ("system", """Ты — эксперт по анализу контента из Telegram каналов.
 Ответь на вопрос пользователя на основе предоставленного контекста.
 Используй только информацию из контекста. Если информации недостаточно, скажи об этом.
-Всегда указывай источники (каналы и посты) в конце ответа.
+
+ВАЖНО: Всегда включай ссылки на источники прямо в текст ответа в формате markdown [название канала](ссылка).
+Ссылки должны быть рядом с упоминанием информации из этого источника.
 
 Если есть история предыдущих вопросов и ответов, используй её для лучшего понимания контекста текущего вопроса."""),
             # Context7: Динамически добавляем историю разговора если она есть
@@ -142,6 +144,9 @@ class RAGService:
 Проанализируй найденные посты и предоставь краткое резюме результатов поиска.
 Укажи наиболее релевантные посты с их источниками.
 
+ВАЖНО: Всегда включай ссылки на источники прямо в текст ответа в формате markdown [название канала](ссылка).
+Ссылки должны быть рядом с упоминанием информации из этого источника.
+
 Если есть история предыдущих вопросов и ответов, используй её для лучшего понимания контекста текущего запроса."""),
             MessagesPlaceholder(variable_name="conversation_history", optional=True),
             ("human", "Найденные посты:\n{context}\n\nЗапрос: {query}\n\nРезюме:")
@@ -151,6 +156,9 @@ class RAGService:
             ("system", """Ты — помощник по рекомендации контента.
 На основе найденных постов предложи пользователю наиболее интересный и релевантный контент.
 Объясни, почему эти посты могут быть интересны.
+
+ВАЖНО: Всегда включай ссылки на источники прямо в текст ответа в формате markdown [название канала](ссылка).
+Ссылки должны быть рядом с упоминанием каждого рекомендуемого поста.
 
 Если есть история предыдущих вопросов и ответов, используй её для понимания интересов пользователя."""),
             MessagesPlaceholder(variable_name="conversation_history", optional=True),
@@ -162,6 +170,9 @@ class RAGService:
 Проанализируй найденные посты и определи основные тренды и темы.
 Предоставь краткий анализ популярных тем и их развития.
 
+ВАЖНО: Всегда включай ссылки на источники прямо в текст ответа в формате markdown [название канала](ссылка).
+Ссылки должны быть рядом с упоминанием информации из этого источника.
+
 Если есть история предыдущих вопросов и ответов, используй её для понимания контекста анализа."""),
             MessagesPlaceholder(variable_name="conversation_history", optional=True),
             ("human", "Посты для анализа:\n{context}\n\nЗапрос: {query}\n\nАнализ трендов:")
@@ -171,6 +182,9 @@ class RAGService:
             ("system", """Ты — составитель дайджестов новостей.
 Создай краткий дайджест на основе найденных постов, сгруппированный по темам.
 Каждая тема должна содержать 3-5 ключевых пунктов.
+
+ВАЖНО: Всегда включай ссылки на источники прямо в текст ответа в формате markdown [название канала](ссылка).
+Ссылки должны быть рядом с упоминанием каждой новости или темы.
 
 Если есть история предыдущих вопросов и ответов, используй её для понимания предпочтений пользователя."""),
             MessagesPlaceholder(variable_name="conversation_history", optional=True),
@@ -313,14 +327,14 @@ class RAGService:
                 JOIN user_channel uc ON uc.channel_id = c.id
                 JOIN users u ON u.id = uc.user_id
                 WHERE to_tsvector('russian', COALESCE(p.content, '')) @@ plainto_tsquery('russian', :query)
-                    AND u.tenant_id = :tenant_id::uuid
+                    AND u.tenant_id = CAST(:tenant_id AS uuid)
             """
             
             params = {"query": query, "tenant_id": tenant_id, "limit": limit}
             
             # Добавляем фильтрацию по channel_ids если указаны
             if channel_ids:
-                base_query += " AND p.channel_id = ANY(:channel_ids::uuid[])"
+                base_query += " AND p.channel_id = ANY(CAST(:channel_ids AS uuid[]))"
                 params["channel_ids"] = channel_ids
             
             base_query += " ORDER BY rank DESC LIMIT :limit"
@@ -519,6 +533,52 @@ class RAGService:
                     if isinstance(existing_topics, list):
                         post_scores[post_id]['payload']['topics'] = list(set(existing_topics + result.get('topics', [])))
         
+        # Context7: Дедупликация альбомов - получаем grouped_id из БД и оставляем только первый пост с наивысшим score
+        if db:
+            try:
+                # Получаем grouped_id для всех постов из БД
+                post_ids = [UUID(pid) for pid in post_scores.keys() if pid]
+                if post_ids:
+                    posts_with_grouped = db.query(
+                        Post.id,
+                        Post.grouped_id
+                    ).filter(Post.id.in_(post_ids)).all()
+                    
+                    # Создаем словарь post_id -> grouped_id
+                    post_grouped_map = {str(post.id): post.grouped_id for post in posts_with_grouped if post.grouped_id}
+                    
+                    # Группируем посты по альбомам
+                    album_posts = {}  # grouped_id -> список (post_id, hybrid_score)
+                    for post_id, score_data in post_scores.items():
+                        grouped_id = post_grouped_map.get(post_id)
+                        if grouped_id:
+                            if grouped_id not in album_posts:
+                                album_posts[grouped_id] = []
+                            album_posts[grouped_id].append((post_id, score_data['hybrid_score']))
+                    
+                    # Для каждого альбома оставляем только пост с наивысшим score
+                    posts_to_remove = set()
+                    for grouped_id, posts_list in album_posts.items():
+                        if len(posts_list) > 1:
+                            # Сортируем по score и оставляем только первый
+                            posts_list.sort(key=lambda x: x[1], reverse=True)
+                            # Удаляем все посты кроме первого
+                            for post_id, _ in posts_list[1:]:
+                                posts_to_remove.add(post_id)
+                    
+                    # Удаляем дубликаты альбомов
+                    for post_id in posts_to_remove:
+                        post_scores.pop(post_id, None)
+                    
+                    logger.debug(
+                        "Album deduplication applied",
+                        albums_count=len(album_posts),
+                        removed_duplicates=len(posts_to_remove)
+                    )
+            except Exception as e:
+                logger.warning("Error during album deduplication", error=str(e))
+                # Продолжаем без дедупликации при ошибке
+        
         # Сортировка по hybrid_score
         sorted_results = sorted(
             post_scores.values(),
@@ -552,7 +612,12 @@ class RAGService:
             if len(content) > 500:
                 content = content[:500] + "..."
             
-            context_parts.append(f"[{idx + 1}] {channel_title}: {content}")
+            # Context7: Добавляем ссылку в контекст для inline использования
+            permalink = post.telegram_post_url or ""
+            if permalink:
+                context_parts.append(f"[{idx + 1}] [{channel_title}]({permalink}): {content}")
+            else:
+                context_parts.append(f"[{idx + 1}] {channel_title}: {content}")
             
             sources.append(RAGSource(
                 post_id=str(post_id),
@@ -591,6 +656,11 @@ class RAGService:
         """
         # Проверяем, включено ли обогащение
         if not settings.searxng_enrichment_enabled or not self.searxng_service.enabled:
+            logger.debug(
+                "Enrichment disabled",
+                searxng_enrichment_enabled=settings.searxng_enrichment_enabled,
+                searxng_service_enabled=self.searxng_service.enabled
+            )
             return False
         
         # Если результатов нет - используем fallback (не обогащение)
@@ -791,7 +861,8 @@ class RAGService:
         audio_file_id: Optional[str] = None,
         transcription_text: Optional[str] = None,
         include_conversation_history: bool = True,
-        max_conversation_turns: int = 5
+        max_conversation_turns: int = 5,
+        intent_override: Optional[str] = None
     ) -> RAGResult:
         """
         Выполнение RAG запроса с intent-based routing и поддержкой контекста разговора.
@@ -830,9 +901,15 @@ class RAGService:
                 )
             
             # 1. Классификация намерения
-            intent_result = await self.intent_classifier.classify(query, str(user_id))
-            intent = intent_result.intent
-            confidence = intent_result.confidence
+            # Context7: Если передан intent_override, используем его вместо классификации
+            if intent_override:
+                intent = intent_override
+                confidence = 1.0  # Высокая уверенность для принудительного намерения
+                logger.debug("Using intent override", intent=intent, query=query[:50])
+            else:
+                intent_result = await self.intent_classifier.classify(query, str(user_id))
+                intent = intent_result.intent
+                confidence = intent_result.confidence
             
             # Context7: Для intent="recommend" используем RecommendationService
             if intent == "recommend":
@@ -866,72 +943,118 @@ class RAGService:
                         if not post_id:
                             continue
                         
-                        # Получаем полную информацию о посте из БД
-                        post = db.query(Post).filter(Post.id == UUID(post_id)).first()
-                        if not post:
+                        try:
+                            # Безопасное преобразование post_id в UUID
+                            if isinstance(post_id, UUID):
+                                post_uuid = post_id
+                            elif isinstance(post_id, str):
+                                try:
+                                    post_uuid = UUID(post_id)
+                                except (ValueError, TypeError) as e:
+                                    logger.warning(
+                                        "Invalid post_id format in recommendation",
+                                        post_id=post_id,
+                                        error=str(e)
+                                    )
+                                    continue
+                            else:
+                                logger.warning(
+                                    "Unexpected post_id type in recommendation",
+                                    post_id=post_id,
+                                    post_id_type=type(post_id).__name__
+                                )
+                                continue
+                            
+                            # Получаем полную информацию о посте из БД
+                            post = db.query(Post).filter(Post.id == post_uuid).first()
+                            if not post:
+                                logger.debug("Post not found in database", post_id=str(post_uuid))
+                                continue
+                            
+                            channel = db.query(Channel).filter(Channel.id == post.channel_id).first()
+                            
+                            # Используем post_id как строку для RAGSource
+                            source = RAGSource(
+                                post_id=str(post_uuid),
+                                channel_id=str(post.channel_id),
+                                channel_title=channel.title if channel else "Unknown",
+                                channel_username=channel.username if channel else None,
+                                content=rec.get('content', post.content or ''),
+                                score=rec.get('recommendation_score', 0.8),
+                                permalink=post.telegram_post_url
+                            )
+                            sources.append(source)
+                            
+                            context_parts.append(
+                                f"Пост из канала {source.channel_title}:\n{source.content[:200]}"
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                "Error processing recommendation",
+                                post_id=post_id,
+                                error=str(e),
+                                exc_info=True
+                            )
                             continue
+                    
+                    # Проверяем, что есть источники для генерации ответа
+                    if not sources:
+                        logger.warning("No valid sources found from recommendations", user_id=str(user_id))
+                        # Fallback на обычный поиск
+                        intent = "search"
+                    else:
+                        context = "\n\n".join(context_parts) if context_parts else ""
                         
-                        channel = db.query(Channel).filter(Channel.id == post.channel_id).first()
+                        # Генерация ответа через LLM с conversation history
+                        # Context7: Преобразуем историю в LangChain Message объекты
+                        history_messages = []
+                        if conversation_history:
+                            for msg in conversation_history:
+                                if msg.get("role") == "user":
+                                    history_messages.append(HumanMessage(content=msg.get("content", "")))
+                                elif msg.get("role") == "assistant":
+                                    history_messages.append(AIMessage(content=msg.get("content", "")))
                         
-                        source = RAGSource(
-                            post_id=post_id,
-                            channel_id=str(post.channel_id),
-                            channel_title=channel.title if channel else "Unknown",
-                            channel_username=channel.username if channel else None,
-                            content=rec.get('content', post.content or ''),
-                            score=rec.get('recommendation_score', 0.8),
-                            permalink=post.telegram_post_url
-                        )
-                        sources.append(source)
+                        router_input = {
+                            "query": query,
+                            "context": context,
+                            "intent": intent,
+                            "conversation_history": history_messages if history_messages else []
+                        }
                         
-                        context_parts.append(
-                            f"Пост из канала {source.channel_title}:\n{source.content[:200]}"
-                        )
-                    
-                    context = "\n\n".join(context_parts)
-                    
-                    # Генерация ответа через LLM с conversation history
-                    # Context7: Преобразуем историю в LangChain Message объекты
-                    history_messages = []
-                    if conversation_history:
-                        for msg in conversation_history:
-                            if msg.get("role") == "user":
-                                history_messages.append(HumanMessage(content=msg.get("content", "")))
-                            elif msg.get("role") == "assistant":
-                                history_messages.append(AIMessage(content=msg.get("content", "")))
-                    
-                    router_input = {
-                        "query": query,
-                        "context": context,
-                        "intent": intent,
-                        "conversation_history": history_messages if history_messages else []
-                    }
-                    
-                    answer = await self.intent_router.ainvoke(router_input)
-                    
-                    # Отслеживание интересов
-                    try:
-                        from services.user_interest_service import get_user_interest_service
-                        interest_service = get_user_interest_service(redis_client=self.redis_client)
-                        await interest_service.track_query(
-                            user_id=user_id,
-                            query_text=query,
+                        answer = await self.intent_router.ainvoke(router_input)
+                        
+                        # Отслеживание интересов
+                        try:
+                            from services.user_interest_service import get_user_interest_service
+                            interest_service = get_user_interest_service(redis_client=self.redis_client)
+                            
+                            # Исправление: формируем список словарей с темами
+                            sources_for_tracking = [
+                                {'topics': [rec.get('interest_topic')]}
+                                for rec in recommendations
+                                if rec.get('interest_topic')
+                            ]
+                            
+                            await interest_service.track_query(
+                                user_id=user_id,
+                                query_text=query,
+                                intent=intent,
+                                sources=sources_for_tracking,
+                                db=db
+                            )
+                        except Exception as e:
+                            logger.warning("Failed to track user interest", error=str(e))
+                        
+                        processing_time = int((time.time() - start_time) * 1000)
+                        
+                        return RAGResult(
+                            answer=answer,
+                            sources=sources[:limit],
+                            confidence=confidence,
                             intent=intent,
-                            sources=[{'topics': [rec.get('interest_topic', '')] for rec in recommendations if rec.get('interest_topic')}],
-                            db=db
+                            processing_time_ms=processing_time
                         )
-                    except Exception as e:
-                        logger.warning("Failed to track user interest", error=str(e))
-                    
-                    processing_time = int((time.time() - start_time) * 1000)
-                    
-                    return RAGResult(
-                        answer=answer,
-                        sources=sources[:limit],
-                        confidence=confidence,
-                        intent=intent,
-                        processing_time_ms=processing_time
-                    )
                 else:
                     # Fallback на обычный поиск если нет рекомендаций
                     logger.debug("No recommendations found, falling back to regular search", user_id=str(user_id))
@@ -1074,6 +1197,34 @@ class RAGService:
                     lang="ru"
                 )
                 
+                # Context7: Добавляем внешние источники в context для LLM
+                external_sources_in_context = [
+                    source for source in enriched_sources 
+                    if source.channel_id == "external"
+                ]
+                
+                if external_sources_in_context:
+                    external_context_parts = []
+                    for idx, source in enumerate(external_sources_in_context, 1):
+                        # Context7: Добавляем ссылку в контекст для inline использования
+                        if source.permalink:
+                            external_context_parts.append(
+                                f"[Внешний источник {idx}] [{source.channel_title}]({source.permalink}): {source.content}"
+                            )
+                        else:
+                            external_context_parts.append(
+                                f"[Внешний источник {idx}] {source.channel_title}: {source.content}"
+                            )
+                    
+                    if external_context_parts:
+                        context += "\n\n" + "Внешние источники:\n" + "\n\n".join(external_context_parts)
+                    
+                    logger.debug(
+                        "External sources added to context",
+                        external_count=len(external_sources_in_context),
+                        context_length=len(context)
+                    )
+                
                 # Обновляем источники и confidence
                 sources = enriched_sources
                 confidence = min(1.0, confidence + confidence_boost)
@@ -1147,11 +1298,45 @@ class RAGService:
             try:
                 from services.user_interest_service import get_user_interest_service
                 interest_service = get_user_interest_service(redis_client=self.redis_client)
+                
+                # Извлекаем темы из постов через PostEnrichment
+                sources_for_tracking = []
+                for source in sources:
+                    post_topics = []
+                    try:
+                        post_uuid = UUID(source.post_id)
+                        # Получаем enrichment с тегами/темами
+                        enrichment = db.query(PostEnrichment).filter(
+                            PostEnrichment.post_id == post_uuid,
+                            PostEnrichment.kind == 'tags'
+                        ).first()
+                        
+                        if enrichment and enrichment.data:
+                            # Извлекаем теги из data->'tags' или из legacy поля tags
+                            tags = enrichment.data.get('tags', [])
+                            if not tags and enrichment.tags:
+                                tags = enrichment.tags
+                            
+                            if isinstance(tags, list):
+                                post_topics = [str(tag) for tag in tags if tag]
+                    except Exception as e:
+                        logger.debug("Error extracting topics from post", post_id=source.post_id, error=str(e))
+                    
+                    # Если нет тем из enrichment, используем ключевые слова из запроса
+                    if not post_topics:
+                        # Простое извлечение: первые 2-3 слова из запроса
+                        words = query.lower().split()[:3]
+                        if words:
+                            post_topics = [' '.join(words)]
+                    
+                    if post_topics:
+                        sources_for_tracking.append({'topics': post_topics})
+                
                 await interest_service.track_query(
                     user_id=user_id,
                     query_text=query,
                     intent=intent,
-                    sources=[{'topics': [s.channel_title] if s.channel_title else []} for s in sources],
+                    sources=sources_for_tracking,
                     db=db
                 )
             except Exception as e:

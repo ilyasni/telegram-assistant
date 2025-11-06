@@ -377,12 +377,12 @@ class EnrichmentRepository:
                                 WHEN EXCLUDED.kind = 'tags' THEN COALESCE(
                                     CASE 
                                         WHEN EXCLUDED.data->'tags' IS NOT NULL AND jsonb_typeof(EXCLUDED.data->'tags') = 'array'
-                                        THEN ARRAY(SELECT jsonb_array_elements_text(EXCLUDED.data->'tags'))
+                                        THEN (SELECT array_agg(value) FROM jsonb_array_elements_text(EXCLUDED.data->'tags') AS value)
                                         ELSE NULL
                                     END,
                                     CASE 
                                         WHEN EXCLUDED.data->'enrichment_data'->'tags' IS NOT NULL AND jsonb_typeof(EXCLUDED.data->'enrichment_data'->'tags') = 'array'
-                                        THEN ARRAY(SELECT jsonb_array_elements_text(EXCLUDED.data->'enrichment_data'->'tags'))
+                                        THEN (SELECT array_agg(value) FROM jsonb_array_elements_text(EXCLUDED.data->'enrichment_data'->'tags') AS value)
                                         ELSE NULL
                                     END,
                                     post_enrichment.tags

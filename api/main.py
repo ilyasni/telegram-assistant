@@ -12,7 +12,7 @@ from config import settings
 from fastapi.staticfiles import StaticFiles
 # from routers import health, channels, posts, tg_auth, users, rag, sessions, admin_invites, tg_webapp_auth
 from bot.webhook import router as bot_router, init_bot, ensure_webhook
-from bot.handlers import router as bot_handlers
+from bot.handlers.base import router as bot_handlers
 
 # Middleware imports
 from middleware.tracing import TracingMiddleware
@@ -268,7 +268,7 @@ async def logging_middleware(request: Request, call_next):
             token = auth_header.split(' ', 1)[1]
             try:
                 import jwt as jwt_lib
-                payload = jwt_lib.decode(token, settings.jwt_secret, algorithms=["HS256"], options={"verify_signature": False})
+                payload = jwt_lib.decode(token, settings.jwt_secret.get_secret_value(), algorithms=["HS256"], options={"verify_signature": False})
                 tier = payload.get('tier', 'unknown')
             except Exception:
                 pass

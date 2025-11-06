@@ -124,10 +124,10 @@ class SearXNGService:
         # Context7: BasicAuth для SearXNG (если настроено)
         # Если SEARXNG_USER и SEARXNG_PASSWORD заданы, используем BasicAuth
         auth = None
-        if settings.searxng_user and settings.searxng_password:
+        if settings.searxng_user and settings.searxng_password.get_secret_value():
             auth = httpx.BasicAuth(
                 settings.searxng_user,
-                settings.searxng_password
+                settings.searxng_password.get_secret_value()
             )
         
         # Context7: Браузероподобные заголовки для обхода bot detection

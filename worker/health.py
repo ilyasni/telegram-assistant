@@ -10,7 +10,7 @@ from typing import Dict, Any
 import redis.asyncio as redis
 import psycopg2
 import requests
-from worker.feature_flags import feature_flags
+from shared.feature_flags import feature_flags
 from worker.config import settings
 import structlog
 

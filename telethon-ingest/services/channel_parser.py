@@ -62,10 +62,15 @@ class ParserConfig:
     retry_max: int = int(os.getenv("PARSER_RETRY_MAX", "3"))
     
     # Redis
-    redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379")
+    redis_url: str = os.getenv("REDIS_URL", "redis://redis:6379")
     
     # База данных
-    db_url: str = os.getenv("DATABASE_URL", "postgresql://user:pass@localhost/db")
+    db_url: str = os.getenv("DATABASE_URL") or ""  # Обязательное поле, проверяется в __post_init__
+    
+    def __post_init__(self):
+        """Валидация обязательных полей."""
+        if not self.db_url:
+            raise ValueError("DATABASE_URL must be set in environment variables")
     
     # Адаптивные пороги и статистика
     stats_window_days: int = int(os.getenv("PARSER_STATS_WINDOW_DAYS", "14"))
@@ -2568,7 +2573,11 @@ async def example_parsing():
     # from worker.event_bus import create_publisher  # Temporarily disabled
     
     # Создание сессии БД
-    engine = create_async_engine("postgresql+asyncpg://user:pass@localhost/db")
+    # Используем DATABASE_URL из окружения (пример)
+    db_url = os.getenv("DATABASE_URL")
+    if not db_url:
+        raise ValueError("DATABASE_URL must be set")
+    engine = create_async_engine(db_url)
     async with AsyncSession(engine) as session:
         # Создание event publisher
         # publisher = await create_publisher()  # Temporarily disabled

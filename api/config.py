@@ -1,8 +1,10 @@
 """Конфигурация для API сервиса."""
 
 import json
+import os
 from pydantic_settings import BaseSettings
-from pydantic import field_validator
+from pydantic import field_validator, SecretStr, Field, model_validator
+from typing import Optional
 
 
 class Settings(BaseSettings):
@@ -15,7 +17,7 @@ class Settings(BaseSettings):
     redis_url: str
     
     # JWT
-    jwt_secret: str
+    jwt_secret: SecretStr  # Обязательное поле, без дефолта
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 30
     
@@ -57,7 +59,7 @@ class Settings(BaseSettings):
     s3_bucket_name: str = "bucket-467940"  # Локальное имя для SDK операций
     s3_region: str = "ru-central-1"
     s3_access_key_id: str = ""
-    s3_secret_access_key: str = ""
+    s3_secret_access_key: SecretStr = SecretStr("")  # SecretStr для безопасности
     s3_default_tenant_id: str = ""
     s3_use_compression: bool = True
     s3_compression_level: int = 6
@@ -102,7 +104,7 @@ class Settings(BaseSettings):
     searxng_rate_limit_per_user: int = 10  # Запросов в минуту на пользователя
     # Context7: BasicAuth для SearXNG (если требуется)
     searxng_user: str = ""
-    searxng_password: str = ""
+    searxng_password: SecretStr = SecretStr("")  # SecretStr для безопасности
     
     # Context7: SearXNG Enrichment Configuration - обогащение ответов внешними источниками
     # Используется для улучшения ответов при низкой уверенности или малом количестве результатов
@@ -114,7 +116,7 @@ class Settings(BaseSettings):
     
     # SaluteSpeech Configuration - Context7: для транскрибации голосовых сообщений
     salutespeech_client_id: str = ""
-    salutespeech_client_secret: str = ""
+    salutespeech_client_secret: SecretStr = SecretStr("")  # SecretStr для безопасности
     salutespeech_scope: str = "SALUTE_SPEECH_PERS"
     salutespeech_url: str = "https://smartspeech.sber.ru/rest/v1"
     voice_transcription_enabled: bool = True
@@ -133,7 +135,7 @@ class Settings(BaseSettings):
     openai_api_key: str = "dummy"  # gpt2giga-proxy игнорирует, использует GIGACHAT_CREDENTIALS
     
     # GigaChat Configuration - Context7: для прямого использования GigaChat API
-    gigachat_credentials: str = ""
+    gigachat_credentials: SecretStr = SecretStr("")  # SecretStr для безопасности
     gigachat_scope: str = "GIGACHAT_API_PERS"
     gigachat_proxy_url: str = "http://gpt2giga-proxy:8090"  # URL gpt2giga-proxy для embeddings
     
@@ -143,11 +145,25 @@ class Settings(BaseSettings):
     # Neo4j Configuration - Context7: для GraphRAG и графа знаний
     neo4j_uri: str = "neo4j://neo4j:7687"
     neo4j_user: str = "neo4j"
-    neo4j_password: str = "neo4j123"  # Context7: Исправлен пароль (должен совпадать с docker-compose.yml)
+    # Context7: Optional для dev окружения, обязательное для production
+    neo4j_password: Optional[SecretStr] = Field(
+        default=None,
+        description="Neo4j password (required in production, optional in dev with default 'changeme')"
+    )
     neo4j_vector_index_name: str = "post_embeddings"
     neo4j_fulltext_index_name: str = "post_fulltext"
     neo4j_interest_sync_interval_min: int = 15
     neo4j_max_graph_depth: int = 2  # Максимальная глубина обхода графа для производительности
+    
+    @model_validator(mode="after")
+    def set_neo4j_password_default(self):
+        """Context7: Устанавливает дефолтный пароль, если переменная не установлена."""
+        if self.neo4j_password is None:
+            # Context7: Если переменная NEO4J_PASSWORD не установлена, используем дефолт
+            # Это безопасно, так как в docker-compose.yml используется дефолт "changeme" для Neo4j
+            # В production рекомендуется установить NEO4J_PASSWORD явно
+            self.neo4j_password = SecretStr("changeme")
+        return self
     
     class Config:
         env_file = ".env"

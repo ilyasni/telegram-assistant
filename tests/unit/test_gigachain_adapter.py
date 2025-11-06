@@ -408,7 +408,7 @@ class TestContractTestRunner:
         # с реальными провайдерами (если доступны API ключи)
         
         # Проверка доступности провайдеров
-        from worker.feature_flags import feature_flags
+        from shared.feature_flags import feature_flags
         
         available_providers = feature_flags.get_available_ai_providers()
         

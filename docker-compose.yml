@@ -427,6 +427,10 @@ services:
       DEFAULT_TENANT_ID: ${DEFAULT_TENANT_ID}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       ENVIRONMENT: ${ENVIRONMENT:-production}
+      # Neo4j Configuration - Context7: для GraphRAG и графа знаний
+      NEO4J_URI: ${NEO4J_URI:-neo4j://neo4j:7687}
+      NEO4J_USER: ${NEO4J_USER:-neo4j}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD}
       # Context7 best practice: timezone для корректной работы с временем
       TZ: Europe/Moscow
       # S3 Storage Configuration (Cloud.ru) - Context7: для Vision + S3 Integration
@@ -562,6 +566,8 @@ services:
       - ./worker/event_bus.py:/app/event_bus.py:ro
       # Context7: Mount events schemas для разработки (hot reload)
       - ./worker/events:/app/events:ro
+      # Context7: Mount vision helper для hot reload изменений лимита
+      - ./worker/run_all_tasks_vision_helper.py:/app/run_all_tasks_vision_helper.py:ro
       # Context7: Mount scripts для E2E тестов
       - ./scripts:/opt/telegram-assistant/scripts:ro
       # Context7 best practice: монтируем timezone данные хоста
@@ -570,6 +576,8 @@ services:
       # Context7: Volume mount для api модуля (cross-service import для VisionAnalysisTask)
       # TODO: [C7-ID: ARCH-SHARED-001] Переместить S3StorageService в shared-пакет
       - ./api:/opt/telegram-assistant/api:ro
+      # Context7: Volume mount для shared пакета (hot reload изменений)
+      - ./shared:/app/shared:ro
     depends_on:
       supabase-db:
         condition: service_started

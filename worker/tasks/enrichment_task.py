@@ -1356,7 +1356,7 @@ class EnrichmentWorker:
             # Context7: Валидация crawl данных перед сохранением
             if kind == 'crawl' and enrichment_payload.get('urls'):
                 try:
-                    from shared.python.shared.schemas.enrichment_validation import validate_crawl_enrichment
+                    from shared.schemas.enrichment_validation import validate_crawl_enrichment
                     # Валидируем каждый URL отдельно
                     for url in enrichment_payload.get('urls', []):
                         crawl_data_for_validation = {

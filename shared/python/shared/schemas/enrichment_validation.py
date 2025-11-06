@@ -88,6 +88,41 @@ class VisionEnrichmentData(BaseModel):
             else:
                 logger.warning("Invalid hex color format", color=color)
         return validated
+    
+    @field_validator('ocr', mode='before')
+    @classmethod
+    def validate_ocr(cls, v: Any) -> Optional[OCRData]:
+        """
+        Context7: Валидация OCR данных перед созданием OCRData объекта.
+        Конвертирует пустые OCR объекты в None для корректной обработки.
+        """
+        if v is None:
+            return None
+        
+        # Если это словарь, проверяем наличие валидного текста
+        if isinstance(v, dict):
+            ocr_text = v.get("text")
+            # Если текст пустой или отсутствует, возвращаем None
+            if not ocr_text or not str(ocr_text).strip():
+                logger.debug("OCR text is empty, converting to None", ocr_dict=v)
+                return None
+            # Если текст валидный, создаем OCRData объект
+            try:
+                return OCRData(**v)
+            except Exception as e:
+                logger.warning("Failed to create OCRData, converting to None", error=str(e), ocr_dict=v)
+                return None
+        
+        # Если это уже OCRData объект, возвращаем как есть
+        if isinstance(v, OCRData):
+            return v
+        
+        # Для других типов пытаемся создать OCRData
+        try:
+            return OCRData(**v) if isinstance(v, dict) else None
+        except Exception:
+            logger.warning("Invalid OCR format, converting to None", ocr_value=v)
+            return None
 
 
 class CrawlEnrichmentData(BaseModel):

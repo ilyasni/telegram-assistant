@@ -100,7 +100,7 @@ class EnrichmentEngine:
     
     def __init__(
         self,
-        redis_url: str = "redis://localhost:6379",
+        redis_url: str = None,
         max_concurrent_crawls: int = 3,
         rate_limit_per_host: int = 10,  # запросов в минуту
         cache_ttl: int = 3600,  # 1 час
@@ -108,7 +108,9 @@ class EnrichmentEngine:
         s3_service: Optional[Any] = None,  # S3StorageService для сохранения HTML/MD в S3
         circuit_breaker: Optional[Any] = None  # CircuitBreaker для защиты от каскадных сбоев
     ):
-        self.redis_url = redis_url
+        import os
+        # Получаем из ENV переменных, без localhost дефолтов
+        self.redis_url = redis_url or os.getenv("REDIS_URL", "redis://redis:6379")
         self.max_concurrent_crawls = max_concurrent_crawls
         self.rate_limit_per_host = rate_limit_per_host
         self.cache_ttl = cache_ttl

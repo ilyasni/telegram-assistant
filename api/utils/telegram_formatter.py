@@ -25,19 +25,39 @@ class TelegramHTMLRenderer(HTMLRenderer):
         super().__init__(*args, **kwargs)
     
     def heading(self, text: str, level: int, **attrs) -> str:
-        """Заголовки → <b>...</b>"""
-        return f"<b>{text}</b>\n"
+        """
+        Заголовки с улучшенным форматированием.
+        Context7: Добавляем визуальные разделители для лучшей читабельности.
+        """
+        # Убираем лишние пробелы
+        text = text.strip()
+        
+        # Для заголовков уровня 1 и 2 добавляем разделитель
+        if level == 1:
+            # H1: большой заголовок с разделителем сверху и снизу
+            return f"\n<b>{text}</b>\n━━━━━━━━━━\n\n"
+        elif level == 2:
+            # H2: средний заголовок с разделителем снизу
+            return f"\n<b>{text}</b>\n──────────\n\n"
+        else:
+            # H3+: обычный заголовок
+            return f"\n<b>{text}</b>\n\n"
     
     def paragraph(self, text: str) -> str:
-        """Абзацы → текст + \n\n"""
+        """
+        Абзацы с улучшенным форматированием.
+        Context7: Добавляем пустую строку после абзаца для читабельности.
+        """
         if not text.strip():
-            return ""
+            return "\n"
+        # Убираем лишние переносы внутри абзаца
+        text = re.sub(r'\n+', ' ', text.strip())
         return f"{text}\n\n"
     
     def list(self, text: str, ordered: bool, **attrs) -> str:
         """
-        Списки: обрабатываем уже отрендеренный HTML текст элементов.
-        В mistune v3 list() вызывается ПОСЛЕ того, как все list_item() уже отрендерены.
+        Списки с улучшенным форматированием.
+        Context7: Добавляем отступы и улучшенные маркеры для читабельности.
         """
         # Получаем start из attrs если есть
         start = attrs.get('start', 1)
@@ -61,11 +81,11 @@ class TelegramHTMLRenderer(HTMLRenderer):
             # Извлекаем содержимое <li> с сохранением форматирования
             item_content = match.group(1).strip()
             
-            # Определяем маркер
+            # Определяем маркер с улучшенным форматированием
             if ordered:
-                marker = f"{start + idx}) "
+                marker = f"<b>{start + idx}.</b> "
             else:
-                marker = "• "
+                marker = "▸ "  # Более заметный маркер для неупорядоченных списков
             
             # Добавляем маркер и содержимое (с сохранением HTML форматирования)
             result_parts.append(f"{marker}{item_content}\n")
@@ -76,7 +96,12 @@ class TelegramHTMLRenderer(HTMLRenderer):
         if last_end < len(text):
             result_parts.append(text[last_end:])
         
-        return "".join(result_parts)
+        # Добавляем пустую строку после списка для читабельности
+        result = "".join(result_parts)
+        if result.strip():
+            result += "\n"
+        
+        return result
     
     def list_item(self, text: str, **attrs) -> str:
         """
@@ -125,11 +150,25 @@ class TelegramHTMLRenderer(HTMLRenderer):
         return f"<s>{text}</s>"
     
     def block_quote(self, text: str) -> str:
-        """Цитаты → <i>...</i> или с префиксом ›"""
+        """
+        Цитаты с улучшенным форматированием.
+        Context7: Добавляем визуальное выделение цитат для читабельности.
+        """
         # Убираем лишние переносы и добавляем префикс
         lines = text.strip().split('\n')
-        quoted_lines = [f"› {line}" if line.strip() else line for line in lines]
-        return "\n".join(quoted_lines) + "\n\n"
+        quoted_lines = []
+        for line in lines:
+            if line.strip():
+                # Добавляем визуальный маркер цитаты
+                quoted_lines.append(f"│ {line.strip()}")
+            else:
+                quoted_lines.append("")
+        
+        # Обёртываем в курсив для визуального выделения
+        result = "\n".join(quoted_lines)
+        if result.strip():
+            return f"<i>{result}</i>\n\n"
+        return "\n"
     
     def table(self, text: str) -> str:
         """Таблицы → упрощение до <pre> или текста"""
@@ -137,8 +176,11 @@ class TelegramHTMLRenderer(HTMLRenderer):
         return f"<pre>{escape(text)}</pre>\n"
     
     def thematic_break(self) -> str:
-        """Горизонтальная линия → просто перенос строки"""
-        return "\n---\n\n"
+        """
+        Горизонтальная линия с улучшенным форматированием.
+        Context7: Добавляем визуальный разделитель для лучшей читабельности.
+        """
+        return "\n━━━━━━━━━━\n\n"
     
     def blank_line(self) -> str:
         """Пустая строка"""
@@ -194,18 +236,18 @@ def _sanitize_url(url: str) -> Optional[str]:
         return None
 
 
-def split_for_telegram(html: str, limit: int = 4096) -> List[str]:
+def split_for_telegram(html_text: str, limit: int = 4096) -> List[str]:
     """
     Безопасный чанкинг HTML для Telegram с сохранением валидности тегов.
     
     Подсчитывает видимый текст (игнорируя теги), html.unescape для учёта
     &amp; → 1 символ. Блоки <pre><code>...</code></pre> не разрываются.
     """
-    if not html:
+    if not html_text:
         return [""]
     
     # Токенизация HTML на текст и теги
-    tokens = _tokenize_html(html)
+    tokens = _tokenize_html(html_text)
     
     chunks = []
     current_chunk = []
@@ -462,8 +504,14 @@ def markdown_to_telegram_html(md_text: str) -> str:
     # Постобработка спойлеров
     html_text = _postprocess_spoilers(html_text, spoiler_markers)
     
-    # Убираем лишние переносы в конце
-    return html_text.rstrip()
+    # Context7: Постобработка для улучшения читабельности
+    # Убираем более 2 подряд идущих переносов строк (оставляем максимум 2)
+    html_text = re.sub(r'\n{3,}', '\n\n', html_text)
+    
+    # Убираем переносы в начале и конце
+    html_text = html_text.strip()
+    
+    return html_text
 
 
 def markdown_to_telegram_chunks(md_text: str, limit: int = 4096) -> List[str]:
@@ -477,6 +525,6 @@ def markdown_to_telegram_chunks(md_text: str, limit: int = 4096) -> List[str]:
     Returns:
         Список чанков HTML валидных для Telegram
     """
-    html = markdown_to_telegram_html(md_text)
-    return split_for_telegram(html, limit=limit)
+    html_text = markdown_to_telegram_html(md_text)
+    return split_for_telegram(html_text, limit=limit)
 

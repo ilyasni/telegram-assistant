@@ -82,26 +82,66 @@ class DigestService:
             temperature=0.7,
         )
         
-        # Context7: Few-shot промпт для генерации дайджеста
+        # Context7: Структурированный промпт для генерации дайджеста с executive summary и улучшенной версткой
         self.digest_prompt = ChatPromptTemplate.from_messages([
             ("system", """Ты — эксперт по составлению дайджестов новостей из Telegram каналов.
 
-Создай краткий дайджест на основе предоставленных постов, сгруппированный по темам.
-Каждая тема должна содержать 3-5 ключевых пунктов с кратким описанием.
+Создай структурированный дайджест на основе предоставленных постов, сгруппированный по темам.
 
-Формат ответа:
+СТРУКТУРА ДАЙДЖЕСТА:
+
+1. **EXECUTIVE SUMMARY** (в начале):
+   - Краткое саммари на 2-3 предложения: на что обратить внимание, главные тренды, ключевые события
+   - Выдели самые важные новости по метрикам популярности
+
+2. **ТЕМАТИЧЕСКИЕ БЛОКИ**:
+   - Каждая тема — отдельный блок с заголовком ## Тема: [Название]
+   - Между блоками ОБЯЗАТЕЛЬНО оставляй пустую строку для читаемости
+   - В каждом блоке 3-5 ключевых новостей
+
+3. **ФОРМАТ НОВОСТИ**:
+   - **Заголовок**: краткий заголовок новости (1 строка)
+   - **Суть**: 1-2 предложения с ключевой информацией (что произошло, почему важно)
+   - **Метрики**: [Популярность: X%] если указаны в данных
+   - **Ссылка**: [Канал](ссылка) на оригинальный пост
+
+ВАЖНО:
+- ВСЕГДА начинай с Executive Summary
+- ВСЕГДА оставляй пустую строку между тематическими блоками
+- Для каждой новости давай не только заголовок, но и 1-2 предложения сути
+- Используй метрики (👁️ просмотры, ❤️ реакции, ↪️ репосты, 💬 комментарии) для оценки важности
+- ВСЕГДА включай ссылку на оригинальный пост для каждой новости
+
+ФОРМАТ ОТВЕТА:
+
+## 📊 Executive Summary
+
+[2-3 предложения: главные тренды, на что обратить внимание, ключевые события]
+
 ## Тема 1: [Название темы]
-- Пункт 1: [краткое описание]
-- Пункт 2: [краткое описание]
-- Пункт 3: [краткое описание]
+
+**Заголовок новости 1**
+Суть новости: [1-2 предложения с ключевой информацией] [Популярность: X%] [Канал](ссылка)
+
+**Заголовок новости 2**
+Суть новости: [1-2 предложения с ключевой информацией] [Популярность: X%] [Канал](ссылка)
+
+**Заголовок новости 3**
+Суть новости: [1-2 предложения с ключевой информацией] [Популярность: X%] [Канал](ссылка)
+
 
 ## Тема 2: [Название темы]
-- Пункт 1: [краткое описание]
-- Пункт 2: [краткое описание]
+
+**Заголовок новости 1**
+Суть новости: [1-2 предложения с ключевой информацией] [Популярность: X%] [Канал](ссылка)
+
+**Заголовок новости 2**
+Суть новости: [1-2 предложения с ключевой информацией] [Популярность: X%] [Канал](ссылка)
+
 ...
 
-Используй только информацию из предоставленных постов. Всегда указывай источники (каналы) в конце."""),
-            ("human", "Посты для дайджеста:\n{context}\n\nТемы: {topics}\n\nСоздай дайджест:")
+Используй только информацию из предоставленных постов. Ссылки на посты обязательны для каждой новости."""),
+            ("human", "Посты для дайджеста:\n{context}\n\nТемы: {topics}\n\nСоздай структурированный дайджест с Executive Summary, метриками популярности и ссылками на источники:")
         ])
         
         logger.info("Digest Service initialized", qdrant_url=qdrant_url)
@@ -223,7 +263,13 @@ class DigestService:
                                     'permalink': post.telegram_post_url,
                                     'posted_at': post.posted_at,
                                     'topic': topic,
-                                    'score': result.score
+                                    'score': result.score,
+                                    # Context7: Метрики популярности для отображения в дайджесте
+                                    'engagement_score': float(post.engagement_score) if post.engagement_score else 0.0,
+                                    'views_count': post.views_count or 0,
+                                    'reactions_count': post.reactions_count or 0,
+                                    'forwards_count': post.forwards_count or 0,
+                                    'replies_count': post.replies_count or 0
                                 })
                 
                 # Context7: Использование Neo4j для поиска связанных тем через граф
@@ -266,7 +312,13 @@ class DigestService:
                                                 'posted_at': post.posted_at,
                                                 'topic': related_topic,
                                                 'score': graph_post.get('score', 0.7),
-                                                'related_topic': related_topic != topic  # Флаг связанной темы
+                                                'related_topic': related_topic != topic,  # Флаг связанной темы
+                                                # Context7: Метрики популярности
+                                                'engagement_score': float(post.engagement_score) if post.engagement_score else 0.0,
+                                                'views_count': post.views_count or 0,
+                                                'reactions_count': post.reactions_count or 0,
+                                                'forwards_count': post.forwards_count or 0,
+                                                'replies_count': post.replies_count or 0
                                             })
                 except Exception as e:
                     logger.warning("GraphRAG search failed in digest, continuing without graph", error=str(e))
@@ -299,7 +351,13 @@ class DigestService:
                             'permalink': post.telegram_post_url,
                             'posted_at': post.posted_at,
                             'topic': topic,
-                            'score': 0.5  # Средний score для FTS результатов
+                            'score': 0.5,  # Средний score для FTS результатов
+                            # Context7: Метрики популярности
+                            'engagement_score': float(post.engagement_score) if post.engagement_score else 0.0,
+                            'views_count': post.views_count or 0,
+                            'reactions_count': post.reactions_count or 0,
+                            'forwards_count': post.forwards_count or 0,
+                            'replies_count': post.replies_count or 0
                         })
             
             except Exception as e:
@@ -317,20 +375,121 @@ class DigestService:
                 seen.add(post['post_id'])
                 unique_posts.append(post)
         
+        # Context7: Дедупликация альбомов - оставляем только первый пост из альбома с наивысшим score
+        try:
+            # Получаем grouped_id для всех постов из БД
+            post_ids = [UUID(p['post_id']) for p in unique_posts]
+            if post_ids:
+                posts_with_grouped = db.query(
+                    Post.id,
+                    Post.grouped_id
+                ).filter(Post.id.in_(post_ids)).all()
+                
+                # Создаем словарь post_id -> grouped_id
+                post_grouped_map = {str(post.id): post.grouped_id for post in posts_with_grouped if post.grouped_id}
+                
+                # Группируем посты по альбомам
+                album_posts = {}  # grouped_id -> список (post_index, score)
+                for idx, post_data in enumerate(unique_posts):
+                    grouped_id = post_grouped_map.get(post_data['post_id'])
+                    if grouped_id:
+                        if grouped_id not in album_posts:
+                            album_posts[grouped_id] = []
+                        album_posts[grouped_id].append((idx, post_data['score']))
+                
+                # Для каждого альбома оставляем только пост с наивысшим score
+                indices_to_remove = set()
+                for grouped_id, posts_list in album_posts.items():
+                    if len(posts_list) > 1:
+                        # Сортируем по score и оставляем только первый
+                        posts_list.sort(key=lambda x: x[1], reverse=True)
+                        # Удаляем все посты кроме первого
+                        for idx, _ in posts_list[1:]:
+                            indices_to_remove.add(idx)
+                
+                # Удаляем дубликаты альбомов (в обратном порядке, чтобы не сбить индексы)
+                for idx in sorted(indices_to_remove, reverse=True):
+                    unique_posts.pop(idx)
+                
+                logger.debug(
+                    "Album deduplication applied in digest",
+                    albums_count=len(album_posts),
+                    removed_duplicates=len(indices_to_remove)
+                )
+        except Exception as e:
+            logger.warning("Error during album deduplication in digest", error=str(e))
+            # Продолжаем без дедупликации при ошибке
+        
         return unique_posts
     
     async def _assemble_context(self, posts: List[Dict[str, Any]], max_posts: int = 20) -> str:
-        """Сборка контекста из постов для генерации дайджеста."""
+        """
+        Сборка контекста из постов для генерации дайджеста.
+        
+        Context7: Включает метрики популярности и ссылки на посты.
+        """
+        if not posts:
+            return ""
+        
+        # Вычисляем максимальный engagement_score для нормализации
+        max_engagement = max((p.get('engagement_score', 0.0) for p in posts), default=1.0)
+        if max_engagement == 0:
+            max_engagement = 1.0  # Избегаем деления на ноль
+        
         context_parts = []
         
         for idx, post in enumerate(posts[:max_posts], 1):
-            content = post['content']
-            if len(content) > 300:
-                content = content[:300] + "..."
+            content = post.get('content', '')
+            # Context7: Увеличиваем лимит для лучшего понимания сути новости (до 500 символов)
+            if len(content) > 500:
+                content = content[:500] + "..."
             
-            context_parts.append(
-                f"[{idx}] {post['channel_title']}: {content}"
-            )
+            channel_title = post.get('channel_title', 'Неизвестный канал')
+            permalink = post.get('permalink', '')
+            
+            # Context7: Вычисляем относительную популярность (%)
+            engagement_score = post.get('engagement_score', 0.0)
+            popularity_percent = int((engagement_score / max_engagement) * 100) if max_engagement > 0 else 0
+            
+            # Context7: Формируем метрики популярности
+            views = post.get('views_count', 0)
+            reactions = post.get('reactions_count', 0)
+            forwards = post.get('forwards_count', 0)
+            replies = post.get('replies_count', 0)
+            
+            # Формируем строку метрик
+            metrics_parts = []
+            if views > 0:
+                metrics_parts.append(f"👁️ {views}")
+            if reactions > 0:
+                metrics_parts.append(f"❤️ {reactions}")
+            if forwards > 0:
+                metrics_parts.append(f"↪️ {forwards}")
+            if replies > 0:
+                metrics_parts.append(f"💬 {replies}")
+            
+            metrics_str = " | ".join(metrics_parts) if metrics_parts else "—"
+            
+            # Context7: Улучшенный формат контекста для лучшей генерации заголовков и сути
+            # Формат: [N] Канал | Популярность: X% | Метрики | Ссылка
+            # Затем полный текст поста для извлечения сути
+            post_header = f"[{idx}] **{channel_title}**"
+            
+            # Добавляем метрики популярности
+            if popularity_percent > 0:
+                post_header += f" | Популярность: {popularity_percent}%"
+            
+            if metrics_str != "—":
+                post_header += f" | {metrics_str}"
+            
+            # Добавляем ссылку в формате markdown для лучшей обработки LLM
+            if permalink:
+                post_header += f" | [Ссылка]({permalink})"
+            
+            # Context7: Структурируем контекст: заголовок с метриками, затем контент для извлечения сути
+            post_line = f"{post_header}\n\n**Текст поста:**\n{content}"
+            
+            context_parts.append(post_line)
         
         return "\n\n".join(context_parts)
     
@@ -369,8 +528,29 @@ class DigestService:
         if not digest_settings.enabled:
             raise ValueError("Дайджест отключен в настройках")
         
-        if not digest_settings.topics or len(digest_settings.topics) == 0:
-            raise ValueError("Не указаны темы для дайджеста")
+        # Context7: Если темы не указаны, используем интересы пользователя как fallback
+        topics = digest_settings.topics if digest_settings.topics and len(digest_settings.topics) > 0 else []
+        
+        if not topics:
+            # Получаем топ интересов пользователя из user_interests
+            try:
+                from services.user_interest_service import get_user_interest_service
+                interest_service = get_user_interest_service()
+                user_interests = await interest_service.get_user_interests(user_id, limit=5, db=db)
+                
+                if user_interests:
+                    # Берем топ-5 тем по весу
+                    topics = [interest.get('topic', '') for interest in user_interests[:5] if interest.get('topic')]
+                    logger.info(
+                        "Using user interests as topics fallback",
+                        user_id=str(user_id),
+                        topics_count=len(topics)
+                    )
+            except Exception as e:
+                logger.warning("Failed to get user interests as fallback", error=str(e))
+        
+        if not topics or len(topics) == 0:
+            raise ValueError("Не указаны темы для дайджеста. Укажите темы в настройках или используйте поиск для формирования интересов.")
         
         # Получаем каналы пользователя (если channels_filter не указан, используем все)
         user_channels = db.query(UserChannel).filter(UserChannel.user_id == user_id).all()
@@ -387,12 +567,12 @@ class DigestService:
         logger.info(
             "Collecting posts for digest",
             user_id=str(user_id),
-            topics=digest_settings.topics,
+            topics=topics,
             channels_count=len(channel_ids) if channel_ids else 0
         )
         
         posts = await self._collect_posts_by_topics(
-            topics=digest_settings.topics,
+            topics=topics,
             tenant_id=tenant_id,
             user_id=user_id,
             channel_ids=channel_ids,
@@ -401,11 +581,11 @@ class DigestService:
         )
         
         if not posts:
-            logger.warning("No posts found for digest", user_id=str(user_id), topics=digest_settings.topics)
+            logger.warning("No posts found for digest", user_id=str(user_id), topics=topics)
             return DigestContent(
                 content="Не найдено постов по указанным темам за выбранный период.",
                 posts_count=0,
-                topics=digest_settings.topics,
+                topics=topics,
                 sections=[]
             )
         
@@ -418,7 +598,7 @@ class DigestService:
             # ChatPromptTemplate.format_messages() возвращает список messages
             messages = self.digest_prompt.format_messages(
                 context=context,
-                topics=", ".join(digest_settings.topics)
+                topics=", ".join(topics)
             )
             
             if not messages:
@@ -426,7 +606,7 @@ class DigestService:
                 return DigestContent(
                     content="Не удалось сгенерировать дайджест: пустой промпт.",
                     posts_count=len(posts),
-                    topics=digest_settings.topics,
+                    topics=topics,
                     sections=[]
                 )
             
@@ -434,20 +614,20 @@ class DigestService:
             content = response.content if hasattr(response, 'content') else str(response)
             
             # Парсим секции из markdown (простой парсинг)
-            sections = self._parse_sections(content, digest_settings.topics)
+            sections = self._parse_sections(content, topics)
             
             logger.info(
                 "Digest generated",
                 user_id=str(user_id),
                 posts_count=len(posts),
-                topics=digest_settings.topics,
+                topics=topics,
                 processing_time_ms=int((time.time() - start_time) * 1000)
             )
             
             return DigestContent(
                 content=content,
                 posts_count=len(posts),
-                topics=digest_settings.topics,
+                topics=topics,
                 sections=sections
             )
         

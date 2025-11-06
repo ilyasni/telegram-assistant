@@ -19,7 +19,7 @@ from worker.event_bus import EventConsumer, RedisStreamsClient
 from worker.events.schemas import PostDeletedEventV1
 from worker.integrations.qdrant_client import QdrantClient
 from worker.integrations.neo4j_client import Neo4jClient
-from worker.feature_flags import feature_flags
+from shared.feature_flags import feature_flags
 
 logger = structlog.get_logger()
 
@@ -75,16 +75,18 @@ class CleanupTask:
     
     def __init__(
         self,
-        redis_url: str = "redis://redis:6379",
-        qdrant_url: str = "http://localhost:6333",
-        neo4j_url: str = "bolt://localhost:7687",
+        redis_url: str = None,
+        qdrant_url: str = None,
+        neo4j_url: str = None,
         consumer_group: str = "cleanup_workers",
         consumer_name: str = "cleanup_worker_1",
         max_job_duration_minutes: int = 30
     ):
-        self.redis_url = redis_url
-        self.qdrant_url = qdrant_url
-        self.neo4j_url = neo4j_url
+        import os
+        # Получаем из ENV переменных, без localhost дефолтов
+        self.redis_url = redis_url or os.getenv("REDIS_URL", "redis://redis:6379")
+        self.qdrant_url = qdrant_url or os.getenv("QDRANT_URL", "http://qdrant:6333")
+        self.neo4j_url = neo4j_url or os.getenv("NEO4J_URI", "bolt://neo4j:7687")
         self.consumer_group = consumer_group
         self.consumer_name = consumer_name
         self.max_job_duration_minutes = max_job_duration_minutes

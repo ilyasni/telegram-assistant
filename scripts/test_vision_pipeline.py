@@ -62,25 +62,9 @@ from sqlalchemy.orm import Session
 
 
 def get_db_connection_string() -> str:
-    """Context7: Получение строки подключения к БД (используем DATABASE_URL как worker)."""
-    # Context7: Worker использует DATABASE_URL
-    database_url = os.getenv("DATABASE_URL")
-    
-    if database_url:
-        # Убираем +asyncpg для asyncpg (если есть)
-        return database_url.replace("postgresql+asyncpg://", "postgresql://")
-    
-    # Fallback: собираем из отдельных переменных
-    db_host = os.getenv("DB_HOST", os.getenv("POSTGRES_HOST", "supabase-db"))
-    db_port = os.getenv("DB_PORT", os.getenv("POSTGRES_PORT", "5432"))
-    db_user = os.getenv("POSTGRES_USER", "postgres")
-    db_password = os.getenv("POSTGRES_PASSWORD", "") or os.getenv("DB_PASSWORD", "")
-    db_name = os.getenv("POSTGRES_DB", os.getenv("DB_NAME", "postgres"))
-    
-    if not db_password:
-        raise ValueError("DATABASE_URL или POSTGRES_PASSWORD не установлены. Проверьте переменные окружения.")
-    
-    return f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+    """Context7: Получение строки подключения к БД (используем единую утилиту)."""
+    from shared.utils.db_connection import get_database_url
+    return get_database_url(kind="rw", async_=False)
 
 
 def get_redis_url() -> str:

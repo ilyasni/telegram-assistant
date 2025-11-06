@@ -42,7 +42,7 @@ class SaluteSpeechService:
             redis_client: Redis клиент для кэширования
         """
         self.client_id = client_id or settings.salutespeech_client_id
-        self.client_secret = client_secret or settings.salutespeech_client_secret
+        self.client_secret = client_secret or settings.salutespeech_client_secret.get_secret_value()
         self.scope = scope or settings.salutespeech_scope
         self.api_url = api_url or settings.salutespeech_url
         self.redis_client = redis_client

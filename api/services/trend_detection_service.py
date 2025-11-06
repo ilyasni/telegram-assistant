@@ -10,7 +10,7 @@ from datetime import datetime, date, timedelta, timezone
 
 import structlog
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, func, desc, text as sa_text
+from sqlalchemy import func, desc, text as sa_text
 from qdrant_client import QdrantClient
 from langchain_gigachat import GigaChat
 from langchain_core.prompts import ChatPromptTemplate
@@ -162,11 +162,9 @@ class TrendDetectionService:
             # Получаем посты за последние N дней
             cutoff_date = datetime.now(timezone.utc) - timedelta(days=days)
             
+            # Context7: Посты удаляются физически из БД, поле deleted отсутствует
             posts = db.query(Post).join(PostEnrichment).filter(
-                and_(
-                    Post.posted_at >= cutoff_date,
-                    Post.deleted == False
-                )
+                Post.posted_at >= cutoff_date
             ).order_by(desc(Post.posted_at)).limit(10000).all()  # Ограничение для производительности
             
             posts_data = []
@@ -191,6 +189,56 @@ class TrendDetectionService:
                     'topics': enrichment.topics if enrichment and enrichment.topics else [],
                     'keywords': enrichment.keywords if enrichment and enrichment.keywords else []
                 })
+            
+            # Context7: Дедупликация альбомов - оставляем только первый пост из альбома с наивысшим engagement_score
+            try:
+                # Получаем grouped_id для всех постов из БД
+                post_ids = [UUID(p['post_id']) for p in posts_data]
+                if post_ids:
+                    posts_with_grouped = db.query(
+                        Post.id,
+                        Post.grouped_id,
+                        Post.engagement_score
+                    ).filter(Post.id.in_(post_ids)).all()
+                    
+                    # Создаем словарь post_id -> (grouped_id, engagement_score)
+                    post_grouped_map = {
+                        str(post.id): (post.grouped_id, float(post.engagement_score) if post.engagement_score else 0.0)
+                        for post in posts_with_grouped if post.grouped_id
+                    }
+                    
+                    # Группируем посты по альбомам
+                    album_posts = {}  # grouped_id -> список (post_index, engagement_score)
+                    for idx, post_data in enumerate(posts_data):
+                        grouped_info = post_grouped_map.get(post_data['post_id'])
+                        if grouped_info:
+                            grouped_id, engagement = grouped_info
+                            if grouped_id not in album_posts:
+                                album_posts[grouped_id] = []
+                            album_posts[grouped_id].append((idx, engagement))
+                    
+                    # Для каждого альбома оставляем только пост с наивысшим engagement_score
+                    indices_to_remove = set()
+                    for grouped_id, posts_list in album_posts.items():
+                        if len(posts_list) > 1:
+                            # Сортируем по engagement_score и оставляем только первый
+                            posts_list.sort(key=lambda x: x[1], reverse=True)
+                            # Удаляем все посты кроме первого
+                            for idx, _ in posts_list[1:]:
+                                indices_to_remove.add(idx)
+                    
+                    # Удаляем дубликаты альбомов (в обратном порядке, чтобы не сбить индексы)
+                    for idx in sorted(indices_to_remove, reverse=True):
+                        posts_data.pop(idx)
+                    
+                    logger.debug(
+                        "Album deduplication applied in trends",
+                        albums_count=len(album_posts),
+                        removed_duplicates=len(indices_to_remove)
+                    )
+            except Exception as e:
+                logger.warning("Error during album deduplication in trends", error=str(e))
+                # Продолжаем без дедупликации при ошибке
             
             logger.info("Posts collected for trend analysis", count=len(posts_data), days=days)
             return posts_data

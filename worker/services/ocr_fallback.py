@@ -1,6 +1,7 @@
 """
 OCR Fallback Service для случаев quota exhausted
-Context7 best practice: локальный OCR как fallback для Vision API
+Context7 best practice: использование OpenRouter Vision API как fallback для Vision анализа
+с моделью qwen/qwen2.5-vl-32b-instruct:free
 """
 
 import logging
@@ -30,25 +31,52 @@ ocr_duration_seconds = Histogram(
 
 class OCRFallbackService:
     """
-    OCR Fallback Service для извлечения текста из изображений.
+    OCR Fallback Service для анализа изображений через OpenRouter Vision API.
     
-    Engines:
-    - tesseract: Tesseract OCR (требует установки)
-    - rapidocr: RapidOCR (Python-based)
+    Context7: Использует OpenRouter Vision с моделью qwen/qwen2.5-vl-32b-instruct:free
+    для полноценного Vision анализа (OCR + классификация + описание).
+    
+    Совместимый интерфейс с предыдущей версией для обратной совместимости.
     """
     
-    def __init__(self, engine: str = "tesseract", languages: str = "rus+eng"):
+    def __init__(
+        self,
+        engine: str = "openrouter",
+        languages: str = "rus+eng",
+        openrouter_adapter: Optional[Any] = None
+    ):
+        """
+        Инициализация OCR Fallback Service.
+        
+        Args:
+            engine: Движок OCR (по умолчанию "openrouter")
+            languages: Языки для OCR (не используется для OpenRouter)
+            openrouter_adapter: OpenRouterVisionAdapter (создаётся автоматически если не передан)
+        """
         self.engine = engine.lower()
         self.languages = languages
         
-        # Lazy инициализация engines
-        self._tesseract_available = False
-        self._rapidocr_available = False
+        # Context7: Инициализация OpenRouter Vision Adapter
+        if openrouter_adapter:
+            self.openrouter_adapter = openrouter_adapter
+        else:
+            try:
+                from ai_adapters.openrouter_vision import OpenRouterVisionAdapter
+                self.openrouter_adapter = OpenRouterVisionAdapter(
+                    model="qwen/qwen2.5-vl-32b-instruct:free"
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to initialize OpenRouter Vision Adapter",
+                    error=str(e),
+                    engine=engine
+                )
+                self.openrouter_adapter = None
         
         logger.info(
             "OCRFallbackService initialized",
             engine=engine,
-            languages=languages
+            openrouter_available=bool(self.openrouter_adapter)
         )
     
     def _check_tesseract(self) -> bool:
@@ -73,43 +101,57 @@ class OCRFallbackService:
     
     async def extract_text(self, image_bytes: bytes) -> str:
         """
-        Извлечение текста из изображения через OCR.
+        Извлечение текста из изображения через OpenRouter Vision API.
+        
+        Context7: Использует OpenRouter Vision для полноценного анализа изображений.
         
         Args:
             image_bytes: Байты изображения
             
         Returns:
-            Извлечённый текст
+            Извлечённый текст (OCR результат)
         """
         import time
         start_time = time.time()
         
         try:
-            if self.engine == "tesseract" and self._check_tesseract():
-                text = await self._extract_with_tesseract(image_bytes)
-            elif self.engine == "rapidocr" and self._check_rapidocr():
-                text = await self._extract_with_rapidocr(image_bytes)
+            if self.engine == "openrouter" and self.openrouter_adapter:
+                # Context7: Используем OpenRouter Vision для анализа
+                # Получаем полный анализ и извлекаем OCR текст
+                result = await self.openrouter_adapter.analyze_media(
+                    sha256="",  # Не используется для fallback
+                    file_content=image_bytes,
+                    mime_type="image/jpeg",  # Определяется автоматически
+                    tenant_id="fallback",
+                    trace_id="ocr_fallback"
+                )
+                
+                # Извлекаем OCR текст из результата
+                ocr_data = result.get("ocr")
+                if ocr_data and isinstance(ocr_data, dict):
+                    text = ocr_data.get("text", "")
+                else:
+                    text = ""
+                
+                duration = time.time() - start_time
+                ocr_duration_seconds.labels(engine=self.engine).observe(duration)
+                ocr_requests_total.labels(engine=self.engine, status="success").inc()
+                
+                logger.debug(
+                    "OCR text extracted via OpenRouter",
+                    engine=self.engine,
+                    text_length=len(text),
+                    duration_ms=int(duration * 1000)
+                )
+                
+                return text
             else:
                 logger.warning(
-                    "Requested OCR engine not available",
+                    "OpenRouter Vision adapter not available",
                     engine=self.engine,
-                    tesseract_available=self._tesseract_available,
-                    rapidocr_available=self._rapidocr_available
+                    openrouter_available=bool(self.openrouter_adapter)
                 )
                 return ""
-            
-            duration = time.time() - start_time
-            ocr_duration_seconds.labels(engine=self.engine).observe(duration)
-            ocr_requests_total.labels(engine=self.engine, status="success").inc()
-            
-            logger.debug(
-                "OCR text extracted",
-                engine=self.engine,
-                text_length=len(text),
-                duration_ms=int(duration * 1000)
-            )
-            
-            return text
             
         except Exception as e:
             ocr_requests_total.labels(engine=self.engine, status="error").inc()
@@ -147,31 +189,89 @@ class OCRFallbackService:
     
     async def classify_content_type(self, ocr_text: str) -> Dict[str, Any]:
         """
-        Zero-shot классификация типа контента по OCR тексту.
+        Классификация типа контента.
         
-        Упрощённая эвристика, в production нужна модель или LLM.
+        Context7: Для OpenRouter Vision классификация выполняется автоматически
+        в методе analyze_media. Этот метод оставлен для обратной совместимости.
+        
+        Args:
+            ocr_text: OCR текст (не используется для OpenRouter)
+            
+        Returns:
+            Результат классификации в формате совместимом с предыдущей версией
         """
-        text_lower = ocr_text.lower()
+        # Context7: Для OpenRouter Vision классификация выполняется автоматически
+        # Этот метод используется только для обратной совместимости
+        # В реальности классификация выполняется в analyze_media()
         
-        # Простые эвристики для определения типа
+        text_lower = ocr_text.lower() if ocr_text else ""
+        
+        # Простые эвристики для определения типа (fallback)
         is_meme = any(word in text_lower for word in [
             'мем', 'meme', 'lol', 'хаха', 'рофл', 'кринж'
         ])
         
         # Определение типа
-        content_type = "text"
+        content_type = "other"
         if is_meme:
             content_type = "meme"
         elif len(ocr_text) > 500:
             content_type = "document"
         elif any(word in text_lower for word in ['скриншот', 'screenshot']):
             content_type = "screenshot"
+        elif len(ocr_text) > 50:
+            content_type = "text"
         
         return {
             "type": content_type,
-            "confidence": 0.6,  # Низкая уверенность для OCR-only классификации
+            "confidence": 0.6,  # Низкая уверенность для эвристической классификации
             "tags": [],
             "is_meme": is_meme,
-            "method": "ocr_fallback"
+            "method": "openrouter_fallback"
         }
+    
+    async def analyze_image(
+        self,
+        image_bytes: bytes,
+        mime_type: str = "image/jpeg",
+        tenant_id: str = "fallback",
+        trace_id: str = "ocr_fallback"
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Полный анализ изображения через OpenRouter Vision API.
+        
+        Context7: Новый метод для полноценного Vision анализа через OpenRouter.
+        Используется вместо комбинации extract_text + classify_content_type.
+        
+        Args:
+            image_bytes: Байты изображения
+            mime_type: MIME тип изображения
+            tenant_id: ID tenant
+            trace_id: Trace ID для корреляции
+            
+        Returns:
+            Результат Vision анализа в формате совместимом с GigaChatVisionAdapter
+        """
+        if not self.openrouter_adapter:
+            logger.warning("OpenRouter Vision adapter not available")
+            return None
+        
+        try:
+            result = await self.openrouter_adapter.analyze_media(
+                sha256="",  # Не используется для fallback
+                file_content=image_bytes,
+                mime_type=mime_type,
+                tenant_id=tenant_id,
+                trace_id=trace_id
+            )
+            
+            return result
+            
+        except Exception as e:
+            logger.error(
+                "OpenRouter Vision analysis failed",
+                error=str(e),
+                trace_id=trace_id
+            )
+            return None
 

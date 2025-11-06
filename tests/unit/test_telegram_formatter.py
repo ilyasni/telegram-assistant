@@ -2,7 +2,7 @@
 Тестирование модуля telegram_formatter для проверки всех кейсов.
 """
 
-from utils.telegram_formatter import (
+from api.utils.telegram_formatter import (
     markdown_to_telegram_html,
     markdown_to_telegram_chunks,
     split_for_telegram

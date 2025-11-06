@@ -13,20 +13,22 @@ import warnings
 import os
 from typing import Dict, Any
 
-# Runtime guard: предупреждение в production
-if os.getenv("ENV") == "production":
+# Централизованные депрекейты
+try:
+    from shared.deprecations import warn_deprecated
+    warn_deprecated(
+        module="api.config.feature_flags",
+        replacement="shared.feature_flags",
+        remove_by="2025-02-13"
+    )
+except ImportError:
+    # Fallback если shared недоступен
     warnings.warn(
-        "api.config.feature_flags is deprecated. Use shared.feature_flags instead.",
+        "api.config.feature_flags is DEPRECATED. Use shared.feature_flags instead. "
+        "See docs/MIGRATION_FEATURE_FLAGS.md",
         DeprecationWarning,
         stacklevel=2
     )
-
-warnings.warn(
-    "api.config.feature_flags is DEPRECATED. Use shared.feature_flags instead. "
-    "See docs/MIGRATION_FEATURE_FLAGS.md",
-    DeprecationWarning,
-    stacklevel=2
-)
 
 # Re-export из shared для обратной совместимости
 try:

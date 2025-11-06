@@ -22,6 +22,7 @@ class RAGQuery(BaseModel):
     channel_ids: Optional[List[str]] = None
     audio_file_id: Optional[str] = None
     transcription_text: Optional[str] = None
+    intent_override: Optional[str] = None
 
 
 class RAGResultResponse(BaseModel):
@@ -60,7 +61,8 @@ async def rag_query(query_data: RAGQuery, request: Request, db: Session = Depend
         limit=query_data.limit or 5,
         channel_ids=query_data.channel_ids,
         audio_file_id=query_data.audio_file_id,
-        transcription_text=query_data.transcription_text
+        transcription_text=query_data.transcription_text,
+        intent_override=query_data.intent_override
     )
     
     # Преобразуем источники в dict для ответа

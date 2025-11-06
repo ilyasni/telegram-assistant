@@ -504,13 +504,22 @@ class VisionAnalysisTask:
                 
                 try:
                     # Context7: Проверка политики Vision с детальным логированием
+                    # Сначала проверяем budget gate для определения quota_exhausted
+                    quota_exhausted = False
+                    if self.budget_gate:
+                        budget_check = await self.budget_gate.check_budget(
+                            tenant_id=tenant_id,
+                            estimated_tokens=1792
+                        )
+                        quota_exhausted = not budget_check.allowed
+                    
                     policy_result = self.policy_engine.evaluate_media_for_vision(
                         media_file={
                             "mime_type": media_file.mime_type,
                             "size_bytes": media_file.size_bytes
                         },
                         channel_username=None,  # TODO: получить из БД
-                        quota_exhausted=False  # TODO: проверить через budget_gate
+                        quota_exhausted=quota_exhausted
                     )
                     
                     # Context7: Детальное логирование причин пропуска медиа
@@ -1182,14 +1191,51 @@ class VisionAnalysisTask:
                         return None
             
             if not analysis_result:
+                # Context7: Fallback на OpenRouter Vision при ошибках GigaChat
+                # Если GigaChat Vision API не смог проанализировать медиа, пробуем OpenRouter Vision
+                if self.ocr_fallback and hasattr(self.ocr_fallback, 'analyze_image'):
+                    logger.info(
+                        "GigaChat Vision failed after retries, falling back to OpenRouter Vision",
+                        extra={
+                            "sha256": media_file.sha256[:16] + "...",
+                            "post_id": post_id,
+                            "parse_errors": vision_api_parse_errors,
+                            "invalid_json_errors": vision_api_invalid_json_errors,
+                            "trace_id": trace_id
+                        }
+                    )
+                    try:
+                        fallback_result = await self._process_with_ocr(media_file, tenant_id, post_id, trace_id)
+                        if fallback_result:
+                            logger.info(
+                                "OpenRouter Vision fallback succeeded",
+                                extra={
+                                    "sha256": media_file.sha256[:16] + "...",
+                                    "post_id": post_id,
+                                    "trace_id": trace_id
+                                }
+                            )
+                            return fallback_result
+                    except Exception as fallback_error:
+                        logger.warning(
+                            "OpenRouter Vision fallback also failed",
+                            extra={
+                                "sha256": media_file.sha256[:16] + "...",
+                                "post_id": post_id,
+                                "error": str(fallback_error),
+                                "trace_id": trace_id
+                            }
+                        )
+                
                 logger.error(
-                    "Vision analysis failed after retries",
+                    "Vision analysis failed after retries and fallback",
                     extra={
                         "sha256": media_file.sha256[:16] + "...",
                         "post_id": post_id,
                         "trace_id": trace_id,
                         "parse_errors": vision_api_parse_errors,
-                        "invalid_json_errors": vision_api_invalid_json_errors
+                        "invalid_json_errors": vision_api_invalid_json_errors,
+                        "fallback_available": bool(self.ocr_fallback and hasattr(self.ocr_fallback, 'analyze_image'))
                     }
                 )
                 return None
@@ -1201,6 +1247,44 @@ class VisionAnalysisTask:
             }
             
         except Exception as e:
+            # Context7: Fallback на OpenRouter Vision при исключениях GigaChat Vision API
+            # Если произошло исключение при анализе через GigaChat, пробуем OpenRouter Vision
+            logger.warning(
+                "GigaChat Vision analysis exception, trying OpenRouter Vision fallback",
+                extra={
+                    "sha256": media_file.sha256[:16] + "..." if media_file.sha256 else None,
+                    "post_id": post_id,
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                    "trace_id": trace_id
+                }
+            )
+            
+            if self.ocr_fallback and hasattr(self.ocr_fallback, 'analyze_image'):
+                try:
+                    fallback_result = await self._process_with_ocr(media_file, tenant_id, post_id, trace_id)
+                    if fallback_result:
+                        logger.info(
+                            "OpenRouter Vision fallback succeeded after GigaChat exception",
+                            extra={
+                                "sha256": media_file.sha256[:16] + "..." if media_file.sha256 else None,
+                                "post_id": post_id,
+                                "trace_id": trace_id
+                            }
+                        )
+                        return fallback_result
+                except Exception as fallback_error:
+                    logger.warning(
+                        "OpenRouter Vision fallback also failed after GigaChat exception",
+                        extra={
+                            "sha256": media_file.sha256[:16] + "..." if media_file.sha256 else None,
+                            "post_id": post_id,
+                            "gigachat_error": str(e),
+                            "fallback_error": str(fallback_error),
+                            "trace_id": trace_id
+                        }
+                    )
+            
             logger.error(
                 "Vision analysis failed with exception",
                 extra={
@@ -1208,7 +1292,8 @@ class VisionAnalysisTask:
                     "post_id": post_id,
                     "error": str(e),
                     "error_type": type(e).__name__,
-                    "trace_id": trace_id
+                    "trace_id": trace_id,
+                    "fallback_available": bool(self.ocr_fallback and hasattr(self.ocr_fallback, 'analyze_image'))
                 },
                 exc_info=True
             )
@@ -1221,7 +1306,12 @@ class VisionAnalysisTask:
         post_id: str,
         trace_id: str
     ) -> Optional[Dict[str, Any]]:
-        """Обработка медиа через OCR fallback."""
+        """
+        Обработка медиа через OCR fallback (OpenRouter Vision).
+        
+        Context7: Использует OpenRouter Vision API с моделью qwen/qwen2.5-vl-32b-instruct:free
+        для полноценного Vision анализа вместо простого OCR.
+        """
         if not self.ocr_fallback:
             return None
         
@@ -1232,7 +1322,51 @@ class VisionAnalysisTask:
                 logger.warning("File not found in S3 for OCR", s3_key=media_file.s3_key)
                 return None
             
-            # OCR извлечение текста
+            # Context7: Используем новый метод analyze_image для полноценного Vision анализа
+            # Если доступен метод analyze_image (OpenRouter), используем его
+            if hasattr(self.ocr_fallback, 'analyze_image'):
+                analysis_result = await self.ocr_fallback.analyze_image(
+                    image_bytes=file_content,
+                    mime_type=media_file.mime_type or "image/jpeg",
+                    tenant_id=tenant_id,
+                    trace_id=trace_id
+                )
+                
+                if analysis_result:
+                    # Context7: Формируем результат в формате совместимом с GigaChatVisionAdapter
+                    ocr_data = analysis_result.get("ocr")
+                    ocr_text = ocr_data.get("text") if ocr_data and isinstance(ocr_data, dict) else None
+                    
+                    classification = analysis_result.get("classification", {})
+                    if isinstance(classification, dict):
+                        classification_type = classification.get("type", "other")
+                        labels = classification.get("tags", [])
+                    else:
+                        classification_type = classification if classification else "other"
+                        labels = analysis_result.get("labels", [])
+                    
+                    return {
+                        "sha256": media_file.sha256,
+                        "s3_key": media_file.s3_key,
+                        "analysis": {
+                            "provider": "ocr_fallback",
+                            "model": analysis_result.get("model", "qwen/qwen2.5-vl-32b-instruct:free"),
+                            "classification": classification_type,
+                            "labels": labels,
+                            "description": analysis_result.get("description"),
+                            "is_meme": analysis_result.get("is_meme", False),
+                            "objects": analysis_result.get("objects", []),
+                            "scene": analysis_result.get("scene"),
+                            "ocr": ocr_data,  # Полный OCR объект или None
+                            "ocr_text": ocr_text,  # Для обратной совместимости
+                            "context": analysis_result.get("context", {}),
+                            "tokens_used": analysis_result.get("tokens_used", 0),
+                            "file_id": None,
+                        }
+                    }
+            
+            # Fallback на старый метод extract_text + classify_content_type
+            # (для обратной совместимости с локальными OCR библиотеками)
             ocr_text = await self.ocr_fallback.extract_text(file_content)
             
             # Context7: Логирование результата OCR для отладки
@@ -1275,7 +1409,13 @@ class VisionAnalysisTask:
             }
             
         except Exception as e:
-            logger.error("OCR fallback failed", sha256=media_file.sha256, error=str(e))
+            logger.error(
+                "OCR fallback failed",
+                sha256=media_file.sha256,
+                error=str(e),
+                error_type=type(e).__name__,
+                trace_id=trace_id
+            )
             return None
     
     def _extract_ocr_data(self, result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -1299,7 +1439,7 @@ class VisionAnalysisTask:
             if ocr_text_stripped and len(ocr_text_stripped) > 0:
                 ocr_data = {
                     "text": ocr_text_stripped,
-                    "engine": "tesseract" if result.get("provider") == "ocr_fallback" else "gigachat",
+                    "engine": "openrouter" if result.get("provider") == "ocr_fallback" else "gigachat",
                     "confidence": None
                 }
         elif result.get("ocr"):
@@ -1318,7 +1458,7 @@ class VisionAnalysisTask:
                         }
                         # Если engine не указан, определяем по provider
                         if not ocr_data.get("engine"):
-                            ocr_data["engine"] = "tesseract" if result.get("provider") == "ocr_fallback" else "gigachat"
+                            ocr_data["engine"] = "openrouter" if result.get("provider") == "ocr_fallback" else "gigachat"
             elif isinstance(ocr_obj, str):
                 # Если ocr как строка (fallback)
                 ocr_text_stripped = ocr_obj.strip() if ocr_obj else ""
@@ -1530,7 +1670,7 @@ class VisionAnalysisTask:
             
             # Context7: Валидация данных перед сохранением
             try:
-                from shared.python.shared.schemas.enrichment_validation import validate_vision_enrichment
+                from shared.schemas.enrichment_validation import validate_vision_enrichment
                 validated_data = validate_vision_enrichment(vision_data)
                 # Конвертируем обратно в dict для сохранения
                 vision_data = validated_data.model_dump(exclude_none=False)
@@ -2324,10 +2464,27 @@ async def create_vision_analysis_task(
         )
     
     if ocr_fallback_enabled:
-        ocr_fallback = OCRFallbackService(
-            engine=vision_config.get("ocr_engine", "tesseract"),
-            languages=vision_config.get("ocr_languages", "rus+eng")
-        )
+        # Context7: Используем OpenRouter Vision для OCR fallback
+        # Модель qwen/qwen2.5-vl-32b-instruct:free для полноценного Vision анализа
+        try:
+            from ai_adapters.openrouter_vision import OpenRouterVisionAdapter
+            openrouter_adapter = OpenRouterVisionAdapter(
+                model="qwen/qwen2.5-vl-32b-instruct:free"
+            )
+            ocr_fallback = OCRFallbackService(
+                engine="openrouter",
+                openrouter_adapter=openrouter_adapter
+            )
+            logger.info(
+                "OCR fallback initialized with OpenRouter Vision",
+                model="qwen/qwen2.5-vl-32b-instruct:free"
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to initialize OpenRouter Vision adapter, OCR fallback disabled",
+                error=str(e)
+            )
+            ocr_fallback = None
     else:
         logger.info(
             "OCR fallback disabled",

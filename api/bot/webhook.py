@@ -57,7 +57,7 @@ def init_bot() -> None:
         _dp = Dispatcher()
         # Регистрация хендлеров
         try:
-            from bot.handlers import router as handlers_router  # local import to avoid cycles
+            from bot.handlers.base import router as handlers_router  # local import to avoid cycles
             _dp.include_router(handlers_router)
         except Exception as e:
             logger.error("Failed to register bot handlers", error=str(e))
@@ -151,6 +151,7 @@ async def set_bot_commands() -> None:
             BotCommand(command="ask", description="Задать вопрос"),
             BotCommand(command="search", description="Поиск по каналам"),
             BotCommand(command="recommend", description="Получить рекомендации"),
+            BotCommand(command="trends", description="Тренды в каналах"),
             BotCommand(command="subscription", description="Информация о подписке"),
             BotCommand(command="admin", description="Админ-панель"),
         ]

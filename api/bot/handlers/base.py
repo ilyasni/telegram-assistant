@@ -1,11 +1,12 @@
 """Telegram bot handlers with full functionality."""
 
 from aiogram import Router, F
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Voice
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from bot.states import DigestStates, AddChannelStates, ChannelManagementStates, SearchStates
 import httpx
 import structlog
 import re
@@ -20,6 +21,21 @@ router = Router()
 
 # API base URL
 API_BASE = "http://api:8000"
+
+# Подключение роутеров из подмодулей
+try:
+    from bot.handlers.trends_handlers import router as trends_router
+    router.include_router(trends_router)
+    logger.info("Trends handlers router included")
+except Exception as e:
+    logger.warning("Failed to include trends handlers router", error=str(e))
+
+try:
+    from bot.handlers.digest_handlers import router as digest_router
+    router.include_router(digest_router)
+    logger.info("Digest handlers router included")
+except Exception as e:
+    logger.warning("Failed to include digest handlers router", error=str(e))
 
 
 def _kb_login():
@@ -714,6 +730,10 @@ async def _rag_query(msg: Message, question: str, intent_override: Optional[str]
             "user_id": user['id']
         }
         
+        # Добавляем intent_override если указан
+        if intent_override:
+            query_data["intent_override"] = intent_override
+        
         # Добавляем данные о транскрибации если есть
         if voice_transcription:
             transcription_text = question  # question уже содержит транскрибированный текст
@@ -738,35 +758,39 @@ async def _rag_query(msg: Message, question: str, intent_override: Optional[str]
             "trend": "📈",
             "digest": "📰"
         }
+        intent_labels = {
+            "ask": "Ответ",
+            "search": "Результаты поиска",
+            "recommend": "Рекомендации",
+            "trend": "Тренды",
+            "digest": "Дайджест"
+        }
         emoji = intent_emoji.get(intent, "🤖")
+        label = intent_labels.get(intent, "Результат")
         
         # Конвертируем markdown ответ в Telegram HTML и разбиваем на чанки
+        # Context7: Ссылки уже включены inline в ответ через промпты LLM
         answer_chunks = markdown_to_telegram_chunks(answer)
         
-        # Формируем источники (только в последнем чанке)
-        sources_text = ""
-        if sources:
-            sources_text = "<b>📚 Источники:</b>\n"
-            for idx, source in enumerate(sources[:5], 1):  # Показываем до 5 источников
-                channel_title = source.get('channel_title', 'Неизвестный канал')
-                permalink = source.get('permalink', '')
-                if permalink:
-                    sources_text += f"{idx}. <a href='{permalink}'>{channel_title}</a>\n"
-                else:
-                    sources_text += f"{idx}. {channel_title}\n"
-        
+        # Context7: Улучшенное форматирование предупреждения о низкой уверенности
         confidence_text = ""
         if confidence < 0.5:
-            confidence_text = "\n⚠️ <i>Уверенность в ответе низкая. Попробуйте уточнить запрос.</i>"
+            confidence_text = "\n\n━━━━━━━━━━\n⚠️ <i>Уверенность в ответе низкая. Попробуйте уточнить запрос.</i>"
         
-        # Отправляем чанки
+        # Отправляем чанки с улучшенным форматированием
         for idx, chunk in enumerate(answer_chunks):
             is_last = idx == len(answer_chunks) - 1
-            text = f"{emoji} <b>Результат:</b>\n\n{chunk}\n\n"
             
-            # Добавляем источники и предупреждение только в последний чанк
+            # Context7: Улучшенная структура заголовка для читабельности
+            if idx == 0:
+                # Первый чанк - с заголовком
+                text = f"{emoji} <b>{label}</b>\n\n{chunk}"
+            else:
+                # Остальные чанки - без заголовка, только контент
+                text = chunk
+            
+            # Добавляем предупреждение только в последний чанк
             if is_last:
-                text += sources_text
                 text += confidence_text
             
             if idx == 0:
@@ -1008,13 +1032,23 @@ async def cmd_my_channels(msg: Message):
 # УНИВЕРСАЛЬНЫЙ ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ
 # ============================================================================
 
-@router.message(F.text & ~F.text.startswith("/"))
+@router.message(
+    F.text & ~F.text.startswith("/"),
+    ~StateFilter(DigestStates.waiting_topics),
+    ~StateFilter(DigestStates.waiting_schedule_time),
+    ~StateFilter(AddChannelStates.await_username),
+    ~StateFilter(ChannelManagementStates.viewing_channel),
+    ~StateFilter(ChannelManagementStates.confirming_delete),
+    ~StateFilter(SearchStates.awaiting_query)
+)
 async def handle_text_message(msg: Message):
     """
     Универсальный обработчик текстовых сообщений с автоматическим определением намерения.
     
     Context7: Автоматически определяет намерение пользователя через IntentClassifier
     и обрабатывает запрос через RAG Service.
+    
+    Исключает сообщения в состояниях FSM (ввод тем дайджеста, добавление каналов и т.д.).
     """
     # Игнорируем очень короткие сообщения (возможно, случайные)
     if len(msg.text.strip()) < 3:
@@ -1055,11 +1089,11 @@ async def handle_voice_message(msg: Message):
             return
         
         # Context7: Проверяем настройки SaluteSpeech перед обработкой
-        if not settings.salutespeech_client_id or not settings.salutespeech_client_secret:
+        if not settings.salutespeech_client_id or not settings.salutespeech_client_secret.get_secret_value():
             logger.warning(
                 "SaluteSpeech not configured",
                 has_client_id=bool(settings.salutespeech_client_id),
-                has_client_secret=bool(settings.salutespeech_client_secret)
+                has_client_secret=bool(settings.salutespeech_client_secret.get_secret_value())
             )
             await msg.answer(
                 "❌ <b>Транскрибация недоступна</b>\n\n"

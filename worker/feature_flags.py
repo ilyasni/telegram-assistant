@@ -12,20 +12,22 @@ Replacement: from shared.feature_flags import feature_flags
 import warnings
 import os
 
-# Runtime guard: предупреждение в production
-if os.getenv("ENV") == "production":
+# Централизованные депрекейты
+try:
+    from shared.deprecations import warn_deprecated
+    warn_deprecated(
+        module="worker.feature_flags",
+        replacement="shared.feature_flags",
+        remove_by="2025-02-13"
+    )
+except ImportError:
+    # Fallback если shared недоступен
     warnings.warn(
-        "worker.feature_flags is deprecated. Use shared.feature_flags instead.",
+        "worker.feature_flags is DEPRECATED. Use shared.feature_flags instead. "
+        "See docs/MIGRATION_FEATURE_FLAGS.md",
         DeprecationWarning,
         stacklevel=2
     )
-
-warnings.warn(
-    "worker.feature_flags is DEPRECATED. Use shared.feature_flags instead. "
-    "See docs/MIGRATION_FEATURE_FLAGS.md",
-    DeprecationWarning,
-    stacklevel=2
-)
 
 # Re-export из shared для обратной совместимости
 try:

@@ -998,7 +998,7 @@ class IndexingTask:
             
             # Context7: Валидация payload через Pydantic перед сохранением
             try:
-                from shared.python.shared.schemas.enrichment_validation import validate_qdrant_payload
+                from shared.schemas.enrichment_validation import validate_qdrant_payload
                 # Добавляем обязательные поля для валидации
                 payload_for_validation = payload.copy()
                 payload_for_validation.setdefault('has_media', post_data.get('has_media', False))
@@ -1263,7 +1263,7 @@ class IndexingTask:
             }
             
             try:
-                from shared.python.shared.schemas.enrichment_validation import validate_neo4j_post_node
+                from shared.schemas.enrichment_validation import validate_neo4j_post_node
                 validated_node = validate_neo4j_post_node(node_data)
                 # Конвертируем обратно в dict для передачи в create_post_node
                 node_data = validated_node.model_dump(exclude_none=False)

@@ -9,9 +9,11 @@ enrichment:
   # Включение/отключение enrichment
   enabled: true
   
-  # OCR Fallback (отключено по умолчанию - нет GPU и локальных моделей)
+  # OCR Fallback (включено с OpenRouter Vision)
+  # Context7: Использует OpenRouter Vision API с моделью qwen/qwen2.5-vl-32b-instruct:free
+  # для полноценного Vision анализа (OCR + классификация + описание)
   # См. docs/OCR_FALLBACK_LIMITATIONS.md для деталей
-  ocr_fallback_enabled: false
+  ocr_fallback_enabled: true
   
   # Максимальное количество параллельных операций enrichment
   max_concurrent_operations: 5

@@ -62,7 +62,7 @@ def get_vision_config_from_env() -> Dict[str, Any]:
         "base_url": os.getenv("GIGACHAT_BASE_URL", "https://gigachat.devices.sberbank.ru/api/v1"),
         "verify_ssl": os.getenv("GIGACHAT_VERIFY_SSL", "false").lower() == "true",
         "timeout": int(os.getenv("GIGACHAT_VISION_TIMEOUT", "600")),
-        "max_daily_tokens": int(os.getenv("GIGACHAT_MAX_DAILY_TOKENS", "250000")),
+        "max_daily_tokens": int(os.getenv("GIGACHAT_MAX_DAILY_TOKENS", "1250000")),  # Context7: Увеличен в 5 раз (250000 * 5)
         "max_concurrent": int(os.getenv("GIGACHAT_MAX_CONCURRENT_REQUESTS", "3")),
         "policy_config_path": os.getenv("VISION_POLICY_CONFIG_PATH", "/app/config/vision_policy.yml"),
         "ocr_fallback_enabled": os.getenv("VISION_OCR_FALLBACK_ENABLED", "true").lower() == "true",

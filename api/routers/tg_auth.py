@@ -80,7 +80,7 @@ def issue_session_token(tenant_id: str, ttl_seconds: int = None) -> str:
         "exp": now + ttl_seconds,
         "nonce": base64.urlsafe_b64encode(os.urandom(12)).decode().rstrip("=")
     }
-    return jwt.encode(payload, settings.jwt_secret, algorithm="HS256")
+    return jwt.encode(payload, settings.jwt_secret.get_secret_value(), algorithm="HS256")
 
 
 def decode_session_token(token: str) -> dict:
@@ -91,7 +91,7 @@ def decode_session_token(token: str) -> dict:
     try:
         payload = jwt.decode(
             token, 
-            settings.jwt_secret, 
+            settings.jwt_secret.get_secret_value(), 
             algorithms=["HS256"],
             options={"verify_aud": True},  # Включаем проверку audience
             audience="tg-auth"  # Обязательная проверка audience

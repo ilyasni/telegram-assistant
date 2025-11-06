@@ -148,8 +148,7 @@ class GraphService:
                     """
                     result = await session.run(
                         cypher_query,
-                        topic=topic,
-                        limit=limit
+                        parameters={"topic": topic, "limit": limit}
                     )
                 else:
                     # Поиск по всем темам, связанным с запросом
@@ -167,8 +166,7 @@ class GraphService:
                     """
                     result = await session.run(
                         cypher_query,
-                        query=query,
-                        limit=limit
+                        parameters={"query": query, "limit": limit}
                     )
                 
                 posts = []
@@ -218,7 +216,7 @@ class GraphService:
                 LIMIT 20
                 """
                 
-                result = await session.run(query, user_id=user_id)
+                result = await session.run(query, parameters={"user_id": user_id})
                 
                 interests = []
                 async for record in result:
@@ -273,9 +271,7 @@ class GraphService:
                 
                 result = await session.run(
                     query,
-                    user_id=user_id,
-                    topic=topic,
-                    weight=weight
+                    parameters={"user_id": user_id, "topic": topic, "weight": weight}
                 )
                 
                 record = await result.single()
@@ -319,7 +315,7 @@ class GraphService:
                 LIMIT $limit
                 """
                 
-                result = await session.run(query, topic=topic, limit=limit)
+                result = await session.run(query, parameters={"topic": topic, "limit": limit})
                 
                 similar_topics = []
                 async for record in result:

@@ -83,7 +83,7 @@ class IntentClassifier:
         api_key = openai_api_key or settings.openai_api_key or "dummy"
         
         self.llm = GigaChat(
-            credentials=settings.gigachat_credentials,
+            credentials=settings.gigachat_credentials.get_secret_value(),
             scope=settings.gigachat_scope or "GIGACHAT_API_PERS",
             model="GigaChat",
             base_url=api_base,

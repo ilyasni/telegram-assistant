@@ -141,7 +141,7 @@ class GigaChatVisionAdapter:
         
         # Context7: Circuit breaker для защиты от каскадных сбоев
         if circuit_breaker is None:
-            from shared.python.shared.utils.circuit_breaker import CircuitBreaker
+            from shared.utils.circuit_breaker import CircuitBreaker
             import os
             failure_threshold = int(os.getenv("GIGACHAT_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "5"))
             recovery_timeout = int(os.getenv("GIGACHAT_CIRCUIT_BREAKER_RECOVERY_TIMEOUT", "60"))
@@ -417,16 +417,16 @@ class GigaChatVisionAdapter:
                 async def _call_gigachat_api():
                     """Внутренняя функция для вызова GigaChat API через circuit breaker."""
                     return client.chat({
-                        "messages": [
-                            {
-                                "role": "user",
-                                "content": analysis_prompt,
-                                "attachments": [file_id]
-                            }
-                        ],
-                        "temperature": 0.1,
-                        "function_call": "auto"  # Для обработки файлов
-                    })
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": analysis_prompt,
+                            "attachments": [file_id]
+                        }
+                    ],
+                    "temperature": 0.1,
+                    "function_call": "auto"  # Для обработки файлов
+                })
                 
                 try:
                     response = await self.circuit_breaker.call_async(_call_gigachat_api)
@@ -482,10 +482,10 @@ class GigaChatVisionAdapter:
                 if self.s3_service and cache_key:
                     try:
                         size_bytes = await self.s3_service.put_json(
-                            data=analysis_result,
-                            s3_key=cache_key,
-                            compress=True
-                        )
+                        data=analysis_result,
+                        s3_key=cache_key,
+                        compress=True
+                    )
                         logger.debug(
                             "Vision result saved to S3 cache",
                             sha256=sha256,

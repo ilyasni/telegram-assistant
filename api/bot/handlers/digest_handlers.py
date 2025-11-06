@@ -102,14 +102,18 @@ async def cmd_digest(msg: Message):
 @router.callback_query(F.data == "digest:menu")
 async def callback_digest_menu(callback: CallbackQuery):
     """Возврат в главное меню дайджестов."""
-    await callback.message.edit_text(
-        "📰 <b>Дайджесты</b>\n\n"
-        "Персонализированные дайджесты новостей по вашим темам.\n\n"
-        "Выберите действие:",
-        reply_markup=_kb_digest_menu(),
-        parse_mode="HTML"
-    )
-    await callback.answer()
+    try:
+        await callback.message.edit_text(
+            "📰 <b>Дайджесты</b>\n\n"
+            "Персонализированные дайджесты новостей по вашим темам.\n\n"
+            "Выберите действие:",
+            reply_markup=_kb_digest_menu(),
+            parse_mode="HTML"
+        )
+        await callback.answer()
+    except Exception as e:
+        logger.error("Error showing digest menu", error=str(e))
+        await callback.answer("❌ Ошибка загрузки меню", show_alert=True)
 
 
 @router.callback_query(F.data == "digest:settings")

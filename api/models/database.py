@@ -280,6 +280,9 @@ class Post(Base):
     invert_media = Column(Boolean, default=False)
     last_metrics_update = Column(DateTime, default=datetime.utcnow)
     
+    # Context7: Поле для связи постов с альбомами (Telegram grouped_id)
+    grouped_id = Column(BigInteger, nullable=True, index=True)
+    
     # Relationships
     channel = relationship("Channel", back_populates="posts")
     indexing_status = relationship("IndexingStatus", back_populates="post")

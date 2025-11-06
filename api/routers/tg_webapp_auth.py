@@ -75,7 +75,7 @@ def create_jwt(
     
     # Подпись (упрощенная)
     signature = hmac.new(
-        settings.jwt_secret.encode(),
+        settings.jwt_secret.get_secret_value().encode(),
         f"{header_b64}.{payload_b64}".encode(),
         hashlib.sha256
     ).digest()
