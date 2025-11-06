@@ -78,20 +78,23 @@ async def generate_digest_for_user(user_id: str, tenant_id: str, db: Session):
             
             if user and user.telegram_id:
                 try:
-                    # Форматируем дайджест для отправки
-                    digest_text = f"📰 <b>Ваш дайджест за {digest_history.digest_date}</b>\n\n"
-                    digest_text += digest_content.content[:4000]  # Лимит Telegram - 4096 символов
+                    # Импортируем функцию конвертации
+                    from utils.telegram_formatter import markdown_to_telegram_chunks
                     
-                    if digest_content.posts_count > 0:
-                        digest_text += f"\n\n📊 <i>Найдено постов: {digest_content.posts_count}</i>"
+                    # Конвертируем markdown в Telegram HTML и разбиваем на чанки
+                    digest_chunks = markdown_to_telegram_chunks(digest_content.content)
                     
                     # Отправляем через бота
                     if bot:
-                        await bot.send_message(
-                            chat_id=user.telegram_id,
-                            text=digest_text,
-                            parse_mode="HTML"
-                        )
+                        for idx, chunk in enumerate(digest_chunks):
+                            prefix = f"📰 <b>Ваш дайджест за {digest_history.digest_date}</b>\n\n" if idx == 0 else ""
+                            suffix = f"\n\n📊 <i>Найдено постов: {digest_content.posts_count}</i>" if idx == len(digest_chunks) - 1 and digest_content.posts_count > 0 else ""
+                            
+                            await bot.send_message(
+                                chat_id=user.telegram_id,
+                                text=prefix + chunk + suffix,
+                                parse_mode="HTML"
+                            )
                         
                         # Обновляем статус
                         digest_history.status = "sent"

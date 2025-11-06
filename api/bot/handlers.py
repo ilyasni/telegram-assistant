@@ -13,6 +13,7 @@ import io
 from typing import Optional
 from datetime import datetime
 from config import settings
+from utils.telegram_formatter import markdown_to_telegram_chunks
 
 logger = structlog.get_logger()
 router = Router()
@@ -739,22 +740,41 @@ async def _rag_query(msg: Message, question: str, intent_override: Optional[str]
         }
         emoji = intent_emoji.get(intent, "🤖")
         
-        text = f"{emoji} <b>Результат:</b>\n\n{answer}\n\n"
+        # Конвертируем markdown ответ в Telegram HTML и разбиваем на чанки
+        answer_chunks = markdown_to_telegram_chunks(answer)
         
+        # Формируем источники (только в последнем чанке)
+        sources_text = ""
         if sources:
-            text += "<b>📚 Источники:</b>\n"
+            sources_text = "<b>📚 Источники:</b>\n"
             for idx, source in enumerate(sources[:5], 1):  # Показываем до 5 источников
                 channel_title = source.get('channel_title', 'Неизвестный канал')
                 permalink = source.get('permalink', '')
                 if permalink:
-                    text += f"{idx}. <a href='{permalink}'>{channel_title}</a>\n"
+                    sources_text += f"{idx}. <a href='{permalink}'>{channel_title}</a>\n"
                 else:
-                    text += f"{idx}. {channel_title}\n"
+                    sources_text += f"{idx}. {channel_title}\n"
         
+        confidence_text = ""
         if confidence < 0.5:
-            text += "\n⚠️ <i>Уверенность в ответе низкая. Попробуйте уточнить запрос.</i>"
+            confidence_text = "\n⚠️ <i>Уверенность в ответе низкая. Попробуйте уточнить запрос.</i>"
         
-        await loading_msg.edit_text(text, parse_mode="HTML", disable_web_page_preview=True)
+        # Отправляем чанки
+        for idx, chunk in enumerate(answer_chunks):
+            is_last = idx == len(answer_chunks) - 1
+            text = f"{emoji} <b>Результат:</b>\n\n{chunk}\n\n"
+            
+            # Добавляем источники и предупреждение только в последний чанк
+            if is_last:
+                text += sources_text
+                text += confidence_text
+            
+            if idx == 0:
+                # Первый чанк - редактируем сообщение загрузки
+                await loading_msg.edit_text(text, parse_mode="HTML", disable_web_page_preview=True)
+            else:
+                # Остальные чанки - новые сообщения
+                await msg.answer(text, parse_mode="HTML", disable_web_page_preview=True)
         
     except httpx.TimeoutException:
         await loading_msg.edit_text("⏱️ <b>Превышено время ожидания</b>\n\nПопробуйте позже или упростите запрос.")

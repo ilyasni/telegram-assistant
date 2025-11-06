@@ -463,6 +463,7 @@ class ParseAllChannelsTask:
             logger.info("Lock held by another instance, skipping tick")
             return
         
+        tick_start_time = datetime.now(timezone.utc)
         try:
             logger.info("Running scheduler tick (lock acquired)")
             
@@ -476,9 +477,36 @@ class ParseAllChannelsTask:
             
             if not channels:
                 logger.warning("No active channels found for parsing")
-                return
+                # Context7: Не делаем return здесь, чтобы finally блок освободил lock
+                # Просто пропускаем парсинг каналов
             
-            for channel in channels:
+            # Context7: Ограничиваем время выполнения tick, чтобы lock не зависал
+            # TTL lock = interval_sec * 2, поэтому tick должен завершиться быстрее
+            max_tick_duration = self.interval_sec * 1.5  # 90% от TTL lock
+            channels_processed = 0
+            
+            # Context7: Сортируем каналы по last_parsed_at (старые первыми) для равномерного парсинга
+            # Это гарантирует, что каналы с давно не обновленными данными обрабатываются в первую очередь
+            channels_sorted = sorted(
+                channels,
+                key=lambda c: (
+                    c.get('last_parsed_at') is None,  # Новые каналы (None) первыми
+                    c.get('last_parsed_at') or datetime.min.replace(tzinfo=timezone.utc)  # Затем по дате (старые первыми)
+                )
+            )
+            
+            for idx, channel in enumerate(channels_sorted):
+                # Context7: Проверяем, не превысили ли мы максимальное время выполнения
+                elapsed = (datetime.now(timezone.utc) - tick_start_time).total_seconds()
+                if elapsed > max_tick_duration:
+                    logger.warning(
+                        "Tick duration exceeded maximum, stopping channel processing",
+                        channels_processed=channels_processed,
+                        channels_total=len(channels),
+                        elapsed_seconds=elapsed,
+                        max_duration_seconds=max_tick_duration
+                    )
+                    break
                 try:
                     # Get HWM from Redis
                     hwm_key = f"parse_hwm:{channel['id']}"
@@ -536,9 +564,21 @@ class ParseAllChannelsTask:
                     
                     # Context7: [C7-ID: backfill-missing-posts-001] Проверка и запуск backfill при пропусках
                     await self._check_and_trigger_backfill(channel)
+                    
+                    channels_processed += 1
+                    # Context7: Логируем прогресс каждые 10 каналов
+                    if channels_processed % 10 == 0:
+                        elapsed = (datetime.now(timezone.utc) - tick_start_time).total_seconds()
+                        logger.info(
+                            "Tick progress",
+                            channels_processed=channels_processed,
+                            channels_total=len(channels),
+                            elapsed_seconds=elapsed
+                        )
                         
                 except Exception as e:
                     logger.error(f"Failed to monitor channel {channel['id']}: {str(e)}")
+                    channels_processed += 1
             
             # Update scheduler freshness metric
             now_ts = datetime.now(timezone.utc).timestamp()
@@ -549,7 +589,13 @@ class ParseAllChannelsTask:
                 self.app_state["scheduler"]["last_tick_ts"] = datetime.now(timezone.utc).isoformat()
                 self.app_state["scheduler"]["status"] = "running"
             
-            logger.info("Scheduler tick completed")
+            tick_duration = (datetime.now(timezone.utc) - tick_start_time).total_seconds()
+            logger.info(
+                "Scheduler tick completed",
+                channels_processed=channels_processed,
+                channels_total=len(channels) if channels else 0,
+                duration_seconds=tick_duration
+            )
             
         finally:
             await self._release_lock()

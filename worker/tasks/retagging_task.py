@@ -435,8 +435,7 @@ class RetaggingTask:
                         p.content,
                         p.has_media,
                         pe.tags,
-                        pe.metadata->>'tags_version' as tags_version,
-                        PostTaggedEventV1.compute_hash(COALESCE(pe.tags, '[]'::jsonb)::text[]) as tags_hash
+                        pe.metadata->>'tags_version' as tags_version
                     FROM posts p
                     LEFT JOIN post_enrichment pe ON pe.post_id = p.id AND pe.kind = 'tags'
                     WHERE p.id = $1
@@ -446,7 +445,8 @@ class RetaggingTask:
                 if not row:
                     return None
                 
-                # Вычисляем tags_hash
+                # Context7: Вычисляем tags_hash в Python, а не в SQL
+                # PostgreSQL не знает о Python функциях
                 tags = row.get('tags') or []
                 if isinstance(tags, str):
                     import json

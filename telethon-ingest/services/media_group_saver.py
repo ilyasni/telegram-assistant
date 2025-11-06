@@ -293,6 +293,11 @@ async def save_media_group(
                 # Маппинг media_type на media_kind
                 media_kind = media_type if media_type in ['photo', 'video', 'document', 'audio'] else None
             
+            # Context7: asyncpg требует JSON строку для JSONB при executemany
+            # Используем json.dumps() для преобразования dict в JSON строку
+            # Это аналогично подходу в enrichment_repository.py (строка 160)
+            meta_value = json.dumps({}, ensure_ascii=False)
+            
             item_data = {
                 "group_id": group_id,
                 "post_id": post_id,
@@ -303,13 +308,14 @@ async def save_media_group(
                 "sha256": sha256,  # Дублируем для поля sha256
                 "media_object_id": media_object_id,
                 "media_kind": media_kind,
-                "meta": {}  # Context7: Передаем dict напрямую, SQLAlchemy/asyncpg автоматически преобразует в JSONB
+                "meta": meta_value  # Context7: JSON строка для asyncpg JSONB
             }
             items_params.append(item_data)
         
         if items_params:
-            # Context7: Исправлен SQL запрос - используем CAST(:meta AS jsonb) как в enrichment_repository.py
-            # SQLAlchemy/asyncpg передает dict как параметр, PostgreSQL CAST преобразует в JSONB
+            # Context7: Исправлен SQL запрос - используем CAST(:meta AS jsonb) для asyncpg
+            # При executemany через SQLAlchemy asyncpg требует явного CAST для JSON строк
+            # Это аналогично подходу в enrichment_repository.py, но с именованными параметрами
             insert_items_sql = text("""
                 INSERT INTO media_group_items (
                     group_id, post_id, position, media_type,
@@ -330,7 +336,10 @@ async def save_media_group(
                     media_kind = COALESCE(EXCLUDED.media_kind, media_group_items.media_kind)
             """)
             
-            await db_session.execute(insert_items_sql, items_params)
+            # Context7: Выполняем вставку по одному элементу, так как executemany может не работать с CAST
+            # Это менее эффективно, но гарантирует правильную обработку JSONB
+            for item_param in items_params:
+                await db_session.execute(insert_items_sql, item_param)
         
         logger.info(
             "Media group saved",

@@ -439,18 +439,17 @@ async def callback_digest_generate(callback: CallbackQuery):
                 posts_count = result.get("posts_count", 0)
                 topics = result.get("topics", [])
                 
-                # Ограничиваем длину контента (Telegram лимит 4096 символов)
-                if len(content) > 4000:
-                    content = content[:4000] + "\n\n... (продолжение в следующем сообщении)"
+                # Импортируем функцию конвертации
+                from utils.telegram_formatter import markdown_to_telegram_chunks
                 
-                text = (
-                    f"📰 <b>Дайджест готов!</b>\n\n"
-                    f"📊 Постов: {posts_count}\n"
-                    f"📝 Темы: {', '.join(topics[:5])}\n\n"
-                    f"{content}"
-                )
+                # Конвертируем markdown в Telegram HTML и разбиваем на чанки
+                chunks = markdown_to_telegram_chunks(content)
                 
-                await callback.message.answer(text, parse_mode="HTML")
+                # Отправляем чанки
+                for idx, chunk in enumerate(chunks):
+                    prefix = f"📰 <b>Дайджест готов!</b>\n\n📊 Постов: {posts_count}\n📝 Темы: {', '.join(topics[:5])}\n\n" if idx == 0 else ""
+                    await callback.message.answer(prefix + chunk, parse_mode="HTML")
+                
                 await callback.answer("✅ Дайджест сгенерирован")
             else:
                 error_detail = r.json().get("detail", "Неизвестная ошибка")

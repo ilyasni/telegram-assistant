@@ -230,12 +230,21 @@ class EnrichmentRepository:
                         """, data_jsonb, post_id, kind)
                     elif kind == 'tags':
                         # Context7: Синхронизация tags для tags kind
+                        # Используем ARRAY(SELECT jsonb_array_elements_text(...)) для преобразования JSONB массива в text[]
                         await conn.execute("""
                             UPDATE post_enrichment
                             SET 
                                 tags = COALESCE(
-                                    ($1::jsonb->'tags')::text[],
-                                    ($1::jsonb->'enrichment_data'->'tags')::text[],
+                                    CASE 
+                                        WHEN $1::jsonb->'tags' IS NOT NULL AND jsonb_typeof($1::jsonb->'tags') = 'array'
+                                        THEN ARRAY(SELECT jsonb_array_elements_text($1::jsonb->'tags'))
+                                        ELSE NULL
+                                    END,
+                                    CASE 
+                                        WHEN $1::jsonb->'enrichment_data'->'tags' IS NOT NULL AND jsonb_typeof($1::jsonb->'enrichment_data'->'tags') = 'array'
+                                        THEN ARRAY(SELECT jsonb_array_elements_text($1::jsonb->'enrichment_data'->'tags'))
+                                        ELSE NULL
+                                    END,
                                     tags
                                 )
                             WHERE post_id = $2 AND kind = 'tags'
@@ -313,8 +322,16 @@ class EnrichmentRepository:
                             END,
                             tags = CASE 
                                 WHEN EXCLUDED.kind = 'tags' THEN COALESCE(
-                                    (EXCLUDED.data->'tags')::text[],
-                                    (EXCLUDED.data->'enrichment_data'->'tags')::text[],
+                                    CASE 
+                                        WHEN EXCLUDED.data->'tags' IS NOT NULL AND jsonb_typeof(EXCLUDED.data->'tags') = 'array'
+                                        THEN ARRAY(SELECT jsonb_array_elements_text(EXCLUDED.data->'tags'))
+                                        ELSE NULL
+                                    END,
+                                    CASE 
+                                        WHEN EXCLUDED.data->'enrichment_data'->'tags' IS NOT NULL AND jsonb_typeof(EXCLUDED.data->'enrichment_data'->'tags') = 'array'
+                                        THEN ARRAY(SELECT jsonb_array_elements_text(EXCLUDED.data->'enrichment_data'->'tags'))
+                                        ELSE NULL
+                                    END,
                                     post_enrichment.tags
                                 )
                                 ELSE post_enrichment.tags

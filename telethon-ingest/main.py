@@ -432,8 +432,14 @@ async def run_ingest_loop():
         # Context7: Инициализация MediaProcessor для обработки медиа в real-time событиях
         media_processor = None
         try:
+            # Context7: Добавляем корень проекта в sys.path для импорта модулей
+            import sys
+            project_root = '/opt/telegram-assistant'
+            if project_root not in sys.path:
+                sys.path.insert(0, project_root)
+            
             from api.services.s3_storage import S3StorageService
-            from api.services.storage_quota import StorageQuotaService
+            from worker.services.storage_quota import StorageQuotaService
             from services.media_processor import MediaProcessor
             
             # Инициализация S3StorageService с параметрами из env

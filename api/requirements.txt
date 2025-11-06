@@ -38,3 +38,6 @@ apscheduler>=3.10.0
 
 # Anti-duplicates
 simhash>=2.1.2
+
+# Markdown parsing
+mistune>=3.0.0

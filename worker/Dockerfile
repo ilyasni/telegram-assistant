@@ -3,8 +3,11 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # [C7-ID: dev-mode-006] Оптимизация слоёв: системные зависимости
+# Context7: Убрали зависимости Playwright - используем внешний crawl4ai сервис
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
+    curl \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # [C7-ID: dev-mode-006] Оптимизация кеша: копируем requirements отдельно
@@ -18,6 +21,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 COPY shared/ /app/shared/
 RUN pip install -e /app/shared/python
 
+# Context7: Убрали установку Playwright - используем внешний crawl4ai сервис
+
 # [C7-ID: dev-mode-006] Копируем код ПОСЛЕ установки зависимостей
 COPY worker/ .
 
@@ -30,7 +35,8 @@ COPY scripts/pipeline_health_cron.sh /app/scripts/
 COPY config/slo_thresholds.json /app/config/
 
 # Создание пользователя для безопасности
-RUN useradd -m -u 1000 worker && chown -R worker:worker /app
+RUN useradd -m -u 1000 worker && \
+    chown -R worker:worker /app
 USER worker
 
 # Health check

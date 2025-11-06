@@ -141,6 +141,17 @@ class ChannelParser:
         start_time = time.time()
         max_message_date = None
         
+        # Context7: Проверяем и откатываем активную транзакцию перед началом парсинга
+        # Это предотвращает ошибки "A transaction is already begun on this Session"
+        try:
+            if self.db_session.in_transaction():
+                await self.db_session.rollback()
+                logger.debug("Rolled back active transaction before parsing",
+                           channel_id=channel_id)
+        except Exception as e:
+            logger.warning("Failed to rollback transaction before parsing",
+                         channel_id=channel_id, error=str(e))
+        
         # Context7: Сброс статистики для каждого канала
         self.stats = {
             'messages_parsed': 0,
@@ -276,6 +287,17 @@ class ChannelParser:
                         'max_date': None,
                         'rate_limited': True
                     }
+            
+            # Context7: Проверяем и откатываем активную транзакцию перед получением entity
+            # Это предотвращает ошибки "A transaction is already begun on this Session"
+            try:
+                if self.db_session.in_transaction():
+                    await self.db_session.rollback()
+                    logger.debug("Rolled back active transaction before getting channel entity",
+                               channel_id=channel_id)
+            except Exception as e:
+                logger.warning("Failed to rollback transaction before getting channel entity",
+                             channel_id=channel_id, error=str(e))
             
             # Получение entity канала и tg_channel_id
             channel_result = await self._get_channel_entity(telegram_client, channel_id)
@@ -507,6 +529,10 @@ class ChannelParser:
             # Context7 best practice: Автоматическое заполнение tg_channel_id в БД, если отсутствует
             if entity and not tg_channel_id_db and tg_channel_id:
                 try:
+                    # Context7: Проверяем и откатываем активную транзакцию перед началом новой
+                    if self.db_session.in_transaction():
+                        await self.db_session.rollback()
+                    
                     # Context7: Используем транзакцию через async with для безопасной обработки ошибок
                     async with self.db_session.begin():
                         await self.db_session.execute(
@@ -518,9 +544,24 @@ class ChannelParser:
                               username=username,
                               tg_channel_id=tg_channel_id)
                 except Exception as e:
-                    logger.warning("Failed to update tg_channel_id in DB", 
-                                 channel_id=channel_id, error=str(e))
+                    # Context7: Обрабатываем разные типы ошибок gracefully
+                    error_str = str(e)
+                    if "UniqueViolationError" in error_str or "duplicate key" in error_str.lower():
+                        # tg_channel_id уже существует для другого канала - это нормально
+                        logger.debug("tg_channel_id already exists for another channel, skipping update",
+                                   channel_id=channel_id,
+                                   tg_channel_id=tg_channel_id,
+                                   error=error_str)
+                    else:
+                        logger.warning("Failed to update tg_channel_id in DB", 
+                                     channel_id=channel_id, error=error_str)
                     # Context7: Rollback уже выполнен автоматически через async with begin()
+                    # Но делаем дополнительный rollback на случай ошибки
+                    try:
+                        if self.db_session.in_transaction():
+                            await self.db_session.rollback()
+                    except Exception:
+                        pass
             
             if not entity or not tg_channel_id:
                 logger.error("Failed to resolve channel entity", 
@@ -1109,6 +1150,8 @@ class ChannelParser:
             
             # Обрабатываем полученные сообщения
             messages_filtered = 0
+            found_newer_messages = False  # Context7: Флаг для отслеживания наличия новых сообщений
+            
             for message in messages:
                 # Context7: КРИТИЧНО - нормализуем message.date к UTC для корректного сравнения
                 # Telethon может возвращать datetime с разными timezone или без timezone
@@ -1130,18 +1173,29 @@ class ChannelParser:
                         logger.info(f"Reached since_date in historical mode, stopping. message_date_utc={message_date_utc}, since_date={since_date}, messages_yielded={messages_yielded}, messages_filtered={messages_filtered}")
                         break
                 else:  # incremental
-                    # Incremental: парсим только сообщения строго новее since_date (между last_parsed_at и now)
-                    # Сообщения приходят от новых к старым, поэтому при встрече <= since_date останавливаемся
-                    # Это исключает сообщения на границе since_date (равные last_parsed_at), предотвращая дубликаты
-                    if message_date_utc <= since_date:
-                        logger.info(f"Reached since_date in incremental mode, stopping. message_date_utc={message_date_utc}, since_date={since_date}, messages_yielded={messages_yielded}, messages_filtered={messages_filtered}")
+                    # Context7: КРИТИЧНО - для incremental режима проверяем, есть ли сообщения новее since_date
+                    # Если первое сообщение уже старше since_date, это означает, что новых сообщений нет
+                    # НО: если мы уже нашли хотя бы одно новое сообщение, продолжаем до тех пор, пока не встретим старое
+                    if message_date_utc > since_date:
+                        found_newer_messages = True
+                        # Включаем сообщение в batch
+                        batch.append(message)
+                        messages_yielded += 1
+                        messages_filtered += 1
+                    elif found_newer_messages:
+                        # Мы уже нашли новые сообщения, но теперь встретили старое - останавливаемся
+                        logger.info(f"Reached since_date in incremental mode after processing newer messages, stopping. message_date_utc={message_date_utc}, since_date={since_date}, messages_yielded={messages_yielded}, messages_filtered={messages_filtered}")
+                        break
+                    else:
+                        # Первое сообщение уже старше since_date - новых сообщений нет
+                        logger.info(f"No newer messages found in incremental mode. First message date: {message_date_utc}, since_date: {since_date}, messages_yielded={messages_yielded}, messages_filtered={messages_filtered}")
                         break
                 
-                # Используем нормализованную дату для batch
-                # Сохраняем оригинальный message, но используем нормализованную дату для сравнений
-                batch.append(message)
-                messages_yielded += 1
-                messages_filtered += 1
+                # Для historical режима добавляем сообщение в batch
+                if mode == "historical":
+                    batch.append(message)
+                    messages_yielded += 1
+                    messages_filtered += 1
                 
                 if len(batch) >= batch_size:
                     yield batch

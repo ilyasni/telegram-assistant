@@ -1827,6 +1827,8 @@ class PipelineChecker:
         try:
             async with self.db_pool.acquire() as conn:
                 # Ищем посты с тегами (прошли тегирование)
+                # Context7: Ищем посты с непустыми тегами (cardinality > 0)
+                # Используем подзапрос для фильтрации постов с непустыми тегами
                 row = await conn.fetchrow("""
                     SELECT 
                         p.id as post_id,
@@ -1839,13 +1841,18 @@ class PipelineChecker:
                         isi.graph_status,
                         isi.error_message
                     FROM posts p
-                    LEFT JOIN post_enrichment pe_tags 
-                        ON p.id = pe_tags.post_id AND pe_tags.kind = 'tags'
+                    INNER JOIN (
+                        SELECT post_id, tags
+                        FROM post_enrichment
+                        WHERE kind = 'tags'
+                          AND tags IS NOT NULL
+                          AND tags != '{}'::text[]
+                          AND cardinality(tags) > 0
+                    ) pe_tags ON p.id = pe_tags.post_id
                     LEFT JOIN post_enrichment pe_crawl 
                         ON p.id = pe_crawl.post_id AND pe_crawl.kind = 'crawl'
                     LEFT JOIN indexing_status isi
                         ON p.id = isi.post_id
-                    WHERE pe_tags.post_id IS NOT NULL
                     ORDER BY p.posted_at DESC
                     LIMIT 1
                 """)
@@ -1940,7 +1947,27 @@ class PipelineChecker:
                 # 2. Пост проиндексирован в Qdrant И Neo4j, ИЛИ
                 # 3. Есть retryable ошибка (ожидается ретрай)
                 # 4. Пост был пропущен по валидным причинам (пустой текст - нормальное поведение)
-                has_tags = row['tags'] is not None and (isinstance(row['tags'], list) and len(row['tags']) > 0 if isinstance(row['tags'], list) else row['tags'] is not None)
+                # Context7: Проверяем наличие непустых тегов (массив или список с элементами)
+                tags_value = row['tags']
+                logger.debug("Checking tags for pipeline flow", 
+                           post_id=post_id,
+                           tags_value=tags_value,
+                           tags_type=type(tags_value).__name__)
+                
+                if tags_value is None:
+                    has_tags = False
+                    logger.debug("Tags are None", post_id=post_id)
+                elif isinstance(tags_value, (list, tuple)):
+                    has_tags = len(tags_value) > 0
+                    logger.debug("Tags are list/tuple", post_id=post_id, length=len(tags_value), has_tags=has_tags)
+                elif isinstance(tags_value, dict):
+                    # PostgreSQL array может вернуться как dict в некоторых случаях
+                    has_tags = len(tags_value) > 0
+                    logger.debug("Tags are dict", post_id=post_id, length=len(tags_value), has_tags=has_tags)
+                else:
+                    # Другие типы (например, строки) - считаем что теги есть
+                    has_tags = bool(tags_value)
+                    logger.debug("Tags are other type", post_id=post_id, type=type(tags_value).__name__, has_tags=has_tags)
                 
                 # Если статус failed, но ошибка retryable - считаем, что пайплайн работает корректно
                 if (embedding_status == 'failed' or graph_status == 'failed') and is_retryable_error:
