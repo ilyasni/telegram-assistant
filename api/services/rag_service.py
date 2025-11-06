@@ -300,20 +300,33 @@ class RAGService:
         try:
             # Context7: PostgreSQL FTS для keyword search
             # Используем tsvector для поиска по content
-            fts_query = text("""
-                SELECT 
+            # Context7: Фильтрация по tenant_id через JOIN с user_channel и по channel_ids
+            base_query = """
+                SELECT DISTINCT
                     p.id,
                     p.channel_id,
                     p.content,
                     p.telegram_post_url,
                     ts_rank(to_tsvector('russian', COALESCE(p.content, '')), plainto_tsquery('russian', :query)) as rank
                 FROM posts p
+                JOIN channels c ON p.channel_id = c.id
+                JOIN user_channel uc ON uc.channel_id = c.id
+                JOIN users u ON u.id = uc.user_id
                 WHERE to_tsvector('russian', COALESCE(p.content, '')) @@ plainto_tsquery('russian', :query)
-                ORDER BY rank DESC
-                LIMIT :limit
-            """)
+                    AND u.tenant_id = :tenant_id::uuid
+            """
             
-            result = db.execute(fts_query, {"query": query, "limit": limit})
+            params = {"query": query, "tenant_id": tenant_id, "limit": limit}
+            
+            # Добавляем фильтрацию по channel_ids если указаны
+            if channel_ids:
+                base_query += " AND p.channel_id = ANY(:channel_ids::uuid[])"
+                params["channel_ids"] = channel_ids
+            
+            base_query += " ORDER BY rank DESC LIMIT :limit"
+            
+            fts_query = text(base_query)
+            result = db.execute(fts_query, params)
             rows = result.fetchall()
             
             results = []

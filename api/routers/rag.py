@@ -6,6 +6,7 @@ from typing import List, Optional
 from uuid import UUID
 import structlog
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 from models.database import get_db, User
 from services.rag_service import get_rag_service, RAGResult, RAGSource
 from fastapi import Request
@@ -108,8 +109,6 @@ async def get_rag_status(user_id: UUID, request: Request, db: Session = Depends(
     
     try:
         from services.rag_service import get_rag_service
-        from models.database import Post
-        from sqlalchemy import func
         
         rag_service = get_rag_service()
         
@@ -132,10 +131,17 @@ async def get_rag_status(user_id: UUID, request: Request, db: Session = Depends(
         collection_info = rag_service.qdrant_client.get_collection(collection_name)
         indexed_count = collection_info.points_count if collection_info else 0
         
-        # Получаем общее количество постов пользователя
-        total_posts = db.query(func.count(Post.id)).filter(
-            Post.deleted == False
-        ).scalar() or 0
+        # Получаем общее количество постов пользователя (только для его tenant)
+        # Context7: Фильтрация по tenant_id через JOIN с user_channel
+        total_posts_query = text("""
+            SELECT COUNT(DISTINCT p.id)
+            FROM posts p
+            JOIN channels c ON p.channel_id = c.id
+            JOIN user_channel uc ON uc.channel_id = c.id
+            JOIN users u ON u.id = uc.user_id
+            WHERE u.tenant_id = :tenant_id::uuid
+        """)
+        total_posts = db.execute(total_posts_query, {"tenant_id": tenant_id}).scalar() or 0
         
         # Проверяем последнюю индексацию (можно добавить поле в БД для отслеживания)
         status = "indexed" if indexed_count > 0 else "not_indexed"
