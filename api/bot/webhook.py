@@ -2,6 +2,7 @@ from fastapi import APIRouter, Request, HTTPException
 from aiogram import Bot, Dispatcher, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.types import BotCommand
 import structlog
 import json
 from config import settings
@@ -39,6 +40,12 @@ TG_WEBHOOK_LATENCY = Histogram(
 
 
 def init_bot() -> None:
+    """
+    Инициализация бота.
+    
+    Context7: Инициализирует бота и dispatcher, но не устанавливает команды здесь.
+    Команды устанавливаются асинхронно в ensure_webhook() после настройки webhook.
+    """
     global bot, dp
     token = os.getenv("TELEGRAM_BOT_TOKEN") or settings.telegram_bot_token
     if not token:
@@ -54,11 +61,15 @@ def init_bot() -> None:
             _dp.include_router(handlers_router)
         except Exception as e:
             logger.error("Failed to register bot handlers", error=str(e))
+        # Context7: Устанавливаем глобальные переменные напрямую, а не через globals()
+        # Это гарантирует, что переменные будут доступны в модуле
+        import bot.webhook as webhook_module
+        webhook_module.bot = _bot
+        webhook_module.dp = _dp
         globals()['bot'], globals()['dp'] = _bot, _dp
         logger.info("Bot initialized")
     except Exception as e:
         logger.error("Failed to init bot", error=str(e))
-    # Регистрация хендлеров
     
 
 
@@ -116,6 +127,56 @@ async def telegram_webhook(request: Request):
         TG_WEBHOOK_LATENCY.observe(time.perf_counter() - start_ts)
 
 
+async def set_bot_commands() -> None:
+    """
+    Установить список команд бота для отображения в меню Telegram.
+    
+    Context7: Следует best practices aiogram для регистрации команд:
+    - Использует BotCommand для структурированного описания
+    - Команды группируются логически
+    - Описания краткие и понятные
+    - Обработка ошибок с детальным логированием
+    """
+    if not bot:
+        logger.warning("Bot not configured; skipping commands setup")
+        return
+    
+    try:
+        commands = [
+            BotCommand(command="start", description="Начать работу с ботом"),
+            BotCommand(command="help", description="Показать справку по командам"),
+            BotCommand(command="login", description="Войти в систему"),
+            BotCommand(command="add_channel", description="Добавить канал"),
+            BotCommand(command="my_channels", description="Мои каналы"),
+            BotCommand(command="ask", description="Задать вопрос"),
+            BotCommand(command="search", description="Поиск по каналам"),
+            BotCommand(command="recommend", description="Получить рекомендации"),
+            BotCommand(command="subscription", description="Информация о подписке"),
+            BotCommand(command="admin", description="Админ-панель"),
+        ]
+        
+        result = await bot.set_my_commands(commands)
+        if result:
+            logger.info("Bot commands registered successfully", count=len(commands))
+        else:
+            logger.warning("Bot commands registration returned False", count=len(commands))
+        
+        # Context7: Проверяем, что команды действительно установлены
+        try:
+            registered_commands = await bot.get_my_commands()
+            logger.info("Bot commands verified", registered_count=len(registered_commands))
+        except Exception as verify_error:
+            logger.warning("Failed to verify bot commands", error=str(verify_error))
+            
+    except Exception as e:
+        logger.error(
+            "Failed to set bot commands",
+            error=str(e),
+            error_type=type(e).__name__,
+            exc_info=True
+        )
+
+
 async def ensure_webhook() -> None:
     """Установить вебхук в Telegram с секретом, если задано.
 
@@ -143,5 +204,12 @@ async def ensure_webhook() -> None:
         logger.info("Webhook set", url=target_url)
     except Exception as e:
         logger.error("Failed to set webhook", error=str(e))
+    
+    # Context7: Устанавливаем команды бота независимо от результата webhook
+    # Это важно, так как команды могут быть установлены даже если webhook уже настроен
+    try:
+        await set_bot_commands()
+    except Exception as e:
+        logger.error("Failed to set bot commands in ensure_webhook", error=str(e))
 
 

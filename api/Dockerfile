@@ -6,6 +6,8 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     tzdata \
+    curl \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # Context7 best practice: настройка timezone
@@ -18,6 +20,11 @@ COPY api/requirements.txt .
 # [C7-ID: dev-mode-006] Используем cache mount для pip (Context7 best practice)
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --no-cache-dir -r requirements.txt
+
+# Context7: Установка сертификата НУЦ Минцифры для SaluteSpeech API
+# Согласно документации: https://developers.sber.ru/docs/ru/salutespeech/quick-start/certificates
+RUN curl -k "https://gu-st.ru/content/Other/doc/russian_trusted_root_ca.cer" -w "\n" >> $(python -m certifi) || \
+    curl -k "https://gu-st.ru/content/Other/doc/russian_trusted_root_ca.pem" -w "\n" >> $(python -m certifi)
 
 # [C7-ID: CODE-CLEANUP-022] Установка shared пакета (build context теперь корень репозитория)
 COPY shared/ /app/shared/

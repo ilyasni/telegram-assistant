@@ -62,6 +62,15 @@ async def lifespan(app: FastAPI):
         environment=settings.environment,
     )
     
+    # Инициализация scheduler для периодических задач
+    try:
+        from tasks.scheduler_tasks import start_scheduler
+        start_scheduler()
+        logger.info("Scheduler started for digest and trend tasks")
+    except Exception as e:
+        logger.error("Failed to start scheduler", error=str(e))
+        # Продолжаем без scheduler
+    
     # Инициализация Redis для rate limiter
     try:
         logger.info("Initializing rate limiter...")
@@ -101,7 +110,17 @@ async def lifespan(app: FastAPI):
     
     logger.info("Lifespan startup complete, yielding control")
     yield
+    
+    # Shutdown
     logger.info("Lifespan shutdown started")
+    
+    # Остановка scheduler
+    try:
+        from tasks.scheduler_tasks import stop_scheduler
+        stop_scheduler()
+        logger.info("Scheduler stopped")
+    except Exception as e:
+        logger.error("Error stopping scheduler", error=str(e))
     
     # Shutdown (временно отключено)
     # try:
@@ -299,6 +318,9 @@ from routers import health, channels, tg_auth, tg_webapp_auth, users, sessions, 
 from routers import storage  # Context7: Storage Quota Management API
 from routers import admin  # [C7-ID: api-admin-001] Admin panel API
 from routers import admin_invites  # Admin invites management
+from routers import rag  # RAG API endpoints
+from routers import digest  # Digest API endpoints
+from routers import trends  # Trends API endpoints
 app.include_router(health.router, prefix="/api")
 app.include_router(channels.router, prefix="/api")
 app.include_router(tg_auth.router)  # QR auth endpoints
@@ -310,6 +332,9 @@ app.include_router(session_management.router)  # Session management API
 app.include_router(storage.router, prefix="/api")  # Context7: Storage Quota Management API
 app.include_router(admin.router)  # [C7-ID: api-admin-001] Admin panel API
 app.include_router(admin_invites.router)  # Admin invites management
+app.include_router(rag.router, prefix="/api")  # RAG API endpoints
+app.include_router(digest.router, prefix="/api")  # Digest API endpoints
+app.include_router(trends.router, prefix="/api")  # Trends API endpoints
 app.include_router(bot_router, prefix="/tg")
 
 # Диагностический код временно убран

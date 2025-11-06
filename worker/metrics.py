@@ -109,6 +109,31 @@ enrichment_skipped_total = Counter(
     ['reason']
 )
 
+# Context7: CRAWL4AI enrichment metrics
+enrichment_triggers_total = Counter(
+    'enrichment_triggers_total',
+    'Total enrichment triggers checked',
+    ['type', 'decision']  # type: tag|url|wordcount, decision: hit|miss
+)
+
+enrichment_crawl_requests_total = Counter(
+    'enrichment_crawl_requests_total',
+    'Total crawl requests',
+    ['domain', 'status']  # status: ok|timeout|blocked|ssrf_denied
+)
+
+enrichment_crawl_duration_seconds = Histogram(
+    'enrichment_crawl_duration_seconds',
+    'Crawl request duration',
+    buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0]
+)
+
+enrichment_budget_checks_total = Counter(
+    'enrichment_budget_checks_total',
+    'Total budget checks',
+    ['type', 'result']  # type: tenant|domain, result: allowed|denied
+)
+
 # Embedding metrics (imported from embedding_service)
 from ai_providers.embedding_service import embedding_requests_total, embedding_latency_seconds
 

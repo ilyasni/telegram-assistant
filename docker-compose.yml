@@ -263,6 +263,74 @@ services:
     profiles:
       - core
 
+  # SearXNG - Federated search engine for external search grounding
+  # Context7: SearXNG для внешнего поиска (external search grounding) в RAG Service
+  # Основано на best practices из n8n-installer: https://github.com/kossakovsky/n8n-installer
+  searxng:
+    # Context7: Используем кастомный Dockerfile для отключения bot detection
+    # build:
+    #   context: ./searxng
+    #   dockerfile: Dockerfile
+    # Раскомментируйте выше для использования кастомного образа
+    image: searxng/searxng:latest
+    container_name: searxng
+    ports:
+      - "8080:8080"
+    environment:
+      # Context7: КРИТИЧНО! Base URL указывает на полный домен через Caddy
+      # SearXNG использует это для генерации ссылок и проверки запросов
+      - SEARXNG_BASE_URL=https://${SEARXNG_HOSTNAME:-searxng.produman.studio}/
+      # Context7: Hostname для внутренней идентификации
+      - SEARXNG_HOSTNAME=${SEARXNG_HOSTNAME:-searxng.produman.studio}
+      # Context7: Базовые настройки безопасности
+      - SEARXNG_BIND_ADDRESS=0.0.0.0
+      - SEARXNG_SECRET_KEY=${SEARXNG_SECRET_KEY:-change-me-in-production}
+      # Context7: Отключаем bot detection и limiter для внутреннего использования
+      # Согласно документации SearXNG: https://docs.searxng.org/admin/settings.html
+      - SEARXNG_LIMITER=false
+      - SEARXNG_PUBLIC_INSTANCE=false
+      # Context7: Отключаем использование limiter.toml (если установлен путь к файлу)
+      - SEARXNG_SETTINGS_PATH=/etc/searxng/settings.yml
+      # Context7: uWSGI workers/threads для оптимизации производительности
+      - UWSGI_WORKERS=${SEARXNG_UWSGI_WORKERS:-4}
+      - UWSGI_THREADS=${SEARXNG_UWSGI_THREADS:-4}
+      # Context7: Timezone для корректной работы с временем
+      - TZ=Europe/Moscow
+    volumes:
+      # Context7: Монтируем каталог целиком (не отдельные файлы)
+      # Контейнер сможет создавать/перезаписывать settings.yml внутри смонтированного каталога
+      # Context7: Права доступа настраиваются автоматически через скрипт setup_searxng_permissions.sh
+      # Запустите один раз: ./scripts/setup_searxng_permissions.sh
+      - ./searxng:/etc/searxng:rw
+      # Context7: Timezone для корректной работы с временем
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    networks:
+      - telegram-network
+    profiles:
+      - rag
+    # Context7: Capabilities для безопасной работы контейнера
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "1m"
+        max-file: "1"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    # Context7: DNS для корректной работы поисковых движков
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+
   # GigaChat Proxy (gpt2giga) - локальная сборка с официальным gpt2giga
   gpt2giga-proxy:
     build:
@@ -371,6 +439,14 @@ services:
       S3_MULTIPART_THRESHOLD_MB: ${S3_MULTIPART_THRESHOLD_MB:-5}
       S3_ADDRESSING_STYLE: ${S3_ADDRESSING_STYLE:-path}
       AWS_SIGNATURE_VERSION: ${AWS_SIGNATURE_VERSION:-s3v4}
+      # SaluteSpeech Configuration - Context7: для транскрибации голосовых сообщений
+      SALUTESPEECH_CLIENT_ID: ${SALUTESPEECH_CLIENT_ID}
+      SALUTESPEECH_CLIENT_SECRET: ${SALUTESPEECH_CLIENT_SECRET}
+      SALUTESPEECH_SCOPE: ${SALUTESPEECH_SCOPE:-SALUTE_SPEECH_PERS}
+      SALUTESPEECH_URL: ${SALUTESPEECH_URL:-https://smartspeech.sber.ru/rest/v1}
+      VOICE_TRANSCRIPTION_ENABLED: ${VOICE_TRANSCRIPTION_ENABLED:-true}
+      VOICE_MAX_DURATION_SEC: ${VOICE_MAX_DURATION_SEC:-60}
+      VOICE_CACHE_TTL: ${VOICE_CACHE_TTL:-86400}
     volumes:
       - ./webapp:/app/webapp:ro
       - ./api:/app:ro  # Context7: монтируем код для разработки (read-only для безопасности)

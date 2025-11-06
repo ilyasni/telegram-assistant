@@ -39,10 +39,11 @@ class Neo4jClient:
         password: Optional[str] = None
     ):
         # Источник правды — env, с возможностью явной передачи аргументов
+        # Context7: Исправлен дефолтный пароль (должен совпадать с docker-compose.yml)
         env_uri = os.getenv("NEO4J_URI") or os.getenv("NEO4J_URL")
         self.uri = uri or env_uri or "neo4j://neo4j:7687"
         self.username = username or os.getenv("NEO4J_USER", "neo4j")
-        self.password = password or os.getenv("NEO4J_PASSWORD", "changeme")
+        self.password = password or os.getenv("NEO4J_PASSWORD", "neo4j123")
         
         # [C7-ID: WORKER-NEO4J-PROVIDER-001] - Async-loop provider
         self._driver = None
@@ -172,7 +173,14 @@ class Neo4jClient:
         post_id: str,
         tags: List[Dict[str, Any]]
     ) -> bool:
-        """Создание связей с тегами."""
+        """
+        Создание связей с тегами и Topic узлов.
+        
+        Context7: Создаёт:
+        - Tag узлы с связью TAGGED_AS
+        - Topic узлы из тегов (нормализованных) с связью HAS_TOPIC
+        - RELATED_TO связи между Topic узлами (на основе схожести тегов)
+        """
         try:
             if not self._driver or not tags:
                 return True
@@ -180,6 +188,8 @@ class Neo4jClient:
             await self._ping()
             
             async with self._driver.session() as session:
+                topic_names = []
+                
                 for tag in tags:
                     tag_name = tag.get('name', '')
                     tag_category = tag.get('category', 'other')
@@ -188,7 +198,7 @@ class Neo4jClient:
                     if not tag_name:
                         continue
                     
-                    # [C7-ID: WORKER-NEO4J-PROVIDER-001] - MERGE с параметрами
+                    # Context7: Создаём Tag узел
                     query = """
                     MATCH (p:Post {post_id: $post_id})
                     MERGE (t:Tag {name: $tag_name})
@@ -204,10 +214,53 @@ class Neo4jClient:
                         tag_category=tag_category,
                         confidence=confidence
                     )
+                    
+                    # Context7: Нормализуем тег для Topic (lowercase, убираем лишние символы)
+                    topic_name = str(tag_name).strip().lower()
+                    if topic_name and len(topic_name) > 2:  # Минимальная длина темы
+                        topic_names.append(topic_name)
                 
-                logger.debug("Tag relationships created", 
+                # Context7: Создаём Topic узлы и связи HAS_TOPIC
+                if topic_names:
+                    for topic_name in set(topic_names):  # Уникальные темы
+                        topic_query = """
+                        MATCH (p:Post {post_id: $post_id})
+                        MERGE (topic:Topic {name: $topic_name})
+                        ON CREATE SET topic.created_at = datetime()
+                        MERGE (p)-[:HAS_TOPIC]->(topic)
+                        RETURN topic.name as topic_name
+                        """
+                        
+                        await session.run(
+                            topic_query,
+                            post_id=post_id,
+                            topic_name=topic_name
+                        )
+                    
+                    # Context7: Создаём RELATED_TO связи между Topic узлами из одного поста
+                    # (темы из одного поста считаются связанными)
+                    # Используем set(topic_names) для получения уникальных тем
+                    unique_topics = set(topic_names)
+                    if len(unique_topics) > 1:
+                        related_topics_query = """
+                        MATCH (p:Post {post_id: $post_id})-[:HAS_TOPIC]->(t1:Topic)
+                        MATCH (p)-[:HAS_TOPIC]->(t2:Topic)
+                        WHERE t1.name < t2.name
+                        MERGE (t1)-[r:RELATED_TO]-(t2)
+                        ON CREATE SET r.similarity = 0.5, r.weight = 1
+                        ON MATCH SET r.weight = r.weight + 1, r.similarity = 0.5 + (r.weight * 0.1)
+                        RETURN count(r) as relationships_created
+                        """
+                        
+                        await session.run(
+                            related_topics_query,
+                            post_id=post_id
+                        )
+                
+                logger.debug("Tag and Topic relationships created", 
                            post_id=post_id,
-                           tags_count=len(tags))
+                           tags_count=len(tags),
+                           topics_count=len(set(topic_names)) if topic_names else 0)
                 return True
                 
         except Exception as e:

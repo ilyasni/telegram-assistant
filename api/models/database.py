@@ -1,9 +1,11 @@
 """Модели базы данных."""
 
-from sqlalchemy import create_engine, Column, String, Integer, Boolean, DateTime, Text, JSON, BigInteger, ForeignKey, UniqueConstraint, Index, CheckConstraint, PrimaryKeyConstraint, func, text, event
+from sqlalchemy import create_engine, Column, String, Integer, Boolean, DateTime, Text, JSON, BigInteger, ForeignKey, UniqueConstraint, Index, CheckConstraint, PrimaryKeyConstraint, func, text, event, REAL, Time, Date, Computed, TypeDecorator
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship, Session
 from sqlalchemy.dialects.postgresql import UUID, JSONB
+from sqlalchemy.dialects.postgresql.base import ischema_names
+import json
 import uuid
 from datetime import datetime
 from typing import Generator, Optional
@@ -11,6 +13,48 @@ from contextvars import ContextVar
 from config import settings
 
 Base = declarative_base()
+
+# Context7: TypeDecorator для работы с pgvector типом
+class VectorType(TypeDecorator):
+    """TypeDecorator для работы с pgvector типом vector(n).
+    
+    Использует Text как базовый тип и конвертирует между list и строковым представлением vector.
+    """
+    impl = Text
+    cache_ok = True
+    
+    def __init__(self, dimensions: int = 1536):
+        super().__init__()
+        self.dimensions = dimensions
+    
+    def load_dialect_impl(self, dialect):
+        # Для PostgreSQL используем Text, но с явным указанием типа в SQL
+        return dialect.type_descriptor(Text())
+    
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        if isinstance(value, list):
+            # Конвертируем список в строку для vector типа: '[0.1,0.2,0.3]'
+            # pgvector принимает формат массива PostgreSQL
+            # Используем format для правильного форматирования чисел
+            vector_str = '[' + ','.join(f"{float(v):.6f}" if isinstance(v, (int, float)) else str(float(v)) for v in value) + ']'
+            return vector_str
+        if isinstance(value, str):
+            # Уже строка, возвращаем как есть
+            return value
+        return value
+    
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return None
+        if isinstance(value, str):
+            # Парсим строку обратно в список: '[0.1,0.2,0.3]' -> [0.1, 0.2, 0.3]
+            value = value.strip('[]')
+            if not value:
+                return None
+            return [float(v.strip()) for v in value.split(',') if v.strip()]
+        return value
 
 # Context7: ContextVar для передачи request и tenant_id через dependency injection
 _request_context: Optional[ContextVar] = ContextVar('request_context', default=None)
@@ -219,6 +263,9 @@ class Post(Base):
     forwards_count = Column(Integer, default=0)
     reactions_count = Column(Integer, default=0)
     replies_count = Column(Integer, default=0)
+    # Context7: engagement_score как GENERATED ALWAYS AS STORED (определяется в миграции)
+    # SQLAlchemy 2.0: используем Computed() для computed columns
+    engagement_score = Column(REAL, Computed("LOG(1 + COALESCE(views_count, 0)) + 2 * LOG(1 + COALESCE(reactions_count, 0)) + 3 * LOG(1 + COALESCE(forwards_count, 0)) + LOG(1 + COALESCE(replies_count, 0))", persisted=True))
     is_pinned = Column(Boolean, default=False)
     is_edited = Column(Boolean, default=False)
     edited_at = Column(DateTime)
@@ -348,6 +395,11 @@ class PostEnrichment(Base):
     
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Context7: Агрегаты альбомов
+    album_size = Column(Integer, nullable=True)  # Количество элементов в альбоме
+    vision_labels_agg = Column(JSONB, nullable=True)  # Агрегированные метки vision из всех элементов альбома
+    ocr_present = Column(Boolean, default=False)  # Наличие OCR текста в альбоме
     
     # Legacy поля (deprecated, будут удалены после миграции)
     tags = Column(JSONB, default=[])  # DEPRECATED: использовать data->'tags'
@@ -633,3 +685,152 @@ class PostReply(Base):
     # Relationships
     post = relationship("Post", back_populates="replies", foreign_keys=[post_id])
     reply_to_post = relationship("Post", foreign_keys=[reply_to_post_id])
+
+
+# ============================================================================
+# ДАЙДЖЕСТЫ И ТРЕНДЫ (Context7: добавлены согласно миграции 20250131_digest_trends)
+# ============================================================================
+
+class DigestSettings(Base):
+    """Настройки дайджестов пользователя."""
+    __tablename__ = "digest_settings"
+    
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    enabled = Column(Boolean, nullable=False, default=True)
+    schedule_time = Column(Time, nullable=False, server_default="09:00:00")
+    schedule_tz = Column(String(255), nullable=False, default="Europe/Moscow")
+    frequency = Column(String(20), nullable=False, default="daily")  # daily, weekly, monthly
+    topics = Column(JSONB, nullable=False, default=[])  # Массив тематик/тегов, указанных пользователем (обязательно для генерации)
+    channels_filter = Column(JSONB, nullable=True)  # Список channel_id или null (все каналы пользователя)
+    max_items_per_digest = Column(Integer, nullable=False, default=10)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+    
+    # Relationships
+    user = relationship("User")
+
+
+class DigestHistory(Base):
+    """История отправленных дайджестов."""
+    __tablename__ = "digest_history"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    digest_date = Column(Date, nullable=False)
+    content = Column(Text, nullable=False)
+    posts_count = Column(Integer, nullable=False, default=0)
+    topics = Column(JSONB, nullable=False, default=[])  # Тематики, по которым был сгенерирован дайджест
+    sent_at = Column(DateTime(timezone=True), nullable=True)
+    status = Column(String(20), nullable=False, default="pending")  # pending, sent, failed
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    
+    # Relationships
+    user = relationship("User")
+    
+    __table_args__ = (
+        Index('idx_digest_history_user_id', 'user_id'),
+        Index('idx_digest_history_digest_date', 'digest_date'),
+        Index('idx_digest_history_status', 'status'),
+        Index('idx_digest_history_created_at', 'created_at', postgresql_ops={'created_at': 'DESC'}),
+    )
+
+
+class RAGQueryHistory(Base):
+    """История запросов пользователя для анализа намерений."""
+    __tablename__ = "rag_query_history"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    query_text = Column(Text, nullable=False)
+    query_type = Column(String(50), nullable=False)  # ask, search, recommend, trend, digest
+    intent = Column(String(50), nullable=True)  # Определенное намерение GigaChat
+    confidence = Column(REAL, nullable=True)  # Уверенность классификации (0.0-1.0)
+    response_text = Column(Text, nullable=True)
+    sources_count = Column(Integer, nullable=True, default=0)
+    processing_time_ms = Column(Integer, nullable=True)
+    audio_file_id = Column(String(255), nullable=True)
+    transcription_text = Column(Text, nullable=True)
+    transcription_provider = Column(String(50), nullable=False, default="salutespeech")
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    
+    # Relationships
+    user = relationship("User")
+    
+    __table_args__ = (
+        Index('idx_rag_query_history_user_id', 'user_id'),
+        Index('idx_rag_query_history_created_at', 'created_at', postgresql_ops={'created_at': 'DESC'}),
+        Index('idx_rag_query_history_intent', 'intent'),
+        Index('idx_rag_query_history_query_type', 'query_type'),
+    )
+
+
+class UserInterest(Base):
+    """Интересы пользователей (PostgreSQL для запросов и аналитики)."""
+    __tablename__ = "user_interests"
+    
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    topic = Column(Text, nullable=False, primary_key=True)
+    weight = Column(REAL, nullable=False, server_default="0.0")
+    query_count = Column(Integer, nullable=False, server_default="0")
+    view_count = Column(Integer, nullable=False, server_default="0")
+    last_updated = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    
+    # Relationships
+    user = relationship("User")
+    
+    __table_args__ = (
+        Index('idx_user_interests_user_id', 'user_id'),
+        Index('idx_user_interests_weight', 'user_id', 'weight', postgresql_ops={'weight': 'DESC'}),
+        Index('idx_user_interests_topic', 'topic'),
+        Index('idx_user_interests_last_updated', 'last_updated', postgresql_ops={'last_updated': 'DESC'}),
+    )
+
+
+class TrendDetection(Base):
+    """Обнаруженные тренды (глобальные, без учета пользовательских настроек)."""
+    __tablename__ = "trends_detection"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    trend_keyword = Column(String(500), nullable=False)  # Ключевое слово/фраза
+    # Context7: trend_embedding использует vector(1536) из pgvector для векторного поиска
+    # TypeDecorator автоматически конвертирует между list и vector типом
+    trend_embedding = Column(VectorType(dimensions=1536), nullable=True)  # Embedding для поиска похожих (GigaChat EmbeddingsGigaR, 1536 dim)
+    frequency_count = Column(Integer, nullable=False, default=0)  # Количество упоминаний
+    growth_rate = Column(REAL, nullable=True)  # Процент роста упоминаний
+    engagement_score = Column(REAL, nullable=True)  # Средний engagement (views + reactions + forwards + replies)
+    first_mentioned_at = Column(DateTime(timezone=True), nullable=True)
+    last_mentioned_at = Column(DateTime(timezone=True), nullable=True)
+    channels_affected = Column(JSONB, nullable=False, default=[])  # Список channel_id
+    posts_sample = Column(JSONB, nullable=False, default=[])  # Примеры постов (до 10) с их engagement метриками
+    detected_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    status = Column(String(20), nullable=False, default="active")  # active, archived
+    
+    __table_args__ = (
+        Index('idx_trends_detection_keyword', 'trend_keyword'),
+        Index('idx_trends_detection_last_mentioned', 'last_mentioned_at', postgresql_ops={'last_mentioned_at': 'DESC'}),
+        Index('idx_trends_detection_detected_at', 'detected_at', postgresql_ops={'detected_at': 'DESC'}),
+        Index('idx_trends_detection_status', 'status'),
+        Index('idx_trends_detection_engagement', 'engagement_score', postgresql_ops={'engagement_score': 'DESC NULLS LAST'}),
+    )
+
+
+class TrendAlert(Base):
+    """Уведомления пользователей о трендах."""
+    __tablename__ = "trend_alerts"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    trend_id = Column(UUID(as_uuid=True), ForeignKey("trends_detection.id", ondelete="CASCADE"), nullable=False)
+    sent_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    read_at = Column(DateTime(timezone=True), nullable=True)
+    
+    # Relationships
+    user = relationship("User")
+    trend = relationship("TrendDetection")
+    
+    __table_args__ = (
+        Index('idx_trend_alerts_user_id', 'user_id'),
+        Index('idx_trend_alerts_trend_id', 'trend_id'),
+        Index('idx_trend_alerts_sent_at', 'sent_at', postgresql_ops={'sent_at': 'DESC'}),
+    )

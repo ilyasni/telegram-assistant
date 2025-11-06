@@ -143,7 +143,7 @@ class ParseAllChannelsTask:
     def __init__(self, config, db_url: str, redis_client: Optional[Any], parser=None, app_state: Optional[Dict] = None, telegram_client_manager: Optional[Any] = None, media_processor: Optional[Any] = None):
         self.config = config
         self.db_url = db_url
-        self.redis: Optional[redis.Redis] = None
+        self.redis: Optional[redis.Redis] = redis_client  # Context7: Используем переданный async Redis клиент
         self.parser = parser  # Будет инициализирован при необходимости
         self.app_state = app_state
         self.telegram_client_manager = telegram_client_manager  # TelegramClientManager для парсинга
@@ -204,7 +204,14 @@ class ParseAllChannelsTask:
         try:
             # Initialize Redis if not available
             if self.redis is None:
-                self.redis = redis.from_url(settings.redis_url)
+                # Context7: Создаём async Redis клиент (redis.asyncio)
+                self.redis = redis.from_url(
+                    settings.redis_url,
+                    decode_responses=True,
+                    socket_connect_timeout=10,
+                    socket_timeout=30,
+                    retry_on_timeout=True
+                )
                 logger.info("Redis initialized for lock acquisition")
             
             # Context7: async Redis - используем await для set()

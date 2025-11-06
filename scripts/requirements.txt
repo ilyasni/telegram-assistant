@@ -1,5 +1,5 @@
 # E2E Testing Script Dependencies
-# Используется для scripts/check_pipeline_e2e.py
+# Используется для scripts/check_pipeline_e2e.py, check_pipeline_health.py, test_pipeline_suite.py
 #
 # Для production: используйте pip install --require-hashes после генерации hash-файла
 # pip-compile --generate-hashes scripts/requirements.txt > scripts/requirements-hashed.txt
@@ -28,4 +28,12 @@ httpx==0.27.0
 # JSON Schema validation (для env-check.py)
 # [C7-ID: dev-mode-010] Context7 best practice: используем Python jsonschema вместо Node.js ajv-cli
 jsonschema==4.20.0
+
+# Testing framework (Context7: для pytest структуры)
+pytest==7.4.3
+pytest-asyncio==0.21.1
+pytest-xdist==3.5.0  # для параллельного запуска тестов
+
+# AWS S3 (опционально, для проверки S3)
+boto3==1.34.0
 

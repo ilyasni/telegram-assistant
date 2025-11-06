@@ -156,19 +156,26 @@ async def scan_iter(client: redis.Redis, pattern: str, count: int = 200):
             break
 
 
-async def stream_stats(client: redis.Redis, stream: str, group_hint: str | None = None) -> Dict[str, Any]:
+async def stream_stats(client: redis.Redis, stream: str, group_hint: str | None = None, include_pending_details: bool = False) -> Dict[str, Any]:
     """
     Статистика Redis Stream: xlen, группы, PEL summary.
+    
+    Context7: Поддержка детальной информации о pending messages через XPENDING с параметрами.
+    
+    Args:
+        include_pending_details: Если True, возвращает детальную информацию о pending messages
+                                 (message_id, consumer, time_since_delivered, delivery_count)
     
     Returns:
         {
             'xlen': int | None,
             'groups': [{'name', 'consumers', 'pending', 'last_delivered_id'}],
             'pending_summary': {'total', 'min_id', 'max_id'} | None,
+            'pending_messages': [{'message_id', 'consumer', 'time_since_delivered', 'delivery_count'}] | None,
             'errors': [str]
         }
     """
-    out = {'xlen': None, 'groups': [], 'pending_summary': None, 'errors': []}
+    out = {'xlen': None, 'groups': [], 'pending_summary': None, 'pending_messages': None, 'errors': []}
     
     try:
         out['xlen'] = await client.xlen(stream)
@@ -222,6 +229,7 @@ async def stream_stats(client: redis.Redis, stream: str, group_hint: str | None 
         grp = group_hint or (out['groups'][0]['name'] if out['groups'] else None)
         if grp:
             try:
+                # Context7: XPENDING для summary (без параметров - быстрая проверка)
                 pend = await client.xpending(stream, grp)
                 # pend = {'pending': N, 'min': id, 'max': id, 'consumers': [...]}
                 out['pending_summary'] = {
@@ -229,6 +237,43 @@ async def stream_stats(client: redis.Redis, stream: str, group_hint: str | None 
                     'min_id': pend.get('min'),
                     'max_id': pend.get('max')
                 }
+                
+                # Context7: Детальная информация о pending messages (если запрошена)
+                if include_pending_details and pend.get('pending', 0) > 0:
+                    try:
+                        # Context7: Используем xpending_range для получения детальной информации
+                        # Формат: XPENDING stream group [start] [end] [count] [consumer]
+                        # Используем min_id и max_id из summary, или '-', '+' для всех
+                        start_id = pend.get('min', '-')
+                        end_id = pend.get('max', '+')
+                        count = min(100, pend.get('pending', 0))  # Ограничиваем для производительности
+                        
+                        # Context7: Redis-py async использует xpending_range для детальной информации
+                        # xpending_range(name, groupname, min="-", max="+", count=100)
+                        pending_details_raw = await client.xpending_range(stream, grp, min=start_id, max=end_id, count=count)
+                        
+                        # Обработка результата: список [message_id, consumer, time_since_delivered, delivery_count]
+                        pending_messages = []
+                        if pending_details_raw:
+                            for item in pending_details_raw:
+                                if isinstance(item, (list, tuple)) and len(item) >= 4:
+                                    message_id = item[0].decode('utf-8') if isinstance(item[0], bytes) else str(item[0])
+                                    consumer = item[1].decode('utf-8') if isinstance(item[1], bytes) else str(item[1])
+                                    time_since_delivered = int(item[2]) if isinstance(item[2], (int, str)) else 0
+                                    delivery_count = int(item[3]) if isinstance(item[3], (int, str)) else 0
+                                    
+                                    pending_messages.append({
+                                        'message_id': message_id,
+                                        'consumer': consumer,
+                                        'time_since_delivered': time_since_delivered,
+                                        'delivery_count': delivery_count
+                                    })
+                        
+                        out['pending_messages'] = pending_messages
+                    except Exception as e:
+                        logger.debug("Failed to get pending messages details", error=str(e))
+                        out['errors'].append(f"xpending_details:{e}")
+                
             except Exception as e:
                 out['errors'].append(f"xpending:{e}")
     except Exception as e:
@@ -613,7 +658,9 @@ class PipelineChecker:
             try:
                 # Для indexed stream используем группу "indexing_monitoring" для XPENDING
                 group_hint = "indexing_monitoring" if stream_name == "stream:posts:indexed" else None
-                stats = await stream_stats(self.redis_client, stream_name, group_hint=group_hint)
+                # Для deep режима включаем детальную информацию о pending messages
+                include_details = self.mode == "deep"
+                stats = await stream_stats(self.redis_client, stream_name, group_hint=group_hint, include_pending_details=include_details)
                 streams_data[stream_name] = stats
                 
                 # Проверка порога pending
@@ -1082,7 +1129,9 @@ class PipelineChecker:
             
             for stream_name, group_hint in vision_streams:
                 try:
-                    stats = await stream_stats(self.redis_client, stream_name, group_hint=group_hint)
+                    # Для vision streams включаем детальную информацию о pending messages для проверки возраста
+                    include_details = True  # Всегда включаем для vision (нужно для проверки застрявших событий)
+                    stats = await stream_stats(self.redis_client, stream_name, group_hint=group_hint, include_pending_details=include_details)
                     vision_results['streams'][stream_name] = stats
                 except Exception as e:
                     logger.warning("Vision stream check failed", stream=stream_name, error=str(e))

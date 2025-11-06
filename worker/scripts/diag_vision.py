@@ -44,10 +44,14 @@ async def check_vision_enrichment(post_id: str, db_url: str) -> Dict[str, Any]:
         
         conn = await asyncpg.connect(db_url)
         
-        # Получаем данные из post_enrichment
+        # Context7: Получаем данные из post_enrichment (новый формат через data JSONB)
         row = await conn.fetchrow("""
             SELECT 
                 post_id,
+                kind,
+                provider,
+                status,
+                data,
                 vision_classification,
                 vision_description,
                 vision_ocr_text,
@@ -57,9 +61,12 @@ async def check_vision_enrichment(post_id: str, db_url: str) -> Dict[str, Any]:
                 vision_analyzed_at,
                 vision_tokens_used,
                 s3_vision_keys,
-                s3_media_keys
+                s3_media_keys,
+                ocr_present
             FROM post_enrichment
-            WHERE post_id = $1
+            WHERE post_id = $1 AND kind = 'vision'
+            ORDER BY updated_at DESC
+            LIMIT 1
         """, post_id)
         
         await conn.close()
@@ -70,28 +77,59 @@ async def check_vision_enrichment(post_id: str, db_url: str) -> Dict[str, Any]:
                 "message": f"Post {post_id} не найден или не имеет Vision обогащения"
             }
         
-        # Анализ данных
-        has_classification = bool(row['vision_classification'])
-        has_description = bool(row['vision_description'])
-        has_ocr = bool(row['vision_ocr_text'])
-        has_s3_keys = bool(row['s3_vision_keys'])
+        # Context7: Анализ данных (новый формат через data JSONB)
+        data = row['data']
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except json.JSONDecodeError:
+                data = None
+        
+        # Извлечение OCR из нового формата
+        ocr_data = None
+        ocr_text_new = None
+        ocr_engine = None
+        ocr_confidence = None
+        
+        if data and isinstance(data, dict):
+            ocr_data = data.get('ocr')
+            if isinstance(ocr_data, dict):
+                ocr_text_new = ocr_data.get('text')
+                ocr_engine = ocr_data.get('engine')
+                ocr_confidence = ocr_data.get('confidence')
+            elif isinstance(ocr_data, str):
+                ocr_text_new = ocr_data
+        
+        # Legacy поля
+        has_classification = bool(row.get('vision_classification'))
+        has_description = bool(row.get('vision_description'))
+        has_ocr_legacy = bool(row.get('vision_ocr_text'))
+        has_ocr_new = bool(ocr_text_new)
+        has_s3_keys = bool(row.get('s3_vision_keys'))
         
         return {
             "status": "found",
             "post_id": str(row['post_id']),
-            "analyzed_at": row['vision_analyzed_at'].isoformat() if row['vision_analyzed_at'] else None,
-            "provider": row['vision_provider'],
-            "model": row['vision_model'],
-            "tokens_used": row['vision_tokens_used'],
-            "is_meme": row['vision_is_meme'],
-            "has_classification": has_classification,
-            "has_description": has_description,
-            "has_ocr": has_ocr,
+            "kind": row.get('kind'),
+            "provider": row.get('provider') or row.get('vision_provider'),
+            "status_db": row.get('status'),
+            "analyzed_at": row.get('vision_analyzed_at').isoformat() if row.get('vision_analyzed_at') else None,
+            "model": row.get('vision_model') or (data.get('model') if data else None),
+            "tokens_used": row.get('vision_tokens_used') or (data.get('tokens_used') if data else None),
+            "is_meme": row.get('vision_is_meme') or (data.get('is_meme') if data else False),
+            "has_classification": has_classification or bool(data.get('classification') if data else None),
+            "has_description": has_description or bool(data.get('description') if data else None),
+            "has_ocr": has_ocr_new or has_ocr_legacy,
+            "has_ocr_new": has_ocr_new,
+            "has_ocr_legacy": has_ocr_legacy,
+            "ocr_engine": ocr_engine,
+            "ocr_confidence": ocr_confidence,
             "has_s3_keys": has_s3_keys,
-            "s3_vision_keys_count": len(row['s3_vision_keys']) if row['s3_vision_keys'] else 0,
-            "classification": row['vision_classification'],
-            "description_preview": (row['vision_description'] or '')[:200] if row['vision_description'] else None,
-            "ocr_preview": (row['vision_ocr_text'] or '')[:200] if row['vision_ocr_text'] else None
+            "s3_vision_keys_count": len(row['s3_vision_keys']) if row.get('s3_vision_keys') else 0,
+            "classification": row.get('vision_classification') or (data.get('classification') if data else None),
+            "description_preview": (row.get('vision_description') or (data.get('description') if data else None) or '')[:200],
+            "ocr_preview": (ocr_text_new or row.get('vision_ocr_text') or '')[:200],
+            "data_keys": list(data.keys()) if data and isinstance(data, dict) else []
         }
         
     except Exception as e:

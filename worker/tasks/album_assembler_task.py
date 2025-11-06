@@ -366,13 +366,59 @@ class AlbumAssemblerTask:
             logger.warning("Missing album_id in albums.parsed event", message_id=message_id)
             return
         
+        # Context7: Проверяем tenant_id из события
+        # Если tenant_id отсутствует или 'default', пытаемся получить из БД
+        if not tenant_id or tenant_id == 'default':
+            try:
+                # Context7: Получаем tenant_id из БД через channel_id
+                tenant_id_result = await self.db.execute(
+                    text("""
+                        SELECT COALESCE(
+                            (SELECT u.tenant_id::text FROM users u 
+                             JOIN user_channel uc ON uc.user_id = u.id 
+                             WHERE uc.channel_id = c.id 
+                             LIMIT 1),
+                            CAST(c.settings->>'tenant_id' AS text),
+                            'default'
+                        ) as tenant_id
+                        FROM channels c
+                        WHERE c.id = :channel_id
+                        LIMIT 1
+                    """),
+                    {"channel_id": channel_id}
+                )
+                row = tenant_id_result.fetchone()
+                if row and row[0] and row[0] != 'default':
+                    tenant_id = str(row[0])
+                    logger.debug(
+                        "Using tenant_id from DB for album",
+                        album_id=album_id,
+                        tenant_id=tenant_id
+                    )
+                else:
+                    logger.warning(
+                        "tenant_id not found or is 'default' for album, using 'default'",
+                        album_id=album_id,
+                        channel_id=channel_id,
+                        tenant_id_from_event=tenant_id
+                    )
+                    tenant_id = tenant_id or 'default'
+            except Exception as e:
+                logger.warning(
+                    "Failed to get tenant_id from DB for album, using from event",
+                    album_id=album_id,
+                    error=str(e),
+                    tenant_id_from_event=tenant_id
+                )
+                tenant_id = tenant_id or 'default'
+        
         # Инициализируем состояние альбома в Redis
         state_key = f"{self.state_prefix}{album_id}"
         state = {
             'album_id': album_id,
             'grouped_id': grouped_id,
             'channel_id': channel_id,
-            'tenant_id': tenant_id,
+            'tenant_id': tenant_id,  # Context7: Используем tenant_id из события или БД
             'items_count': items_count,
             'post_ids': post_ids,
             'items_analyzed': [],  # Set[post_id]
@@ -718,11 +764,21 @@ class AlbumAssemblerTask:
                     logger.debug("Error calculating assembly lag", error=str(e))
             
             # Context7: Сохраняем vision summary в S3
+            # Context7: tenant_id должен быть из state (заполнен из albums.parsed события)
+            # Если tenant_id отсутствует или 'default', логируем предупреждение
             s3_key = None
             size_bytes = None
             if self.s3_service and vision_summary:
                 try:
-                    tenant_id = state.get('tenant_id', 'default')
+                    tenant_id = state.get('tenant_id')
+                    if not tenant_id or tenant_id == 'default':
+                        logger.warning(
+                            "tenant_id is missing or 'default' in album state, using 'default' for S3",
+                            album_id=album_id,
+                            tenant_id_from_state=tenant_id
+                        )
+                        tenant_id = tenant_id or 'default'
+                    
                     s3_key = self.s3_service.build_album_key(
                         tenant_id=tenant_id,
                         album_id=album_id,
@@ -812,6 +868,62 @@ class AlbumAssemblerTask:
                     album_id=album_id,
                     error=str(e)
                 )
+            
+            # Context7: Обновляем post_enrichment для всех постов альбома
+            # Заполняем album_size и vision_labels_agg для каждого поста
+            # Context7 best practice: Используем bulk update через UPDATE с подзапросом для эффективности
+            try:
+                # Конвертируем vision_labels в JSONB для vision_labels_agg
+                vision_labels_jsonb = json.dumps(vision_labels, ensure_ascii=False) if vision_labels else None
+                
+                # Context7: Bulk update всех постов альбома одним запросом
+                # Используем подзапрос для получения post_ids из media_group_items
+                update_result = await self.db.execute(
+                    text("""
+                        UPDATE post_enrichment
+                        SET 
+                            album_size = :items_count,
+                            vision_labels_agg = CAST(:vision_labels AS jsonb),
+                            ocr_present = :has_text
+                        WHERE post_id IN (
+                            SELECT post_id
+                            FROM media_group_items
+                            WHERE group_id = :album_id
+                        )
+                        AND kind = 'vision'
+                    """),
+                    {
+                        "album_id": album_id,
+                        "items_count": state['items_count'],
+                        "vision_labels": vision_labels_jsonb,
+                        "has_text": bool(ocr_text)
+                    }
+                )
+                
+                rows_updated = update_result.rowcount
+                await self.db.commit()
+                
+                logger.info(
+                    "Album enrichment updated in post_enrichment",
+                    album_id=album_id,
+                    rows_updated=rows_updated,
+                    album_size=state['items_count'],
+                    vision_labels_count=len(vision_labels) if vision_labels else 0,
+                    ocr_present=bool(ocr_text)
+                )
+            except Exception as e:
+                logger.error(
+                    "Failed to update post_enrichment for album",
+                    album_id=album_id,
+                    error=str(e),
+                    exc_info=True
+                )
+                # Не прерываем выполнение, если обновление post_enrichment не удалось
+                # Откатываем транзакцию для этого обновления
+                try:
+                    await self.db.rollback()
+                except Exception:
+                    pass
             
             # Формируем событие album.assembled
             event = AlbumAssembledEventV1(

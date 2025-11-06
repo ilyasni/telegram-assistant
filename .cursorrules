@@ -23,6 +23,8 @@ Load modular rules from `.cursor/rules/` and apply them in numeric order:
 - `06-evaluation-llmops.mdc` — оценка качества, A/B тесты, метрики
 - `07-devops-observability.mdc` — мониторинг, health checks, Grafana
 - `08-docker-rebuild.mdc` — Docker сборка, пересоздание контейнеров, диагностика
+- `09-e2e-testing.mdc` — E2E тестирование пайплайна, SLO пороги, диагностика
+- `10-code-cleanup.mdc` — правила очистки кода, legacy модули, импорты
 - `99-troubleshooting.mdc` — диагностика, частые проблемы, фиксы
 
 If conflicts occur, lower-numbered files win.

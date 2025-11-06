@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 import yaml
 from crawl4ai import AsyncWebCrawler
 from crawl4ai.extraction_strategy import LLMExtractionStrategy
+from crawl4ai import LLMConfig
 from sqlalchemy import text
 
 from event_bus import EventConsumer, ConsumerConfig, PostEnrichedEvent, get_event_publisher
@@ -23,7 +24,11 @@ from metrics import (
     enrichment_requests_total,
     enrichment_latency_seconds,
     enrichment_skipped_total,
-    posts_processed_total
+    posts_processed_total,
+    enrichment_triggers_total,
+    enrichment_crawl_requests_total,
+    enrichment_crawl_duration_seconds,
+    enrichment_budget_checks_total
 )
 
 # ============================================================================
@@ -247,27 +252,6 @@ class EnrichmentWorker:
             # МЕТРИКА: попытка обработки
             posts_processed_total.labels(stage='enrichment', success='attempt').inc()
             
-            # Проверка триггеров enrichment
-            should_enrich, skip_reason = await self._should_enrich_post(post_id, tags)
-            
-            if not should_enrich:
-                logger.info(f"Post {post_id} skipped from enrichment: {skip_reason}")
-                await self._publish_skipped_enrichment(event_data, skip_reason)
-                self.stats['posts_skipped'] += 1
-                enrichment_skipped_total.labels(reason=skip_reason).inc()
-                # МЕТРИКА: пропуск обогащения
-                posts_processed_total.labels(stage='enrichment', success='skip').inc()
-                return
-            
-            # [C7-ID: ENRICH-URLS-001] Источники URLs: event.urls → regex из text → []
-            urls = list(event_data.get('urls', []) or [])
-            if not urls:
-                # Парсинг URLs из текста
-                text = event_data.get('text', '') or ''
-                urls = self._extract_urls_from_text(text)
-            
-            logger.info(f"Post {post_id} URLs: {len(urls)} from event/parsing")
-            
             # [C7-ID: ENRICH-DEV-FIX-002] Санитизация post_id перед запросом к БД
             sanitized_post_id = str(normalize_post_id(post_id)) if os.getenv("FEATURE_ALLOW_NON_UUID_IDS", "false").lower() == "true" else post_id
             
@@ -284,10 +268,138 @@ class EnrichmentWorker:
                 posts_processed_total.labels(stage='enrichment', success='skip').inc()
                 return
             
+            # [C7-ID: ENRICH-URLS-001] Источники URLs: event.urls → regex из text → []
+            urls = list(event_data.get('urls', []) or [])
+            if not urls:
+                # Парсинг URLs из текста
+                text = post_context.get('content', '') or event_data.get('text', '') or ''
+                urls = self._extract_urls_from_text(text)
+            
+            logger.info(f"Post {post_id} URLs: {len(urls)} from event/parsing")
+            
             # [C7-ID: ENRICH-DBG-011] Построение enriched_event с логами «между шагами»
             logger.info("enrich_build_start", extra={"post_id": post_id})
             
-            # Формирование минимального enrichment_data
+            # Построение enriched_event
+            # Context7: Добавляем tenant_id из post_context для multi-tenant изоляции
+            # Context7: Если tenant_id отсутствует в post_context, пытаемся получить из БД
+            tenant_id = None
+            if post_context:
+                tenant_id = post_context.get("tenant_id")
+            
+            # Context7: Если tenant_id отсутствует или равен 'default', пытаемся получить из БД
+            if not tenant_id or tenant_id == "default":
+                try:
+                    tenant_id_result = await self.db_session.execute(
+                        text("""
+                            SELECT COALESCE(
+                                (SELECT u.tenant_id::text FROM users u 
+                                 JOIN user_channel uc ON uc.user_id = u.id 
+                                 WHERE uc.channel_id = c.id 
+                                 LIMIT 1),
+                                CAST(pe_tags.data->>'tenant_id' AS text),
+                                CAST(c.settings->>'tenant_id' AS text),
+                                'default'
+                            ) as tenant_id
+                            FROM posts p
+                            JOIN channels c ON c.id = p.channel_id
+                            LEFT JOIN post_enrichment pe_tags 
+                                ON pe_tags.post_id = p.id AND pe_tags.kind = 'tags'
+                            WHERE p.id = :post_id
+                            LIMIT 1
+                        """),
+                        {"post_id": post_id}
+                    )
+                    row = tenant_id_result.fetchone()
+                    if row:
+                        tenant_id_db = str(row[0]) if row[0] else None
+                        if tenant_id_db and tenant_id_db != "default":
+                            tenant_id = tenant_id_db
+                            logger.debug(
+                                "Using tenant_id from DB in enrichment_task",
+                                post_id=post_id,
+                                tenant_id=tenant_id
+                            )
+                except Exception as e:
+                    logger.debug(
+                        "Failed to get tenant_id from DB in enrichment_task",
+                        post_id=post_id,
+                        error=str(e)
+                    )
+            
+            # Context7: Fallback на 'default' если все еще не найден
+            if not tenant_id or tenant_id == "default":
+                tenant_id = "default"
+                logger.warning(
+                    "tenant_id not found or is 'default' in enrichment_task, using 'default'",
+                    post_id=post_id,
+                    tenant_id_from_post_context=post_context.get("tenant_id") if post_context else None
+                )
+            
+            # Context7: Проверка триггеров enrichment с post_content из БД
+            post_content = post_context.get('content', '') if post_context else ''
+            logger.debug("enrich_trigger_check_start", extra={
+                "post_id": post_id,
+                "has_post_content": bool(post_content),
+                "content_length": len(post_content) if post_content else 0,
+                "tags_count": len(tags),
+                "urls_count": len(urls) if urls else 0
+            })
+            should_enrich, skip_reason, trigger_reason, triggers = await self._should_enrich_post(
+                post_id=post_id,
+                tags=tags,
+                post_content=post_content
+            )
+            logger.debug("enrich_trigger_check_done", extra={
+                "post_id": post_id,
+                "should_enrich": should_enrich,
+                "skip_reason": skip_reason,
+                "trigger_reason": trigger_reason,
+                "triggers": triggers
+            })
+            
+            if not should_enrich:
+                logger.info(f"Post {post_id} skipped from enrichment: {skip_reason}")
+                await self._publish_skipped_enrichment(event_data, skip_reason)
+                self.stats['posts_skipped'] += 1
+                enrichment_skipped_total.labels(reason=skip_reason).inc()
+                # МЕТРИКА: пропуск обогащения
+                posts_processed_total.labels(stage='enrichment', success='skip').inc()
+                return
+            
+            # Context7: Обогащение через crawl4ai (если есть URLs)
+            logger.debug("enrich_crawl_check", extra={
+                "post_id": post_id,
+                "has_urls": bool(urls),
+                "urls_count": len(urls) if urls else 0,
+                "urls_type": type(urls).__name__
+            })
+            crawl_enrichment = None
+            if urls:
+                # Создаём post dict для _enrich_post_urls
+                post_for_enrichment = {
+                    'urls': urls,
+                    'tenant_id': tenant_id,
+                    'post_id': post_id  # Context7: Добавляем post_id для логирования
+                }
+                try:
+                    logger.info("enrich_crawl_start", extra={"post_id": post_id, "urls_count": len(urls), "urls": urls[:3]})
+                    crawl_enrichment = await self._enrich_post_urls(post_for_enrichment, tenant_id=tenant_id)
+                    logger.info("enrich_crawl_done", extra={
+                        "post_id": post_id,
+                        "has_results": crawl_enrichment is not None,
+                        "results_count": len(crawl_enrichment.get('crawl_results', [])) if crawl_enrichment else 0
+                    })
+                except Exception as e:
+                    logger.exception("enrich_crawl_error", extra={
+                        "post_id": post_id,
+                        "error": str(e),
+                        "urls_count": len(urls)
+                    })
+                    # Продолжаем обработку даже при ошибке crawl
+                    crawl_enrichment = None
+            
+            # Формирование enrichment_data с metadata
             enrichment_data = {
                 "kind": "enrichment",
                 "source": "enrichment_task", 
@@ -296,12 +408,21 @@ class EnrichmentWorker:
                 "entities": [],
                 "embedding": None,     # индексатор дожмет (см. флаг INDEXER_EMBED_IF_MISSING)
                 "urls": urls,
+                "reason": trigger_reason,  # Context7: Самый высокий приоритет триггера
+                "metadata": {
+                    "triggers": triggers,  # Context7: Список всех сработавших триггеров
+                    "crawl_priority": "high" if trigger_reason == "trigger:url" and crawl_enrichment else "normal"
+                }
             }
             
-            # Построение enriched_event
+            # Добавляем crawl данные если есть
+            if crawl_enrichment:
+                enrichment_data['crawl_data'] = crawl_enrichment
+            
             enriched_event = {
                 "idempotency_key": event_data.get('idempotency_key', f"{post_id}:enriched:v1"),
                 "post_id": post_id,               # UUID-строка!
+                "tenant_id": tenant_id,  # Context7: tenant_id для multi-tenant (из post_context или БД)
                 "channel_id": post_context.get("channel_id", "") if post_context else "",
                 "text": post_context.get("content", "") if post_context else "",
                 "telegram_post_url": post_context.get("telegram_post_url", "") if post_context else "",
@@ -311,7 +432,8 @@ class EnrichmentWorker:
             
             logger.info("enrich_build_done", extra={
                 "out_keys": list(enriched_event.keys()),
-                "enrich_keys": list(enrichment_data.keys())
+                "enrich_keys": list(enrichment_data.keys()),
+                "has_crawl": "crawl_data" in enrichment_data
             })
             
             # [C7-ID: ENRICH-DBG-004] Dry-run сериализации (ловим «Invalid input …» до публикации)
@@ -343,7 +465,18 @@ class EnrichmentWorker:
             sanitized_post_id_for_save = str(normalize_post_id(post_id)) if os.getenv("FEATURE_ALLOW_NON_UUID_IDS", "false").lower() == "true" else post_id
             
             # Сохранение enrichment данных
-            await self._save_enrichment_data(sanitized_post_id_for_save, enrichment_data)
+            try:
+                logger.info("enrich_save_start", extra={"post_id": sanitized_post_id_for_save, "enrichment_kind": enrichment_data.get("kind", "unknown")})
+                await self._save_enrichment_data(sanitized_post_id_for_save, enrichment_data)
+                logger.info("enrich_save_ok", extra={"post_id": sanitized_post_id_for_save})
+            except Exception as e:
+                logger.exception("enrich_save_fail", extra={
+                    "error": str(e),
+                    "post_id": sanitized_post_id_for_save,
+                    "enrichment_kind": enrichment_data.get("kind", "unknown")
+                })
+                # Продолжаем обработку даже при ошибке сохранения - публикуем событие
+                # Это позволит индексатору работать, даже если БД недоступна
             
             # [C7-ID: ENRICH-PUB-002] Публикация enriched
             try:
@@ -391,11 +524,78 @@ class EnrichmentWorker:
             posts_processed_total.labels(stage='enrichment', success='error').inc()
             self.stats['errors'] += 1
     
-    async def _should_enrich_post(self, post_id: str, tags: List[Dict[str, Any]]) -> tuple[bool, str]:
-        """Проверка, нужно ли обогащать пост."""
+    async def _check_enrichment_triggers(self, post_id: str, tags: List[Dict[str, Any]], post_content: Optional[str] = None) -> tuple[bool, str, List[str]]:
+        """
+        Context7: Проверка триггеров обогащения с OR логикой и приоритетами.
+        
+        Приоритеты:
+        1. URL (trigger:url) - если есть URL в посте
+        2. trigger_tags (trigger:tag) - если есть совпадение тегов
+        3. word_count (trigger:wordcount) - если текст >= min_word_count
+        
+        Returns:
+            (should_enrich: bool, reason: str, triggers: List[str])
+            - reason: самый высокий приоритет из сработавших триггеров
+            - triggers: список всех сработавших триггеров
+        """
+        triggers = []
+        
+        # Приоритет 1: URL триггер
+        if post_content:
+            urls = self._extract_urls_from_text(post_content)
+            if urls:
+                triggers.append("trigger:url")
+                enrichment_triggers_total.labels(type="url", decision="hit").inc()
+            else:
+                enrichment_triggers_total.labels(type="url", decision="miss").inc()
+        
+        # Приоритет 2: trigger_tags
+        trigger_tags_config = self.config.get('crawl4ai', {}).get('trigger_tags', [])
+        if trigger_tags_config:
+            post_tags = [tag.get('name', '').lower() for tag in tags]
+            if any(tag.lower() in post_tags for tag in trigger_tags_config):
+                triggers.append("trigger:tag")
+                enrichment_triggers_total.labels(type="tag", decision="hit").inc()
+            else:
+                enrichment_triggers_total.labels(type="tag", decision="miss").inc()
+        
+        # Приоритет 3: word_count
+        if post_content:
+            min_word_count = self.config.get('crawl4ai', {}).get('min_word_count', 100)
+            word_count = len(post_content.split())
+            if word_count >= min_word_count:
+                triggers.append("trigger:wordcount")
+                enrichment_triggers_total.labels(type="wordcount", decision="hit").inc()
+            else:
+                enrichment_triggers_total.labels(type="wordcount", decision="miss").inc()
+        
+        if not triggers:
+            return False, 'no_triggers', []
+        
+        # Определяем reason как самый высокий приоритет
+        if "trigger:url" in triggers:
+            reason = "trigger:url"
+        elif "trigger:tag" in triggers:
+            reason = "trigger:tag"
+        else:
+            reason = "trigger:wordcount"
+        
+        return True, reason, triggers
+    
+    async def _should_enrich_post(self, post_id: str, tags: List[Dict[str, Any]], post_content: Optional[str] = None) -> tuple[bool, str, Optional[str], Optional[List[str]]]:
+        """
+        Проверка, нужно ли обогащать пост.
+        Context7: Использует OR логику с приоритетами через _check_enrichment_triggers.
+        
+        Returns:
+            (should_enrich: bool, reason: str, trigger_reason: Optional[str], triggers: Optional[List[str]])
+            - reason: причина skip (если should_enrich=False) или None
+            - trigger_reason: самый высокий приоритет триггера (если should_enrich=True)
+            - triggers: список всех сработавших триггеров (если should_enrich=True)
+        """
         # Проверка включения enrichment
         if not self.config.get('enrichment', {}).get('enabled', True):
-            return False, 'enrichment_disabled'
+            return False, 'enrichment_disabled', None, None
         
         # [C7-ID: ENRICH-LIMITS-002] Feature flags для обхода лимитов
         skip_limits_env = os.getenv("ENRICHMENT_SKIP_LIMITS", "false")
@@ -405,27 +605,40 @@ class EnrichmentWorker:
         if skip_limits:
             logger.warning("enrich_limits_skipped: feature_flag enabled", extra={"post_id": post_id})
             # Пропускаем проверку лимитов, возвращаем True для продолжения обогащения
-            return True, None
+            return True, 'skip_limits_feature_flag', 'skip_limits_feature_flag', []
         else:
             # Проверка лимитов пользователя
             if not await self._check_user_limits(post_id):
                 logger.warning("enrich_limits_exceeded", extra={"post_id": post_id})
-                return False, 'user_limits_exceeded'
+                return False, 'user_limits_exceeded', None, None
         
-        # Проверка триггерных тегов
-        trigger_tags = self.config.get('crawl4ai', {}).get('trigger_tags', [])
-        if trigger_tags:
-            post_tags = [tag.get('name', '').lower() for tag in tags]
-            if not any(tag in post_tags for tag in trigger_tags):
-                return False, 'no_trigger_tags'
+        # Получаем контент поста для проверки триггеров (если не передан)
+        if post_content is None:
+            post = await self._get_post_content(post_id)
+            post_content = post.get('content', '') if post else ''
         
-        # Проверка минимального количества слов
-        min_word_count = self.config.get('crawl4ai', {}).get('min_word_count', 500)
-        post = await self._get_post_content(post_id)
-        if post and len(post.get('content', '').split()) < min_word_count:
-            return False, 'below_word_count'
+        # Context7: Проверка триггеров с OR логикой и приоритетами
+        should_enrich, trigger_reason, triggers = await self._check_enrichment_triggers(
+            post_id=post_id,
+            tags=tags,
+            post_content=post_content
+        )
         
-        return True, None
+        if not should_enrich:
+            return False, trigger_reason, None, None
+        
+        # Логируем сработавшие триггеры
+        logger.info(
+            "enrichment_triggers_checked",
+            extra={
+                "post_id": post_id,
+                "reason": trigger_reason,
+                "triggers": triggers,
+                "trigger_count": len(triggers)
+            }
+        )
+        
+        return True, None, trigger_reason, triggers
     
     def _should_skip_limits(self, event) -> bool:
         """Проверка feature flags для обхода лимитов."""
@@ -446,13 +659,21 @@ class EnrichmentWorker:
         return False
 
     def _extract_urls_from_text(self, text: str) -> list[str]:
-        """Извлечение URLs из текста через regex."""
-        # [C7-ID: ENRICH-URLS-001] Парсинг URLs из текста
-        import re
-        if not text:
-            return []
-        pattern = r"https?://[^\s)]+"
-        return re.findall(pattern, text)
+        """
+        Извлечение URLs из текста через URLNormalizer.
+        Context7: Использует улучшенную экстракцию с поддержкой Markdown/Telegram форматов.
+        """
+        # Импортируем URLNormalizer
+        from services.url_normalizer import URLNormalizer
+        
+        # Создаём нормализатор (если ещё не создан)
+        if not hasattr(self, '_url_normalizer'):
+            strip_params = self.config.get('crawl4ai', {}).get('strip_query_params', [])
+            self._url_normalizer = URLNormalizer(strip_params=strip_params)
+        
+        # Извлекаем и нормализуем URL
+        urls = self._url_normalizer.extract_urls_from_text(text)
+        return urls
 
     def _minimal_enrichment(self, event) -> dict:
         """Минимальный payload для разблокировки пайплайна."""
@@ -472,6 +693,108 @@ class EnrichmentWorker:
             "version": "v1",
         }
 
+    async def _check_budget(self, tenant_id: str, domain: str) -> tuple[bool, Optional[str]]:
+        """
+        Context7: Проверка бюджетов для CRAWL4AI (per-tenant daily, per-domain hourly).
+        Использует Redis для on-line счетчиков.
+        
+        Args:
+            tenant_id: ID tenant
+            domain: Домен URL для проверки hourly лимита
+            
+        Returns:
+            (is_allowed: bool, reason_if_denied: Optional[str])
+        """
+        if not self.redis_client:
+            # Если Redis недоступен, разрешаем (graceful degradation)
+            logger.warning("Budget check Redis unavailable, allowing request")
+            return True, None
+        
+        crawl_config = self.config.get('crawl4ai', {})
+        budgets = crawl_config.get('budgets', {})
+        
+        per_tenant_daily = budgets.get('per_tenant_daily', 300)
+        per_domain_hourly = budgets.get('per_domain_hourly', 60)
+        
+        try:
+            # Проверка per-tenant daily budget
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            tenant_key = f"enrich:budget:tenant:{tenant_id}:{today}"
+            
+            # Получаем текущее значение
+            tenant_count = await self.redis_client.get(tenant_key)
+            tenant_count = int(tenant_count) if tenant_count else 0
+            
+            if tenant_count >= per_tenant_daily:
+                logger.warning(
+                    "Enrichment budget exceeded (tenant daily)",
+                    tenant_id=tenant_id,
+                    count=tenant_count,
+                    limit=per_tenant_daily
+                )
+                enrichment_budget_checks_total.labels(type="tenant", result="denied").inc()
+                return False, "budget_exceeded:tenant_daily"
+            else:
+                enrichment_budget_checks_total.labels(type="tenant", result="allowed").inc()
+            
+            # Проверка per-domain hourly budget
+            if domain:
+                current_hour = datetime.now(timezone.utc).strftime("%Y-%m-%d:%H")
+                domain_key = f"enrich:budget:domain:{domain}:{current_hour}"
+                
+                domain_count = await self.redis_client.get(domain_key)
+                domain_count = int(domain_count) if domain_count else 0
+                
+                if domain_count >= per_domain_hourly:
+                    logger.warning(
+                        "Enrichment budget exceeded (domain hourly)",
+                        domain=domain,
+                        count=domain_count,
+                        limit=per_domain_hourly
+                    )
+                    enrichment_budget_checks_total.labels(type="domain", result="denied").inc()
+                    return False, "budget_exceeded:domain_hourly"
+                else:
+                    enrichment_budget_checks_total.labels(type="domain", result="allowed").inc()
+            
+            return True, None
+            
+        except Exception as e:
+            logger.error("Budget check error", tenant_id=tenant_id, domain=domain, error=str(e))
+            # При ошибке разрешаем (graceful degradation)
+            return True, None
+    
+    async def _increment_budget(self, tenant_id: str, domain: str):
+        """
+        Context7: Инкремент счетчиков бюджетов после успешного crawl.
+        Использует Redis для on-line счетчиков с TTL.
+        
+        Args:
+            tenant_id: ID tenant
+            domain: Домен URL
+        """
+        if not self.redis_client:
+            return
+        
+        try:
+            # Инкремент per-tenant daily
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            tenant_key = f"enrich:budget:tenant:{tenant_id}:{today}"
+            await self.redis_client.incr(tenant_key)
+            # TTL: 25 часов для daily
+            await self.redis_client.expire(tenant_key, 25 * 3600)
+            
+            # Инкремент per-domain hourly
+            if domain:
+                current_hour = datetime.now(timezone.utc).strftime("%Y-%m-%d:%H")
+                domain_key = f"enrich:budget:domain:{domain}:{current_hour}"
+                await self.redis_client.incr(domain_key)
+                # TTL: 2 часа для hourly
+                await self.redis_client.expire(domain_key, 2 * 3600)
+            
+        except Exception as e:
+            logger.error("Budget increment error", tenant_id=tenant_id, domain=domain, error=str(e))
+    
     async def _check_user_limits(self, post_id: str) -> bool:
         """Проверка лимитов пользователя."""
         try:
@@ -529,8 +852,26 @@ class EnrichmentWorker:
         
         result = await self.db_session.execute(
             text("""
-            SELECT p.id, p.content, p.channel_id, p.telegram_post_url, p.posted_at, p.telegram_message_id
+            SELECT 
+                p.id, 
+                p.content, 
+                p.channel_id, 
+                p.telegram_post_url, 
+                p.posted_at, 
+                p.telegram_message_id,
+                COALESCE(
+                    (SELECT u.tenant_id::text FROM users u 
+                     JOIN user_channel uc ON uc.user_id = u.id 
+                     WHERE uc.channel_id = c.id 
+                     LIMIT 1),
+                    CAST(pe_tags.data->>'tenant_id' AS text),
+                    CAST(c.settings->>'tenant_id' AS text),
+                    'default'
+                ) as tenant_id
             FROM posts p
+            JOIN channels c ON p.channel_id = c.id
+            LEFT JOIN post_enrichment pe_tags 
+                ON pe_tags.post_id = p.id AND pe_tags.kind = 'tags'
             WHERE p.id = :post_id
             """),
             {"post_id": post_id}
@@ -576,8 +917,11 @@ class EnrichmentWorker:
         row = result.fetchone()
         return dict(row._mapping) if row else None
     
-    async def _enrich_post_urls(self, post: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Обогащение поста через crawl4ai."""
+    async def _enrich_post_urls(self, post: Dict[str, Any], tenant_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """
+        Обогащение поста через crawl4ai с проверкой бюджетов.
+        Context7: Проверяет бюджеты перед crawl, инкрементирует после успешного crawl.
+        """
         urls = post.get('urls', [])
         if not urls:
             return None
@@ -589,13 +933,86 @@ class EnrichmentWorker:
             'crawled_at': datetime.now(timezone.utc).isoformat()
         }
         
+        # Получаем tenant_id если не передан
+        if not tenant_id:
+            tenant_id = post.get('tenant_id')
+            
+            # Context7: Если tenant_id отсутствует или равен 'default', пытаемся получить из БД
+            if not tenant_id or tenant_id == 'default':
+                try:
+                    # Context7: Используем тот же SQL запрос, что и в _handle_post_tagged
+                    # Получаем post_id из post (может быть в разных форматах)
+                    post_id = post.get('id') or post.get('post_id')
+                    if post_id:
+                        tenant_id_result = await self.db_session.execute(
+                            text("""
+                                SELECT COALESCE(
+                                    (SELECT u.tenant_id::text FROM users u 
+                                     JOIN user_channel uc ON uc.user_id = u.id 
+                                     WHERE uc.channel_id = c.id 
+                                     LIMIT 1),
+                                    CAST(pe_tags.data->>'tenant_id' AS text),
+                                    CAST(c.settings->>'tenant_id' AS text),
+                                    'default'
+                                ) as tenant_id
+                                FROM posts p
+                                JOIN channels c ON c.id = p.channel_id
+                                LEFT JOIN post_enrichment pe_tags 
+                                    ON pe_tags.post_id = p.id AND pe_tags.kind = 'tags'
+                                WHERE p.id = :post_id
+                                LIMIT 1
+                            """),
+                            {"post_id": post_id}
+                        )
+                        row = tenant_id_result.fetchone()
+                        if row and row[0]:
+                            tenant_id_db = str(row[0]) if row[0] else None
+                            if tenant_id_db and tenant_id_db != "default":
+                                tenant_id = tenant_id_db
+                                logger.debug(
+                                    "Using tenant_id from DB in _crawl_post_urls",
+                                    post_id=post_id,
+                                    tenant_id=tenant_id
+                                )
+                except Exception as e:
+                    logger.debug(
+                        "Failed to get tenant_id from DB in _crawl_post_urls",
+                        post_id=post.get('id') or post.get('post_id'),
+                        error=str(e)
+                    )
+            
+            # Context7: Fallback на 'default' только если все еще не найден
+            if not tenant_id or tenant_id == 'default':
+                tenant_id = 'default'
+                logger.warning(
+                    "tenant_id not found or is 'default' in _crawl_post_urls, using 'default'",
+                    post_id=post.get('id') or post.get('post_id'),
+                    tenant_id_from_post=post.get('tenant_id')
+                )
+        
         for url in urls:
             try:
-                # Проверка кеша
-                cached_result = await self._get_cached_crawl(url)
+                # Context7: Глобальная дедупликация - проверка кеша по нормализованному URL
+                cached_result = await self._check_url_crawled(url)
                 if cached_result:
                     enrichment_data['crawl_results'].append(cached_result)
                     self.stats['cache_hits'] += 1
+                    logger.info("Using cached crawl result", url=url, cache_hit=True)
+                    continue
+                
+                # Context7: Проверка бюджета перед crawl
+                domain = self._get_domain_from_url(url)
+                is_allowed, budget_reason = await self._check_budget(tenant_id, domain)
+                if not is_allowed:
+                    logger.warning(
+                        "Crawl skipped due to budget",
+                        url=url,
+                        tenant_id=tenant_id,
+                        domain=domain,
+                        reason=budget_reason
+                    )
+                    # Метрика для skip
+                    enrichment_skipped_total.labels(reason=budget_reason or "budget_exceeded").inc()
                     continue
                 
                 # Crawl URL
@@ -604,94 +1021,197 @@ class EnrichmentWorker:
                     enrichment_data['crawl_results'].append(crawl_result)
                     enrichment_data['total_word_count'] += crawl_result.get('word_count', 0)
                     
-                    # Кеширование результата
-                    await self._cache_crawl_result(url, crawl_result)
+                    # Context7: Сохранение результата в глобальный кеш (дедупликация)
+                    await self._mark_url_crawled(url, crawl_result)
+                    
+                    # Context7: Инкремент бюджетов после успешного crawl
+                    await self._increment_budget(tenant_id, domain)
                     
                     self.stats['urls_crawled'] += 1
                 else:
                     self.stats['urls_failed'] += 1
                     
             except Exception as e:
-                logger.error(f"Failed to crawl URL {url}: {e}")
+                logger.error(f"Failed to crawl URL: url={url}, error={str(e)}", exc_info=True)
                 self.stats['urls_failed'] += 1
         
         return enrichment_data if enrichment_data['crawl_results'] else None
     
-    async def _get_cached_crawl(self, url: str) -> Optional[Dict[str, Any]]:
-        """Получение кешированного результата crawl."""
+    def _get_enrichment_key(self, url: str) -> str:
+        """
+        Context7: Генерация enrichment ключа для глобальной дедупликации.
+        Использует нормализованный URL + policy_version (без post_id для глобальной дедупликации).
+        
+        Args:
+            url: URL для нормализации
+            
+        Returns:
+            SHA256 хеш нормализованного URL + policy_version
+        """
+        import hashlib
+        
+        # Получаем нормализатор
+        if not hasattr(self, '_url_normalizer'):
+            from services.url_normalizer import URLNormalizer
+            strip_params = self.config.get('crawl4ai', {}).get('strip_query_params', [])
+            self._url_normalizer = URLNormalizer(strip_params=strip_params)
+        
+        # Нормализуем URL
+        normalized_url = self._url_normalizer.normalize_url(url)
+        
+        # Получаем policy_version (версия политики для инвалидации кеша)
+        policy_version = self.config.get('crawl4ai', {}).get('policy_version', 'v1')
+        
+        # Генерируем ключ
+        key_data = f"{normalized_url}:{policy_version}"
+        enrichment_key = hashlib.sha256(key_data.encode('utf-8')).hexdigest()
+        
+        return enrichment_key
+    
+    async def _check_url_crawled(self, url: str) -> Optional[Dict[str, Any]]:
+        """
+        Context7: Проверка, был ли URL уже обработан (глобальная дедупликация).
+        Возвращает кешированный результат если он есть.
+        
+        Args:
+            url: URL для проверки
+            
+        Returns:
+            Кешированный результат crawl или None
+        """
         if not self.config.get('crawl4ai', {}).get('caching', {}).get('enabled', True):
             return None
         
-        cache_key = f"crawl:{hashlib.sha256(url.encode()).hexdigest()}"
-        cached_data = await self.redis_client.get(cache_key)
+        enrichment_key = self._get_enrichment_key(url)
+        cache_key = f"enrich:crawl:{enrichment_key}"
         
-        if cached_data:
-            try:
-                return json.loads(cached_data)
-            except json.JSONDecodeError:
-                return None
+        try:
+            cached_data = await self.redis_client.get(cache_key)
+            if cached_data:
+                try:
+                    result = json.loads(cached_data)
+                    logger.debug("Cached crawl result found", url=url, enrichment_key=enrichment_key[:16])
+                    return result
+                except json.JSONDecodeError:
+                    logger.warning(f"Failed to parse cached crawl result: url={url}")
+                    return None
+        except Exception as e:
+            logger.error(f"Error checking cached crawl: url={url}, error={str(e)}", exc_info=True)
         
         return None
     
-    async def _cache_crawl_result(self, url: str, result: Dict[str, Any]):
-        """Кеширование результата crawl."""
+    async def _mark_url_crawled(self, url: str, result: Dict[str, Any]):
+        """
+        Context7: Сохранение результата crawl в Redis с TTL (глобальная дедупликация).
+        
+        Args:
+            url: URL (используется для генерации ключа)
+            result: Результат crawl для сохранения
+        """
         if not self.config.get('crawl4ai', {}).get('caching', {}).get('enabled', True):
             return
         
-        cache_key = f"crawl:{hashlib.sha256(url.encode()).hexdigest()}"
-        ttl_days = self.config.get('crawl4ai', {}).get('caching', {}).get('ttl_days', 7)
-        ttl_seconds = ttl_days * 24 * 3600
+        enrichment_key = self._get_enrichment_key(url)
+        cache_key = f"enrich:crawl:{enrichment_key}"
         
-        await self.redis_client.setex(
-            cache_key,
-            ttl_seconds,
-            json.dumps(result)
-        )
-    
-    async def _crawl_url(self, url: str) -> Optional[Dict[str, Any]]:
-        """Crawl URL через crawl4ai."""
-        start_time = time.time()
+        ttl_days = self.config.get('crawl4ai', {}).get('caching', {}).get('ttl_days', 7)
+        ttl_seconds = int(ttl_days * 24 * 3600)
         
         try:
-            # Проверка ограничений домена
-            if not await self._is_url_allowed(url):
-                logger.info(f"URL {url} is not allowed by domain restrictions")
+            await self.redis_client.setex(
+                cache_key,
+                ttl_seconds,
+                json.dumps(result)
+            )
+            logger.debug("Crawl result cached", url=url, enrichment_key=enrichment_key[:16], ttl_days=ttl_days)
+        except Exception as e:
+            logger.error(f"Error caching crawl result: url={url}, error={str(e)}", exc_info=True)
+    
+    async def _get_cached_crawl(self, url: str) -> Optional[Dict[str, Any]]:
+        """
+        Получение кешированного результата crawl (legacy метод).
+        Context7: Использует _check_url_crawled для глобальной дедупликации.
+        """
+        return await self._check_url_crawled(url)
+    
+    async def _cache_crawl_result(self, url: str, result: Dict[str, Any]):
+        """
+        Кеширование результата crawl (legacy метод).
+        Context7: Использует _mark_url_crawled для глобальной дедупликации.
+        """
+        await self._mark_url_crawled(url, result)
+    
+    async def _crawl_url(self, url: str) -> Optional[Dict[str, Any]]:
+        """
+        Crawl URL через crawl4ai с SSRF защитой и ограничениями.
+        Context7: Использует _validate_url_security, ограничения из конфига.
+        """
+        start_time = time.time()
+        crawl_config = self.config.get('crawl4ai', {})
+        
+        try:
+            # Context7: SSRF защита перед crawl
+            is_allowed, deny_reason = self._validate_url_security(url)
+            if not is_allowed:
+                logger.warning(f"URL blocked by SSRF protection: url={url}, reason={deny_reason}")
+                # Метрика для SSRF блокировки
+                domain = self._get_domain_from_url(url)
+                enrichment_crawl_requests_total.labels(domain=domain, status="ssrf_denied").inc()
                 return None
             
-            # Настройки crawl
-            timeout = self.config.get('crawl4ai', {}).get('timeout_seconds', 30)
+            # Настройки crawl из конфига
+            timeout = crawl_config.get('total_timeout_s', 15)
+            # Context7: max_redirects и max_response_bytes ограничения применяются через SSRF защиту
+            # и валидацию URL в _validate_url_security
+            
+            # Context7: Нормализация URL перед crawl (повторная канонизация - граница доверия)
+            if hasattr(self, '_url_normalizer'):
+                normalized_url = self._url_normalizer.normalize_url(url)
+            else:
+                from services.url_normalizer import URLNormalizer
+                strip_params = crawl_config.get('strip_query_params', [])
+                self._url_normalizer = URLNormalizer(strip_params=strip_params)
+                normalized_url = self._url_normalizer.normalize_url(url)
             
             # Crawl с извлечением текста
+            # Context7: Ограничения безопасности (max_redirects, max_response_bytes) 
+            # могут быть не поддерживаться напрямую в arun - передаются через конфигурацию crawler
+            # Context7: Используем новый API crawl4ai с LLMConfig
+            # Для простого извлечения markdown не нужен LLM, но LLMExtractionStrategy может улучшить качество
+            llm_config = LLMConfig(
+                provider="openai/gpt-4o-mini",  # Используем дешевую модель для извлечения
+                api_token="dummy"  # Не используется для простого извлечения, но требуется для инициализации
+            )
             result = await self.crawler.arun(
-                url=url,
+                url=normalized_url,
                 extraction_strategy=LLMExtractionStrategy(
-                    provider="openai",
-                    api_token="dummy",  # Не используется для простого извлечения
+                    llm_config=llm_config,
                     instruction="Extract the main content and return as markdown"
                 ),
                 timeout=timeout,
                 wait_for="networkidle"
             )
             
+            crawl_duration = time.time() - start_time
+            
             if result.success and result.extracted_content:
                 # Подсчёт слов
                 word_count = len(result.extracted_content.split())
                 
                 crawl_result = {
-                    'url': url,
+                    'url': normalized_url,  # Сохраняем нормализованный URL
+                    'original_url': url,  # Сохраняем оригинальный URL для отслеживания
                     'title': result.metadata.get('title', ''),
                     'content': result.extracted_content,
                     'markdown': result.markdown,
                     'word_count': word_count,
                     'crawled_at': datetime.now(timezone.utc).isoformat(),
-                    'latency_ms': int((time.time() - start_time) * 1000)
+                    'latency_ms': int(crawl_duration * 1000),
+                    'status': 'ok'
                 }
                 
-                # Метрики
-                enrichment_latency_seconds.labels(
-                    provider='crawl4ai',
-                    operation='crawl'
-                ).observe(time.time() - start_time)
+                # Метрики (используем enrichment_crawl_duration_seconds для crawl)
+                enrichment_crawl_duration_seconds.observe(crawl_duration)
                 
                 enrichment_requests_total.labels(
                     provider='crawl4ai',
@@ -699,13 +1219,38 @@ class EnrichmentWorker:
                     success=True
                 ).inc()
                 
+                # Context7: Метрики для crawl статусов
+                domain = self._get_domain_from_url(normalized_url)
+                enrichment_crawl_requests_total.labels(domain=domain, status="ok").inc()
+                enrichment_crawl_duration_seconds.observe(crawl_duration)
+                
+                logger.info(
+                    "Crawl successful",
+                    url=normalized_url,
+                    word_count=word_count,
+                    latency_ms=int(crawl_duration * 1000)
+                )
+                
                 return crawl_result
             else:
-                logger.warning(f"Crawl failed for {url}: {result.error_message}")
+                error_msg = result.error_message if hasattr(result, 'error_message') else "Unknown error"
+                logger.warning(f"Crawl failed: url={normalized_url}, error={error_msg}")
+                
+                # Метрика для failed crawl
+                domain = self._get_domain_from_url(normalized_url)
+                enrichment_crawl_requests_total.labels(domain=domain, status="blocked").inc()
+                
                 return None
                 
+        except asyncio.TimeoutError:
+            logger.warning(f"Crawl timeout: url={url}, timeout={timeout}")
+            # Метрика для timeout
+            domain = self._get_domain_from_url(url)
+            enrichment_crawl_requests_total.labels(domain=domain, status="timeout").inc()
+            return None
+                
         except Exception as e:
-            logger.error(f"Crawl error for {url}: {e}")
+            logger.error(f"Crawl error: url={url}, error={str(e)}", exc_info=True)
             
             # Метрики ошибки
             enrichment_requests_total.labels(
@@ -714,29 +1259,101 @@ class EnrichmentWorker:
                 success=False
             ).inc()
             
+            domain = self._get_domain_from_url(url)
+            enrichment_crawl_requests_total.labels(domain=domain, status="blocked").inc()
+            
             return None
     
-    async def _is_url_allowed(self, url: str) -> bool:
-        """Проверка разрешённости URL."""
+    def _get_domain_from_url(self, url: str) -> str:
+        """Извлечение домена из URL для метрик."""
         try:
             parsed = urlparse(url)
-            domain = parsed.netloc.lower()
+            return parsed.netloc.lower() or "unknown"
+        except Exception:
+            return "unknown"
+    
+    def _validate_url_security(self, url: str) -> tuple[bool, Optional[str]]:
+        """
+        Context7: SSRF защита - валидация URL безопасности.
+        
+        Проверки:
+        - Разрешить только http:// и https://
+        - Запретить: file:, data:, ftp:, gopher:, localhost, 127.0.0.1, ::1
+        - Запретить RFC1918: 10.x.x.x, 172.16-31.x.x, 192.168.x.x
+        - Запретить link-local: 169.254.x.x
+        
+        Returns:
+            (is_allowed: bool, reason_if_denied: Optional[str])
+        """
+        try:
+            parsed = urlparse(url)
+            scheme = parsed.scheme.lower()
             
-            # Проверка заблокированных доменов
-            blocked_domains = self.config.get('crawl4ai', {}).get('domain_restrictions', {}).get('blocked_domains', [])
-            if any(blocked in domain for blocked in blocked_domains):
-                return False
+            # 1. Разрешаем только http:// и https://
+            if scheme not in ['http', 'https']:
+                return False, f"ssrf_denied: scheme_not_allowed ({scheme})"
             
-            # Проверка разрешённых доменов (если указаны)
-            allowed_domains = self.config.get('crawl4ai', {}).get('domain_restrictions', {}).get('allowed_domains', [])
-            if allowed_domains and not any(allowed in domain for allowed in allowed_domains):
-                return False
+            # 2. Проверка hostname на локальные адреса
+            hostname = parsed.hostname
+            if not hostname:
+                return False, "ssrf_denied: no_hostname"
             
-            return True
+            hostname_lower = hostname.lower()
+            
+            # Запрещаем localhost и его варианты
+            if hostname_lower in ['localhost', '127.0.0.1', '::1', '0.0.0.0']:
+                return False, "ssrf_denied: localhost"
+            
+            # Проверка на IP адреса (RFC1918 и link-local)
+            import ipaddress
+            try:
+                ip = ipaddress.ip_address(hostname)
+                
+                # Запрещаем private IP (RFC1918)
+                if ip.is_private:
+                    return False, "ssrf_denied: private_ip"
+                
+                # Запрещаем link-local
+                if ip.is_link_local:
+                    return False, "ssrf_denied: link_local"
+                
+                # Запрещаем loopback
+                if ip.is_loopback:
+                    return False, "ssrf_denied: loopback"
+                
+            except ValueError:
+                # Не IP адрес, проверяем домен
+                pass
+            
+            # 3. Проверка заблокированных доменов
+            denylist_domains = self.config.get('crawl4ai', {}).get('denylist_domains', [])
+            if denylist_domains:
+                for blocked in denylist_domains:
+                    if blocked.lower() in hostname_lower:
+                        return False, f"ssrf_denied: denylist_domain ({blocked})"
+            
+            # 4. Проверка разрешённых доменов (whitelist)
+            allowlist_domains = self.config.get('crawl4ai', {}).get('allowlist_domains', [])
+            if allowlist_domains:
+                # Если whitelist не пустой, разрешаем только домены из whitelist
+                if not any(allowed.lower() in hostname_lower for allowed in allowlist_domains):
+                    return False, "ssrf_denied: not_in_allowlist"
+            
+            return True, None
             
         except Exception as e:
-            logger.error(f"URL validation error: {e}")
-            return False
+            logger.error(f"URL security validation error: url={url}, error={str(e)}", exc_info=True)
+            return False, f"ssrf_denied: validation_error ({str(e)})"
+    
+    async def _is_url_allowed(self, url: str) -> bool:
+        """
+        Проверка разрешённости URL (legacy метод).
+        Context7: Использует _validate_url_security для SSRF защиты.
+        """
+        is_allowed, reason = self._validate_url_security(url)
+        if not is_allowed:
+            logger.warning(f"URL blocked by security check: url={url}, reason={reason}")
+        return is_allowed
     
     async def _save_enrichment_data(self, post_id: str, enrichment_data: Dict[str, Any]):
         """
@@ -746,14 +1363,45 @@ class EnrichmentWorker:
         - kind='crawl' если есть crawl_results (результаты crawl4ai)
         - kind='general' если нет crawl_results (простое обогащение через теги/URLs)
         """
-        # Context7: Импорт shared репозитория
+        # Context7: Импорт shared репозитория с правильной обработкой путей
+        # Best practice: сначала пробуем импорт напрямую (если пакет установлен через pip install -e)
+        # Затем добавляем пути для dev окружения (volume mounts)
         import sys
         import os
-        shared_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'shared', 'python'))
-        if shared_path not in sys.path:
-            sys.path.insert(0, shared_path)
         
-        from shared.repositories.enrichment_repository import EnrichmentRepository
+        try:
+            # Попытка 1: Прямой импорт (если пакет установлен через pip install -e)
+            from shared.repositories.enrichment_repository import EnrichmentRepository
+        except ImportError:
+            # Попытка 2: Добавление пути из worker контейнера
+            # Context7: Dockerfile устанавливает через `pip install -e /app/shared/python`
+            # Поэтому пакет должен быть доступен напрямую, но если нет - добавляем пути
+            shared_paths = [
+                '/app/shared/python',  # Production путь в контейнере (из Dockerfile)
+                os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', 'shared', 'python')),  # Dev путь от worker/tasks
+                os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'shared', 'python')),  # Альтернативный путь
+            ]
+            
+            for shared_path in shared_paths:
+                if os.path.exists(shared_path) and shared_path not in sys.path:
+                    sys.path.insert(0, shared_path)
+                    logger.debug(f"Added shared path to sys.path: {shared_path}")
+            
+            try:
+                from shared.repositories.enrichment_repository import EnrichmentRepository
+            except ImportError as e:
+                logger.error(f"Failed to import EnrichmentRepository: {e}", extra={
+                    "sys_path": sys.path[:5],  # Первые 5 путей для отладки
+                    "shared_paths_tried": shared_paths,
+                    "cwd": os.getcwd()
+                })
+                # Context7: Graceful degradation - логируем ошибку, но не падаем
+                # Продолжаем обработку без сохранения в БД (данные уже в событии posts.enriched)
+                logger.warning("DB save failed, but continuing with event emission", extra={
+                    "post_id": post_id,
+                    "error": str(e)
+                })
+                return
         
         try:
             logger.info("enrichment_save_start", extra={"post_id": post_id, "enrichment_keys": list(enrichment_data.keys())})
@@ -805,9 +1453,12 @@ class EnrichmentWorker:
                 'metadata': {k: v for k, v in enrichment_data.items() if k not in ['crawl_results', 'latency_ms']}
             }
             
-            # Добавляем crawl_md только для crawl kind
-            if kind == 'crawl':
+            # Context7: Добавляем crawl_md в data JSONB для синхронизации с legacy полем
+            # Это позволяет EnrichmentRepository синхронизировать legacy поле crawl_md
+            if kind == 'crawl' and crawl_md:
                 enrichment_payload['crawl_md'] = crawl_md
+                # Также добавляем в enrichment_data для полноты
+                enrichment_payload['enrichment_data']['crawl_md'] = crawl_md
             
             # Используем EnrichmentRepository (принимает SQLAlchemy AsyncSession)
             repo = EnrichmentRepository(self.db_session)

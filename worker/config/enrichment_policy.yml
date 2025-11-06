@@ -9,6 +9,10 @@ enrichment:
   # Включение/отключение enrichment
   enabled: true
   
+  # OCR Fallback (отключено по умолчанию - нет GPU и локальных моделей)
+  # См. docs/OCR_FALLBACK_LIMITATIONS.md для деталей
+  ocr_fallback_enabled: false
+  
   # Максимальное количество параллельных операций enrichment
   max_concurrent_operations: 5
   
@@ -30,53 +34,51 @@ crawl4ai:
   enabled: true
   
   # Триггеры для обогащения (теги, которые запускают crawl4ai)
+  # Context7: Короткий список для старта, расширяется по телеметрии
   trigger_tags:
-    - longread
+    - ai
     - research
-    - paper
-    - release
-    - law
-    - deepdive
-    - analysis
     - report
-    - study
-    - whitepaper
   
   # Минимальное количество слов для обогащения
-  min_word_count: 500
+  # Context7: Снижено с 500 до 100 для более гибкого обогащения
+  min_word_count: 100
   
-  # Максимальное количество токенов в день на пользователя
-  max_tokens_per_day_per_user: 50000
-  
-  # Таймаут для crawl операций (секунды)
-  timeout_seconds: 30
-  
-  # Максимальная длина URL для обогащения
-  max_url_length: 2048
-  
-  # Ограничения на домены
-  domain_restrictions:
-    # Разрешённые домены (пустой список = все разрешены)
-    allowed_domains: []
+  # Разрешённые домены (пустой список = все с SSRF-guard)
+  allowlist_domains: []
     
     # Запрещённые домены
-    blocked_domains:
-      - "example.com"
-      - "test.com"
+  denylist_domains:
+    - localhost
+    - 127.0.0.1
   
-  # Настройки безопасности
-  security:
-    # Проверка robots.txt
-    respect_robots_txt: true
-    
-    # Максимальная глубина редиректов
-    max_redirects: 5
-    
-    # User-Agent для запросов
-    user_agent: "TelegramAssistant/1.0 (Crawl4AI Bot)"
-    
-    # Задержка между запросами (секунды)
-    request_delay: 1.0
+  # Максимальная конкуренция на домен
+  max_concurrency_per_domain: 2
+  
+  # Максимальная глубина редиректов (≤3 для безопасности)
+  max_redirects: 3
+  
+  # Общий timeout для crawl операций (секунды)
+  total_timeout_s: 15
+  
+  # Максимальный размер ответа (10MB)
+  max_response_bytes: 10485760
+  
+  # Параметры для удаления из URL (для нормализации)
+  strip_query_params:
+    - utm_*
+    - gclid
+    - fbclid
+  
+  # Бюджеты для ограничения нагрузки
+  budgets:
+    # Максимальное количество crawl запросов на tenant в день
+    per_tenant_daily: 300
+    # Максимальное количество crawl запросов на домен в час
+    per_domain_hourly: 60
+  
+  # Версия политики (для инвалидации кеша при изменении политики)
+  policy_version: v1
   
   # Кеширование результатов
   caching:

@@ -1,0 +1,14 @@
+# Context7: Минимальная конфигурация SearXNG для внутреннего использования
+# Основано на best practices из n8n-installer: https://github.com/kossakovsky/n8n-installer
+use_default_settings: true
+
+server:
+  limiter: false
+  public_instance: false
+  secret_key: "vcfymLc0NUXiKLlkwfE75Y75yBORU3c"
+
+search:
+  safe_search: 0
+  formats:
+    - html
+    - json

@@ -90,6 +90,57 @@ class Settings(BaseSettings):
     # WebApp auth TTL (Context7)
     webapp_auth_ttl_seconds: int = 900  # 15 минут по умолчанию
     
+    # SearXNG Configuration - Context7: для внешнего поиска (external search grounding)
+    # Основано на best practices из n8n-installer: https://github.com/kossakovsky/n8n-installer
+    # Вариант A: Используем внутренний URL для прямого доступа (минуя Caddy)
+    # Это позволяет избежать проблем с bot detection при внутреннем использовании
+    searxng_url: str = "http://searxng:8080"
+    # Вариант B (если нужен HTTPS через Caddy): "https://searxng.produman.studio"
+    searxng_enabled: bool = True
+    searxng_cache_ttl: int = 3600  # TTL кэша в секундах
+    searxng_max_results: int = 5
+    searxng_rate_limit_per_user: int = 10  # Запросов в минуту на пользователя
+    # Context7: BasicAuth для SearXNG (если требуется)
+    searxng_user: str = ""
+    searxng_password: str = ""
+    
+    # SaluteSpeech Configuration - Context7: для транскрибации голосовых сообщений
+    salutespeech_client_id: str = ""
+    salutespeech_client_secret: str = ""
+    salutespeech_scope: str = "SALUTE_SPEECH_PERS"
+    salutespeech_url: str = "https://smartspeech.sber.ru/rest/v1"
+    voice_transcription_enabled: bool = True
+    voice_max_duration_sec: int = 60
+    voice_cache_ttl: int = 86400
+    
+    # RAG Conversation Context - Context7: для multi-turn conversations
+    rag_conversation_history_enabled: bool = True
+    rag_max_conversation_turns: int = 5  # Максимальное количество пар вопрос-ответ для контекста
+    rag_conversation_window_hours: int = 24  # Окно времени для истории (часы)
+    
+    # OpenAI-compatible API (gpt2giga-proxy) - Context7: для работы с GigaChat через LangChain
+    # Context7: Используем URL без /v1, так как прокси может перенаправлять на /chat/completions
+    # LangChain автоматически добавит /v1 при необходимости
+    openai_api_base: str = "http://gpt2giga-proxy:8090"
+    openai_api_key: str = "dummy"  # gpt2giga-proxy игнорирует, использует GIGACHAT_CREDENTIALS
+    
+    # GigaChat Configuration - Context7: для прямого использования GigaChat API
+    gigachat_credentials: str = ""
+    gigachat_scope: str = "GIGACHAT_API_PERS"
+    gigachat_proxy_url: str = "http://gpt2giga-proxy:8090"  # URL gpt2giga-proxy для embeddings
+    
+    # Qdrant Configuration - Context7: для векторного поиска
+    qdrant_url: str = "http://qdrant:6333"
+    
+    # Neo4j Configuration - Context7: для GraphRAG и графа знаний
+    neo4j_uri: str = "neo4j://neo4j:7687"
+    neo4j_user: str = "neo4j"
+    neo4j_password: str = "neo4j123"  # Context7: Исправлен пароль (должен совпадать с docker-compose.yml)
+    neo4j_vector_index_name: str = "post_embeddings"
+    neo4j_fulltext_index_name: str = "post_fulltext"
+    neo4j_interest_sync_interval_min: int = 15
+    neo4j_max_graph_depth: int = 2  # Максимальная глубина обхода графа для производительности
+    
     class Config:
         env_file = ".env"
         case_sensitive = False

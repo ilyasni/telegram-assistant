@@ -396,6 +396,57 @@ class VisionAnalysisTask:
             post_id = event.post_id
             trace_id = event.trace_id
             
+            # Context7: Если tenant_id из события равен 'default', пытаемся получить из БД
+            if not tenant_id or tenant_id == 'default':
+                try:
+                    from sqlalchemy import text
+                    tenant_id_result = await self.db.execute(
+                        text("""
+                            SELECT COALESCE(
+                                (SELECT u.tenant_id::text FROM users u 
+                                 JOIN user_channel uc ON uc.user_id = u.id 
+                                 WHERE uc.channel_id = c.id 
+                                 LIMIT 1),
+                                CAST(pe_tags.data->>'tenant_id' AS text),
+                                CAST(c.settings->>'tenant_id' AS text),
+                                'default'
+                            ) as tenant_id
+                            FROM posts p
+                            JOIN channels c ON c.id = p.channel_id
+                            LEFT JOIN post_enrichment pe_tags 
+                                ON pe_tags.post_id = p.id AND pe_tags.kind = 'tags'
+                            WHERE p.id = :post_id
+                            LIMIT 1
+                        """),
+                        {"post_id": post_id}
+                    )
+                    row = tenant_id_result.fetchone()
+                    if row and row[0] and row[0] != 'default':
+                        tenant_id = str(row[0])
+                        logger.debug(
+                            "Using tenant_id from DB in vision_analysis_task",
+                            post_id=post_id,
+                            tenant_id=tenant_id,
+                            trace_id=trace_id
+                        )
+                except Exception as e:
+                    logger.debug(
+                        "Failed to get tenant_id from DB in vision_analysis_task",
+                        post_id=post_id,
+                        error=str(e),
+                        trace_id=trace_id
+                    )
+            
+            # Context7: Fallback на 'default' только если все еще не найден
+            if not tenant_id or tenant_id == 'default':
+                tenant_id = 'default'
+                logger.warning(
+                    "tenant_id not found or is 'default' in vision_analysis_task, using 'default'",
+                    post_id=post_id,
+                    tenant_id_from_event=event.tenant_id,
+                    trace_id=trace_id
+                )
+            
             # Context7: Нормализация post_id на раннем этапе для консистентности
             # Используем тот же подход, что и в EnrichmentTask
             original_post_id = post_id
@@ -510,6 +561,8 @@ class VisionAnalysisTask:
                                 }
                             )
                             # Fallback на OCR если разрешено
+                            # Context7: Проверяем, что OCR fallback доступен (self.ocr_fallback не None)
+                            # Если OCR fallback отключен через ocr_fallback_enabled=false, self.ocr_fallback = None
                             if policy_result.get("use_ocr") and self.ocr_fallback:
                                 logger.info(
                                     "Falling back to OCR",
@@ -524,15 +577,22 @@ class VisionAnalysisTask:
                                     analysis_results.append(result)
                                     vision_media_total.labels(result="ok", reason="ocr_fallback").inc()
                             else:
-                                skipped_reasons.append({
-                                    "media_id": media_id,
-                                    "reason": "budget",
-                                    "details": {
+                                # OCR fallback недоступен или не разрешен политикой
+                                skip_reason = "budget"
+                                skip_details = {
                                         "budget_bucket": budget_reason,
                                         "estimated_tokens": 1792
                                     }
+                                if not self.ocr_fallback:
+                                    skip_reason = "budget_no_ocr_fallback"
+                                    skip_details["ocr_fallback_disabled"] = True
+                                
+                                skipped_reasons.append({
+                                    "media_id": media_id,
+                                    "reason": skip_reason,
+                                    "details": skip_details
                                 })
-                                vision_media_total.labels(result="skipped", reason="budget_exhausted").inc()
+                                vision_media_total.labels(result="skipped", reason=skip_reason).inc()
                             continue
                     
                     # Vision анализ через GigaChat
@@ -1175,6 +1235,26 @@ class VisionAnalysisTask:
             # OCR извлечение текста
             ocr_text = await self.ocr_fallback.extract_text(file_content)
             
+            # Context7: Логирование результата OCR для отладки
+            if ocr_text and ocr_text.strip():
+                logger.debug(
+                    "OCR text extracted successfully",
+                    sha256=media_file.sha256[:16] + "...",
+                    text_length=len(ocr_text),
+                    text_preview=ocr_text[:100] if len(ocr_text) > 100 else ocr_text,
+                    post_id=post_id,
+                    trace_id=trace_id
+                )
+            else:
+                logger.warning(
+                    "OCR text is empty or whitespace only",
+                    sha256=media_file.sha256[:16] + "...",
+                    s3_key=media_file.s3_key,
+                    engine=self.ocr_fallback.engine,
+                    post_id=post_id,
+                    trace_id=trace_id
+                )
+            
             # Классификация по тексту
             classification = await self.ocr_fallback.classify_content_type(ocr_text)
             
@@ -1185,7 +1265,7 @@ class VisionAnalysisTask:
                     "provider": "ocr_fallback",
                     "model": self.ocr_fallback.engine,
                     "classification": classification,
-                    "ocr_text": ocr_text,
+                    "ocr_text": ocr_text if ocr_text and ocr_text.strip() else None,  # Context7: Сохраняем None вместо пустой строки
                     "description": None,
                     "is_meme": classification.get("is_meme", False),
                     "context": {},
@@ -1198,6 +1278,60 @@ class VisionAnalysisTask:
             logger.error("OCR fallback failed", sha256=media_file.sha256, error=str(e))
             return None
     
+    def _extract_ocr_data(self, result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Context7: Извлечение OCR данных из результата анализа.
+        Поддерживает оба формата: ocr_text (legacy) и ocr объект (новый формат).
+        
+        Args:
+            result: Результат анализа из GigaChat Vision API или ocr_fallback
+            
+        Returns:
+            OCR объект с полями {text, engine, confidence} или None
+        """
+        ocr_data = None
+        
+        # Формат 1: ocr_text как строка (legacy, используется ocr_fallback)
+        ocr_text = result.get("ocr_text")
+        if ocr_text is not None:
+            # Context7: Проверяем, что текст не пустой и не только пробелы
+            ocr_text_stripped = str(ocr_text).strip() if ocr_text else ""
+            if ocr_text_stripped and len(ocr_text_stripped) > 0:
+                ocr_data = {
+                    "text": ocr_text_stripped,
+                    "engine": "tesseract" if result.get("provider") == "ocr_fallback" else "gigachat",
+                    "confidence": None
+                }
+        elif result.get("ocr"):
+            # Формат 2: ocr как объект (новый формат, используется GigaChat)
+            ocr_obj = result.get("ocr")
+            if isinstance(ocr_obj, dict):
+                ocr_text_obj = ocr_obj.get("text")
+                # Context7: Проверяем, что текст не пустой и не только пробелы
+                if ocr_text_obj is not None:
+                    ocr_text_stripped = str(ocr_text_obj).strip() if ocr_text_obj else ""
+                    if ocr_text_stripped and len(ocr_text_stripped) > 0:
+                        ocr_data = {
+                            "text": ocr_text_stripped,
+                            "engine": ocr_obj.get("engine", "gigachat"),
+                            "confidence": ocr_obj.get("confidence")
+                        }
+                        # Если engine не указан, определяем по provider
+                        if not ocr_data.get("engine"):
+                            ocr_data["engine"] = "tesseract" if result.get("provider") == "ocr_fallback" else "gigachat"
+            elif isinstance(ocr_obj, str):
+                # Если ocr как строка (fallback)
+                ocr_text_stripped = ocr_obj.strip() if ocr_obj else ""
+                if ocr_text_stripped and len(ocr_text_stripped) > 0:
+                    ocr_data = {
+                        "text": ocr_text_stripped,
+                        "engine": "gigachat",
+                        "confidence": None
+                    }
+        
+        # Возвращаем OCR только если есть валидный текст
+        return ocr_data if (ocr_data and ocr_data.get("text") and len(ocr_data.get("text", "").strip()) > 0) else None
+    
     async def _save_to_db(
         self,
         post_id: str,
@@ -1208,15 +1342,35 @@ class VisionAnalysisTask:
         Context7: Сохранение результатов Vision анализа в БД через EnrichmentRepository.
         Использует единую модель с kind='vision' и структурированное JSONB поле data.
         """
-        # Context7: Импорт shared репозитория
+        # Context7: Импорт shared репозитория с правильной обработкой путей
         import sys
         import os
         import uuid
-        shared_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'shared', 'python'))
-        if shared_path not in sys.path:
-            sys.path.insert(0, shared_path)
         
-        from shared.repositories.enrichment_repository import EnrichmentRepository
+        try:
+            # Попытка 1: Прямой импорт (если пакет установлен через pip install -e)
+            from shared.repositories.enrichment_repository import EnrichmentRepository
+        except ImportError:
+            # Попытка 2: Добавление пути из worker контейнера
+            shared_paths = [
+                '/app/shared/python',  # Production путь в контейнере (из Dockerfile)
+                os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', 'shared', 'python')),  # Dev путь от worker/tasks
+                os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'shared', 'python')),  # Альтернативный путь
+            ]
+            
+            for shared_path in shared_paths:
+                if os.path.exists(shared_path) and shared_path not in sys.path:
+                    sys.path.insert(0, shared_path)
+                    logger.debug(f"Added shared path to sys.path: {shared_path}")
+            
+            try:
+                from shared.repositories.enrichment_repository import EnrichmentRepository
+            except ImportError as e:
+                logger.error(f"Failed to import EnrichmentRepository: {e}", extra={
+                    "sys_path": sys.path[:5],
+                    "shared_paths_tried": shared_paths
+                })
+                raise
         
         try:
             if not analysis_results:
@@ -1255,6 +1409,10 @@ class VisionAnalysisTask:
             first_result = analysis_results[0]["analysis"]
             analyzed_at = datetime.now(timezone.utc)
             
+            # Context7: Для ocr_fallback provider, проверяем наличие ocr_text в результатах
+            # ocr_fallback возвращает ocr_text в analysis["ocr_text"], но может быть пустым
+            provider = first_result.get("provider", "unknown")
+            
             # Структурируем данные для JSONB поля data с использованием VisionEnrichment структуры
             # Извлекаем classification type из classification dict или напрямую
             classification = first_result.get("classification")
@@ -1280,6 +1438,42 @@ class VisionAnalysisTask:
                     })
             
             # Используем новую структуру VisionEnrichment с обязательными полями
+            # OCR данные - Context7: Поддержка двух форматов (ocr_text и ocr объект)
+            # Сохраняем None вместо пустого объекта, если OCR отсутствует
+            # ВАЖНО: Для ocr_fallback provider, ocr_text находится в first_result["ocr_text"]
+            ocr_extracted = self._extract_ocr_data(first_result)
+            # Context7: Проверяем, что OCR текст не пустой и не только пробелы
+            ocr_value = None
+            if ocr_extracted and ocr_extracted.get("text"):
+                ocr_text = ocr_extracted.get("text", "").strip()
+                if ocr_text and len(ocr_text) > 0:
+                    ocr_value = ocr_extracted
+                    logger.debug(
+                        "OCR value set for vision_data",
+                        post_id=post_id,
+                        ocr_text_length=len(ocr_text),
+                        ocr_engine=ocr_extracted.get("engine"),
+                        provider=first_result.get("provider"),
+                        trace_id=trace_id
+                    )
+                else:
+                    logger.debug(
+                        "OCR text is empty after strip, setting ocr_value to None",
+                        post_id=post_id,
+                        provider=first_result.get("provider"),
+                        ocr_extracted_keys=list(ocr_extracted.keys()) if ocr_extracted else None,
+                        trace_id=trace_id
+                    )
+            else:
+                logger.debug(
+                    "No OCR data extracted, setting ocr_value to None",
+                    post_id=post_id,
+                    provider=first_result.get("provider"),
+                    has_ocr_text=bool(first_result.get("ocr_text")),
+                    has_ocr_obj=bool(first_result.get("ocr")),
+                    trace_id=trace_id
+                )
+            
             vision_data = {
                 "model": first_result.get("model", "unknown"),
                 "model_version": None,  # TODO: добавить версию модели если доступна
@@ -1295,11 +1489,7 @@ class VisionAnalysisTask:
                 "objects": first_result.get("objects", []),
                 "scene": first_result.get("scene"),
                 # OCR данные
-                "ocr": {
-                    "text": first_result.get("ocr_text"),
-                    "engine": "tesseract" if first_result.get("provider") == "ocr_fallback" else "gigachat",
-                    "confidence": first_result.get("ocr", {}).get("confidence") if isinstance(first_result.get("ocr"), dict) else None
-                } if first_result.get("ocr_text") or first_result.get("ocr") else None,
+                "ocr": ocr_value,
                 # NSFW и aesthetic scores
                 "nsfw_score": first_result.get("nsfw_score"),
                 "aesthetic_score": first_result.get("aesthetic_score"),
@@ -2050,11 +2240,45 @@ async def create_vision_analysis_task(
     )
     
     # OCR Fallback (опционально)
+    # Context7: Проверяем флаг из enrichment_policy.yml
     ocr_fallback = None
-    if vision_config.get("ocr_fallback_enabled", True):
+    ocr_fallback_enabled = vision_config.get("ocr_fallback_enabled", True)
+    
+    # Загружаем enrichment_policy.yml для проверки глобального флага
+    try:
+        import yaml
+        enrichment_policy_path = os.getenv(
+            "ENRICHMENT_CONFIG_PATH",
+            os.path.join(os.path.dirname(__file__), "..", "config", "enrichment_policy.yml")
+        )
+        if os.path.exists(enrichment_policy_path):
+            with open(enrichment_policy_path, 'r', encoding='utf-8') as f:
+                enrichment_policy = yaml.safe_load(f)
+                # Флаг из enrichment_policy.yml имеет приоритет
+                policy_ocr_enabled = enrichment_policy.get("enrichment", {}).get("ocr_fallback_enabled")
+                if policy_ocr_enabled is not None:
+                    ocr_fallback_enabled = policy_ocr_enabled
+                    logger.info(
+                        "OCR fallback flag from enrichment_policy.yml",
+                        ocr_fallback_enabled=ocr_fallback_enabled,
+                        path=enrichment_policy_path
+                    )
+    except Exception as e:
+        logger.warning(
+            "Failed to load enrichment_policy.yml for OCR fallback flag",
+            error=str(e),
+            using_default=ocr_fallback_enabled
+        )
+    
+    if ocr_fallback_enabled:
         ocr_fallback = OCRFallbackService(
             engine=vision_config.get("ocr_engine", "tesseract"),
             languages=vision_config.get("ocr_languages", "rus+eng")
+        )
+    else:
+        logger.info(
+            "OCR fallback disabled",
+            reason="ocr_fallback_enabled=false in enrichment_policy.yml"
         )
     
     # DLQ Service

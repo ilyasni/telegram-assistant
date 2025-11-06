@@ -1357,6 +1357,68 @@ class ChannelParser:
                    posts_data_count=len(posts_data),
                    max_date=max_date)
         
+        # Context7 best practice: Создаём user_channel даже если нет новых постов
+        # Это необходимо для корректной работы сохранения альбомов для существующих постов
+        if not posts_data:
+            # Если нет новых постов, но есть сообщения (даже дубликаты),
+            # создаём user_channel для обеспечения возможности создания альбомов
+            try:
+                # Context7: Проверяем состояние сессии перед созданием user_channel
+                if self.db_session.in_transaction():
+                    await self.db_session.rollback()
+                    logger.debug("Rolled back existing transaction before ensuring user_channel",
+                                channel_id=channel_id)
+                
+                # Создаём user_channel через atomic_saver
+                user_data = {
+                    'telegram_id': user_id,
+                    'tenant_id': tenant_id,
+                    'first_name': '',
+                    'last_name': '',
+                    'username': ''
+                }
+                
+                channel_title = channel_entity.title if channel_entity and hasattr(channel_entity, 'title') else ''
+                channel_username = channel_entity.username if channel_entity and hasattr(channel_entity, 'username') else ''
+                
+                if not channel_title or not channel_username:
+                    try:
+                        result = await self.db_session.execute(
+                            text("SELECT title, username FROM channels WHERE id = :channel_id"),
+                            {"channel_id": channel_id}
+                        )
+                        row = result.fetchone()
+                        if row:
+                            channel_title = row.title or channel_title
+                            channel_username = row.username or channel_username
+                    except Exception as e:
+                        logger.warning("Failed to get channel title/username from DB", error=str(e))
+                
+                channel_data = {
+                    'id': channel_id,
+                    'telegram_id': tg_channel_id,
+                    'title': channel_title,
+                    'username': channel_username
+                }
+                
+                # Context7: Создаём user и channel, чтобы user_channel мог быть создан
+                # Context7: Проверяем состояние транзакции перед началом новой
+                if self.db_session.in_transaction():
+                    await self.db_session.rollback()
+                async with self.db_session.begin():
+                    await self.atomic_saver._upsert_user(self.db_session, user_data)
+                    channel_id_uuid = await self.atomic_saver._upsert_channel(self.db_session, channel_data)
+                    await self.atomic_saver._ensure_user_channel(self.db_session, user_data, channel_data, channel_id_uuid)
+                
+                logger.info("Ensured user_channel for existing channel (no new posts)",
+                           channel_id=channel_id,
+                           telegram_id=user_id)
+            except Exception as e:
+                logger.warning("Failed to ensure user_channel when no new posts",
+                             channel_id=channel_id,
+                             error=str(e),
+                             exc_info=True)
+        
         if posts_data:
             # Подготовка данных пользователя и канала
             # [C7-ID: dev-mode-012] tenant_id из параметра функции (передается в parse_channel_messages)
@@ -1389,6 +1451,7 @@ class ChannelParser:
                     logger.warning("Failed to get channel title/username from DB", error=str(e))
             
             channel_data = {
+                'id': channel_id,  # Context7: Передаём channel_id для использования в upsert
                 'telegram_id': tg_channel_id,  # Используем tg_channel_id (bigint), не channel_id (UUID)
                 'title': channel_title,
                 'username': channel_username
@@ -1408,158 +1471,391 @@ class ChannelParser:
                           inserted_count=inserted_count)
                 
                 # Context7: Сохранение альбомов в media_groups/media_group_items
-                # Собираем все посты альбома по grouped_id из сохранённых постов
+                # Context7 best practice: Собираем альбомы из БД, а не только из текущего batch
+                # Это позволяет обрабатывать альбомы, разбитые на несколько batches
+                # ВАЖНО: save_batch_atomic уже завершил транзакцию, используем новую транзакцию для альбомов
                 try:
+                    # Context7: Проверяем состояние сессии перед сохранением альбомов
+                    if self.db_session.in_transaction():
+                        # Если транзакция активна (не должно быть), откатываем
+                        await self.db_session.rollback()
+                        logger.warning("Found active transaction after save_batch_atomic, rolled back",
+                                      channel_id=channel_id)
+                    
                     from services.media_group_saver import save_media_group
                     
-                    # Context7: Группируем посты по grouped_id из сохранённых данных
-                    # Используем grouped_id из posts_data, так как альбом может быть разбит на несколько сообщений
-                    albums_data: Dict[int, Dict[str, Any]] = {}
-                    
+                    # Context7: Собираем уникальные grouped_id из текущего batch
+                    grouped_ids_in_batch = set()
                     for post_data in posts_data:
                         grouped_id = post_data.get('grouped_id')
-                        if not grouped_id:
-                            continue
-                        
-                        if grouped_id not in albums_data:
-                            # Context7: Получаем UUID пользователя из БД по telegram_id
+                        if grouped_id:
+                            grouped_ids_in_batch.add(grouped_id)
+                    
+                    # Context7: Также проверяем grouped_id из обработанных сообщений (даже если они были пропущены)
+                    # Это позволяет обрабатывать альбомы для существующих постов
+                    # Context7 best practice: Проверяем отсутствующие альбомы, если:
+                    # 1. Есть новые посты в batch (processed > 0), ИЛИ
+                    # 2. Есть grouped_id в текущем batch, которые еще не имеют альбомов
+                    should_check_missing = processed > 0 or len(grouped_ids_in_batch) > 0
+                    
+                    if should_check_missing:
+                        # Получаем все grouped_id из канала, которые ещё не имеют альбомов
+                        # Context7: Ограничиваем поиск только grouped_id из текущего batch + максимум 20 отсутствующих
+                        try:
+                            missing_albums_result = await self.db_session.execute(
+                                text("""
+                                    SELECT DISTINCT p.grouped_id
+                                    FROM posts p
+                                    LEFT JOIN media_groups mg ON mg.channel_id = p.channel_id 
+                                                              AND mg.grouped_id = p.grouped_id
+                                    WHERE p.channel_id = :channel_id
+                                      AND p.grouped_id IS NOT NULL
+                                      AND mg.id IS NULL
+                                      AND (p.grouped_id = ANY(CAST(:grouped_ids AS bigint[])) OR :check_all = true)
+                                    LIMIT 20
+                                """),
+                                {
+                                    "channel_id": channel_id,
+                                    "grouped_ids": list(grouped_ids_in_batch) if grouped_ids_in_batch else [0],
+                                    "check_all": processed > 0  # Проверяем все отсутствующие только если есть новые посты
+                                }
+                            )
+                            missing_albums = missing_albums_result.fetchall()
+                            for row in missing_albums:
+                                if row.grouped_id:
+                                    grouped_ids_in_batch.add(row.grouped_id)
+                            
+                            if missing_albums:
+                                logger.info("Found existing posts with missing albums",
+                                           channel_id=channel_id,
+                                           missing_albums_count=len(missing_albums),
+                                           processed=processed,
+                                           has_grouped_ids_in_batch=len(grouped_ids_in_batch) > 0)
+                        except Exception as e:
+                            logger.warning("Failed to check for missing albums",
+                                         channel_id=channel_id,
+                                         error=str(e))
+                    
+                    logger.info("Checking for albums in batch",
+                               channel_id=channel_id,
+                               grouped_ids_count=len(grouped_ids_in_batch),
+                               grouped_ids=list(grouped_ids_in_batch)[:5] if grouped_ids_in_batch else [])
+                    
+                    if not grouped_ids_in_batch:
+                        # Нет альбомов в текущем batch - пропускаем обработку альбомов
+                        logger.debug("No media groups in batch, skipping album processing",
+                                   channel_id=channel_id)
+                    else:
+                        # Context7: Используем отдельную транзакцию для сохранения альбомов
+                        # Context7: Проверяем состояние транзакции перед началом новой
+                        if self.db_session.in_transaction():
+                            await self.db_session.rollback()
+                            logger.debug("Rolled back active transaction before saving albums",
+                                       channel_id=channel_id)
+                        async with self.db_session.begin():
+                            # Context7: Получаем UUID пользователя один раз (для всех альбомов канала)
                             user_uuid = None
                             try:
+                                # Сначала пытаемся получить через user_channel (приоритет 1)
                                 result = await self.db_session.execute(
-                                    text("SELECT id FROM users WHERE telegram_id = :telegram_id LIMIT 1"),
-                                    {"telegram_id": int(user_id)}
+                                    text("""
+                                        SELECT u.id::text
+                                        FROM users u
+                                        JOIN user_channel uc ON uc.user_id = u.id
+                                        WHERE uc.channel_id = :channel_id
+                                        LIMIT 1
+                                    """),
+                                    {"channel_id": channel_id}
                                 )
                                 row = result.fetchone()
                                 if row:
-                                    user_uuid = str(row.id)
+                                    user_uuid = str(row[0])
                                 else:
-                                    logger.warning(
-                                        "User UUID not found for telegram_id, skipping album",
-                                        telegram_id=user_id,
-                                        grouped_id=grouped_id
+                                    # Fallback: пытаемся получить по telegram_id (приоритет 2)
+                                    result2 = await self.db_session.execute(
+                                        text("SELECT id::text FROM users WHERE telegram_id = :telegram_id LIMIT 1"),
+                                        {"telegram_id": int(user_id)}
                                     )
-                                    continue
+                                    row2 = result2.fetchone()
+                                    if row2:
+                                        user_uuid = str(row2[0])
                             except Exception as e:
                                 logger.warning(
-                                    "Failed to get user UUID, skipping album",
+                                    "Failed to get user UUID for albums",
+                                    channel_id=channel_id,
                                     telegram_id=user_id,
-                                    grouped_id=grouped_id,
                                     error=str(e)
                                 )
-                                continue
                             
-                            albums_data[grouped_id] = {
-                                'user_id': user_uuid,  # Используем UUID вместо telegram_id
-                                'channel_id': channel_id,
-                                'grouped_id': grouped_id,
-                                'post_ids': [],
-                                'media_types': [],
-                                'media_sha256s': [],
-                                'media_bytes': []
-                            }
-                        
-                        # Добавляем пост в альбом
-                        post_id = post_data.get('id')
-                        if post_id:
-                            albums_data[grouped_id]['post_ids'].append(post_id)
-                            
-                            # Добавляем информацию о медиа из post_data
-                            media_files = post_data.get('media_files', [])
-                            if media_files:
-                                for mf in media_files:
-                                    # Определяем тип медиа
-                                    mime = getattr(mf, 'mime_type', '')
-                                    media_type = (
-                                        'photo' if 'image' in mime else
-                                        'video' if 'video' in mime else
-                                        'document'
-                                    )
-                                    albums_data[grouped_id]['media_types'].append(media_type)
-                                    
-                                    sha256 = getattr(mf, 'sha256', None)
-                                    if sha256:
-                                        albums_data[grouped_id]['media_sha256s'].append(sha256)
-                                    
-                                    size_bytes = getattr(mf, 'size_bytes', None)
-                                    if size_bytes:
-                                        albums_data[grouped_id]['media_bytes'].append(size_bytes)
-                    
-                    # Сохраняем альбомы в БД
-                    for grouped_id, album_data in albums_data.items():
-                        # Фильтруем альбомы с более чем одним элементом
-                        if len(album_data['post_ids']) <= 1:
-                            continue  # Одиночное медиа, не альбом
-                        
-                        try:
-                            # Получаем реальные post_id из БД
-                            actual_post_ids = []
-                            for post_uuid in album_data['post_ids']:
-                                result = await self.db_session.execute(
-                                    text("SELECT id FROM posts WHERE id = :post_id"),
-                                    {"post_id": post_uuid}
+                            if not user_uuid:
+                                logger.error(
+                                    "User UUID not found for channel/telegram_id, skipping album processing",
+                                    channel_id=channel_id,
+                                    telegram_id=user_id,
+                                    grouped_ids=list(grouped_ids_in_batch)[:3]
                                 )
-                                row = result.fetchone()
-                                if row:
-                                    actual_post_ids.append(str(row.id))
+                                # Context7: Пробуем найти user_id по telegram_id напрямую
+                                try:
+                                    result3 = await self.db_session.execute(
+                                        text("SELECT id::text FROM users WHERE telegram_id = :telegram_id LIMIT 1"),
+                                        {"telegram_id": int(user_id) if user_id else None}
+                                    )
+                                    row3 = result3.fetchone()
+                                    if row3:
+                                        user_uuid = str(row3[0])
+                                        logger.info("Found user UUID via direct telegram_id lookup",
+                                                  user_uuid=user_uuid, telegram_id=user_id)
+                                except Exception as e:
+                                    logger.warning("Failed direct telegram_id lookup", error=str(e))
                             
-                            if len(actual_post_ids) > 1:  # Только для реальных альбомов
-                                # Получаем caption_text и posted_at из первого поста альбома
-                                caption_text = None
-                                posted_at = None
-                                if album_data.get('post_ids') and len(album_data['post_ids']) > 0:
-                                    first_post_uuid = album_data['post_ids'][0]
-                                    try:
-                                        result = await self.db_session.execute(
-                                            text("SELECT content, posted_at FROM posts WHERE id = :post_id LIMIT 1"),
-                                            {"post_id": first_post_uuid}
-                                        )
-                                        row = result.fetchone()
-                                        if row:
-                                            caption_text = row[0] if row[0] else None
-                                            posted_at = row[1] if row[1] else None
-                                    except Exception as e:
-                                        logger.debug(
-                                            "Failed to get caption_text/posted_at from first post",
-                                            post_id=first_post_uuid,
-                                            error=str(e)
-                                        )
+                            if not user_uuid:
+                                # Context7: КРИТИЧНО - пытаемся создать user_channel прямо сейчас
+                                logger.warning(
+                                    "User UUID not found - attempting to create user_channel",
+                                    channel_id=channel_id,
+                                    telegram_id=user_id,
+                                    grouped_ids_count=len(grouped_ids_in_batch)
+                                )
                                 
-                                group_id = await save_media_group(
-                                    db_session=self.db_session,
-                                    user_id=album_data['user_id'],
-                                    channel_id=album_data['channel_id'],
-                                    grouped_id=album_data['grouped_id'],
-                                    post_ids=actual_post_ids,
-                                    media_types=album_data['media_types'][:len(actual_post_ids)],  # Обрезаем до нужной длины
-                                    media_sha256s=album_data['media_sha256s'][:len(actual_post_ids)] if album_data['media_sha256s'] else None,
-                                    media_bytes=album_data['media_bytes'][:len(actual_post_ids)] if album_data['media_bytes'] else None,
-                                    caption_text=caption_text,
-                                    posted_at=posted_at,
-                                    media_kinds=album_data['media_types'][:len(actual_post_ids)],  # Используем media_types как media_kinds
-                                    trace_id=f"{tenant_id}:{channel_id}:{grouped_id}",
-                                    tenant_id=tenant_id,
-                                    event_publisher=self.event_publisher,
-                                    redis_client=self.redis_client
-                                )
-                                if group_id:
-                                    logger.info(
-                                        "Media group saved to DB",
-                                        group_id=group_id,
-                                        grouped_id=grouped_id,
-                                        items_count=len(actual_post_ids)
+                                # Context7: Создаём user_channel через atomic_saver
+                                try:
+                                    user_data = {
+                                        'telegram_id': user_id,
+                                        'tenant_id': tenant_id,
+                                        'first_name': '',
+                                        'last_name': '',
+                                        'username': ''
+                                    }
+                                    
+                                    channel_title = channel_entity.title if channel_entity and hasattr(channel_entity, 'title') else ''
+                                    channel_username = channel_entity.username if channel_entity and hasattr(channel_entity, 'username') else ''
+                                    
+                                    if not channel_title or not channel_username:
+                                        try:
+                                            result = await self.db_session.execute(
+                                                text("SELECT title, username FROM channels WHERE id = :channel_id"),
+                                                {"channel_id": channel_id}
+                                            )
+                                            row = result.fetchone()
+                                            if row:
+                                                channel_title = row.title or channel_title
+                                                channel_username = row.username or channel_username
+                                        except Exception as e:
+                                            logger.warning("Failed to get channel title/username from DB", error=str(e))
+                                    
+                                    channel_data = {
+                                        'id': channel_id,
+                                        'telegram_id': tg_channel_id,
+                                        'title': channel_title,
+                                        'username': channel_username
+                                    }
+                                    
+                                    # Создаём user и channel
+                                    await self.atomic_saver._upsert_user(self.db_session, user_data)
+                                    channel_id_uuid = await self.atomic_saver._upsert_channel(self.db_session, channel_data)
+                                    await self.atomic_saver._ensure_user_channel(self.db_session, user_data, channel_data, channel_id_uuid)
+                                    
+                                    # Повторно пытаемся получить user_uuid
+                                    result3 = await self.db_session.execute(
+                                        text("SELECT id::text FROM users WHERE telegram_id = :telegram_id LIMIT 1"),
+                                        {"telegram_id": int(user_id) if user_id else None}
                                     )
-                        except Exception as e:
-                            logger.warning(
-                                "Failed to save media group to DB",
-                                grouped_id=grouped_id,
-                                error=str(e),
-                                exc_info=True
-                            )
-                            # Не прерываем транзакцию - альбом можно сохранить позже
+                                    row3 = result3.fetchone()
+                                    if row3:
+                                        user_uuid = str(row3[0])
+                                        logger.info("Created user_channel and found user UUID",
+                                                  user_uuid=user_uuid,
+                                                  telegram_id=user_id)
+                                except Exception as e:
+                                    logger.error("Failed to create user_channel for albums",
+                                               channel_id=channel_id,
+                                               error=str(e),
+                                               exc_info=True)
+                            
+                            if not user_uuid:
+                                logger.error(
+                                    "CRITICAL: Cannot save albums - user UUID not found after creation attempt",
+                                    channel_id=channel_id,
+                                    telegram_id=user_id,
+                                    grouped_ids_count=len(grouped_ids_in_batch)
+                                )
+                            else:
+                                # Context7: Для каждого grouped_id из текущего batch собираем альбом из БД
+                                logger.info("Processing albums for user",
+                                           user_uuid=user_uuid,
+                                           grouped_ids_count=len(grouped_ids_in_batch),
+                                           channel_id=channel_id)
+                                for grouped_id in grouped_ids_in_batch:
+                                    try:
+                                        # Context7: Проверяем, есть ли уже альбом в media_groups (идемпотентность)
+                                        existing_album = await self.db_session.execute(
+                                            text("""
+                                                SELECT id FROM media_groups 
+                                                WHERE user_id = :user_id 
+                                                  AND channel_id = :channel_id 
+                                                  AND grouped_id = :grouped_id
+                                                LIMIT 1
+                                            """),
+                                            {"user_id": user_uuid, "channel_id": channel_id, "grouped_id": grouped_id}
+                                        )
+                                        if existing_album.fetchone():
+                                            # Альбом уже существует, пропускаем
+                                            logger.debug(
+                                                "Album already exists in media_groups, skipping",
+                                                grouped_id=grouped_id,
+                                                channel_id=channel_id
+                                            )
+                                            continue
+                                        
+                                        # Context7: Получаем ВСЕ посты с этим grouped_id из БД (не только из текущего batch)
+                                        posts_result = await self.db_session.execute(
+                                            text("""
+                                                SELECT 
+                                                    p.id,
+                                                    p.content,
+                                                    p.posted_at,
+                                                    p.telegram_message_id,
+                                                    COUNT(DISTINCT pm.file_sha256) as media_count
+                                                FROM posts p
+                                                LEFT JOIN post_media_map pm ON pm.post_id = p.id
+                                                WHERE p.channel_id = :channel_id
+                                                  AND p.grouped_id = :grouped_id
+                                                GROUP BY p.id, p.content, p.posted_at, p.telegram_message_id
+                                                ORDER BY p.telegram_message_id ASC
+                                            """),
+                                            {"channel_id": channel_id, "grouped_id": grouped_id}
+                                        )
+                                        
+                                        album_posts = posts_result.fetchall()
+                                        
+                                        if len(album_posts) <= 1:
+                                            # Одиночное медиа, не альбом
+                                            logger.debug(
+                                                "Skipping single post (not an album)",
+                                                grouped_id=grouped_id,
+                                                posts_count=len(album_posts)
+                                            )
+                                            continue
+                                        
+                                        # Context7: Собираем данные альбома
+                                        actual_post_ids = [str(row.id) for row in album_posts]
+                                        
+                                        # Получаем медиа информацию из post_media_map и media_objects
+                                        # Context7: Сортируем по telegram_message_id для сохранения порядка альбома
+                                        # Context7 best practice: asyncpg требует правильный синтаксис для массивов
+                                        # Используем CAST как в atomic_db_saver.py для text[], но для uuid[]
+                                        media_result = await self.db_session.execute(
+                                            text("""
+                                                SELECT 
+                                                    pm.post_id,
+                                                    mo.mime as mime_type,
+                                                    mo.file_sha256,
+                                                    mo.size_bytes,
+                                                    p.telegram_message_id
+                                                FROM post_media_map pm
+                                                JOIN media_objects mo ON mo.file_sha256 = pm.file_sha256
+                                                JOIN posts p ON p.id = pm.post_id
+                                                WHERE pm.post_id = ANY(CAST(:post_ids AS uuid[]))
+                                                ORDER BY p.telegram_message_id ASC, pm.post_id
+                                            """),
+                                            {"post_ids": actual_post_ids}
+                                        )
+                                        
+                                        media_rows = media_result.fetchall()
+                                        
+                                        # Группируем медиа по post_id и сортируем по порядку постов
+                                        media_by_post = {}
+                                        for row in media_rows:
+                                            post_id_str = str(row.post_id)
+                                            if post_id_str not in media_by_post:
+                                                media_by_post[post_id_str] = []
+                                            media_by_post[post_id_str].append({
+                                                'mime_type': row.mime_type,
+                                                'sha256': row.file_sha256,
+                                                'size_bytes': row.size_bytes
+                                            })
+                                        
+                                        # Собираем media_types, media_sha256s, media_bytes в порядке постов
+                                        media_types = []
+                                        media_sha256s = []
+                                        media_bytes = []
+                                        
+                                        for post_row in album_posts:
+                                            post_id_str = str(post_row.id)
+                                            if post_id_str in media_by_post:
+                                                for media in media_by_post[post_id_str]:
+                                                    mime = media['mime_type'] or ''
+                                                    media_type = (
+                                                        'photo' if 'image' in mime else
+                                                        'video' if 'video' in mime else
+                                                        'document'
+                                                    )
+                                                    media_types.append(media_type)
+                                                    media_sha256s.append(media['sha256'])
+                                                    media_bytes.append(media['size_bytes'])
+                                            else:
+                                                # Пост без медиа - пропускаем
+                                                pass
+                                        
+                                        # Получаем caption_text и posted_at из первого поста
+                                        first_post = album_posts[0]
+                                        caption_text = first_post.content if first_post.content else None
+                                        posted_at = first_post.posted_at
+                                        
+                                        # Сохраняем альбом
+                                        group_id = await save_media_group(
+                                            db_session=self.db_session,
+                                            user_id=user_uuid,
+                                            channel_id=channel_id,
+                                            grouped_id=grouped_id,
+                                            post_ids=actual_post_ids,
+                                            media_types=media_types[:len(actual_post_ids)] if media_types else ['photo'] * len(actual_post_ids),
+                                            media_sha256s=media_sha256s[:len(actual_post_ids)] if media_sha256s else None,
+                                            media_bytes=media_bytes[:len(actual_post_ids)] if media_bytes else None,
+                                            caption_text=caption_text,
+                                            posted_at=posted_at,
+                                            media_kinds=media_types[:len(actual_post_ids)] if media_types else ['photo'] * len(actual_post_ids),
+                                            trace_id=f"{tenant_id}:{channel_id}:{grouped_id}",
+                                            tenant_id=tenant_id,
+                                            event_publisher=self.event_publisher,
+                                            redis_client=self.redis_client
+                                        )
+                                        
+                                        if group_id:
+                                            logger.info(
+                                                "Media group saved to DB",
+                                                group_id=group_id,
+                                                grouped_id=grouped_id,
+                                                items_count=len(actual_post_ids),
+                                                posts_from_current_batch=len([p for p in posts_data if p.get('grouped_id') == grouped_id])
+                                            )
+                                        else:
+                                            logger.warning(
+                                                "Failed to save media group (save_media_group returned None)",
+                                                grouped_id=grouped_id,
+                                                channel_id=channel_id
+                                            )
+                                    except Exception as e:
+                                        logger.warning(
+                                            "Failed to save media group to DB",
+                                            grouped_id=grouped_id,
+                                            error=str(e),
+                                            exc_info=True
+                                        )
+                                        # Не прерываем транзакцию - альбом можно сохранить позже
+                                        # Транзакция будет откачена автоматически при ошибке через context manager
+                            # Транзакция для альбомов автоматически коммитится через context manager
                 except ImportError as e:
                     logger.debug("media_group_saver not available", error=str(e))
                 except Exception as e:
                     logger.warning("Failed to save albums to DB", error=str(e))
+                    # Context7: Если была активна транзакция, откатываем
+                    if self.db_session.in_transaction():
+                        try:
+                            await self.db_session.rollback()
+                        except Exception as rollback_error:
+                            logger.error("Failed to rollback after album save error", 
+                                       error=str(rollback_error))
                 
                 # Context7: Сохранение деталей forwards/reactions/replies и медиа в CAS для каждого поста
                 try:
@@ -1968,22 +2264,41 @@ class ChannelParser:
         """
         
         try:
+            # Context7: Проверяем состояние транзакции перед обновлением
+            # Если транзакция прервана, делаем rollback и начинаем новую
+            if self.db_session.in_transaction():
+                try:
+                    # Проверяем, не прервана ли транзакция
+                    await self.db_session.execute(text("SELECT 1"))
+                except Exception as check_error:
+                    if "aborted" in str(check_error).lower() or "failed" in str(check_error).lower():
+                        logger.warning("Transaction aborted, rolling back before last_parsed_at update",
+                                     channel_id=channel_id, error=str(check_error))
+                        await self.db_session.rollback()
+            elif "aborted" in str(getattr(self.db_session, '_transaction', None) or "").lower():
+                # Если транзакция была прервана, делаем rollback
+                try:
+                    await self.db_session.rollback()
+                except Exception:
+                    pass
+            
             now = datetime.now(timezone.utc)
             
-            # Context7: Supabase best practice - параметризованные запросы, атомарное обновление
-            result = await self.db_session.execute(
-                text("UPDATE channels SET last_parsed_at = :now WHERE id = :channel_id"),
-                {"now": now, "channel_id": channel_id}
-            )
-            
-            # Context7: Проверяем, что обновление произошло
-            rows_affected = result.rowcount
-            if rows_affected == 0:
-                logger.warning("No rows updated for last_parsed_at", 
-                             channel_id=channel_id,
-                             parsed_count=parsed_count)
-            
-            await self.db_session.commit()
+            # Context7: Используем отдельную транзакцию для обновления last_parsed_at
+            async with self.db_session.begin():
+                # Context7: Supabase best practice - параметризованные запросы, атомарное обновление
+                result = await self.db_session.execute(
+                    text("UPDATE channels SET last_parsed_at = :now WHERE id = :channel_id"),
+                    {"now": now, "channel_id": channel_id}
+                )
+                
+                # Context7: Проверяем, что обновление произошло
+                rows_affected = result.rowcount
+                if rows_affected == 0:
+                    logger.warning("No rows updated for last_parsed_at", 
+                                 channel_id=channel_id,
+                                 parsed_count=parsed_count)
+                    # Коммит выполняется автоматически через context manager
             
             # Удаление HWM после успешного обновления
             hwm_key = f"parse_hwm:{channel_id}"
@@ -2109,20 +2424,49 @@ class ChannelParser:
                          error=str(e))
     
     async def _update_channel_stats(self, channel_id: str, messages_count: int):
-        """Обновление статистики канала."""
+        """
+        Обновление статистики канала.
+        Context7 best practice: Используем отдельную транзакцию для обновления статистики.
+        """
         try:
-            await self.db_session.execute(
-                text("""
-                    UPDATE channels 
-                    SET last_message_at = NOW()
-                    WHERE id = :channel_id
-                """),
-                {"channel_id": channel_id}
-            )
-            await self.db_session.commit()
+            # Context7: Проверяем состояние транзакции
+            if self.db_session.in_transaction():
+                try:
+                    await self.db_session.execute(text("SELECT 1"))
+                except Exception as check_error:
+                    if "aborted" in str(check_error).lower() or "failed" in str(check_error).lower():
+                        logger.warning("Transaction aborted, rolling back before channel stats update",
+                                     channel_id=channel_id, error=str(check_error))
+                        await self.db_session.rollback()
+            
+            # Context7: Используем отдельную транзакцию для обновления статистики
+            # Context7: Проверяем состояние транзакции перед началом новой
+            if self.db_session.in_transaction():
+                await self.db_session.rollback()
+            async with self.db_session.begin():
+                await self.db_session.execute(
+                    text("""
+                        UPDATE channels 
+                        SET last_message_at = NOW()
+                        WHERE id = :channel_id
+                    """),
+                    {"channel_id": channel_id}
+                )
+                # Коммит выполняется автоматически через context manager
             
         except Exception as e:
-            logger.error(f"Failed to update channel stats: {e}")
+            logger.error("Failed to update channel stats", 
+                        channel_id=channel_id,
+                        error=str(e),
+                        exc_info=True)
+            # Context7: Если была активна транзакция, откатываем
+            if self.db_session.in_transaction():
+                try:
+                    await self.db_session.rollback()
+                except Exception as rollback_error:
+                    logger.error("Failed to rollback after channel stats update error",
+                               channel_id=channel_id,
+                               error=str(rollback_error))
     
     async def handle_flood_wait(self, error: errors.FloodWaitError):
         """Обработка FloodWait ошибки."""

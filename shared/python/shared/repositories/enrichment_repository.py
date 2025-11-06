@@ -192,7 +192,8 @@ class EnrichmentRepository:
                         updated_at
                     )
                     
-                    # Context7: Обновление legacy полей для vision после основного upsert
+                    # Context7: Обновление legacy полей для обратной совместимости после основного upsert
+                    # Синхронизируем legacy поля из data JSONB для всех kinds
                     if kind == 'vision':
                         await conn.execute("""
                             UPDATE post_enrichment
@@ -210,6 +211,35 @@ class EnrichmentRepository:
                                 )
                             WHERE post_id = $3 AND kind = 'vision'
                         """, data_jsonb, updated_at, post_id)
+                    elif kind in ('crawl', 'general'):
+                        # Context7: Синхронизация crawl_md для crawl и general kinds
+                        await conn.execute("""
+                            UPDATE post_enrichment
+                            SET 
+                                crawl_md = COALESCE(
+                                    NULLIF($1::jsonb->>'crawl_md', ''),
+                                    NULLIF($1::jsonb->'enrichment_data'->'crawl_data'->>'crawl_md', ''),
+                                    crawl_md
+                                ),
+                                summary = COALESCE(
+                                    NULLIF($1::jsonb->>'summary', ''),
+                                    NULLIF($1::jsonb->'enrichment_data'->>'summary', ''),
+                                    summary
+                                )
+                            WHERE post_id = $2 AND kind = $3
+                        """, data_jsonb, post_id, kind)
+                    elif kind == 'tags':
+                        # Context7: Синхронизация tags для tags kind
+                        await conn.execute("""
+                            UPDATE post_enrichment
+                            SET 
+                                tags = COALESCE(
+                                    ($1::jsonb->'tags')::text[],
+                                    ($1::jsonb->'enrichment_data'->'tags')::text[],
+                                    tags
+                                )
+                            WHERE post_id = $2 AND kind = 'tags'
+                        """, data_jsonb, post_id)
             
             elif self._is_sqlalchemy:
                 # SQLAlchemy AsyncSession
@@ -263,6 +293,31 @@ class EnrichmentRepository:
                                     EXCLUDED.updated_at
                                 )
                                 ELSE post_enrichment.vision_analyzed_at
+                            END,
+                            -- Context7: Синхронизация legacy полей для crawl/general kinds
+                            crawl_md = CASE 
+                                WHEN EXCLUDED.kind IN ('crawl', 'general') THEN COALESCE(
+                                    NULLIF(EXCLUDED.data->>'crawl_md', ''),
+                                    NULLIF(EXCLUDED.data->'enrichment_data'->'crawl_data'->>'crawl_md', ''),
+                                    post_enrichment.crawl_md
+                                )
+                                ELSE post_enrichment.crawl_md
+                            END,
+                            summary = CASE 
+                                WHEN EXCLUDED.kind IN ('crawl', 'general') THEN COALESCE(
+                                    NULLIF(EXCLUDED.data->>'summary', ''),
+                                    NULLIF(EXCLUDED.data->'enrichment_data'->>'summary', ''),
+                                    post_enrichment.summary
+                                )
+                                ELSE post_enrichment.summary
+                            END,
+                            tags = CASE 
+                                WHEN EXCLUDED.kind = 'tags' THEN COALESCE(
+                                    (EXCLUDED.data->'tags')::text[],
+                                    (EXCLUDED.data->'enrichment_data'->'tags')::text[],
+                                    post_enrichment.tags
+                                )
+                                ELSE post_enrichment.tags
                             END
                     """),
                     {

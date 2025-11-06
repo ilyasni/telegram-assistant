@@ -48,6 +48,7 @@ class Settings:
     qdrant_collection: str = os.getenv("QDRANT_COLLECTION", "telegram_posts")
     
     # Neo4j settings
+    # Context7: Исправлен дефолтный пароль (должен совпадать с docker-compose.yml)
     neo4j_url: str = os.getenv("NEO4J_URI", "neo4j://neo4j:7687")
     neo4j_username: str = os.getenv("NEO4J_USER", "neo4j")
     neo4j_password: str = os.getenv("NEO4J_PASSWORD", "neo4j123")

@@ -387,17 +387,64 @@ class TagPersistenceTask:
         Context7: Сохранение тегов в post_enrichment через EnrichmentRepository.
         Использует единую модель с kind='tags' и структурированное JSONB поле data.
         """
-        # Context7: Импорт shared репозитория
+        # Context7: Импорт shared репозитория с правильной обработкой путей
         import sys
         import os
-        shared_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'shared', 'python'))
-        if shared_path not in sys.path:
-            sys.path.insert(0, shared_path)
         
-        from shared.repositories.enrichment_repository import EnrichmentRepository
+        try:
+            # Попытка 1: Прямой импорт (если пакет установлен через pip install -e)
+            from shared.repositories.enrichment_repository import EnrichmentRepository
+        except ImportError:
+            # Попытка 2: Добавление пути из worker контейнера
+            shared_paths = [
+                '/app/shared/python',  # Production путь в контейнере (из Dockerfile)
+                os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', 'shared', 'python')),  # Dev путь от worker/tasks
+                os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'shared', 'python')),  # Альтернативный путь
+            ]
+            
+            for shared_path in shared_paths:
+                if os.path.exists(shared_path) and shared_path not in sys.path:
+                    sys.path.insert(0, shared_path)
+                    logger.debug(f"Added shared path to sys.path: {shared_path}")
+            
+            try:
+                from shared.repositories.enrichment_repository import EnrichmentRepository
+            except ImportError as e:
+                logger.error(f"Failed to import EnrichmentRepository: {e}", extra={
+                    "sys_path": sys.path[:5],
+                    "shared_paths_tried": shared_paths
+                })
+                raise
         
         async with self.pool.acquire() as conn:
             async with conn.transaction():
+                # Context7: Извлекаем tenant_id из БД (как в enrichment_task и indexing_task)
+                # Используем COALESCE с приоритетами: users -> tags_data -> channels.settings
+                tenant_id_result = await conn.fetchrow(
+                    """
+                    SELECT COALESCE(
+                        (SELECT u.tenant_id::text FROM users u 
+                         JOIN user_channel uc ON uc.user_id = u.id 
+                         WHERE uc.channel_id = c.id 
+                         LIMIT 1),
+                        CAST(pe_tags.data->>'tenant_id' AS text),
+                        CAST(c.settings->>'tenant_id' AS text),
+                        'default'
+                    ) as tenant_id
+                    FROM posts p
+                    JOIN channels c ON p.channel_id = c.id
+                    LEFT JOIN post_enrichment pe_tags 
+                        ON pe_tags.post_id = p.id AND pe_tags.kind = 'tags'
+                    WHERE p.id = $1
+                    LIMIT 1
+                    """,
+                    post_id
+                )
+                
+                # Context7: Используем tenant_id из БД, fallback на metadata, затем 'default'
+                tenant_id_from_db = tenant_id_result["tenant_id"] if tenant_id_result else None
+                tenant_id = metadata.get("tenant_id") or tenant_id_from_db or "default"
+                
                 # Проверяем, изменились ли теги (для метрик)
                 existing_tags_result = await conn.fetchrow(
                     "SELECT tags FROM post_enrichment WHERE post_id = $1 AND kind = 'tags'",
@@ -411,7 +458,7 @@ class TagPersistenceTask:
                     "tags_hash": tags_hash,
                     "provider": metadata.get("provider", "gigachat"),
                     "latency_ms": int(metadata.get("latency_ms") or 0),
-                    "tenant_id": metadata.get("tenant_id", "default"),
+                    "tenant_id": tenant_id,  # Context7: Используем tenant_id из БД, не из metadata
                     "trace_id": metadata.get("trace_id", str(uuid.uuid4())),
                     "metadata": {k: v for k, v in metadata.items() if k not in ["provider", "latency_ms", "tenant_id", "trace_id"]}
                 }
@@ -421,7 +468,9 @@ class TagPersistenceTask:
                            post_id=post_id,
                            tags_count=len(tags) if tags else 0,
                            tags_sample=tags[:3] if tags else [],
-                           tags_data_count=len(tags_data.get('tags', [])))
+                           tags_data_count=len(tags_data.get('tags', [])),
+                           tenant_id=tenant_id,
+                           tenant_id_source="db" if tenant_id_from_db and tenant_id_from_db != "default" else ("metadata" if metadata.get("tenant_id") else "default"))
                 
                 # Используем EnrichmentRepository (принимает asyncpg.Pool)
                 repo = EnrichmentRepository(self.pool)
@@ -453,10 +502,11 @@ class TagPersistenceTask:
                 )
                 
                 # КРИТИЧНО: Публикация в posts.enriched (даже если теги пустые!)
+                # Context7: Используем tenant_id из БД, не хардкод 'default'
                 enriched_event = {
                     "schema": "posts.enriched.v1",
                     "post_id": post_id,
-                    "tenant_id": metadata.get("tenant_id", "default"),
+                    "tenant_id": tenant_id,  # Context7: Используем tenant_id из БД
                     "tags": tags or [],
                     "enrichment": {},  # Будет заполнено crawl4ai
                     "trace_id": metadata.get("trace_id", str(uuid.uuid4())),
@@ -464,7 +514,7 @@ class TagPersistenceTask:
                 }
                 
                 await self.publisher.publish_event("posts.enriched", enriched_event)
-                logger.info(f"Published posts.enriched event for post_id={post_id}")
+                logger.info(f"Published posts.enriched event for post_id={post_id}, tenant_id={tenant_id}")
     
     async def health_check(self) -> Dict[str, Any]:
         """Health check."""

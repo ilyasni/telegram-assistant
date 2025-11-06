@@ -2,13 +2,14 @@
 
 from aiogram import Router, F
 from aiogram.filters import Command
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Voice
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 import httpx
 import structlog
 import re
+import io
 from typing import Optional
 from datetime import datetime
 from config import settings
@@ -40,6 +41,8 @@ def _kb_main_menu():
         [InlineKeyboardButton(text="📊 Мои каналы", callback_data="menu:channels")],
         [InlineKeyboardButton(text="➕ Добавить канал", callback_data="menu:add_channel")],
         [InlineKeyboardButton(text="🔍 Поиск", callback_data="menu:search")],
+        [InlineKeyboardButton(text="📰 Дайджесты", callback_data="digest:menu")],
+        [InlineKeyboardButton(text="📈 Тренды", callback_data="trends:menu")],
         [InlineKeyboardButton(text="💎 Подписка", callback_data="menu:subscription")],
     ])
 
@@ -113,6 +116,67 @@ async def cmd_start(msg: Message):
             "Ассистент.\nИспользуйте кнопку ниже для входа.",
             reply_markup=_kb_login()
         )
+
+
+@router.message(Command("help"))
+async def cmd_help(msg: Message):
+    """
+    Обработчик команды /help с описанием всех доступных функций.
+    
+    Context7: Следует best practices aiogram для команды help:
+    - Структурированное форматирование с эмодзи
+    - Группировка команд по категориям
+    - Примеры использования
+    - Информация о дополнительных возможностях
+    """
+    help_text = """🤖 <b>Помощь по командам бота</b>
+
+<b>🚀 Основные команды</b>
+/start — Начать работу с ботом
+/help — Показать эту справку
+/login [INVITE_CODE] — Войти в систему (с инвайт-кодом или без)
+
+<b>📺 Управление каналами</b>
+/add_channel @channel_name — Добавить канал для отслеживания
+Пример: <code>/add_channel @durov</code>
+
+/my_channels — Показать список ваших подписанных каналов
+
+<b>🔍 Поиск и вопросы</b>
+/ask <i>ваш вопрос</i> — Задать вопрос ассистенту
+Пример: <code>/ask Что нового в AI?</code>
+
+/search <i>запрос</i> — Поиск по содержимому каналов
+Пример: <code>/search машинное обучение</code>
+
+/recommend <i>запрос</i> — Получить рекомендации
+Пример: <code>/recommend интересные новости про AI</code>
+
+<b>💬 Текстовые и голосовые сообщения</b>
+Вы можете просто написать вопрос текстом — бот автоматически обработает запрос через RAG.
+
+Также поддерживаются голосовые сообщения — бот распознает речь и ответит на ваш вопрос.
+
+<b>💎 Подписка</b>
+/subscription — Информация о вашей подписке и лимитах
+
+<b>👑 Администрирование</b>
+/admin — Открыть админ-панель (только для администраторов)
+
+<b>💡 Советы</b>
+• Задавайте вопросы естественным языком
+• Используйте голосовые сообщения для быстрого ввода
+• Команды работают без аргументов — просто отправьте текст
+• Результаты поиска включают ссылки на источники
+
+<b>📝 Примечание</b>
+Для входа в систему используйте Mini App через кнопку внизу или команду /login."""
+    
+    await msg.answer(
+        help_text,
+        parse_mode="HTML",
+        reply_markup=_kb_login()
+    )
 
 
 @router.message(Command("login"))
@@ -233,19 +297,25 @@ async def cmd_search(msg: Message):
         return
     
     query = args[1]
-    await msg.answer("🔍 <b>Поиск</b>\n\nФункция поиска пока в разработке.")
+    await _rag_query(msg, query, intent_override="search")
 
 
 @router.message(Command("recommend"))
 async def cmd_recommend(msg: Message):
     """Обработчик команды /recommend."""
-    await msg.answer("🎯 <b>Рекомендации</b>\n\nФункция рекомендаций пока в разработке.")
+    args = msg.text.split(maxsplit=1)
+    if len(args) < 2:
+        await msg.answer(
+            "❌ <b>Неверный формат</b>\n\n"
+            "Использование: <code>/recommend запрос</code>\n"
+            "Пример: <code>/recommend интересные новости про AI</code>"
+        )
+        return
+    
+    query = args[1]
+    await _rag_query(msg, query, intent_override="recommend")
 
 
-@router.message(Command("digest"))
-async def cmd_digest(msg: Message):
-    """Обработчик команды /digest."""
-    await msg.answer("📰 <b>Дайджест</b>\n\nФункция дайджеста пока в разработке.")
 
 
 @router.message(Command("subscription"))
@@ -614,43 +684,86 @@ async def _delete_channel_callback(cb: CallbackQuery, channel_id: str):
         await cb.message.edit_text("❌ Ошибка удаления канала")
 
 
-async def _rag_query(msg: Message, question: str):
-    """Выполнить RAG запрос."""
+async def _rag_query(msg: Message, question: str, intent_override: Optional[str] = None, voice_transcription: bool = False, audio_file_id: Optional[str] = None):
+    """
+    Выполнить RAG запрос через API.
+    
+    Args:
+        msg: Telegram сообщение
+        question: Текст вопроса
+        intent_override: Принудительное намерение (опционально, для команд)
+        voice_transcription: Флаг, что запрос пришел из голосового сообщения
+    """
     try:
+        # Показываем индикатор загрузки
+        loading_msg = await msg.answer("🔍 <b>Обрабатываю запрос...</b>")
+        
         # Получить пользователя
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(f"{API_BASE}/api/users/{msg.from_user.id}")
             if r.status_code == 404:
-                await msg.answer("❌ Пользователь не найден. Используйте /start")
+                await loading_msg.edit_text("❌ Пользователь не найден. Используйте /start")
                 return
             r.raise_for_status()
             user = r.json()
         
-        # Выполнить RAG запрос
+        # Выполнить RAG запрос через API
         query_data = {
             "query": question,
             "user_id": user['id']
         }
         
-        async with httpx.AsyncClient() as client:
+        # Добавляем данные о транскрибации если есть
+        if voice_transcription:
+            transcription_text = question  # question уже содержит транскрибированный текст
+            query_data["audio_file_id"] = audio_file_id
+            query_data["transcription_text"] = transcription_text
+        
+        async with httpx.AsyncClient(timeout=60) as client:
             r = await client.post(f"{API_BASE}/api/rag/query", json=query_data)
             r.raise_for_status()
             result = r.json()
         
         answer = result['result']['answer']
         sources = result['result']['sources']
+        intent = result['result'].get('intent', 'ask')
+        confidence = result['result'].get('confidence', 0.0)
         
-        text = f"🤖 <b>Ответ на ваш вопрос:</b>\n\n{answer}\n\n"
+        # Форматируем ответ в зависимости от намерения
+        intent_emoji = {
+            "ask": "🤖",
+            "search": "🔍",
+            "recommend": "🎯",
+            "trend": "📈",
+            "digest": "📰"
+        }
+        emoji = intent_emoji.get(intent, "🤖")
+        
+        text = f"{emoji} <b>Результат:</b>\n\n{answer}\n\n"
+        
         if sources:
-            text += "<b>Источники:</b>\n"
-            for source in sources[:3]:  # Показываем только первые 3
-                text += f"• {source.get('title', 'Без названия')}\n"
+            text += "<b>📚 Источники:</b>\n"
+            for idx, source in enumerate(sources[:5], 1):  # Показываем до 5 источников
+                channel_title = source.get('channel_title', 'Неизвестный канал')
+                permalink = source.get('permalink', '')
+                if permalink:
+                    text += f"{idx}. <a href='{permalink}'>{channel_title}</a>\n"
+                else:
+                    text += f"{idx}. {channel_title}\n"
         
-        await msg.answer(text)
+        if confidence < 0.5:
+            text += "\n⚠️ <i>Уверенность в ответе низкая. Попробуйте уточнить запрос.</i>"
         
+        await loading_msg.edit_text(text, parse_mode="HTML", disable_web_page_preview=True)
+        
+    except httpx.TimeoutException:
+        await loading_msg.edit_text("⏱️ <b>Превышено время ожидания</b>\n\nПопробуйте позже или упростите запрос.")
+    except httpx.HTTPStatusError as e:
+        logger.error("HTTP error in RAG query", status_code=e.response.status_code, response_text=e.response.text[:200])
+        await loading_msg.edit_text("❌ <b>Ошибка обработки запроса</b>\n\nПопробуйте позже.")
     except Exception as e:
         logger.error("Error in RAG query", error=str(e))
-        await msg.answer("❌ Произошла ошибка при поиске")
+        await loading_msg.edit_text("❌ <b>Произошла ошибка при обработке запроса</b>\n\nПопробуйте позже.")
 
 
 async def _show_subscription(msg: Message):
@@ -869,3 +982,241 @@ async def cmd_my_channels(msg: Message):
     except Exception as e:
         logger.error("Error in /my_channels", error=str(e))
         await msg.answer("❌ Произошла ошибка")
+
+
+# ============================================================================
+# УНИВЕРСАЛЬНЫЙ ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ
+# ============================================================================
+
+@router.message(F.text & ~F.text.startswith("/"))
+async def handle_text_message(msg: Message):
+    """
+    Универсальный обработчик текстовых сообщений с автоматическим определением намерения.
+    
+    Context7: Автоматически определяет намерение пользователя через IntentClassifier
+    и обрабатывает запрос через RAG Service.
+    """
+    # Игнорируем очень короткие сообщения (возможно, случайные)
+    if len(msg.text.strip()) < 3:
+        await msg.answer("❌ <b>Слишком короткий запрос</b>\n\nПопробуйте задать более подробный вопрос.")
+        return
+    
+    # Обрабатываем через RAG
+    await _rag_query(msg, msg.text)
+
+
+# ============================================================================
+# ОБРАБОТЧИК ГОЛОСОВЫХ СООБЩЕНИЙ
+# ============================================================================
+
+@router.message(F.voice)
+async def handle_voice_message(msg: Message):
+    """
+    Обработчик голосовых сообщений с транскрибацией через SaluteSpeech.
+    
+    Context7: Транскрибирует голосовое сообщение и автоматически обрабатывает через RAG.
+    """
+    try:
+        # Проверяем, включена ли транскрибация
+        if not settings.voice_transcription_enabled:
+            await msg.answer(
+                "❌ <b>Транскрибация голосовых сообщений отключена</b>\n\n"
+                "Используйте текстовые сообщения для вопросов."
+            )
+            return
+        
+        # Проверяем длительность
+        if msg.voice.duration > settings.voice_max_duration_sec:
+            await msg.answer(
+                f"❌ <b>Голосовое сообщение слишком длинное</b>\n\n"
+                f"Максимальная длительность: {settings.voice_max_duration_sec} секунд.\n"
+                f"Ваше сообщение: {msg.voice.duration} секунд."
+            )
+            return
+        
+        # Context7: Проверяем настройки SaluteSpeech перед обработкой
+        if not settings.salutespeech_client_id or not settings.salutespeech_client_secret:
+            logger.warning(
+                "SaluteSpeech not configured",
+                has_client_id=bool(settings.salutespeech_client_id),
+                has_client_secret=bool(settings.salutespeech_client_secret)
+            )
+            await msg.answer(
+                "❌ <b>Транскрибация недоступна</b>\n\n"
+                "Сервис транскрибации не настроен. Используйте текстовые сообщения для вопросов."
+            )
+            return
+        
+        # Показываем индикатор обработки
+        loading_msg = await msg.answer("🎤 <b>Обрабатываю голосовое сообщение...</b>")
+        
+        # Получаем пользователя
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(f"{API_BASE}/api/users/{msg.from_user.id}")
+            if r.status_code == 404:
+                await loading_msg.edit_text("❌ Пользователь не найден. Используйте /start")
+                return
+            r.raise_for_status()
+            user = r.json()
+        
+        # Скачиваем файл голосового сообщения
+        redis_client = None
+        try:
+            # Context7: Используем глобальный bot из webhook, а не создаем новый
+            try:
+                from bot.webhook import bot as global_bot
+                if not global_bot:
+                    # Fallback: создаем временный bot если глобальный не инициализирован
+                    from aiogram import Bot
+                    global_bot = Bot(token=settings.telegram_bot_token)
+            except ImportError:
+                # Fallback: если не можем импортировать, создаем новый
+                from aiogram import Bot
+                global_bot = Bot(token=settings.telegram_bot_token)
+            
+            file = await global_bot.get_file(msg.voice.file_id)
+            
+            # Context7: Используем упрощенный метод download (aiogram best practice)
+            # download возвращает BytesIO напрямую
+            audio_bytes_io = await global_bot.download(file.file_id)
+            audio_bytes = audio_bytes_io.read()
+            
+            # Context7: Используем SaluteSpeech Service с async Redis клиентом
+            # Используем глобальный Redis клиент из webhook для переиспользования соединений
+            from services.salutespeech_service import get_salutespeech_service
+            try:
+                from bot.webhook import redis_client as global_redis_client
+                if global_redis_client:
+                    redis_client = global_redis_client
+                else:
+                    # Fallback: создаем временный клиент
+                    import redis.asyncio as redis
+                    redis_client = redis.from_url(settings.redis_url, decode_responses=True)
+            except (ImportError, AttributeError):
+                # Fallback: создаем временный клиент
+                import redis.asyncio as redis
+                redis_client = redis.from_url(settings.redis_url, decode_responses=True)
+            
+            salutespeech_service = get_salutespeech_service(redis_client=redis_client)
+            
+            transcription_result = await salutespeech_service.transcribe(
+                audio_data=audio_bytes,
+                audio_format="ogg_opus",
+                language="ru"
+            )
+            
+            transcription_text = transcription_result.get("text", "")
+            
+            if not transcription_text or len(transcription_text.strip()) < 3:
+                await loading_msg.edit_text(
+                    "❌ <b>Не удалось распознать речь</b>\n\n"
+                    "Попробуйте записать сообщение заново или используйте текстовый ввод."
+                )
+                return
+            
+            # Показываем транскрипцию
+            await loading_msg.edit_text(
+                f"🎤 <b>Распознано:</b>\n\n{transcription_text}\n\n"
+                f"🔍 <b>Обрабатываю запрос...</b>"
+            )
+            
+            # Обрабатываем транскрибированный текст через RAG
+            # Передаем audio_file_id для сохранения в историю
+            # Получаем file_id из voice объекта
+            audio_file_id = msg.voice.file_id if msg.voice else None
+            
+            await _rag_query(
+                msg, 
+                transcription_text, 
+                voice_transcription=True,
+                audio_file_id=audio_file_id
+            )
+        
+        except httpx.TimeoutException as timeout_error:
+            logger.error(
+                "Timeout processing voice message",
+                error=str(timeout_error),
+                user_id=msg.from_user.id,
+                voice_duration=msg.voice.duration if msg.voice else None,
+                exc_info=True
+            )
+            await loading_msg.edit_text("⏱️ <b>Превышено время ожидания</b>\n\nПопробуйте позже.")
+        except Exception as e:
+            # Context7: Детальное логирование всех ошибок
+            error_details = {
+                "error": str(e),
+                "error_type": type(e).__name__,
+                "user_id": msg.from_user.id,
+                "voice_duration": msg.voice.duration if msg.voice else None,
+                "voice_file_id": msg.voice.file_id if msg.voice else None,
+                "has_client_id": bool(settings.salutespeech_client_id),
+                "has_client_secret": bool(settings.salutespeech_client_secret),
+                "api_url": settings.salutespeech_url,
+                "transcription_enabled": settings.voice_transcription_enabled
+            }
+            
+            logger.error(
+                "Error processing voice message",
+                **error_details,
+                exc_info=True
+            )
+            
+            # Context7: Пользовательские сообщения об ошибках с детализацией
+            error_msg = "❌ <b>Ошибка обработки голосового сообщения</b>\n\n"
+            
+            error_str_lower = str(e).lower()
+            
+            if "authorization" in error_str_lower or "401" in str(e):
+                error_msg += (
+                    "🔐 <b>Ошибка авторизации</b>\n\n"
+                    "Проблема с настройками сервиса транскрибации.\n"
+                    "Проверьте правильность Authorization key в настройках."
+                )
+            elif "token" in error_str_lower or "404" in str(e):
+                error_msg += (
+                    "🔑 <b>Ошибка получения токена</b>\n\n"
+                    "Не удалось получить токен доступа к сервису транскрибации.\n"
+                    "Проверьте настройки SaluteSpeech API."
+                )
+            elif "timeout" in error_str_lower:
+                error_msg += (
+                    "⏱️ <b>Превышено время ожидания</b>\n\n"
+                    "Сервис транскрибации не ответил вовремя.\n"
+                    "Попробуйте позже или используйте более короткое сообщение."
+                )
+            elif "empty" in error_str_lower or "распознать" in error_str_lower:
+                error_msg += (
+                    "🎤 <b>Не удалось распознать речь</b>\n\n"
+                    "Попробуйте записать сообщение заново:\n"
+                    "• Говорите четче\n"
+                    "• Уменьшите фоновый шум\n"
+                    "• Используйте текстовый ввод"
+                )
+            else:
+                error_msg += (
+                    "⚠️ <b>Внутренняя ошибка</b>\n\n"
+                    "Попробуйте позже или используйте текстовый ввод.\n"
+                    f"Код ошибки: {type(e).__name__}"
+                )
+            
+            await loading_msg.edit_text(error_msg)
+        finally:
+            # Context7: Закрываем Redis клиент только если он был создан локально (не глобальный)
+            # Глобальный клиент не закрываем, так как он используется другими частями системы
+            if redis_client and hasattr(redis_client, '__module__'):
+                # Проверяем, что это не глобальный клиент из webhook
+                try:
+                    from bot.webhook import redis_client as global_redis_client
+                    if redis_client is not global_redis_client:
+                        # Это локальный клиент - закрываем его
+                        await redis_client.aclose()
+                except (ImportError, AttributeError):
+                    # Если не можем проверить, значит это локальный клиент - закрываем
+                    try:
+                        await redis_client.aclose()
+                    except Exception as e:
+                        logger.warning("Error closing Redis client", error=str(e))
+    
+    except Exception as e:
+        logger.error("Error in voice handler", error=str(e))
+        await msg.answer("❌ <b>Произошла ошибка при обработке голосового сообщения</b>")

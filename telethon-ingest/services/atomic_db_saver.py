@@ -138,30 +138,58 @@ class AtomicDBSaver:
             self.logger.warning("Failed to check/rollback session state", error=str(e))
         
         try:
+            # Context7: Детальное логирование начала транзакции
+            self.logger.debug("Starting atomic batch save transaction",
+                            posts_count=len(posts_data),
+                            telegram_id=user_data.get('telegram_id'),
+                            channel_telegram_id=channel_data.get('telegram_id'))
+            
             async with db_session.begin():
                 # 1. UPSERT user (ON CONFLICT telegram_id)
+                self.logger.debug("Upserting user", telegram_id=user_data.get('telegram_id'))
                 await self._upsert_user(db_session, user_data)
+                self.logger.debug("User upserted successfully", telegram_id=user_data.get('telegram_id'))
                 
                 # 2. UPSERT channel (ON CONFLICT telegram_id)
-                await self._upsert_channel(db_session, channel_data)
+                self.logger.debug("Upserting channel", telegram_id=channel_data.get('telegram_id'))
+                channel_id_uuid = await self._upsert_channel(db_session, channel_data)
+                self.logger.debug("Channel upserted successfully", 
+                                channel_id=channel_id_uuid,
+                                telegram_id=channel_data.get('telegram_id'))
+                
+                # 2.5. Context7 best practice: Создаём user_channel связь если её нет
+                # Это необходимо для корректной работы сохранения альбомов
+                # Context7: Не прерываем транзакцию при ошибке - это дополнительная операция
+                try:
+                    await self._ensure_user_channel(db_session, user_data, channel_data, channel_id_uuid)
+                except Exception as e:
+                    # Логируем, но не прерываем транзакцию
+                    self.logger.warning("_ensure_user_channel failed but continuing transaction",
+                                      error=str(e),
+                                      error_type=type(e).__name__)
                 
                 # 3. BULK INSERT posts (ON CONFLICT DO NOTHING)
+                self.logger.debug("Bulk inserting posts", posts_count=len(posts_data))
                 inserted_count = await self._bulk_insert_posts(
                     db_session, 
                     posts_data
                 )
+                self.logger.debug("Posts bulk inserted", inserted_count=inserted_count)
                 
             # Коммит успешен (context manager автоматически коммитит)
             duration = time.time() - start_time
             db_batch_commit_latency_seconds.observe(duration)
             db_posts_insert_success_total.inc(inserted_count)
             
+            # Context7: Детальное логирование успешного сохранения
             self.logger.info("Atomic batch save successful", 
                            user_id=user_data.get('telegram_id'),
                            channel_id=channel_data.get('telegram_id'),
+                           channel_id_uuid=channel_id_uuid,
                            posts_count=len(posts_data),
                            inserted_count=inserted_count,
-                           duration=duration)
+                           duration=duration,
+                           tenant_id=user_data.get('tenant_id'))
             
             return True, None, inserted_count
             
@@ -402,10 +430,11 @@ class AtomicDBSaver:
             if post_media_map_params:
                 # Context7: Проверяем существующие связи (для метрик)
                 # Context7 best practice: asyncpg требует ANY() для IN с параметрами
+                # Context7: Исправлен SQL - убран ::text[] из параметра, используем CAST
                 sha256_list = [mf.sha256 for mf in media_files]
                 existing_map_check_sql = text("""
                     SELECT file_sha256 FROM post_media_map 
-                    WHERE post_id = :post_id AND file_sha256 = ANY(:sha256_list::text[])
+                    WHERE post_id = :post_id AND file_sha256 = ANY(CAST(:sha256_list AS text[]))
                 """)
                 existing_map_result = await db_session.execute(
                     existing_map_check_sql,
@@ -527,14 +556,20 @@ class AtomicDBSaver:
                               telegram_id=telegram_id)
             
         except Exception as e:
-            self.logger.error("Failed to upsert user", 
+            # Context7: Критическая ошибка - транзакция будет откачена
+            self.logger.error("Failed to upsert user - transaction will be rolled back", 
                             user_data=user_data,
-                            error=str(e))
+                            error=str(e),
+                            error_type=type(e).__name__,
+                            exc_info=True)
             raise
     
-    async def _upsert_channel(self, db_session: AsyncSession, channel_data: Dict[str, Any]) -> None:
+    async def _upsert_channel(self, db_session: AsyncSession, channel_data: Dict[str, Any]) -> str:
         """
         Context7: UPSERT канала с ON CONFLICT.
+        
+        Returns:
+            channel_id (UUID строка) - ID канала в БД
         """
         try:
             # Подготовка данных канала
@@ -553,8 +588,9 @@ class AtomicDBSaver:
             username_raw = channel_data.get('username', '')
             username_normalized = username_raw.lstrip('@') if username_raw else ''
             
+            channel_id = channel_data.get('id') or str(uuid.uuid4())
             channel_record = {
-                'id': str(uuid.uuid4()),
+                'id': channel_id,
                 'tg_channel_id': tg_channel_id,  # int для bigint в БД
                 'title': channel_data.get('title', ''),
                 'username': username_normalized,  # Сохраняем нормализованный username (без @)
@@ -563,6 +599,7 @@ class AtomicDBSaver:
             }
             
             # UPSERT через PostgreSQL ON CONFLICT (по tg_channel_id, без несуществующих полей)
+            # Context7: Получаем channel_id из существующей записи или используем новый
             sql = """
             INSERT INTO channels (id, tg_channel_id, title, username, is_active, created_at)
             VALUES (:id, :tg_channel_id, :title, :username, :is_active, :created_at)
@@ -571,19 +608,104 @@ class AtomicDBSaver:
                 title = EXCLUDED.title,
                 username = EXCLUDED.username,
                 is_active = EXCLUDED.is_active
+            RETURNING id
             """
             
-            await db_session.execute(text(sql), channel_record)
+            result = await db_session.execute(text(sql), channel_record)
+            returned_id = result.scalar_one()
+            channel_id_uuid = str(returned_id) if returned_id else channel_id
+            
             db_channels_upserted_total.inc()
             
             self.logger.debug("Channel upserted", 
-                            telegram_id=channel_data.get('telegram_id'))
+                            telegram_id=channel_data.get('telegram_id'),
+                            channel_id=channel_id_uuid)
+            
+            return channel_id_uuid
             
         except Exception as e:
             self.logger.error("Failed to upsert channel", 
                             channel_data=channel_data,
                             error=str(e))
             raise
+    
+    async def _ensure_user_channel(self, db_session: AsyncSession, user_data: Dict[str, Any], channel_data: Dict[str, Any], channel_id: str) -> None:
+        """
+        Context7 best practice: Создание user_channel связи если её нет.
+        Это необходимо для корректной работы сохранения альбомов и других операций,
+        требующих связь пользователя с каналом.
+        
+        Args:
+            db_session: AsyncSession
+            user_data: Данные пользователя с telegram_id и tenant_id
+            channel_data: Данные канала
+            channel_id: UUID канала (из _upsert_channel)
+        """
+        try:
+            # Получаем user_id по telegram_id
+            telegram_id = user_data.get('telegram_id')
+            if isinstance(telegram_id, str):
+                telegram_id = int(telegram_id)
+            
+            get_user_sql = text("""
+                SELECT id FROM users WHERE telegram_id = :telegram_id LIMIT 1
+            """)
+            result = await db_session.execute(get_user_sql, {"telegram_id": telegram_id})
+            user_row = result.fetchone()
+            
+            if not user_row:
+                self.logger.warning("User not found for user_channel creation",
+                                  telegram_id=telegram_id)
+                return
+            
+            user_id = str(user_row.id)
+            
+            # Проверяем существование user_channel связи
+            check_sql = text("""
+                SELECT user_id, channel_id FROM user_channel
+                WHERE user_id = :user_id AND channel_id = :channel_id
+                LIMIT 1
+            """)
+            check_result = await db_session.execute(
+                check_sql,
+                {"user_id": user_id, "channel_id": channel_id}
+            )
+            
+            if check_result.fetchone():
+                # Связь уже существует
+                self.logger.debug("user_channel already exists",
+                                user_id=user_id,
+                                channel_id=channel_id)
+                return
+            
+            # Создаём user_channel связь
+            # Context7: Идемпотентность через ON CONFLICT DO NOTHING
+            insert_sql = text("""
+                INSERT INTO user_channel (user_id, channel_id, is_active, subscribed_at, settings)
+                VALUES (:user_id, :channel_id, true, NOW(), '{}'::jsonb)
+                ON CONFLICT (user_id, channel_id) DO NOTHING
+            """)
+            await db_session.execute(
+                insert_sql,
+                {"user_id": user_id, "channel_id": channel_id}
+            )
+            
+            self.logger.info("user_channel created successfully",
+                           user_id=user_id,
+                           channel_id=channel_id,
+                           telegram_id=telegram_id,
+                           tenant_id=user_data.get('tenant_id'))
+            
+        except Exception as e:
+            # Context7: КРИТИЧНО - не прерываем транзакцию, но логируем детально
+            # Это может быть проблема с FK или другими ограничениями
+            self.logger.error("Failed to ensure user_channel - transaction will continue",
+                            user_data=user_data,
+                            channel_id=channel_id,
+                            error=str(e),
+                            error_type=type(e).__name__,
+                            exc_info=True)
+            # Не пробрасываем исключение - это дополнительная операция
     
     async def _bulk_insert_posts(self, db_session: AsyncSession, posts_data: List[Dict[str, Any]]) -> int:
         """

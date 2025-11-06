@@ -353,7 +353,8 @@ class ProxyHTTPHandler(BaseHTTPRequestHandler):
     
     def do_GET(self):
         """Обработка GET запросов"""
-        if self.path == "/v1/models":
+        # Context7: Обрабатываем оба пути для совместимости
+        if self.path == "/v1/models" or self.path == "/models":
             self._handle_models()
         elif self.path == "/health":
             self._handle_health()
@@ -362,7 +363,8 @@ class ProxyHTTPHandler(BaseHTTPRequestHandler):
     
     def do_POST(self):
         """Обработка POST запросов"""
-        if self.path == "/v1/chat/completions":
+        # Context7: Обрабатываем оба пути для совместимости
+        if self.path == "/v1/chat/completions" or self.path == "/chat/completions":
             self._handle_chat_completions()
         else:
             self._send_error(404, "Not Found")

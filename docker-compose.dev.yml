@@ -12,7 +12,6 @@ services:
       --reload --reload-dir /app
       --reload-include "*.py"
       --reload-exclude "sessions/*" --reload-exclude "logs/*" --reload-exclude "__pycache__/*"
-      --reload-use-polling
       --reload-delay 0.3
     volumes:
       - ./api:/app
@@ -37,6 +36,7 @@ services:
       PYTHONDONTWRITEBYTECODE: "1"
     volumes:
       - ./worker:/app
+      - ./shared/python:/app/shared/python  # Context7: Монтируем shared/python для доступа к EnrichmentRepository
   crawl4ai:
     environment:
       APP_ENV: development  # [C7-ID: dev-mode-001]

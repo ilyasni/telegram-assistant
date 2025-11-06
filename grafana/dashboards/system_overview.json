@@ -109,7 +109,12 @@
               }
             ]
           },
-          "unit": "reqps"
+          "unit": "ops",
+          "decimals": 4,
+          "min": 0,
+          "max": null,
+          "nullValueMode": "null",
+          "noValue": "0 ops"
         },
         "overrides": []
       },
@@ -148,7 +153,13 @@
           "editorMode": "code",
           "expr": "sum(rate(posts_processed_total[5m]))",
           "legendFormat": "Posts Processing Rate",
-          "refId": "A"
+          "refId": "A",
+          "interval": "",
+          "intervalMs": 1000,
+          "exemplar": false,
+          "format": "table",
+          "instant": false,
+          "range": true
         }
       ],
       "description": "Current rate of posts being processed across all stages",

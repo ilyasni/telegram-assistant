@@ -212,6 +212,10 @@ class IndexingTask:
             
             logger.info("IndexingTask started, consuming posts.enriched events")
             
+            # Context7: Устанавливаем running флаг для EventConsumer перед запуском цикла
+            # Это необходимо, так как _consume_with_trim проверяет self.event_consumer.running
+            self.event_consumer.running = True
+            
             # Context7 best practice: обработка backlog при старте
             # Перечитываем сообщения с начала stream для обработки необработанных событий
             backlog_processed = await self._process_backlog_once("posts.enriched")
@@ -466,6 +470,19 @@ class IndexingTask:
                 indexing_processed_total.labels(status='skipped').inc()
                 return
             
+            # Context7: Если tenant_id из post_data это 'default' или None, используем tenant_id из event_data
+            # Это позволяет корректно индексировать посты, для которых tenant_id не извлекается из БД
+            event_tenant_id = event_data.get('tenant_id')
+            if post_data and (not post_data.get('tenant_id') or post_data.get('tenant_id') == 'default'):
+                if event_tenant_id and event_tenant_id != 'default':
+                    logger.debug(
+                        "Using tenant_id from event_data as fallback",
+                        post_id=post_id,
+                        event_tenant_id=event_tenant_id,
+                        post_data_tenant_id=post_data.get('tenant_id')
+                    )
+                    post_data['tenant_id'] = event_tenant_id
+            
             # Context7: [C7-ID: indexing-with-enrichment-001] Проверка текста ПОСЛЕ композиции с enrichment данными
             # Если основной текст пуст, но есть vision/crawl данные - используем их для индексации
             # Это позволяет индексировать посты только с медиа (vision description/OCR)
@@ -503,7 +520,8 @@ class IndexingTask:
             embedding = await self._generate_embedding(post_data)
             
             # Индексация в Qdrant
-            vector_id = await self._index_to_qdrant(post_id, post_data, embedding)
+            # Context7: Передаём event_data для использования tenant_id из события
+            vector_id = await self._index_to_qdrant(post_id, post_data, embedding, event_data)
             
             # Индексация в Neo4j
             await self._index_to_neo4j(post_id, post_data)
@@ -520,8 +538,48 @@ class IndexingTask:
             await self._update_post_processed(post_id)
             
             # Публикация события posts.indexed
+            # Context7: Добавляем tenant_id для multi-tenant изоляции
+            # Context7: Используем tenant_id из post_data (уже обновлен через event_data fallback выше)
+            # Если tenant_id все еще None или 'default', пытаемся получить из event_data как последний fallback
+            tenant_id = post_data.get('tenant_id')
+            if not tenant_id or tenant_id == 'default':
+                # Приоритет 1: tenant_id из event_data (если передан)
+                if event_data and event_data.get('tenant_id') and event_data.get('tenant_id') != 'default':
+                    tenant_id = event_data.get('tenant_id')
+                    logger.debug(
+                        "Using tenant_id from event_data in posts.indexed",
+                        post_id=post_id,
+                        tenant_id=tenant_id
+                    )
+                else:
+                    # Приоритет 2: запрос к БД
+                    tenant_id_db = await self._get_tenant_id_from_post(post_id)
+                    if tenant_id_db and tenant_id_db != 'default':
+                        tenant_id = tenant_id_db
+                        logger.debug(
+                            "Using tenant_id from DB in posts.indexed",
+                            post_id=post_id,
+                            tenant_id=tenant_id
+                        )
+            
+            # Context7: Если все еще не найден, используем fallback на 'default', но логируем предупреждение
+            # Context7: КРИТИЧНО: tenant_id должен быть строкой, не None, иначе EventPublisher удалит его из JSON
+            if not tenant_id or tenant_id == 'default':
+                logger.warning(
+                    "tenant_id not found or is 'default' for posts.indexed, using 'default'",
+                    post_id=post_id,
+                    tenant_id_from_post_data=post_data.get('tenant_id'),
+                    tenant_id_from_event_data=event_data.get('tenant_id') if event_data else None,
+                    channel_id=post_data.get('channel_id')
+                )
+                tenant_id = tenant_id or 'default'
+            
+            # Context7: Гарантируем, что tenant_id всегда строка (не None), иначе EventPublisher._to_json_bytes удалит его
+            tenant_id_str = str(tenant_id) if tenant_id else 'default'
+            
             await self.publisher.publish_event("posts.indexed", {
                 "post_id": post_id,
+                "tenant_id": tenant_id_str,  # Context7: Обязательно строка, не None
                 "vector_id": vector_id,
                 "indexed_at": datetime.now(timezone.utc).isoformat()
             })
@@ -598,16 +656,24 @@ class IndexingTask:
             cursor = conn.cursor(cursor_factory=RealDictCursor)
             
             # Context7: JOIN с post_enrichment для загрузки всех enrichment данных
-            # Context7: tenant_id получаем из channels, так как posts больше не содержит tenant_id
+            # Context7: tenant_id получаем из users через user_channel (приоритет 1), затем из tags_data (приоритет 2), затем из channels.settings (приоритет 3)
             # Context7: Явное приведение типа для tenant_id через CAST для избежания ошибки "COALESCE types text[] and jsonb cannot be matched"
+            # Context7: users.tenant_id имеет тип UUID, приводим к text для COALESCE
             cursor.execute("""
-                SELECT 
-                    p.id,
-                    p.channel_id,
-                    p.content as text,
-                    p.telegram_message_id,
-                    p.created_at,
-                    CAST(c.settings->>'tenant_id' AS text) as tenant_id,
+                   SELECT 
+                       p.id,
+                       p.channel_id,
+                       p.content as text,
+                       p.telegram_message_id,
+                       p.created_at,
+                       COALESCE(
+                           (SELECT u.tenant_id::text FROM users u 
+                            JOIN user_channel uc ON uc.user_id = u.id 
+                            WHERE uc.channel_id = c.id 
+                            LIMIT 1),
+                           CAST(pe_tags.data->>'tenant_id' AS text),
+                           CAST(c.settings->>'tenant_id' AS text)
+                       ) as tenant_id,
                     NULL as user_id,
                     pe_vision.data as vision_data,
                     pe_crawl.data as crawl_data,
@@ -633,14 +699,24 @@ class IndexingTask:
                 # Context7: Парсинг JSONB полей data из post_enrichment
                 # Если данные уже dict (psycopg2 может автоматически парсить JSONB), оставляем как есть
                 # Если это строки, парсим через json.loads
+                # Context7: Также обрабатываем случаи, когда data это JSONB dict напрямую
                 for key in ['vision_data', 'crawl_data', 'tags_data']:
                     value = result.get(key)
-                    if value and isinstance(value, str):
+                    if value is None:
+                        result[key] = None
+                    elif isinstance(value, str):
                         try:
                             result[key] = json.loads(value)
                         except (json.JSONDecodeError, TypeError):
                             result[key] = None
-                    elif value is None:
+                    elif isinstance(value, dict):
+                        # Уже dict (psycopg2 автоматически парсит JSONB)
+                        result[key] = value
+                    else:
+                        # Неожиданный тип - логируем и устанавливаем None
+                        logger.warning(f"Unexpected type for {key}", 
+                                     post_id=post_id,
+                                     value_type=type(value).__name__)
                         result[key] = None
                 
                 return result
@@ -773,7 +849,7 @@ class IndexingTask:
                         error=str(e))
             raise
     
-    async def _index_to_qdrant(self, post_id: str, post_data: Dict[str, Any], embedding: list) -> str:
+    async def _index_to_qdrant(self, post_id: str, post_data: Dict[str, Any], embedding: list, event_data: Optional[Dict[str, Any]] = None) -> str:
         """
         Индексация поста в Qdrant с расширенным payload для фильтрации и фасетирования.
         
@@ -793,12 +869,35 @@ class IndexingTask:
             album_id = await self._get_album_id_for_post(post_id)
             
             # Context7: Получаем tenant_id из post_data (обязательно для multi-tenant)
+            # Context7: Используем tenant_id из event_data как fallback, если post_data содержит 'default' или None
             tenant_id = post_data.get('tenant_id')
-            if not tenant_id:
-                # Fallback: получаем из БД по channel_id
-                tenant_id = await self._get_tenant_id_from_post(post_id)
-                if not tenant_id:
-                    raise ValueError(f"tenant_id not found for post {post_id}")
+            
+            # Context7: Если tenant_id из post_data это 'default' или None, пытаемся получить из event_data
+            if not tenant_id or tenant_id == 'default':
+                # Приоритет 1: tenant_id из event_data (если передан)
+                if event_data and event_data.get('tenant_id') and event_data.get('tenant_id') != 'default':
+                    tenant_id = event_data.get('tenant_id')
+                    logger.debug(
+                        "Using tenant_id from event_data in _index_to_qdrant",
+                        post_id=post_id,
+                        tenant_id=tenant_id
+                    )
+                else:
+                    # Приоритет 2: запрос к БД
+                    tenant_id = await self._get_tenant_id_from_post(post_id)
+            
+            # Context7: Если всё ещё не найден, используем fallback на 'default', но логируем предупреждение
+            if not tenant_id or tenant_id == 'default':
+                logger.warning(
+                    "tenant_id not found or is 'default', using 'default' for indexing",
+                    post_id=post_id,
+                    tenant_id_from_post_data=post_data.get('tenant_id'),
+                    tenant_id_from_event_data=event_data.get('tenant_id') if event_data else None,
+                    channel_id=post_data.get('channel_id')
+                )
+                tenant_id = tenant_id or 'default'
+                # Context7: НЕ выбрасываем исключение, чтобы не прерывать индексацию
+                # Но логируем для диагностики
             
             # Базовый payload с tenant_id для фильтрации
             payload = {
@@ -985,17 +1084,30 @@ class IndexingTask:
             async with async_session() as session:
                 result = await session.execute(
                     text("""
-                        SELECT CAST(c.settings->>'tenant_id' AS text) as tenant_id
+                        SELECT COALESCE(
+                            (SELECT u.tenant_id::text FROM users u 
+                             JOIN user_channel uc ON uc.user_id = u.id 
+                             WHERE uc.channel_id = c.id 
+                             LIMIT 1),
+                            CAST(pe.data->>'tenant_id' AS text),
+                            CAST(c.settings->>'tenant_id' AS text),
+                            'default'
+                        ) as tenant_id
                         FROM posts p
                         JOIN channels c ON p.channel_id = c.id
+                        LEFT JOIN post_enrichment pe 
+                            ON pe.post_id = p.id AND pe.kind = 'tags'
                         WHERE p.id = :post_id
                         LIMIT 1
                     """),
                     {"post_id": post_id}
                 )
                 row = result.fetchone()
-                if row:
-                    return str(row[0])
+                if row and row[0]:
+                    tenant_id_value = str(row[0])
+                    # Context7: Возвращаем значение, даже если 'default' (для единообразия)
+                    # Вызывающий код должен проверять и использовать fallback
+                    return tenant_id_value
         except Exception as e:
             logger.debug(
                 "Error getting tenant_id for post",
@@ -1082,11 +1194,31 @@ class IndexingTask:
             if post_data.get('tags_data'):
                 enrichment_data['tags'] = post_data.get('tags_data')
             
+            # Context7: Получаем tenant_id с приоритетами (post_data уже обновлен через event_data fallback выше)
+            # Context7: Если tenant_id все еще 'default' или None, пытаемся получить из БД как последний fallback
+            tenant_id_for_neo4j = post_data.get('tenant_id')
+            if not tenant_id_for_neo4j or tenant_id_for_neo4j == 'default':
+                # Приоритет: event_data -> БД -> 'default'
+                if event_data and event_data.get('tenant_id') and event_data.get('tenant_id') != 'default':
+                    tenant_id_for_neo4j = event_data.get('tenant_id')
+                else:
+                    tenant_id_db = await self._get_tenant_id_from_post(post_id)
+                    if tenant_id_db and tenant_id_db != 'default':
+                        tenant_id_for_neo4j = tenant_id_db
+                    else:
+                        tenant_id_for_neo4j = 'default'
+                        logger.warning(
+                            "Using 'default' tenant_id for Neo4j (no real tenant_id found)",
+                            post_id=post_id,
+                            tenant_id_from_post_data=post_data.get('tenant_id'),
+                            tenant_id_from_event_data=event_data.get('tenant_id') if event_data else None
+                        )
+            
             # Context7: Вызов метода create_post_node с enrichment данными
             success = await self.neo4j_client.create_post_node(
                 post_id=post_id,
                 user_id=post_data.get('user_id', 'system'),  # Fallback для совместимости
-                tenant_id=post_data.get('tenant_id', 'default'),  # Fallback для совместимости
+                tenant_id=tenant_id_for_neo4j,  # Context7: Используем tenant_id с приоритетами, fallback на 'default'
                 channel_id=channel_id,
                 expires_at=expires_at,
                 enrichment_data=enrichment_data if enrichment_data else None,
@@ -1099,24 +1231,43 @@ class IndexingTask:
                     album_id=album_id,
                     post_id=post_id,
                     channel_id=channel_id,
-                    tenant_id=post_data.get('tenant_id', 'default')
+                    tenant_id=tenant_id_for_neo4j  # Context7: Используем тот же tenant_id
                 )
             
             if not success:
                 raise Exception("create_post_node returned False")
             
             # Context7: Создание Tag relationships
+            # Context7: tags_data может быть dict с ключом 'tags' или уже списком
             tags_data = post_data.get('tags_data')
-            if tags_data and isinstance(tags_data, dict):
-                tags_list = tags_data.get('tags', [])
-                if tags_list:
+            if tags_data:
+                tags_list = None
+                
+                if isinstance(tags_data, dict):
+                    # Формат: {"tags": [...], "tags_hash": "...", "provider": "..."}
+                    tags_list = tags_data.get('tags', [])
+                elif isinstance(tags_data, list):
+                    # Прямой список тегов (legacy формат)
+                    tags_list = tags_data
+                
+                if tags_list and isinstance(tags_list, list) and len(tags_list) > 0:
                     # Преобразуем список строк в список dict для create_tag_relationships
                     tags_dicts = [
                         {'name': tag, 'category': 'general', 'confidence': 1.0}
                         if isinstance(tag, str) else tag
                         for tag in tags_list
                     ]
-                    await self.neo4j_client.create_tag_relationships(post_id, tags_dicts)
+                    try:
+                        await self.neo4j_client.create_tag_relationships(post_id, tags_dicts)
+                        logger.debug("Tag and Topic relationships created via IndexingTask",
+                                   post_id=post_id,
+                                   tags_count=len(tags_dicts))
+                    except Exception as e:
+                        logger.error("Failed to create tag relationships in IndexingTask",
+                                   post_id=post_id,
+                                   error=str(e),
+                                   tags_count=len(tags_dicts))
+                        # Не прерываем индексацию из-за ошибки создания тегов
             
             # Context7: Создание ImageContent nodes для Vision
             vision_data = post_data.get('vision_data')

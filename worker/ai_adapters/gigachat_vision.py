@@ -481,6 +481,13 @@ class GigaChatVisionAdapter:
         if VisionEnrichment:
             try:
                 parsed = json.loads(content.strip())
+                # Context7: Убеждаемся что OCR извлечён даже если парсинг прошёл
+                # Иногда GigaChat может вернуть ocr как null, но текст есть в description
+                if not parsed.get("ocr") or not parsed.get("ocr", {}).get("text"):
+                    ocr_extracted = self._extract_ocr_from_content(content)
+                    if ocr_extracted:
+                        parsed["ocr"] = ocr_extracted
+                
                 # Валидация через Pydantic
                 try:
                     enrichment = VisionEnrichment(**parsed)
@@ -499,6 +506,12 @@ class GigaChatVisionAdapter:
                 json_match = self._extract_json_with_balance(content)
                 if json_match:
                     parsed = json.loads(json_match)
+                    # Context7: Убеждаемся что OCR извлечён
+                    if not parsed.get("ocr") or not parsed.get("ocr", {}).get("text"):
+                        ocr_extracted = self._extract_ocr_from_content(content)
+                        if ocr_extracted:
+                            parsed["ocr"] = ocr_extracted
+                    
                     try:
                         enrichment = VisionEnrichment(**parsed)
                         vision_parsed_total.labels(status="success", method="bracket_extractor").inc()
@@ -513,6 +526,12 @@ class GigaChatVisionAdapter:
             try:
                 partial_data = self._extract_partial_json(content)
                 if partial_data:
+                    # Context7: Специальная обработка OCR - извлекаем из вложенного объекта
+                    if "ocr" not in partial_data:
+                        ocr_data = self._extract_ocr_from_content(content)
+                        if ocr_data:
+                            partial_data["ocr"] = ocr_data
+                    
                     # Заполняем обязательные поля дефолтами
                     if "description" not in partial_data or len(str(partial_data.get("description", "")).strip()) < 5:
                         partial_data["description"] = content[:200] if len(content) >= 5 else f"Изображение: {content[:195]}"
@@ -537,6 +556,16 @@ class GigaChatVisionAdapter:
         classification_type = self._classify_by_keywords(content)
         is_meme = self._detect_meme_by_keywords(content)
         
+        # Context7: Пытаемся извлечь OCR даже в fallback режиме
+        ocr_extracted = self._extract_ocr_from_content(content)
+        if not ocr_extracted and len(content.strip()) > 20:
+            # Если OCR не найден, но есть длинный текст - возможно это весь ответ и есть OCR
+            ocr_extracted = {
+                "text": content.strip(),
+                "engine": "gigachat",
+                "confidence": 0.5  # Низкая уверенность для fallback
+            }
+        
         # Создаём минимальный валидный VisionEnrichment
         fallback_description = content[:200] if len(content.strip()) >= 5 else f"Изображение (не удалось извлечь описание): {content[:150]}"
         if len(fallback_description.strip()) < 5:
@@ -550,7 +579,7 @@ class GigaChatVisionAdapter:
                     is_meme=is_meme,
                     labels=[],
                     objects=[],
-                    ocr={"text": content, "engine": "fallback", "confidence": 0.0} if content.strip() else None
+                    ocr=ocr_extracted
                 )
                 return self._enrichment_to_dict(enrichment, file_id)
             except Exception as e:
@@ -626,39 +655,170 @@ class GigaChatVisionAdapter:
         """
         Извлечение частичных JSON данных из текста.
         Ищет пары ключ-значение даже в невалидном JSON.
+        Context7: Поддержка вложенных объектов (ocr: {...}).
+        
+        Context7 best practice: защита от catastrophic backtracking:
+        - Ограничение длины content
+        - Ограниченные квантификаторы {1,500} вместо +
+        - Non-greedy квантификаторы где возможно
+        - Обработка ошибок regex
         """
         import json
         import re
         
+        # Context7: Ограничение длины для предотвращения зависания
+        MAX_CONTENT_LENGTH = 50000  # 50KB максимум
+        if len(content) > MAX_CONTENT_LENGTH:
+            content = content[:MAX_CONTENT_LENGTH]
+            logger.debug(f"Content truncated for partial JSON extraction: {len(content)} chars")
+        
         result = {}
         
-        # Попытка найти JSON-подобные пары
-        # Ищем паттерны типа "key": value
-        key_value_pattern = r'["\']?([a-zA-Z_][a-zA-Z0-9_]*)["\']?\s*:\s*([^,}\]]+)'
-        matches = re.findall(key_value_pattern, content)
-        
-        for key, value in matches:
-            value = value.strip().rstrip(',').rstrip('}')
-            # Пытаемся распарсить значение
-            try:
-                # Если это строка в кавычках
-                if value.startswith('"') and value.endswith('"'):
-                    result[key] = json.loads(value)
-                # Если это boolean
-                elif value.lower() in ['true', 'false']:
-                    result[key] = value.lower() == 'true'
-                # Если это число
-                elif value.replace('.', '', 1).replace('-', '', 1).isdigit():
-                    result[key] = float(value) if '.' in value else int(value)
-                # Если это null
-                elif value.lower() == 'null':
-                    result[key] = None
-                else:
+        try:
+            # Context7: Попытка извлечь вложенные объекты (ocr: {...})
+            # Используем ограниченный квантификатор {1,500} вместо +
+            nested_obj_pattern = r'["\']?ocr["\']?\s*:\s*\{([^}]{1,500})\}'
+            nested_match = re.search(nested_obj_pattern, content, re.IGNORECASE)
+            if nested_match:
+                ocr_content = nested_match.group(1)
+                ocr_data = {}
+                # Извлекаем поля из вложенного объекта (ограниченный паттерн)
+                ocr_field_pattern = r'["\']?([a-zA-Z_][a-zA-Z0-9_]*)["\']?\s*:\s*([^,}]{1,200})'
+                ocr_matches = re.findall(ocr_field_pattern, ocr_content)
+                for ocr_key, ocr_value in ocr_matches:
+                    ocr_value = ocr_value.strip().rstrip(',').strip('"\'')
+                    if ocr_key == "text":
+                        ocr_data["text"] = ocr_value
+                    elif ocr_key == "engine":
+                        ocr_data["engine"] = ocr_value
+                    elif ocr_key == "confidence":
+                        try:
+                            ocr_data["confidence"] = float(ocr_value)
+                        except (ValueError, TypeError):
+                            pass
+                if ocr_data:
+                    result["ocr"] = ocr_data
+            
+            # Попытка найти JSON-подобные пары
+            # Context7: Ограниченный квантификатор {1,200} для значений
+            key_value_pattern = r'["\']?([a-zA-Z_][a-zA-Z0-9_]*)["\']?\s*:\s*([^,}\]]{1,200})'
+            matches = re.findall(key_value_pattern, content)
+            
+            # Context7: Ограничиваем количество обрабатываемых пар для производительности
+            MAX_PAIRS = 100
+            for key, value in matches[:MAX_PAIRS]:
+                # Пропускаем уже обработанные ключи
+                if key.lower() == "ocr" and "ocr" in result:
+                    continue
+                    
+                value = value.strip().rstrip(',').rstrip('}')
+                # Пытаемся распарсить значение
+                try:
+                    # Если это строка в кавычках
+                    if value.startswith('"') and value.endswith('"'):
+                        result[key] = json.loads(value)
+                    # Если это boolean
+                    elif value.lower() in ['true', 'false']:
+                        result[key] = value.lower() == 'true'
+                    # Если это число
+                    elif value.replace('.', '', 1).replace('-', '', 1).isdigit():
+                        result[key] = float(value) if '.' in value else int(value)
+                    # Если это null
+                    elif value.lower() == 'null':
+                        result[key] = None
+                    # Если это массив (начинается с [)
+                    elif value.strip().startswith('[') and value.strip().endswith(']'):
+                        try:
+                            result[key] = json.loads(value)
+                        except json.JSONDecodeError:
+                            # Пытаемся извлечь элементы массива (ограниченный паттерн)
+                            array_items = re.findall(r'["\']([^"\']{1,200})["\']', value)
+                            if array_items:
+                                result[key] = array_items[:50]  # Максимум 50 элементов
+                            else:
+                                result[key] = value.strip('"\'')
+                    else:
+                        result[key] = value.strip('"\'')
+                except Exception:
                     result[key] = value.strip('"\'')
-            except Exception:
-                result[key] = value.strip('"\'')
+        
+        except re.error as e:
+            # Context7: Обработка ошибок regex
+            logger.warning(f"Regex error in partial JSON extraction: {e}", exc_info=False)
+        except Exception as e:
+            logger.debug(f"Error in partial JSON extraction: {e}", exc_info=False)
         
         return result if result else None
+    
+    def _extract_ocr_from_content(self, content: str) -> Optional[Dict[str, Any]]:
+        """
+        Context7: Специальная обработка OCR из ответа GigaChat.
+        Извлекает OCR данные даже если основной парсинг не удался.
+        
+        Context7 best practice: защита от catastrophic backtracking через:
+        - Ограничение длины content (max 50KB)
+        - Non-greedy квантификаторы
+        - Ограниченные квантификаторы {0,1000} вместо *
+        - Избегание re.DOTALL на больших текстах
+        
+        Ищет паттерны:
+        - "ocr": {"text": "...", "engine": "...", "confidence": ...}
+        - "ocr": {"text": "..."}
+        - ocr text: "..." (неформатированный)
+        """
+        import re
+        
+        # Context7: Ограничение длины content для предотвращения зависания
+        MAX_CONTENT_LENGTH = 50000  # 50KB максимум для regex операций
+        if len(content) > MAX_CONTENT_LENGTH:
+            # Ограничиваем до первых 50KB и последних 10KB (для поиска OCR)
+            content = content[:MAX_CONTENT_LENGTH] + content[-10000:]
+            logger.debug(f"Content truncated for OCR extraction: {len(content)} chars")
+        
+        try:
+            # Паттерн 1: Стандартный JSON формат (non-greedy, ограниченный)
+            # Context7: Используем {0,1000} вместо * для предотвращения backtracking
+            ocr_pattern1 = r'["\']?ocr["\']?\s*:\s*\{[^}]{0,1000}?["\']text["\']?\s*:\s*["\']([^"\']{0,5000})["\']'
+            match1 = re.search(ocr_pattern1, content, re.IGNORECASE)
+            if match1:
+                ocr_text = match1.group(1)
+                # Ищем engine в пределах 200 символов от найденного OCR
+                start_pos = max(0, match1.start() - 100)
+                end_pos = min(len(content), match1.end() + 100)
+                context_snippet = content[start_pos:end_pos]
+                
+                engine_match = re.search(r'["\']engine["\']?\s*:\s*["\']([^"\']{1,50})["\']', context_snippet, re.IGNORECASE)
+                engine = engine_match.group(1) if engine_match else "gigachat"
+                
+                confidence_match = re.search(r'["\']confidence["\']?\s*:\s*([0-9.]+)', context_snippet, re.IGNORECASE)
+                confidence = float(confidence_match.group(1)) if confidence_match else None
+                
+                return {
+                    "text": ocr_text.strip(),
+                    "engine": engine,
+                    "confidence": confidence
+                }
+            
+            # Паттерн 2: Неформатированный текст после "ocr" или "текст" (ограниченный)
+            ocr_pattern2 = r'(?:ocr|текст|извлечённый\s+текст)[:：]\s*["\']([^"\']{10,5000})["\']'
+            match2 = re.search(ocr_pattern2, content, re.IGNORECASE)
+            if match2:
+                ocr_text = match2.group(1).strip()
+                if len(ocr_text) > 10:  # Минимальная длина для OCR текста
+                    return {
+                        "text": ocr_text,
+                        "engine": "gigachat",
+                        "confidence": 0.8  # Средняя уверенность для извлечённого текста
+                    }
+            
+        except re.error as e:
+            # Context7: Обработка ошибок regex (например, при невалидных паттернах)
+            logger.warning(f"Regex error in OCR extraction: {e}", exc_info=False)
+        except Exception as e:
+            # Другие ошибки - логируем но не падаем
+            logger.debug(f"Error in OCR extraction: {e}", exc_info=False)
+        
+        return None
     
     def _classify_by_keywords(self, content: str) -> str:
         """Классификация по ключевым словам (fallback)."""
