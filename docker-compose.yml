@@ -320,8 +320,10 @@ services:
       options:
         max-size: "1m"
         max-file: "1"
+    # Context7: Health check использует wget вместо curl (curl отсутствует в официальном образе)
+    # Альтернатива: использовать python для проверки health endpoint
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8080/healthz || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3

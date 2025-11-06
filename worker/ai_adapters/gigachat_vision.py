@@ -103,7 +103,8 @@ class GigaChatVisionAdapter:
         s3_service: Optional[S3StorageService] = None,
         budget_gate: Optional[BudgetGateService] = None,
         verify_ssl: bool = False,
-        timeout: int = 600
+        timeout: int = 600,
+        circuit_breaker: Optional[Any] = None
     ):
         """
         Инициализация GigaChat Vision Adapter.
@@ -137,6 +138,21 @@ class GigaChatVisionAdapter:
         self.budget_gate = budget_gate
         self.verify_ssl = verify_ssl
         self.timeout = timeout
+        
+        # Context7: Circuit breaker для защиты от каскадных сбоев
+        if circuit_breaker is None:
+            from shared.python.shared.utils.circuit_breaker import CircuitBreaker
+            import os
+            failure_threshold = int(os.getenv("GIGACHAT_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "5"))
+            recovery_timeout = int(os.getenv("GIGACHAT_CIRCUIT_BREAKER_RECOVERY_TIMEOUT", "60"))
+            self.circuit_breaker = CircuitBreaker(
+                name="gigachat_vision",
+                failure_threshold=failure_threshold,
+                recovery_timeout=recovery_timeout,
+                expected_exception=Exception
+            )
+        else:
+            self.circuit_breaker = circuit_breaker
         
         # GigaChat клиент (создаётся при первом использовании)
         self._client: Optional[GigaChat] = None
@@ -301,9 +317,35 @@ class GigaChatVisionAdapter:
                 
                 cached_result = await self.s3_service.head_object(cache_key)
                 if cached_result:
-                    # TODO: Загрузить из S3 и десериализовать
-                    vision_cache_hits_total.labels(cache_type="s3").inc()
-                    logger.debug("Vision result found in S3 cache", sha256=sha256)
+                    # Context7: Загружаем из S3 кэша и возвращаем результат
+                    try:
+                        cached_data = await self.s3_service.get_json(cache_key)
+                        if cached_data:
+                            # Добавляем метаданные для метрик
+                            cached_data.setdefault("provider", "gigachat")
+                            cached_data.setdefault("model", self.model)
+                            cached_data.setdefault("file_id", None)  # file_id не сохраняется в кэш
+                            
+                            vision_cache_hits_total.labels(cache_type="s3").inc()
+                            logger.debug(
+                                "Vision result loaded from S3 cache",
+                                sha256=sha256,
+                                has_ocr=bool(cached_data.get("ocr") and cached_data["ocr"].get("text")),
+                                ocr_text_length=len(cached_data.get("ocr", {}).get("text", "")) if cached_data.get("ocr") else 0,
+                                trace_id=trace_id
+                            )
+                            return cached_data
+                        else:
+                            logger.warning("S3 cache object exists but failed to parse JSON", sha256=sha256, cache_key=cache_key)
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to load from S3 cache, will analyze fresh",
+                            sha256=sha256,
+                            cache_key=cache_key,
+                            error=str(e),
+                            trace_id=trace_id
+                        )
+                    # Если загрузка из кэша не удалась, продолжаем с анализом
             
             # Проверка budget gate
             if self.budget_gate:
@@ -341,7 +383,8 @@ class GigaChatVisionAdapter:
                     mime_type=mime_type
                 )
                 
-                # Промпт для анализа с strict schema hints
+                # Context7 best practice: Улучшенный промпт с явным запросом OCR
+                # Явно указываем, что OCR обязателен, если на изображении есть текст
                 if not analysis_prompt:
                     analysis_prompt = """Проанализируй изображение или документ и предоставь структурированный JSON со следующей схемой:
 
@@ -352,35 +395,78 @@ class GigaChatVisionAdapter:
   "labels": ["класс1", "класс2", ...],  // максимум 20 классов/атрибутов
   "objects": ["объект1", "объект2", ...],  // максимум 10 объектов на изображении
   "scene": "описание сцены/окружения" или null,
-  "ocr": {"text": "извлечённый текст", "engine": "gigachat", "confidence": 0.0-1.0} или null,
+  "ocr": {"text": "извлечённый текст из изображения", "engine": "gigachat", "confidence": 0.0-1.0} или null,
   "nsfw_score": 0.0-1.0 или null,
   "aesthetic_score": 0.0-1.0 или null,
   "dominant_colors": ["#hex1", "#hex2", ...],  // максимум 5 цветов
   "context": {"emotions": [...], "themes": [...], "relationships": [...]}
 }
 
+ВАЖНО:
+- Если на изображении есть ЛЮБОЙ текст (надписи, подписи, текст в документе, скриншоты), ОБЯЗАТЕЛЬНО заполни поле "ocr" с извлечённым текстом
+- Если текста нет, установи "ocr": null
+- Поле "ocr.text" должно содержать ВЕСЬ видимый текст с изображения, включая мелкий текст
+- Не пропускай текст даже если он частично виден или размыт
+
 Обязательные поля: classification, description, is_meme.
 Ответь ТОЛЬКО валидным JSON без дополнительного текста."""
                 
-                # Vision анализ через chat с attachments
+                # Context7: Vision анализ через chat с attachments с circuit breaker защитой
                 client = self._get_client()
-                response = client.chat({
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": analysis_prompt,
-                            "attachments": [file_id]
-                        }
-                    ],
-                    "temperature": 0.1,
-                    "function_call": "auto"  # Для обработки файлов
-                })
+                
+                async def _call_gigachat_api():
+                    """Внутренняя функция для вызова GigaChat API через circuit breaker."""
+                    return client.chat({
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": analysis_prompt,
+                                "attachments": [file_id]
+                            }
+                        ],
+                        "temperature": 0.1,
+                        "function_call": "auto"  # Для обработки файлов
+                    })
+                
+                try:
+                    response = await self.circuit_breaker.call_async(_call_gigachat_api)
+                except Exception as cb_error:
+                    # Context7: Circuit breaker открыт или произошла ошибка
+                    # Логируем и пробрасываем исключение для обработки выше
+                    logger.warning(
+                        "GigaChat API call blocked by circuit breaker or failed",
+                        sha256=sha256,
+                        error=str(cb_error),
+                        circuit_breaker_state=self.circuit_breaker.get_state(),
+                        trace_id=trace_id
+                    )
+                    raise
                 
                 # Извлечение результата
                 content = response.choices[0].message.content
                 
+                # Context7: Логируем сырой ответ для диагностики OCR
+                logger.debug(
+                    "GigaChat Vision API response received",
+                    sha256=sha256,
+                    content_length=len(content),
+                    content_preview=content[:200] if content else None,
+                    trace_id=trace_id
+                )
+                
                 # Парсинг ответа (упрощённый, реальный должен парсить JSON)
                 analysis_result = self._parse_vision_response(content, file_id)
+                
+                # Context7: Логируем результат парсинга OCR для диагностики
+                has_ocr = bool(analysis_result.get("ocr") and analysis_result["ocr"].get("text"))
+                logger.debug(
+                    "Vision analysis result parsed",
+                    sha256=sha256,
+                    has_ocr=has_ocr,
+                    ocr_text_length=len(analysis_result.get("ocr", {}).get("text", "")) if analysis_result.get("ocr") else 0,
+                    ocr_engine=analysis_result.get("ocr", {}).get("engine") if analysis_result.get("ocr") else None,
+                    trace_id=trace_id
+                )
                 
                 # Учёт токенов
                 tokens_used = getattr(response.usage, 'total_tokens', 0) if hasattr(response, 'usage') else 0
@@ -392,13 +478,32 @@ class GigaChatVisionAdapter:
                         model=self.model
                     )
                 
-                # Сохранение в S3 кэш
+                # Context7: Сохранение в S3 кэш (включая OCR данные)
                 if self.s3_service and cache_key:
-                    await self.s3_service.put_json(
-                        data=analysis_result,
-                        s3_key=cache_key,
-                        compress=True
-                    )
+                    try:
+                        size_bytes = await self.s3_service.put_json(
+                            data=analysis_result,
+                            s3_key=cache_key,
+                            compress=True
+                        )
+                        logger.debug(
+                            "Vision result saved to S3 cache",
+                            sha256=sha256,
+                            cache_key=cache_key,
+                            size_bytes=size_bytes,
+                            has_ocr=bool(analysis_result.get("ocr") and analysis_result["ocr"].get("text")),
+                            ocr_text_length=len(analysis_result.get("ocr", {}).get("text", "")) if analysis_result.get("ocr") else 0,
+                            trace_id=trace_id
+                        )
+                    except Exception as e:
+                        # Не критичная ошибка - логируем но продолжаем
+                        logger.warning(
+                            "Failed to save vision result to S3 cache",
+                            sha256=sha256,
+                            cache_key=cache_key,
+                            error=str(e),
+                            trace_id=trace_id
+                        )
                 
                 duration = time.time() - start_time
                 # Context7: Определяем has_ocr на основе результата
@@ -481,12 +586,28 @@ class GigaChatVisionAdapter:
         if VisionEnrichment:
             try:
                 parsed = json.loads(content.strip())
-                # Context7: Убеждаемся что OCR извлечён даже если парсинг прошёл
-                # Иногда GigaChat может вернуть ocr как null, но текст есть в description
-                if not parsed.get("ocr") or not parsed.get("ocr", {}).get("text"):
+                # Context7: Улучшенная проверка OCR - проверяем все возможные варианты
+                ocr_data = parsed.get("ocr")
+                has_ocr_text = False
+                
+                if ocr_data:
+                    if isinstance(ocr_data, dict):
+                        has_ocr_text = bool(ocr_data.get("text") and str(ocr_data.get("text", "")).strip())
+                    elif isinstance(ocr_data, str):
+                        has_ocr_text = bool(ocr_data.strip())
+                
+                # Если OCR отсутствует или пустой, пытаемся извлечь из content
+                if not has_ocr_text:
                     ocr_extracted = self._extract_ocr_from_content(content)
                     if ocr_extracted:
                         parsed["ocr"] = ocr_extracted
+                        logger.debug("OCR extracted from content after parsing", ocr_length=len(ocr_extracted.get("text", "")))
+                    else:
+                        # Context7: Проверяем, может быть текст в description (для документов)
+                        description = parsed.get("description", "")
+                        if description and len(description.strip()) > 20:
+                            # Если description длинный и похож на OCR текст, пробуем использовать его
+                            logger.debug("No OCR found, but description is long - might contain text", description_length=len(description))
                 
                 # Валидация через Pydantic
                 try:
@@ -778,10 +899,17 @@ class GigaChatVisionAdapter:
         try:
             # Паттерн 1: Стандартный JSON формат (non-greedy, ограниченный)
             # Context7: Используем {0,1000} вместо * для предотвращения backtracking
-            ocr_pattern1 = r'["\']?ocr["\']?\s*:\s*\{[^}]{0,1000}?["\']text["\']?\s*:\s*["\']([^"\']{0,5000})["\']'
-            match1 = re.search(ocr_pattern1, content, re.IGNORECASE)
+            # Улучшенный паттерн для поддержки многострочного текста в OCR
+            ocr_pattern1 = r'["\']?ocr["\']?\s*:\s*\{[^}]{0,2000}?["\']text["\']?\s*:\s*["\']((?:[^"\\]|\\.){0,10000})["\']'
+            match1 = re.search(ocr_pattern1, content, re.IGNORECASE | re.DOTALL)
             if match1:
                 ocr_text = match1.group(1)
+                # Декодируем escape-последовательности
+                try:
+                    ocr_text = ocr_text.encode().decode('unicode_escape')
+                except:
+                    pass
+                
                 # Ищем engine в пределах 200 символов от найденного OCR
                 start_pos = max(0, match1.start() - 100)
                 end_pos = min(len(content), match1.end() + 100)
@@ -793,22 +921,48 @@ class GigaChatVisionAdapter:
                 confidence_match = re.search(r'["\']confidence["\']?\s*:\s*([0-9.]+)', context_snippet, re.IGNORECASE)
                 confidence = float(confidence_match.group(1)) if confidence_match else None
                 
-                return {
-                    "text": ocr_text.strip(),
-                    "engine": engine,
-                    "confidence": confidence
-                }
+                ocr_text_cleaned = ocr_text.strip()
+                if ocr_text_cleaned and len(ocr_text_cleaned) > 0:
+                    return {
+                        "text": ocr_text_cleaned,
+                        "engine": engine,
+                        "confidence": confidence
+                    }
             
             # Паттерн 2: Неформатированный текст после "ocr" или "текст" (ограниченный)
-            ocr_pattern2 = r'(?:ocr|текст|извлечённый\s+текст)[:：]\s*["\']([^"\']{10,5000})["\']'
-            match2 = re.search(ocr_pattern2, content, re.IGNORECASE)
+            # Улучшенный паттерн для поддержки различных форматов
+            ocr_pattern2 = r'(?:ocr|текст|извлечённый\s+текст|распознанный\s+текст)[:：]\s*["\']((?:[^"\\]|\\.){10,10000})["\']'
+            match2 = re.search(ocr_pattern2, content, re.IGNORECASE | re.DOTALL)
             if match2:
-                ocr_text = match2.group(1).strip()
+                ocr_text = match2.group(1)
+                # Декодируем escape-последовательности
+                try:
+                    ocr_text = ocr_text.encode().decode('unicode_escape')
+                except:
+                    pass
+                ocr_text = ocr_text.strip()
                 if len(ocr_text) > 10:  # Минимальная длина для OCR текста
                     return {
                         "text": ocr_text,
                         "engine": "gigachat",
                         "confidence": 0.8  # Средняя уверенность для извлечённого текста
+                    }
+            
+            # Паттерн 3: Текст в блоке code или markdown (если GigaChat обернул в код)
+            ocr_pattern3 = r'```(?:json)?\s*\{[^}]*"ocr"[^}]*"text"\s*:\s*["\']((?:[^"\\]|\\.){10,10000})["\']'
+            match3 = re.search(ocr_pattern3, content, re.IGNORECASE | re.DOTALL)
+            if match3:
+                ocr_text = match3.group(1)
+                try:
+                    ocr_text = ocr_text.encode().decode('unicode_escape')
+                except:
+                    pass
+                ocr_text = ocr_text.strip()
+                if len(ocr_text) > 10:
+                    return {
+                        "text": ocr_text,
+                        "engine": "gigachat",
+                        "confidence": 0.75
                     }
             
         except re.error as e:

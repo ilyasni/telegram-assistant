@@ -377,21 +377,27 @@ class MediaProcessor:
                 )
                 return []
             
-            # Context7: Использование iter_messages() с окном по времени
-            # Telegram ограничивает медиагруппы до 10 элементов, они обычно лежат подряд
-            # Стратегия: limit=30, offset_date=msg.date±5 минут, фильтрация по grouped_id
+            # Context7: Использование iter_messages() с расширенным окном по времени
+            # Context7 best practice: увеличенное окно для больших альбомов
+            # Настраивается через ALBUM_SEARCH_WINDOW_MINUTES (по умолчанию 10 минут)
+            import os
+            window_minutes = int(os.getenv("ALBUM_SEARCH_WINDOW_MINUTES", "10"))
+            search_limit = int(os.getenv("ALBUM_SEARCH_LIMIT", "50"))
+            
+            # Telegram ограничивает медиагруппы до 10 элементов, но для надежности используем большее окно
+            # Стратегия: limit=50, offset_date=msg.date±10 минут, фильтрация по grouped_id
             # Прерывание: если собрали цепочку и следующее сообщение не из альбома
             
             current_date = message.date
-            offset_date_min = current_date - timedelta(minutes=5)
-            offset_date_max = current_date + timedelta(minutes=5)
+            offset_date_min = current_date - timedelta(minutes=window_minutes)
+            offset_date_max = current_date + timedelta(minutes=window_minutes)
             
             album_messages = []
             try:
-                # Context7: Telethon iter_messages around message date
+                # Context7: Telethon iter_messages around message date с расширенным окном
                 async for msg in self.telegram_client.iter_messages(
                     peer,
-                    limit=30,
+                    limit=search_limit,
                     offset_date=current_date,
                     reverse=False
                 ):
@@ -423,6 +429,26 @@ class MediaProcessor:
                         trace_id=trace_id
                     )
                     return []
+                
+                # Context7: Проверка полноты альбома
+                # Если найдено 10 элементов, возможно альбом больше - логируем предупреждение
+                if len(album_messages) >= 10:
+                    logger.warning(
+                        "Album may be incomplete - reached Telegram limit of 10 items",
+                        grouped_id=grouped_id,
+                        items_found=len(album_messages),
+                        window_minutes=window_minutes,
+                        search_limit=search_limit,
+                        trace_id=trace_id
+                    )
+                else:
+                    logger.debug(
+                        "Album messages found",
+                        grouped_id=grouped_id,
+                        items_count=len(album_messages),
+                        window_minutes=window_minutes,
+                        trace_id=trace_id
+                    )
                 
                 logger.debug(
                     "Found album messages",

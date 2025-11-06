@@ -996,6 +996,42 @@ class IndexingTask:
                 
                 payload["crawl"] = crawl_payload
             
+            # Context7: Валидация payload через Pydantic перед сохранением
+            try:
+                from shared.python.shared.schemas.enrichment_validation import validate_qdrant_payload
+                # Добавляем обязательные поля для валидации
+                payload_for_validation = payload.copy()
+                payload_for_validation.setdefault('has_media', post_data.get('has_media', False))
+                payload_for_validation.setdefault('content_length', len(post_data.get('text', '')))
+                if post_data.get('posted_at'):
+                    if isinstance(post_data['posted_at'], datetime):
+                        payload_for_validation['posted_at'] = int(post_data['posted_at'].timestamp())
+                    elif isinstance(post_data['posted_at'], str):
+                        # Парсим ISO timestamp
+                        try:
+                            dt = datetime.fromisoformat(post_data['posted_at'].replace('Z', '+00:00'))
+                            payload_for_validation['posted_at'] = int(dt.timestamp())
+                        except:
+                            payload_for_validation['posted_at'] = None
+                
+                validated_payload = validate_qdrant_payload(payload_for_validation)
+                # Конвертируем обратно в dict, но используем валидированные данные
+                payload = validated_payload.model_dump(exclude_none=False)
+                logger.debug(
+                    "Qdrant payload validated successfully",
+                    post_id=post_id,
+                    payload_size=len(str(payload))
+                )
+            except Exception as validation_error:
+                # Context7: Валидация не критична - логируем но продолжаем
+                logger.warning(
+                    "Qdrant payload validation failed, continuing without validation",
+                    post_id=post_id,
+                    error=str(validation_error),
+                    error_type=type(validation_error).__name__
+                )
+                # Продолжаем с оригинальными данными
+            
             # Context7: Валидация размера payload (< 64KB для Qdrant)
             import json
             payload_json = json.dumps(payload, default=str)
@@ -1214,15 +1250,46 @@ class IndexingTask:
                             tenant_id_from_event_data=event_data.get('tenant_id') if event_data else None
                         )
             
+            # Context7: Валидация данных узла перед созданием в Neo4j
+            node_data = {
+                'post_id': post_id,
+                'tenant_id': tenant_id_for_neo4j,
+                'channel_id': channel_id,
+                'content': post_data.get('text'),
+                'posted_at': post_data.get('created_at').isoformat() if isinstance(post_data.get('created_at'), datetime) else post_data.get('created_at'),
+                'expires_at': expires_at,
+                'indexed_at': datetime.now(timezone.utc).isoformat(),
+                'enrichment_data': enrichment_data if enrichment_data else None
+            }
+            
+            try:
+                from shared.python.shared.schemas.enrichment_validation import validate_neo4j_post_node
+                validated_node = validate_neo4j_post_node(node_data)
+                # Конвертируем обратно в dict для передачи в create_post_node
+                node_data = validated_node.model_dump(exclude_none=False)
+                logger.debug(
+                    "Neo4j post node data validated successfully",
+                    post_id=post_id
+                )
+            except Exception as validation_error:
+                # Context7: Валидация не критична - логируем но продолжаем
+                logger.warning(
+                    "Neo4j post node validation failed, continuing without validation",
+                    post_id=post_id,
+                    error=str(validation_error),
+                    error_type=type(validation_error).__name__
+                )
+                # Продолжаем с оригинальными данными
+            
             # Context7: Вызов метода create_post_node с enrichment данными
             success = await self.neo4j_client.create_post_node(
-                post_id=post_id,
+                post_id=node_data['post_id'],
                 user_id=post_data.get('user_id', 'system'),  # Fallback для совместимости
-                tenant_id=tenant_id_for_neo4j,  # Context7: Используем tenant_id с приоритетами, fallback на 'default'
-                channel_id=channel_id,
-                expires_at=expires_at,
-                enrichment_data=enrichment_data if enrichment_data else None,
-                indexed_at=datetime.now(timezone.utc).isoformat()
+                tenant_id=node_data['tenant_id'],
+                channel_id=node_data['channel_id'],
+                expires_at=node_data['expires_at'],
+                enrichment_data=node_data.get('enrichment_data'),
+                indexed_at=node_data['indexed_at']
             )
             
             # Context7: Создаём узел альбома и связи если пост из альбома

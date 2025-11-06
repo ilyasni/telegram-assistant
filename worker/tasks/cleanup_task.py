@@ -135,6 +135,28 @@ class CleanupTask:
             
             logger.info("CleanupTask started successfully")
             
+            # Context7: Запуск периодического TTL cleanup в фоне
+            # Запускаем каждые 6 часов (настраивается через ENV)
+            import os
+            ttl_cleanup_interval_hours = int(os.getenv("CLEANUP_TTL_INTERVAL_HOURS", "6"))
+            ttl_cleanup_interval_seconds = ttl_cleanup_interval_hours * 3600
+            
+            async def periodic_ttl_cleanup():
+                """Периодический запуск TTL cleanup."""
+                while True:
+                    try:
+                        await asyncio.sleep(ttl_cleanup_interval_seconds)
+                        logger.info("Starting periodic TTL cleanup", interval_hours=ttl_cleanup_interval_hours)
+                        results = await self.run_expired_cleanup()
+                        logger.info("Periodic TTL cleanup completed", results=results)
+                    except Exception as e:
+                        logger.error("Error in periodic TTL cleanup", error=str(e))
+                        await asyncio.sleep(60)  # Пауза при ошибке
+            
+            # Запуск периодического TTL cleanup в фоне
+            asyncio.create_task(periodic_ttl_cleanup())
+            logger.info("Periodic TTL cleanup scheduled", interval_hours=ttl_cleanup_interval_hours)
+            
             # Основной цикл обработки
             while True:
                 try:

@@ -415,6 +415,114 @@ class S3StorageService:
             )
             raise
     
+    async def put_text(
+        self,
+        content: bytes,
+        s3_key: str,
+        content_type: str = "text/plain",
+        compress: bool = True,
+        content_md5: Optional[str] = None
+    ) -> int:
+        """
+        Сохранение текстового контента (HTML, Markdown, etc.) в S3 с опциональным сжатием.
+        
+        Context7 best practice: универсальный метод для текстового контента с поддержкой gzip.
+        
+        Args:
+            content: Содержимое в байтах
+            s3_key: S3 ключ объекта
+            content_type: MIME тип (text/html, text/markdown, etc.)
+            compress: Применять ли gzip сжатие
+            content_md5: Опциональный MD5 для проверки целостности (base64 encoded)
+            
+        Returns:
+            size_bytes (после сжатия, если применено)
+        """
+        import time
+        import hashlib
+        import base64
+        start_time = time.time()
+        
+        try:
+            # Вычисляем MD5 если не передан
+            if not content_md5:
+                content_md5_bytes = hashlib.md5(content).digest()
+                content_md5 = base64.b64encode(content_md5_bytes).decode('utf-8')
+            
+            # Сжатие если нужно
+            if compress and self.use_compression:
+                compressed_content, encoding = self._compress_content(content)
+                extra_args = {
+                    'ContentType': content_type,
+                    'ContentEncoding': encoding,
+                    'ContentMD5': content_md5,
+                }
+                final_content = compressed_content
+            else:
+                final_content = content
+                extra_args = {
+                    'ContentType': content_type,
+                    'ContentMD5': content_md5,
+                }
+            
+            # Загрузка
+            self.s3_client.put_object(
+                Bucket=self.bucket_name,
+                Key=s3_key,
+                Body=final_content,
+                **extra_args
+            )
+            
+            duration = time.time() - start_time
+            size_bucket = self._get_size_bucket(len(final_content))
+            s3_upload_duration_seconds.labels(
+                content_type='text',
+                size_bucket=size_bucket
+            ).observe(duration)
+            s3_operations_total.labels(operation='put', result='success', content_type='text').inc()
+            s3_file_size_bytes.labels(content_type='text').observe(len(final_content))
+            
+            logger.debug(
+                "Text content uploaded to S3",
+                s3_key=s3_key,
+                size_bytes=len(final_content),
+                original_size=len(content),
+                compressed=compress,
+                content_type=content_type
+            )
+            
+            return len(final_content)
+            
+        except (ClientError, BotoCoreError) as e:
+            s3_operations_total.labels(operation='put', result='error', content_type='text').inc()
+            
+            # Context7: Извлекаем request ID для поддержки Cloud.ru
+            request_id = ''
+            amz_request_id = ''
+            amz_id_2 = ''
+            error_code = 'Unknown'
+            
+            if isinstance(e, ClientError):
+                error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+                response_metadata = e.response.get('ResponseMetadata', {})
+                request_id = response_metadata.get('RequestId', '')
+                http_headers = response_metadata.get('HTTPHeaders', {})
+                amz_request_id = http_headers.get('x-amz-request-id', '')
+                amz_id_2 = http_headers.get('x-amz-id-2', '')
+            
+            logger.error(
+                "Failed to upload text content to S3",
+                s3_key=s3_key,
+                error=str(e),
+                error_code=error_code,
+                request_id=request_id or amz_request_id,
+                x_amz_request_id=amz_request_id,
+                x_amz_id_2=amz_id_2,
+                bucket=self.bucket_name,
+                endpoint=self.endpoint_url
+            )
+            raise
+    
     async def put_json(
         self,
         data: Dict[str, Any],
@@ -596,6 +704,91 @@ class S3StorageService:
                 x_amz_request_id=amz_request_id,
                 x_amz_id_2=amz_id_2
             )
+            raise
+    
+    async def get_json(
+        self,
+        s3_key: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Загрузка и десериализация JSON из S3 с автоматической декомпрессией.
+        
+        Context7 best practice: чтение JSON с поддержкой gzip сжатия.
+        
+        Args:
+            s3_key: S3 ключ объекта
+            
+        Returns:
+            Десериализованный JSON dict или None если не найден
+        """
+        import json
+        import gzip
+        import time
+        start_time = time.time()
+        
+        try:
+            response = self.s3_client.get_object(Bucket=self.bucket_name, Key=s3_key)
+            content = response['Body'].read()
+            
+            # Проверяем Content-Encoding для декомпрессии
+            content_encoding = response.get('ContentEncoding', '')
+            if content_encoding == 'gzip' or s3_key.endswith('.gz'):
+                try:
+                    content = gzip.decompress(content)
+                except Exception as e:
+                    logger.warning("Failed to decompress gzip content, trying raw", s3_key=s3_key, error=str(e))
+            
+            # Десериализация JSON
+            try:
+                data = json.loads(content.decode('utf-8'))
+            except json.JSONDecodeError as e:
+                logger.error("Failed to parse JSON from S3", s3_key=s3_key, error=str(e))
+                return None
+            
+            duration = time.time() - start_time
+            s3_upload_duration_seconds.labels(
+                content_type='json',
+                size_bucket=self._get_size_bucket(len(content))
+            ).observe(duration)
+            s3_operations_total.labels(operation='get', result='success', content_type='json').inc()
+            
+            logger.debug(
+                "JSON downloaded and parsed from S3",
+                s3_key=s3_key,
+                size_bytes=len(content),
+                compressed=content_encoding == 'gzip'
+            )
+            return data
+            
+        except ClientError as e:
+            error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+            
+            if error_code == 'NoSuchKey' or error_code == '404':
+                s3_operations_total.labels(operation='get', result='not_found', content_type='json').inc()
+                logger.debug("JSON not found in S3", s3_key=s3_key)
+                return None
+            
+            # Context7: Извлекаем request ID для поддержки Cloud.ru
+            response_metadata = e.response.get('ResponseMetadata', {})
+            request_id = response_metadata.get('RequestId', '')
+            http_headers = response_metadata.get('HTTPHeaders', {})
+            amz_request_id = http_headers.get('x-amz-request-id', '')
+            amz_id_2 = http_headers.get('x-amz-id-2', '')
+            
+            s3_operations_total.labels(operation='get', result='error', content_type='json').inc()
+            logger.error(
+                "Failed to get JSON from S3",
+                s3_key=s3_key,
+                error=str(e),
+                error_code=error_code,
+                request_id=request_id or amz_request_id,
+                x_amz_request_id=amz_request_id,
+                x_amz_id_2=amz_id_2
+            )
+            raise
+        except (BotoCoreError, json.JSONDecodeError) as e:
+            s3_operations_total.labels(operation='get', result='error', content_type='json').inc()
+            logger.error("Failed to get JSON from S3", s3_key=s3_key, error=str(e))
             raise
     
     async def get_object(self, s3_key: str) -> Optional[bytes]:

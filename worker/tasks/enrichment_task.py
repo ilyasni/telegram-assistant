@@ -1353,6 +1353,38 @@ class EnrichmentWorker:
                 # Также добавляем в enrichment_data для полноты
                 enrichment_payload['enrichment_data']['crawl_md'] = crawl_md
             
+            # Context7: Валидация crawl данных перед сохранением
+            if kind == 'crawl' and enrichment_payload.get('urls'):
+                try:
+                    from shared.python.shared.schemas.enrichment_validation import validate_crawl_enrichment
+                    # Валидируем каждый URL отдельно
+                    for url in enrichment_payload.get('urls', []):
+                        crawl_data_for_validation = {
+                            'url': url,
+                            'url_hash': enrichment_payload.get('enrichment_data', {}).get('url_hash', ''),
+                            'content_sha256': enrichment_payload.get('enrichment_data', {}).get('content_sha256'),
+                            'markdown': crawl_md if url in str(crawl_md) else None,
+                            'word_count': enrichment_payload.get('word_count', 0),
+                            'crawled_at': enrichment_payload.get('created_at')
+                        }
+                        # Валидация только первого URL для проверки формата
+                        validate_crawl_enrichment(crawl_data_for_validation)
+                        break  # Валидируем только первый URL
+                    logger.debug(
+                        "Crawl enrichment data validated successfully",
+                        post_id=post_id,
+                        urls_count=len(enrichment_payload.get('urls', []))
+                    )
+                except Exception as validation_error:
+                    # Context7: Валидация не критична - логируем но продолжаем
+                    logger.warning(
+                        "Crawl enrichment validation failed, continuing without validation",
+                        post_id=post_id,
+                        error=str(validation_error),
+                        error_type=type(validation_error).__name__
+                    )
+                    # Продолжаем с оригинальными данными
+            
             # Используем EnrichmentRepository (принимает SQLAlchemy AsyncSession)
             repo = EnrichmentRepository(self.db_session)
             await repo.upsert_enrichment(

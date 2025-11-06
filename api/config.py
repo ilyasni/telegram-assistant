@@ -104,6 +104,14 @@ class Settings(BaseSettings):
     searxng_user: str = ""
     searxng_password: str = ""
     
+    # Context7: SearXNG Enrichment Configuration - обогащение ответов внешними источниками
+    # Используется для улучшения ответов при низкой уверенности или малом количестве результатов
+    searxng_enrichment_enabled: bool = True  # Включить/выключить обогащение
+    searxng_enrichment_confidence_threshold: float = 0.5  # Порог уверенности для обогащения (0.0-1.0)
+    searxng_enrichment_min_results_threshold: int = 3  # Минимальное количество результатов для обогащения
+    searxng_enrichment_score_threshold: float = 0.6  # Порог среднего score для обогащения (0.0-1.0)
+    searxng_enrichment_max_external_results: int = 2  # Максимум внешних результатов для обогащения
+    
     # SaluteSpeech Configuration - Context7: для транскрибации голосовых сообщений
     salutespeech_client_id: str = ""
     salutespeech_client_secret: str = ""

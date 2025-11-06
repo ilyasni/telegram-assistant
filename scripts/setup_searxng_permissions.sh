@@ -39,6 +39,7 @@ CURRENT_GID=$(id -g)
 
 # Context7: Устанавливаем владельца на текущего пользователя для возможности редактирования
 # Затем добавляем SearXNG в группу или используем ACL
+# Сначала устанавливаем владельца на текущего пользователя
 sudo chown -R "${CURRENT_USER}:${CURRENT_USER}" "$SEARXNG_DIR"
 sudo chmod -R 755 "$SEARXNG_DIR"
 

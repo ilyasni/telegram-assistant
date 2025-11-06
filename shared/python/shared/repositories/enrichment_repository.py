@@ -157,7 +157,37 @@ class EnrichmentRepository:
         
         try:
             updated_at = datetime.now(timezone.utc)
+            # Context7: Логируем данные перед сериализацией для диагностики OCR и params_hash
+            has_ocr = bool(data.get("ocr") and (isinstance(data.get("ocr"), dict) and data["ocr"].get("text")))
+            ocr_text_length = len(data.get("ocr", {}).get("text", "")) if isinstance(data.get("ocr"), dict) else 0
+            logger.debug(
+                "Upserting enrichment to DB",
+                post_id=post_id,
+                kind=kind,
+                provider=provider,
+                params_hash=params_hash,
+                has_ocr=has_ocr,
+                ocr_text_length=ocr_text_length,
+                data_keys=list(data.keys()) if isinstance(data, dict) else [],
+                trace_id=trace_id
+            )
+            
+            # Context7: Сериализация JSON с сохранением None значений
+            # ВАЖНО: json.dumps сохраняет None как null в JSON, что корректно для PostgreSQL JSONB
             data_jsonb = json.dumps(data, ensure_ascii=False, default=str)
+            
+            # Context7: Проверяем, что OCR сохранился после сериализации
+            data_parsed = json.loads(data_jsonb)
+            has_ocr_after = bool(data_parsed.get("ocr") and (isinstance(data_parsed.get("ocr"), dict) and data_parsed["ocr"].get("text")))
+            if has_ocr != has_ocr_after:
+                logger.warning(
+                    "OCR data lost during JSON serialization",
+                    post_id=post_id,
+                    kind=kind,
+                    has_ocr_before=has_ocr,
+                    has_ocr_after=has_ocr_after,
+                    trace_id=trace_id
+                )
             
             if self._is_asyncpg:
                 # asyncpg.Pool
@@ -174,13 +204,14 @@ class EnrichmentRepository:
                         )
                         ON CONFLICT (post_id, kind) DO UPDATE SET
                             provider = EXCLUDED.provider,
-                            params_hash = EXCLUDED.params_hash,
+                            params_hash = COALESCE(EXCLUDED.params_hash, post_enrichment.params_hash),
                             data = EXCLUDED.data,
                             status = EXCLUDED.status,
                             error = EXCLUDED.error,
                             updated_at = EXCLUDED.updated_at
                             -- Context7: Legacy поля обновляются только для vision через отдельный UPDATE после INSERT
                             -- Это избегает проблем с ambiguous column references в ON CONFLICT DO UPDATE SET
+                            -- Context7: params_hash использует COALESCE чтобы не перезаписывать существующий hash на NULL
                     """,
                         post_id,
                         kind,
@@ -195,6 +226,28 @@ class EnrichmentRepository:
                     # Context7: Обновление legacy полей для обратной совместимости после основного upsert
                     # Синхронизируем legacy поля из data JSONB для всех kinds
                     if kind == 'vision':
+                        # Context7: Проверяем, что данные сохранились правильно после upsert
+                        check_row = await conn.fetchrow("""
+                            SELECT data, params_hash 
+                            FROM post_enrichment 
+                            WHERE post_id = $1 AND kind = 'vision'
+                        """, post_id)
+                        
+                        if check_row:
+                            saved_data = check_row['data']
+                            saved_params_hash = check_row['params_hash']
+                            saved_has_ocr = bool(saved_data and saved_data.get("ocr") and isinstance(saved_data.get("ocr"), dict) and saved_data["ocr"].get("text"))
+                            logger.debug(
+                                "Enrichment saved to DB - verification",
+                                post_id=post_id,
+                                kind=kind,
+                                params_hash_saved=bool(saved_params_hash),
+                                params_hash_value=saved_params_hash[:16] + "..." if saved_params_hash else None,
+                                has_ocr_saved=saved_has_ocr,
+                                ocr_text_length=len(saved_data.get("ocr", {}).get("text", "")) if saved_data and saved_data.get("ocr") else 0,
+                                trace_id=trace_id
+                            )
+                        
                         await conn.execute("""
                             UPDATE post_enrichment
                             SET 
@@ -269,7 +322,7 @@ class EnrichmentRepository:
                         )
                         ON CONFLICT (post_id, kind) DO UPDATE SET
                             provider = EXCLUDED.provider,
-                            params_hash = EXCLUDED.params_hash,
+                            params_hash = COALESCE(EXCLUDED.params_hash, post_enrichment.params_hash),
                             data = EXCLUDED.data,
                             status = EXCLUDED.status,
                             error = EXCLUDED.error,

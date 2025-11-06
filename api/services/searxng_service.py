@@ -45,6 +45,12 @@ class SearXNGResult(BaseModel):
                     query_params.append(param)
         clean_query = "&".join(query_params) if query_params else ""
         return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, clean_query, ""))
+    
+    class Config:
+        """Context7: JSON encoders для корректной сериализации datetime."""
+        json_encoders = {
+            datetime: lambda v: v.isoformat()
+        }
 
 
 class SearXNGSearchResponse(BaseModel):
@@ -212,7 +218,11 @@ class SearXNGService:
             return True  # В случае ошибки разрешаем запрос
     
     async def _get_from_cache(self, cache_key: str) -> Optional[List[SearXNGResult]]:
-        """Получение результатов из кэша."""
+        """
+        Получение результатов из кэша.
+        
+        Context7: При десериализации из JSON, datetime строки автоматически парсятся Pydantic.
+        """
         if not self.redis_client:
             return None
         
@@ -220,6 +230,7 @@ class SearXNGService:
             cached = self.redis_client.get(cache_key)
             if cached:
                 data = json.loads(cached)
+                # Context7: Pydantic автоматически парсит ISO строки datetime обратно в datetime объекты
                 results = [SearXNGResult(**item) for item in data]
                 logger.debug("SearXNG cache hit", cache_key=cache_key[:32])
                 return results
@@ -229,13 +240,19 @@ class SearXNGService:
         return None
     
     async def _save_to_cache(self, cache_key: str, results: List[SearXNGResult]) -> None:
-        """Сохранение результатов в кэш."""
+        """
+        Сохранение результатов в кэш.
+        
+        Context7: Используем model_dump с mode='json' для корректной сериализации datetime.
+        Это автоматически применяет json_encoders из Config класса.
+        """
         if not self.redis_client:
             return
         
         try:
-            # Хранение только: {title, url, snippet, fetched_at} — без HTML
-            data = [result.model_dump() for result in results]
+            # Context7: Используем mode='json' для автоматической сериализации datetime через json_encoders
+            # Это решает проблему "Object of type datetime is not JSON serializable"
+            data = [result.model_dump(mode='json') for result in results]
             self.redis_client.setex(cache_key, self.cache_ttl, json.dumps(data))
             logger.debug("SearXNG cache saved", cache_key=cache_key[:32], ttl=self.cache_ttl)
         except Exception as e:

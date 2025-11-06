@@ -362,6 +362,16 @@ class AlbumAssemblerTask:
             )
             items_count = len(post_ids)
         
+        # Context7: Проверка полноты альбома для больших альбомов
+        # Если items_count >= 10, возможно альбом неполный (Telegram limit)
+        if items_count >= 10:
+            logger.warning(
+                "Large album detected - may be incomplete due to Telegram 10-item limit",
+                album_id=album_id,
+                items_count=items_count,
+                post_ids_count=len(post_ids)
+            )
+        
         if not album_id:
             logger.warning("Missing album_id in albums.parsed event", message_id=message_id)
             return

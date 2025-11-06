@@ -1488,8 +1488,8 @@ class VisionAnalysisTask:
                 # Objects и scene
                 "objects": first_result.get("objects", []),
                 "scene": first_result.get("scene"),
-                # OCR данные
-                "ocr": ocr_value,
+                # Context7: OCR данные - ВАЖНО: сохраняем даже если None, чтобы поле было в JSON
+                "ocr": ocr_value,  # Может быть None, dict или отсутствовать - все варианты валидны
                 # NSFW и aesthetic scores
                 "nsfw_score": first_result.get("nsfw_score"),
                 "aesthetic_score": first_result.get("aesthetic_score"),
@@ -1508,15 +1508,60 @@ class VisionAnalysisTask:
                 "s3_keys_list": s3_keys_list
             }
             
-            # Вычисляем params_hash для идемпотентности
+            # Context7: Вычисляем params_hash для идемпотентности
             repo = EnrichmentRepository(self.db)
+            model_name = first_result.get("model") or "unknown"
+            provider_name = first_result.get("provider") or "unknown"
             params_hash = repo.compute_params_hash(
-                model=first_result.get("model"),
+                model=model_name,
                 version=None,  # TODO: добавить версию
-                inputs={"provider": first_result.get("provider")}
+                inputs={"provider": provider_name}
             )
             
-            # Используем единый репозиторий для upsert
+            # Context7: Логируем вычисление params_hash для диагностики
+            logger.debug(
+                "Computed params_hash for vision enrichment",
+                post_id=post_id,
+                model=model_name,
+                provider=provider_name,
+                params_hash=params_hash,
+                trace_id=trace_id
+            )
+            
+            # Context7: Валидация данных перед сохранением
+            try:
+                from shared.python.shared.schemas.enrichment_validation import validate_vision_enrichment
+                validated_data = validate_vision_enrichment(vision_data)
+                # Конвертируем обратно в dict для сохранения
+                vision_data = validated_data.model_dump(exclude_none=False)
+                logger.debug(
+                    "Vision enrichment data validated successfully",
+                    post_id=post_id,
+                    trace_id=trace_id
+                )
+            except Exception as validation_error:
+                # Context7: Валидация не критична - логируем но продолжаем
+                logger.warning(
+                    "Vision enrichment validation failed, continuing without validation",
+                    post_id=post_id,
+                    error=str(validation_error),
+                    error_type=type(validation_error).__name__,
+                    trace_id=trace_id
+                )
+                # Продолжаем с оригинальными данными
+            
+            # Context7: Используем единый репозиторий для upsert
+            # Логируем перед сохранением для диагностики OCR
+            logger.debug(
+                "Saving vision enrichment to DB",
+                post_id=post_id,
+                provider=first_result.get("provider", "unknown"),
+                has_ocr=bool(ocr_value),
+                ocr_text_length=len(ocr_value.get("text", "")) if ocr_value else 0,
+                ocr_engine=ocr_value.get("engine") if ocr_value else None,
+                trace_id=trace_id
+            )
+            
             await repo.upsert_enrichment(
                 post_id=post_id,
                 kind='vision',
@@ -1528,7 +1573,15 @@ class VisionAnalysisTask:
                 trace_id=trace_id
             )
             
-            logger.debug("Vision results saved to DB via EnrichmentRepository", post_id=post_id, trace_id=trace_id)
+            # Context7: Логируем после сохранения для подтверждения
+            logger.debug(
+                "Vision results saved to DB via EnrichmentRepository",
+                post_id=post_id,
+                provider=first_result.get("provider", "unknown"),
+                has_ocr=bool(ocr_value),
+                ocr_text_length=len(ocr_value.get("text", "")) if ocr_value else 0,
+                trace_id=trace_id
+            )
             
             # Context7: Синхронизация Vision результатов в Neo4j
             if self.neo4j_client and analysis_results:

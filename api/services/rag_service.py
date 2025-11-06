@@ -567,6 +567,150 @@ class RAGService:
         context = "\n\n".join(context_parts)
         return context, sources
     
+    async def _should_enrich_with_searxng(
+        self,
+        search_results: List[Dict[str, Any]],
+        confidence: float,
+        query: str
+    ) -> bool:
+        """
+        Проверка условий для обогащения ответа через SearXNG.
+        
+        Context7: Обогащение используется при:
+        - Низкой уверенности (confidence < threshold)
+        - Мало результатов (< minimum_results_threshold)
+        - Низкие scores результатов (средний score < score_threshold)
+        
+        Args:
+            search_results: Результаты поиска из каналов
+            confidence: Уверенность в ответе (0.0-1.0)
+            query: Поисковый запрос
+            
+        Returns:
+            True если нужно обогащать ответ через SearXNG
+        """
+        # Проверяем, включено ли обогащение
+        if not settings.searxng_enrichment_enabled or not self.searxng_service.enabled:
+            return False
+        
+        # Если результатов нет - используем fallback (не обогащение)
+        if not search_results:
+            return False
+        
+        # Проверка 1: Низкая уверенность
+        if confidence < settings.searxng_enrichment_confidence_threshold:
+            logger.debug(
+                "Enrichment triggered: low confidence",
+                confidence=confidence,
+                threshold=settings.searxng_enrichment_confidence_threshold
+            )
+            return True
+        
+        # Проверка 2: Мало результатов
+        if len(search_results) < settings.searxng_enrichment_min_results_threshold:
+            logger.debug(
+                "Enrichment triggered: few results",
+                results_count=len(search_results),
+                threshold=settings.searxng_enrichment_min_results_threshold
+            )
+            return True
+        
+        # Проверка 3: Низкие scores результатов
+        if search_results:
+            avg_score = sum(
+                r.get('hybrid_score', r.get('score', 0.0)) 
+                for r in search_results
+            ) / len(search_results)
+            
+            if avg_score < settings.searxng_enrichment_score_threshold:
+                logger.debug(
+                    "Enrichment triggered: low average score",
+                    avg_score=avg_score,
+                    threshold=settings.searxng_enrichment_score_threshold
+                )
+                return True
+        
+        return False
+    
+    async def _enrich_with_searxng(
+        self,
+        query: str,
+        user_id: str,
+        existing_sources: List[RAGSource],
+        lang: str = "ru"
+    ) -> tuple[List[RAGSource], float]:
+        """
+        Обогащение ответа внешними источниками через SearXNG.
+        
+        Context7: Graceful degradation - ошибки SearXNG не должны влиять на основной ответ.
+        Обогащение выполняется параллельно и не блокирует основной flow.
+        
+        Args:
+            query: Поисковый запрос
+            user_id: ID пользователя для rate limiting
+            existing_sources: Существующие источники из каналов
+            lang: Язык поиска
+            
+        Returns:
+            Tuple (обогащенные источники, дополнительный confidence boost)
+        """
+        enriched_sources = existing_sources.copy()
+        confidence_boost = 0.0
+        
+        try:
+            # Context7: Параллельный запрос к SearXNG (не блокирует основной flow)
+            searxng_response = await self.searxng_service.search(
+                query=query,
+                user_id=user_id,
+                lang=lang,
+                score_threshold=0.5  # Фильтруем только релевантные результаты
+            )
+            
+            if searxng_response.results:
+                # Добавляем внешние источники с пометкой "external"
+                external_count = min(
+                    len(searxng_response.results),
+                    settings.searxng_enrichment_max_external_results
+                )
+                
+                for idx, result in enumerate(searxng_response.results[:external_count]):
+                    external_source = RAGSource(
+                        post_id=f"external_{idx}",
+                        channel_id="external",
+                        channel_title=result.title,
+                        channel_username=None,
+                        content=result.snippet,
+                        score=0.5,  # Внешние источники имеют средний score
+                        permalink=str(result.url)
+                    )
+                    enriched_sources.append(external_source)
+                
+                # Context7: Confidence boost на основе качества внешних источников
+                # Чем больше релевантных внешних источников, тем выше boost
+                confidence_boost = min(
+                    0.15,  # Максимальный boost 0.15
+                    len(searxng_response.results[:external_count]) * 0.05
+                )
+                
+                logger.info(
+                    "Enrichment completed",
+                    query=query[:50],
+                    external_results=external_count,
+                    confidence_boost=confidence_boost
+                )
+            else:
+                logger.debug("Enrichment: no external results found", query=query[:50])
+        
+        except Exception as e:
+            # Context7: Graceful degradation - ошибки не влияют на основной ответ
+            logger.warning(
+                "Enrichment failed, continuing without external sources",
+                error=str(e),
+                query=query[:50]
+            )
+        
+        return enriched_sources, confidence_boost
+    
     async def _get_conversation_history(
         self,
         user_id: UUID,
@@ -909,8 +1053,42 @@ class RAGService:
                 
                 return result
             
-            # 4. Сборка контекста
-            context, sources = await self._assemble_context(search_results, db)
+            # 4. Context7: Обогащение ответа через SearXNG (если нужно)
+            enrichment_applied = False
+            if await self._should_enrich_with_searxng(search_results, confidence, query):
+                logger.info(
+                    "Enriching answer with external sources",
+                    query=query[:50],
+                    results_count=len(search_results),
+                    confidence=confidence
+                )
+                
+                # Сначала собираем базовые источники
+                context, sources = await self._assemble_context(search_results, db)
+                
+                # Обогащаем внешними источниками
+                enriched_sources, confidence_boost = await self._enrich_with_searxng(
+                    query=query,
+                    user_id=str(user_id),
+                    existing_sources=sources,
+                    lang="ru"
+                )
+                
+                # Обновляем источники и confidence
+                sources = enriched_sources
+                confidence = min(1.0, confidence + confidence_boost)
+                enrichment_applied = True
+                
+                logger.info(
+                    "Enrichment applied",
+                    query=query[:50],
+                    sources_count=len(sources),
+                    confidence_boost=confidence_boost,
+                    final_confidence=confidence
+                )
+            else:
+                # 4. Сборка контекста (без обогащения)
+                context, sources = await self._assemble_context(search_results, db)
             
             # 5. Подготовка истории разговора для LangChain
             # Context7: Преобразуем список dict в LangChain Message объекты
@@ -986,6 +1164,8 @@ class RAGService:
                 query=query[:50],
                 intent=intent,
                 sources_count=len(sources),
+                confidence=confidence,
+                enrichment_applied=enrichment_applied,
                 processing_time_ms=processing_time
             )
             
