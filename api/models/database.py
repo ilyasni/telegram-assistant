@@ -719,6 +719,7 @@ class DigestHistory(Base):
     
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="SET NULL"), nullable=True)
     digest_date = Column(Date, nullable=False)
     content = Column(Text, nullable=False)
     posts_count = Column(Integer, nullable=False, default=0)
@@ -732,6 +733,7 @@ class DigestHistory(Base):
     
     __table_args__ = (
         Index('idx_digest_history_user_id', 'user_id'),
+        Index('idx_digest_history_tenant_id', 'tenant_id'),
         Index('idx_digest_history_digest_date', 'digest_date'),
         Index('idx_digest_history_status', 'status'),
         Index('idx_digest_history_created_at', 'created_at', postgresql_ops={'created_at': 'DESC'}),
@@ -787,6 +789,30 @@ class UserInterest(Base):
         Index('idx_user_interests_weight', 'user_id', 'weight', postgresql_ops={'weight': 'DESC'}),
         Index('idx_user_interests_topic', 'topic'),
         Index('idx_user_interests_last_updated', 'last_updated', postgresql_ops={'last_updated': 'DESC'}),
+    )
+
+
+class UserCrawlTriggers(Base):
+    """Персонализированные триггеры Crawl4ai на основе пользовательских интересов."""
+    __tablename__ = "user_crawl_triggers"
+
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
+    triggers = Column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    base_topics = Column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    dialog_topics = Column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    derived_keywords = Column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    metadata_payload = Column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    dialog_topics_updated_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    user = relationship("User")
+    tenant = relationship("Tenant")
+
+    __table_args__ = (
+        Index("idx_user_crawl_triggers_tenant_id", "tenant_id"),
+        Index("idx_user_crawl_triggers_updated_at", "updated_at"),
     )
 
 

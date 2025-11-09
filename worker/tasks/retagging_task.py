@@ -308,6 +308,7 @@ class RetaggingTask:
                 # Публикация события posts.tagged с trigger=vision_retag
                 await self._publish_tagged_event(
                     post_id=post_id,
+                    post_context=post_data,
                     tags_list=retag_result.get('tags', []),
                     processing_time=duration,
                     vision_version=analyzed_event.vision_version,
@@ -435,7 +436,12 @@ class RetaggingTask:
                         p.content,
                         p.has_media,
                         pe.tags,
-                        pe.metadata->>'tags_version' as tags_version
+                        pe.metadata->>'tags_version' as tags_version,
+                        pe.metadata->>'tenant_id' as tenant_id,
+                        pe.metadata->>'user_id' as user_id,
+                        pe.metadata->>'channel_id' as channel_id,
+                        pe.metadata->'topics' as topics_json,
+                        p.channel_id as post_channel_id
                     FROM posts p
                     LEFT JOIN post_enrichment pe ON pe.post_id = p.id AND pe.kind = 'tags'
                     WHERE p.id = $1
@@ -456,13 +462,26 @@ class RetaggingTask:
                 
                 tags_hash = PostTaggedEventV1.compute_hash([str(t) for t in tags if t])
                 
+                topics_payload = row.get('topics_json')
+                if isinstance(topics_payload, str):
+                    try:
+                        topics_payload = json.loads(topics_payload)
+                    except json.JSONDecodeError:
+                        topics_payload = []
+                if not isinstance(topics_payload, list):
+                    topics_payload = []
+
                 return {
                     'post_id': str(row['id']),
                     'content': row.get('content') or '',
                     'has_media': row.get('has_media', False),
                     'tags': [str(t) for t in tags if t],
                     'tags_version': row.get('tags_version'),
-                    'tags_hash': tags_hash
+                    'tags_hash': tags_hash,
+                    'tenant_id': row.get('tenant_id'),
+                    'user_id': row.get('user_id'),
+                    'channel_id': str(row.get('post_channel_id')) if row.get('post_channel_id') else None,
+                    'topics': [str(t) for t in topics_payload if t]
                 }
                 
             finally:
@@ -609,6 +628,7 @@ class RetaggingTask:
     async def _publish_tagged_event(
         self,
         post_id: str,
+        post_context: Dict[str, Any],
         tags_list: list,
         processing_time: float,
         vision_version: Optional[str],
@@ -619,6 +639,9 @@ class RetaggingTask:
             tagged_event = PostTaggedEventV1(
                 idempotency_key=f"{post_id}:tagged:v1",
                 post_id=post_id,
+                tenant_id=post_context.get("tenant_id"),
+                user_id=post_context.get("user_id"),
+                channel_id=post_context.get("channel_id"),
                 tags=tags_list,
                 tags_hash=PostTaggedEventV1.compute_hash(tags_list),
                 provider="gigachat",
@@ -628,7 +651,8 @@ class RetaggingTask:
                     "retagged": True
                 },
                 trigger="vision_retag",  # Context7: Анти-петля - RetaggingTask игнорирует такие события
-                vision_version=vision_version
+                vision_version=vision_version,
+                topics=post_context.get("topics") or []
             )
             
             # Публикация в Redis Streams

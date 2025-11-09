@@ -8,15 +8,15 @@ import hashlib
 import json
 import os
 import time
-from datetime import datetime, timezone
-from typing import Dict, Any, Optional, List
+from datetime import datetime, timezone, timedelta
+from typing import Dict, Any, Optional, List, Tuple
 
 import redis.asyncio as redis
 import structlog
 from prometheus_client import Counter, Histogram
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy import select, update
+from sqlalchemy import select, update, text
 
 from events.schemas import VisionUploadedEventV1, VisionAnalyzedEventV1, MediaFile
 from ai_adapters.gigachat_vision import GigaChatVisionAdapter
@@ -25,6 +25,8 @@ from services.budget_gate import BudgetGateService
 from services.ocr_fallback import OCRFallbackService
 from services.storage_quota import StorageQuotaService
 from services.retry_policy import create_retry_decorator, DEFAULT_RETRY_CONFIG, DLQService, should_retry, classify_error
+from services.experiment_manager import VisionExperimentManager
+from shared.utils.phash import compute_phash, PhashResult
 
 # Context7: Импорты из api (ВРЕМЕННОЕ ИСКЛЮЧЕНИЕ для архитектурной границы)
 # ⚠️ КРИТИЧЕСКОЕ ПРАВИЛО: Worker НЕ должен импортировать из API
@@ -94,6 +96,24 @@ vision_media_duration_seconds = Histogram(
     buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0]
 )
 
+vision_experiment_assignments_total = Counter(
+    'vision_experiment_assignments_total',
+    'Vision experiment assignments per tenant',
+    ['experiment', 'variant']
+)
+
+vision_low_priority_enqueued_total = Counter(
+    'vision_low_priority_enqueued_total',
+    'Vision media enqueued to low priority queue',
+    ['reason']
+)
+
+vision_low_priority_processed_total = Counter(
+    'vision_low_priority_processed_total',
+    'Low priority vision processing outcomes',
+    ['status']  # processed | pending | error | budget_exhausted
+)
+
 from prometheus_client import Gauge
 vision_pel_size = Gauge(
     'vision_pel_size',
@@ -105,6 +125,12 @@ vision_pending_older_than_seconds = Gauge(
     'vision_pending_older_than_seconds',
     'Age of oldest pending message in seconds',
     ['percentile', 'consumer_group']  # percentile: 95, 99
+)
+
+ocr_local_latency_seconds = Histogram(
+    'ocr_local_latency_seconds',
+    'Latency of local OCR processing before/after Vision',
+    ['engine', 'mode']  # mode: primary | fallback
 )
 
 
@@ -134,7 +160,9 @@ class VisionAnalysisTask:
         neo4j_client: Optional = None,  # Neo4jClient для синхронизации графа
         stream_name: str = "stream:posts:vision",
         consumer_group: str = "vision_workers",
-        consumer_name: str = None
+        consumer_name: str = None,
+        local_ocr_primary_enabled: bool = False,
+        experiment_manager: Optional[VisionExperimentManager] = None
     ):
         self.redis = redis_client
         self.db = db_session
@@ -146,6 +174,8 @@ class VisionAnalysisTask:
         self.ocr_fallback = ocr_fallback
         self.dlq_service = dlq_service
         self.neo4j_client = neo4j_client
+        self.local_ocr_primary_enabled = local_ocr_primary_enabled
+        self.experiment_manager = experiment_manager
         
         # Context7: Валидация stream name - должен быть stream:posts:vision
         expected_stream = "stream:posts:vision"
@@ -170,6 +200,20 @@ class VisionAnalysisTask:
         self.pel_min_idle_ms = int(os.getenv("VISION_PEL_MIN_IDLE_MS", "60000"))  # 1 минута
         self.pel_batch_size = int(os.getenv("VISION_PEL_BATCH_SIZE", "10"))
         self.pending_check_interval = int(os.getenv("VISION_PENDING_CHECK_INTERVAL", "60"))  # секунды
+        self.phash_enabled = os.getenv("VISION_PHASH_ENABLED", "true").lower() in {"1", "true", "yes"}
+        self.roi_crop_enabled = os.getenv("VISION_ROI_CROP_ENABLED", "false").lower() in {"1", "true", "yes"}
+        self.roi_crop_max_dim = int(os.getenv("VISION_ROI_MAX_DIM", "1024"))
+        self.low_priority_enabled = os.getenv("VISION_LOW_PRIORITY_QUEUE_ENABLED", "false").lower() in {"1", "true", "yes"}
+        self.low_priority_stream_name = os.getenv("VISION_LOW_PRIORITY_STREAM", "stream:posts:vision:low")
+        self.low_priority_consumer_group = os.getenv("VISION_LOW_PRIORITY_CONSUMER_GROUP", "vision_low_priority_workers")
+        self.low_priority_retry_delay_seconds = int(os.getenv("VISION_LOW_PRIORITY_RETRY_DELAY_SECONDS", "300"))
+        self.low_priority_max_retries = int(os.getenv("VISION_LOW_PRIORITY_MAX_RETRIES", "3"))
+        self.low_priority_stream_maxlen = int(os.getenv("VISION_LOW_PRIORITY_MAXLEN", "1000"))
+        self.phash_hash_size = int(os.getenv("VISION_PHASH_HASH_SIZE", "16"))
+        default_ttl = str(7 * 24 * 3600)
+        self.phash_cache_ttl_seconds = int(os.getenv("VISION_PHASH_CACHE_TTL_SECONDS", default_ttl))
+        self.phash_redis_prefix = os.getenv("VISION_PHASH_REDIS_PREFIX", "vision:phash")
+        self._low_priority_backlog_processed = False
         
         logger.info(
             "VisionAnalysisTask initialized",
@@ -212,6 +256,36 @@ class VisionAnalysisTask:
                     group=self.consumer_group
                 )
         
+        if self.low_priority_enabled:
+            try:
+                await self.redis.xgroup_create(
+                    self.low_priority_stream_name,
+                    self.low_priority_consumer_group,
+                    id='0',
+                    mkstream=True
+                )
+                logger.info(
+                    "Created low priority consumer group",
+                    stream=self.low_priority_stream_name,
+                    group=self.low_priority_consumer_group,
+                    consumer_name=self.consumer_name
+                )
+            except redis.ResponseError as e:
+                if "BUSYGROUP" not in str(e):
+                    logger.error(
+                        "Failed to create low priority consumer group",
+                        stream=self.low_priority_stream_name,
+                        group=self.low_priority_consumer_group,
+                        error=str(e)
+                    )
+                    raise
+                else:
+                    logger.debug(
+                        "Low priority consumer group already exists",
+                        stream=self.low_priority_stream_name,
+                        group=self.low_priority_consumer_group
+                    )
+
         logger.info(
             "VisionAnalysisTask started",
             stream=self.stream_name,
@@ -314,6 +388,9 @@ class VisionAnalysisTask:
                             backlog_processed = True
                             logger.debug("No backlog, switching to new messages")
                     
+                    if self.low_priority_enabled:
+                        await self._process_low_priority_queue()
+
                     # Context7: Периодическая проверка pending сообщений (каждые N секунд)
                     current_time = time.time()
                     if current_time - last_pending_check >= self.pending_check_interval:
@@ -370,6 +447,18 @@ class VisionAnalysisTask:
         import time
         start_time = time.time()
         
+        try:
+            priority = self._extract_field_value(fields, "priority")
+            retry_count_str = self._extract_field_value(fields, "retry_count")
+            original_message_id = self._extract_field_value(fields, "original_message_id")
+            retry_count = int(retry_count_str) if retry_count_str and retry_count_str.isdigit() else 0
+            is_low_priority = priority == "low"
+        except Exception:
+            priority = None
+            retry_count = 0
+            original_message_id = None
+            is_low_priority = False
+
         try:
             # Парсинг события
             event_data = self._parse_event_fields(fields)
@@ -472,6 +561,39 @@ class VisionAnalysisTask:
                         }
                     )
             
+            experiment_variants = self._get_experiment_variants(tenant_id)
+            wave_a_variant = experiment_variants.get(
+                "wave_a",
+                "experiment" if self.vision_adapter.preprocess_enabled else "control"
+            )
+            wave_a_active = self.vision_adapter.preprocess_enabled and wave_a_variant == "experiment"
+            wave_b_variant = experiment_variants.get(
+                "wave_b",
+                "experiment" if (self.local_ocr_primary_enabled or self.phash_enabled) else "control"
+            )
+            wave_b_local_ocr_enabled = self.local_ocr_primary_enabled and wave_b_variant == "experiment"
+            wave_b_phash_enabled = self.phash_enabled and wave_b_variant == "experiment"
+            wave_c_variant = experiment_variants.get(
+                "wave_c",
+                "experiment" if (self.roi_crop_enabled or self.low_priority_enabled) else "control"
+            )
+            wave_c_roi_enabled = self.roi_crop_enabled and wave_c_variant == "experiment"
+            wave_c_low_priority_enabled = self.low_priority_enabled and wave_c_variant == "experiment"
+
+            if experiment_variants:
+                logger.debug(
+                    "Vision experiments assigned",
+                    extra={
+                        "tenant_id": tenant_id,
+                        "variants": experiment_variants,
+                        "trace_id": trace_id
+                    }
+                )
+
+            max_output_tokens_override = (
+                self.vision_adapter.max_output_tokens if wave_a_active else None
+            )
+
             # Context7: Идемпотентность на медиа-уровне
             # Проверяем каждый медиа файл отдельно, возвращаем dict {sha256: bool}
             media_idempotency_status = await self._check_media_idempotency(tenant_id, post_id, event.media_files)
@@ -521,6 +643,11 @@ class VisionAnalysisTask:
                         channel_username=None,  # TODO: получить из БД
                         quota_exhausted=quota_exhausted
                     )
+                    prompt_template = self.policy_engine.get_prompt_template(policy_result.get("prompt_key"))
+                    if wave_a_active:
+                        analysis_prompt = prompt_template or self.vision_adapter.default_prompt
+                    else:
+                        analysis_prompt = self.vision_adapter.legacy_prompt
                     
                     # Context7: Детальное логирование причин пропуска медиа
                     if not policy_result["allowed"] or policy_result["skip"]:
@@ -550,6 +677,40 @@ class VisionAnalysisTask:
                         vision_media_total.labels(result="skipped", reason="policy").inc()
                         continue
                     
+                    if (
+                        wave_b_local_ocr_enabled
+                        and policy_result.get("use_ocr")
+                        and self.ocr_fallback
+                    ):
+                        logger.info(
+                            "Processing media via local OCR before Vision",
+                            extra={
+                                "post_id": post_id,
+                                "sha256": media_id[:16] + "...",
+                                "mime_type": media_file.mime_type,
+                                "trace_id": trace_id,
+                            },
+                        )
+                        primary_result = await self._process_with_ocr(
+                            media_file, tenant_id, post_id, trace_id, mode="primary"
+                        )
+                        if primary_result:
+                            primary_result = self._attach_experiment_context(primary_result, experiment_variants)
+                            analysis_results.append(primary_result)
+                            await self._mark_media_as_processed(post_id, media_id)
+                            vision_media_total.labels(result="ok", reason="ocr_primary").inc()
+                            if is_low_priority:
+                                vision_low_priority_processed_total.labels(status="processed").inc()
+                            continue
+                        logger.warning(
+                            "Local OCR primary processing returned no result",
+                            extra={
+                                "post_id": post_id,
+                                "sha256": media_id[:16] + "...",
+                                "trace_id": trace_id,
+                            },
+                        )
+
                     # Context7: Проверка budget gate с детальным логированием
                     if self.budget_gate:
                         budget_check = await self.budget_gate.check_budget(
@@ -566,13 +727,15 @@ class VisionAnalysisTask:
                                     "tenant_id": tenant_id,
                                     "estimated_tokens": 1792,
                                     "reason": budget_reason,
+                                    "priority": priority or "default",
+                                    "retry_count": retry_count,
                                     "trace_id": trace_id
                                 }
                             )
                             # Fallback на OCR если разрешено
                             # Context7: Проверяем, что OCR fallback доступен (self.ocr_fallback не None)
                             # Если OCR fallback отключен через ocr_fallback_enabled=false, self.ocr_fallback = None
-                            if policy_result.get("use_ocr") and self.ocr_fallback:
+                            if wave_b_local_ocr_enabled and policy_result.get("use_ocr") and self.ocr_fallback:
                                 logger.info(
                                     "Falling back to OCR",
                                     extra={
@@ -581,21 +744,74 @@ class VisionAnalysisTask:
                                         "trace_id": trace_id
                                     }
                                 )
-                                result = await self._process_with_ocr(media_file, tenant_id, post_id, trace_id)
+                                result = await self._process_with_ocr(
+                                    media_file, tenant_id, post_id, trace_id, mode="fallback"
+                                )
                                 if result:
+                                    result = self._attach_experiment_context(result, experiment_variants)
                                     analysis_results.append(result)
                                     vision_media_total.labels(result="ok", reason="ocr_fallback").inc()
+                                    if is_low_priority:
+                                        vision_low_priority_processed_total.labels(status="processed").inc()
                             else:
                                 # OCR fallback недоступен или не разрешен политикой
-                                skip_reason = "budget"
+                                if wave_c_low_priority_enabled and not is_low_priority:
+                                    enqueued = await self._enqueue_low_priority_event(
+                                        event=event,
+                                        media_file=media_file,
+                                        reason=budget_reason,
+                                        trace_id=trace_id,
+                                        retry_count=0,
+                                        original_message_id=message_id
+                                    )
+                                    if enqueued:
+                                        skipped_reasons.append({
+                                            "media_id": media_id,
+                                            "reason": "queued_low_priority",
+                                            "details": {
+                                                "budget_bucket": budget_reason,
+                                                "estimated_tokens": 1792,
+                                                "stream": self.low_priority_stream_name
+                                            }
+                                        })
+                                        vision_media_total.labels(result="skipped", reason="queued_low_priority").inc()
+                                        continue
+
+                                if wave_c_low_priority_enabled and is_low_priority and retry_count < self.low_priority_max_retries:
+                                    enqueued = await self._enqueue_low_priority_event(
+                                        event=event,
+                                        media_file=media_file,
+                                        reason=budget_reason,
+                                        trace_id=trace_id,
+                                        retry_count=retry_count,
+                                        original_message_id=message_id
+                                    )
+                                    if enqueued:
+                                        skipped_reasons.append({
+                                            "media_id": media_id,
+                                            "reason": "requeued_low_priority",
+                                            "details": {
+                                                "budget_bucket": budget_reason,
+                                                "estimated_tokens": 1792,
+                                                "retry_count": retry_count + 1,
+                                                "stream": self.low_priority_stream_name
+                                            }
+                                        })
+                                        vision_media_total.labels(result="skipped", reason="queued_low_priority").inc()
+                                        vision_low_priority_processed_total.labels(status="pending").inc()
+                                        continue
+
+                                skip_reason = "budget_low_priority_exhausted" if (is_low_priority and wave_c_low_priority_enabled) else "budget"
                                 skip_details = {
-                                        "budget_bucket": budget_reason,
-                                        "estimated_tokens": 1792
-                                    }
+                                    "budget_bucket": budget_reason,
+                                    "estimated_tokens": 1792,
+                                    "low_priority": is_low_priority,
+                                    "retry_count": retry_count
+                                }
                                 if not self.ocr_fallback:
-                                    skip_reason = "budget_no_ocr_fallback"
                                     skip_details["ocr_fallback_disabled"] = True
-                                
+                                if wave_c_low_priority_enabled and is_low_priority and retry_count >= self.low_priority_max_retries:
+                                    vision_low_priority_processed_total.labels(status="budget_exhausted").inc()
                                 skipped_reasons.append({
                                     "media_id": media_id,
                                     "reason": skip_reason,
@@ -610,16 +826,25 @@ class VisionAnalysisTask:
                         media_file=media_file,
                         tenant_id=tenant_id,
                         post_id=post_id,
-                        trace_id=trace_id
+                        trace_id=trace_id,
+                        analysis_prompt=analysis_prompt,
+                        preprocess_enabled=wave_a_active,
+                        roi_crop_enabled=wave_c_roi_enabled,
+                        max_output_tokens_override=max_output_tokens_override,
+                        phash_enabled=wave_b_phash_enabled,
+                        experiment_variants=experiment_variants
                     )
                     media_duration = time.time() - media_start_time
                     vision_media_duration_seconds.observe(media_duration)
                     
                     if result:
+                        result = self._attach_experiment_context(result, experiment_variants)
                         analysis_results.append(result)
                         # Отметка идемпотентности на уровне медиа
                         await self._mark_media_as_processed(post_id, media_id)
                         vision_media_total.labels(result="ok", reason="success").inc()
+                        if is_low_priority:
+                            vision_low_priority_processed_total.labels(status="processed").inc()
                     else:
                         # Context7: Результат None - анализ не удался (S3 missing, parse error, etc.)
                         # _analyze_media возвращает None с установленным skip_reason в случае ошибок
@@ -774,7 +999,13 @@ class VisionAnalysisTask:
         media_file: MediaFile,
         tenant_id: str,
         post_id: str,
-        trace_id: str
+        trace_id: str,
+        analysis_prompt: Optional[str] = None,
+        preprocess_enabled: Optional[bool] = None,
+        roi_crop_enabled: Optional[bool] = None,
+        max_output_tokens_override: Optional[int] = None,
+        phash_enabled: Optional[bool] = None,
+        experiment_variants: Optional[Dict[str, str]] = None
     ) -> Optional[Dict[str, Any]]:
         """
         Анализ медиа через GigaChat Vision API.
@@ -787,6 +1018,16 @@ class VisionAnalysisTask:
         4. Сохранение результатов
         """
         try:
+            should_preprocess = (
+                self.vision_adapter.preprocess_enabled if preprocess_enabled is None else preprocess_enabled
+            )
+            roi_enabled = (
+                self.vision_adapter.roi_crop_enabled if roi_crop_enabled is None else roi_crop_enabled
+            )
+            effective_max_tokens = max_output_tokens_override
+            phash_active = self.phash_enabled if phash_enabled is None else phash_enabled
+            experiment_context = experiment_variants or {}
+
             # Context7: S3 префлайт - проверка существования объекта перед скачиванием
             # Это позволяет правильно категоризировать ошибки и избежать лишних скачиваний
             max_retries = 3
@@ -1086,6 +1327,54 @@ class VisionAnalysisTask:
                     }
                 return None
             
+            cache_key = None
+            phash_result: Optional[PhashResult] = None
+            if (
+                phash_active
+                and media_file.mime_type
+                and media_file.mime_type.lower().startswith("image/")
+            ):
+                phash_result = self._compute_phash_safe(
+                    file_content=file_content,
+                    sha256=media_file.sha256,
+                    trace_id=trace_id,
+                )
+
+            if phash_result:
+                cached_result, cache_meta = await self._get_phash_cached_result(
+                    tenant_id=tenant_id,
+                    phash_hex=phash_result.hash_hex,
+                    trace_id=trace_id,
+                )
+                if cached_result:
+                    cache_key = cache_meta.get("cache_key") if cache_meta else None
+                    source = cache_meta.get("source") if cache_meta else "phash_cache"
+                    metric_label = cache_meta.get("metric_label") if cache_meta else "phash_cache"
+                    self._attach_phash_to_result(
+                        cached_result,
+                        phash_hex=phash_result.hash_hex,
+                        cache_key=cache_key,
+                        source=source,
+                        hit=True,
+                    )
+                    vision_media_total.labels(result="ok", reason="phash_cache").inc()
+                    try:
+                        vision_cache_hits_total.labels(cache_type=metric_label).inc()
+                    except Exception:
+                        vision_cache_hits_total.labels(cache_type="phash_cache").inc()
+                    await self._mark_media_as_processed(post_id, media_file.sha256)
+                    logger.info(
+                        "Vision analysis skipped via phash cache hit",
+                        extra={
+                            "post_id": post_id,
+                            "sha256": media_file.sha256[:16] + "...",
+                            "phash": phash_result.hash_hex,
+                            "cache_source": source,
+                            "trace_id": trace_id,
+                        },
+                    )
+                    return self._attach_experiment_context(cached_result, experiment_context)
+
             # Context7: Vision анализ с обработкой poison-pattern (невалидный JSON)
             # Лимит ретраев для parse errors: VISION_API_MAX_RETRIES=3
             vision_api_max_retries = int(os.getenv("VISION_API_MAX_RETRIES", "3"))
@@ -1101,7 +1390,11 @@ class VisionAnalysisTask:
                         file_content=file_content,
                         mime_type=media_file.mime_type,
                         tenant_id=tenant_id,
-                        trace_id=trace_id
+                        trace_id=trace_id,
+                        analysis_prompt=analysis_prompt,
+                        preprocess_enabled=should_preprocess,
+                        roi_crop_enabled=roi_enabled,
+                        max_output_tokens_override=effective_max_tokens
                     )
                     
                     if analysis_result:
@@ -1205,8 +1498,24 @@ class VisionAnalysisTask:
                         }
                     )
                     try:
-                        fallback_result = await self._process_with_ocr(media_file, tenant_id, post_id, trace_id)
+                        fallback_result = await self._process_with_ocr(
+                            media_file, tenant_id, post_id, trace_id, mode="fallback"
+                        )
                         if fallback_result:
+                            if phash_result:
+                                self._attach_phash_to_result(
+                                    fallback_result,
+                                    phash_hex=phash_result.hash_hex,
+                                    cache_key=None,
+                                    source="fallback",
+                                    hit=False,
+                                )
+                                await self._store_phash_cache(
+                                    tenant_id=tenant_id,
+                                    phash_hex=phash_result.hash_hex,
+                                    result=fallback_result,
+                                    cache_key=None,
+                                )
                             logger.info(
                                 "OpenRouter Vision fallback succeeded",
                                 extra={
@@ -1215,7 +1524,7 @@ class VisionAnalysisTask:
                                     "trace_id": trace_id
                                 }
                             )
-                            return fallback_result
+                            return self._attach_experiment_context(fallback_result, experiment_context)
                     except Exception as fallback_error:
                         logger.warning(
                             "OpenRouter Vision fallback also failed",
@@ -1240,11 +1549,29 @@ class VisionAnalysisTask:
                 )
                 return None
             
-            return {
+            final_result = {
                 "sha256": media_file.sha256,
                 "s3_key": media_file.s3_key,
                 "analysis": analysis_result,
             }
+
+            if phash_result:
+                self._attach_phash_to_result(
+                    final_result,
+                    phash_hex=phash_result.hash_hex,
+                    cache_key=cache_key,
+                    source="fresh",
+                    hit=False,
+                )
+                await self._store_phash_cache(
+                    tenant_id=tenant_id,
+                    phash_hex=phash_result.hash_hex,
+                    result=final_result,
+                    cache_key=cache_key,
+                )
+
+            final_result = self._attach_experiment_context(final_result, experiment_context)
+            return final_result
             
         except Exception as e:
             # Context7: Fallback на OpenRouter Vision при исключениях GigaChat Vision API
@@ -1262,8 +1589,24 @@ class VisionAnalysisTask:
             
             if self.ocr_fallback and hasattr(self.ocr_fallback, 'analyze_image'):
                 try:
-                    fallback_result = await self._process_with_ocr(media_file, tenant_id, post_id, trace_id)
+                    fallback_result = await self._process_with_ocr(
+                        media_file, tenant_id, post_id, trace_id, mode="fallback"
+                    )
                     if fallback_result:
+                        if phash_result:
+                            self._attach_phash_to_result(
+                                fallback_result,
+                                phash_hex=phash_result.hash_hex,
+                                cache_key=None,
+                                source="fallback",
+                                hit=False,
+                            )
+                            await self._store_phash_cache(
+                                tenant_id=tenant_id,
+                                phash_hex=phash_result.hash_hex,
+                                result=fallback_result,
+                                cache_key=None,
+                            )
                         logger.info(
                             "OpenRouter Vision fallback succeeded after GigaChat exception",
                             extra={
@@ -1272,7 +1615,7 @@ class VisionAnalysisTask:
                                 "trace_id": trace_id
                             }
                         )
-                        return fallback_result
+                        return self._attach_experiment_context(fallback_result, experiment_context)
                 except Exception as fallback_error:
                     logger.warning(
                         "OpenRouter Vision fallback also failed after GigaChat exception",
@@ -1304,7 +1647,8 @@ class VisionAnalysisTask:
         media_file: MediaFile,
         tenant_id: str,
         post_id: str,
-        trace_id: str
+        trace_id: str,
+        mode: str = "fallback"
     ) -> Optional[Dict[str, Any]]:
         """
         Обработка медиа через OCR fallback (OpenRouter Vision).
@@ -1315,6 +1659,9 @@ class VisionAnalysisTask:
         if not self.ocr_fallback:
             return None
         
+        ocr_engine = getattr(self.ocr_fallback, 'engine', 'unknown')
+        provider_name = 'paddleocr' if ocr_engine == 'paddle' else 'ocr_fallback'
+        ocr_start_time = time.time()
         try:
             # Загрузка из S3
             file_content = await self.s3_service.get_object(media_file.s3_key)
@@ -1345,11 +1692,22 @@ class VisionAnalysisTask:
                         classification_type = classification if classification else "other"
                         labels = analysis_result.get("labels", [])
                     
+                    duration = time.time() - ocr_start_time
+                    ocr_local_latency_seconds.labels(engine=ocr_engine, mode=mode).observe(duration)
+                    logger.info(
+                        "Local OCR analysis completed",
+                        engine=ocr_engine,
+                        mode=mode,
+                        duration_ms=int(duration * 1000),
+                        sha256=media_file.sha256[:16] + "..." if media_file.sha256 else None,
+                        trace_id=trace_id,
+                    )
+
                     return {
                         "sha256": media_file.sha256,
                         "s3_key": media_file.s3_key,
                         "analysis": {
-                            "provider": "ocr_fallback",
+                            "provider": provider_name,
                             "model": analysis_result.get("model", "qwen/qwen2.5-vl-32b-instruct:free"),
                             "classification": classification_type,
                             "labels": labels,
@@ -1389,6 +1747,18 @@ class VisionAnalysisTask:
                     trace_id=trace_id
                 )
             
+            duration = time.time() - ocr_start_time
+            ocr_local_latency_seconds.labels(engine=ocr_engine, mode=mode).observe(duration)
+            logger.info(
+                "Local OCR extraction completed",
+                engine=ocr_engine,
+                mode=mode,
+                duration_ms=int(duration * 1000),
+                text_length=len(ocr_text or ""),
+                sha256=media_file.sha256[:16] + "..." if media_file.sha256 else None,
+                trace_id=trace_id,
+            )
+
             # Классификация по тексту
             classification = await self.ocr_fallback.classify_content_type(ocr_text)
             
@@ -1396,8 +1766,8 @@ class VisionAnalysisTask:
                 "sha256": media_file.sha256,
                 "s3_key": media_file.s3_key,
                 "analysis": {
-                    "provider": "ocr_fallback",
-                    "model": self.ocr_fallback.engine,
+                    "provider": provider_name,
+                    "model": ocr_engine,
                     "classification": classification,
                     "ocr_text": ocr_text if ocr_text and ocr_text.strip() else None,  # Context7: Сохраняем None вместо пустой строки
                     "description": None,
@@ -1409,6 +1779,8 @@ class VisionAnalysisTask:
             }
             
         except Exception as e:
+            duration = time.time() - ocr_start_time
+            ocr_local_latency_seconds.labels(engine=ocr_engine, mode=mode).observe(duration)
             logger.error(
                 "OCR fallback failed",
                 sha256=media_file.sha256,
@@ -1812,13 +2184,16 @@ class VisionAnalysisTask:
                 return False
             
             first_analysis = analysis_results[0]["analysis"]
-            
+            classification_value = first_analysis.get("classification", {})
+            if isinstance(classification_value, str):
+                classification_value = {"label": classification_value}
+
             from events.schemas.posts_vision_v1 import VisionAnalysisResult
             
             vision_result = VisionAnalysisResult(
                 provider=first_analysis.get("provider", "gigachat"),
                 model=first_analysis.get("model", "GigaChat-Pro"),
-                classification=first_analysis.get("classification", {}),
+                classification=classification_value,
                 description=first_analysis.get("description"),
                 ocr_text=first_analysis.get("ocr_text"),
                 is_meme=first_analysis.get("is_meme", False),
@@ -2012,6 +2387,401 @@ class VisionAnalysisTask:
         cache_key = f"vision:processed:{post_id}:{sha256}"
         await self.redis.setex(cache_key, ttl_hours * 3600, "1")
     
+    def _get_experiment_variants(self, tenant_id: str) -> Dict[str, str]:
+        if not tenant_id or not self.experiment_manager:
+            return {}
+        variants = self.experiment_manager.assign_all(tenant_id)
+        for name, variant in variants.items():
+            vision_experiment_assignments_total.labels(
+                experiment=name,
+                variant=variant
+            ).inc()
+        return variants
+
+    def _attach_experiment_context(
+        self,
+        result: Optional[Dict[str, Any]],
+        experiment_variants: Dict[str, str]
+    ) -> Optional[Dict[str, Any]]:
+        if not result or not experiment_variants:
+            return result
+        analysis_block = result.get("analysis") if isinstance(result, dict) else None
+        if isinstance(analysis_block, dict):
+            context = analysis_block.setdefault("context", {})
+            context["experiments"] = experiment_variants
+        return result
+
+    async def _enqueue_low_priority_event(
+        self,
+        event: VisionUploadedEventV1,
+        media_file: MediaFile,
+        reason: str,
+        trace_id: str,
+        retry_count: int,
+        original_message_id: Optional[str]
+    ) -> bool:
+        if not self.low_priority_enabled:
+            return False
+        try:
+            payload = event.model_dump(mode="json")
+            payload["media_files"] = [media_file.model_dump(mode="json")]
+            next_retry = retry_count + 1
+            payload["idempotency_key"] = f"{event.idempotency_key}:lp:{media_file.sha256[:12]}:{next_retry}"
+            payload["producer"] = "vision-worker"
+            payload["occurred_at"] = datetime.now(timezone.utc).isoformat()
+            not_before_dt = datetime.now(timezone.utc) + timedelta(seconds=self.low_priority_retry_delay_seconds * next_retry)
+
+            message_fields = {
+                "event": payload.get("event_type", "posts.vision.uploaded"),
+                "data": json.dumps(payload, ensure_ascii=False),
+                "priority": "low",
+                "reason": reason,
+                "retry_count": str(next_retry),
+                "sha256": media_file.sha256,
+                "not_before": not_before_dt.isoformat(),
+            }
+            if original_message_id:
+                message_fields["original_message_id"] = original_message_id
+
+            await self.redis.xadd(
+                self.low_priority_stream_name,
+                message_fields,
+                maxlen=self.low_priority_stream_maxlen,
+                approximate=True
+            )
+            vision_low_priority_enqueued_total.labels(reason=reason).inc()
+            logger.info(
+                "Enqueued media to low priority vision queue",
+                extra={
+                    "post_id": event.post_id,
+                    "sha256": media_file.sha256[:16] + "...",
+                    "reason": reason,
+                    "retry_count": next_retry,
+                    "stream": self.low_priority_stream_name,
+                    "trace_id": trace_id
+                }
+            )
+            return True
+        except Exception as exc:
+            vision_low_priority_enqueued_total.labels(reason="error").inc()
+            logger.error(
+                "Failed to enqueue low priority vision media",
+                extra={
+                    "post_id": event.post_id,
+                    "sha256": media_file.sha256[:16] + "...",
+                    "reason": reason,
+                    "retry_count": retry_count,
+                    "trace_id": trace_id,
+                    "error": str(exc)
+                },
+                exc_info=True
+            )
+            return False
+
+    async def _process_low_priority_queue(self) -> None:
+        if not self.low_priority_enabled:
+            return
+
+        start_id = '0' if not self._low_priority_backlog_processed else '>'
+        block_ms = 1
+
+        try:
+            messages = await self.redis.xreadgroup(
+                self.low_priority_consumer_group,
+                self.consumer_name,
+                {self.low_priority_stream_name: start_id},
+                count=5,
+                block=block_ms
+            )
+        except redis.ResponseError as e:
+            if "NOGROUP" in str(e):
+                try:
+                    await self.redis.xgroup_create(
+                        self.low_priority_stream_name,
+                        self.low_priority_consumer_group,
+                        id='0',
+                        mkstream=True
+                    )
+                except redis.ResponseError:
+                    pass
+            else:
+                logger.debug(
+                    "Low priority queue read error",
+                    extra={
+                        "stream": self.low_priority_stream_name,
+                        "error": str(e)
+                    }
+                )
+            return
+
+        if not messages:
+            if start_id == '0':
+                self._low_priority_backlog_processed = True
+            return
+
+        for _, stream_messages in messages:
+            for message_id, fields in stream_messages:
+                message_id_str = message_id.decode() if isinstance(message_id, bytes) else message_id
+                try:
+                    not_before_value = self._extract_field_value(fields, "not_before")
+                    if not_before_value:
+                        try:
+                            not_before_dt = datetime.fromisoformat(not_before_value)
+                        except ValueError:
+                            not_before_dt = None
+                        if not_before_dt:
+                            now = datetime.now(timezone.utc)
+                            delay = (not_before_dt - now).total_seconds()
+                            if delay > 0:
+                                await asyncio.sleep(min(delay, self.low_priority_retry_delay_seconds))
+
+                    processed = await self._process_event(message_id_str, fields)
+                    if processed:
+                        await self.redis.xack(self.low_priority_stream_name, self.low_priority_consumer_group, message_id)
+                        vision_low_priority_processed_total.labels(status="processed").inc()
+                    else:
+                        vision_low_priority_processed_total.labels(status="pending").inc()
+                except Exception as exc:
+                    vision_low_priority_processed_total.labels(status="error").inc()
+                    logger.error(
+                        "Error processing low priority vision message",
+                        extra={
+                            "message_id": message_id_str,
+                            "error": str(exc)
+                        },
+                        exc_info=True
+                    )
+                    await self._handle_error(message_id_str, fields, exc)
+
+        if start_id == '0':
+            self._low_priority_backlog_processed = False
+
+    def _compute_phash_safe(
+        self,
+        file_content: bytes,
+        sha256: Optional[str],
+        trace_id: str,
+    ) -> Optional[PhashResult]:
+        try:
+            return compute_phash(file_content, hash_size=self.phash_hash_size)
+        except Exception as exc:
+            logger.debug(
+                "Failed to compute phash",
+                extra={
+                    "sha256": (sha256[:16] + "...") if sha256 else None,
+                    "trace_id": trace_id,
+                    "error": str(exc),
+                },
+            )
+            return None
+
+    def _attach_phash_to_result(
+        self,
+        result: Dict[str, Any],
+        phash_hex: str,
+        cache_key: Optional[str],
+        source: str,
+        hit: bool,
+    ) -> None:
+        analysis = result.setdefault("analysis", {})
+        context = analysis.setdefault("context", {})
+        context["phash"] = phash_hex
+        context["phash_hash_size"] = self.phash_hash_size
+        context["phash_source"] = source
+        context["phash_hit"] = hit
+        if cache_key:
+            context["phash_cache_key"] = cache_key
+
+    async def _store_phash_cache(
+        self,
+        tenant_id: str,
+        phash_hex: str,
+        result: Dict[str, Any],
+        cache_key: Optional[str],
+    ) -> None:
+        if not self.phash_enabled:
+            return
+        redis_key = self._build_phash_redis_key(tenant_id, phash_hex)
+        payload: Dict[str, Any] = {
+            "sha256": result.get("sha256"),
+            "cache_key": cache_key,
+            "hash_size": self.phash_hash_size,
+            "stored_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if not cache_key:
+            payload["analysis_result"] = result
+        try:
+            await self.redis.setex(
+                redis_key,
+                self.phash_cache_ttl_seconds,
+                json.dumps(payload, ensure_ascii=False, default=str),
+            )
+        except Exception as exc:
+            logger.debug(
+                "Failed to store phash cache",
+                extra={
+                    "tenant_id": tenant_id,
+                    "phash": phash_hex,
+                    "error": str(exc),
+                },
+            )
+
+    async def _get_phash_cached_result(
+        self,
+        tenant_id: str,
+        phash_hex: str,
+        trace_id: str,
+    ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+        if not self.phash_enabled:
+            return None, {}
+
+        redis_key = self._build_phash_redis_key(tenant_id, phash_hex)
+        try:
+            cached_value = await self.redis.get(redis_key)
+        except Exception as exc:
+            logger.debug(
+                "Failed to read phash cache",
+                extra={
+                    "tenant_id": tenant_id,
+                    "phash": phash_hex,
+                    "error": str(exc),
+                },
+            )
+            cached_value = None
+
+        if cached_value:
+            try:
+                payload = json.loads(cached_value)
+                cache_key = payload.get("cache_key")
+                if cache_key and self.s3_service:
+                    try:
+                        cached_analysis = await self.s3_service.get_json(cache_key)
+                        if cached_analysis:
+                            return (
+                                {
+                                    "sha256": payload.get("sha256"),
+                                    "s3_key": cache_key,
+                                    "analysis": cached_analysis,
+                                },
+                                {"source": "redis", "cache_key": cache_key, "metric_label": "phash_redis"},
+                            )
+                    except Exception as exc:
+                        logger.debug(
+                            "Failed to load phash cache payload from S3",
+                            extra={
+                                "cache_key": cache_key,
+                                "phash": phash_hex,
+                                "error": str(exc),
+                                "trace_id": trace_id,
+                            },
+                        )
+                analysis_result = payload.get("analysis_result")
+                if analysis_result:
+                    return analysis_result, {"source": "redis", "cache_key": analysis_result.get("s3_key"), "metric_label": "phash_redis"}
+            except Exception as exc:
+                logger.debug(
+                    "Failed to deserialize phash cache payload",
+                    extra={
+                        "phash": phash_hex,
+                        "error": str(exc),
+                        "trace_id": trace_id,
+                    },
+                )
+
+        try:
+            result = await self.db.execute(
+                text(
+                    """
+                    SELECT data
+                    FROM post_enrichment
+                    WHERE kind = 'vision' AND (data->'context'->>'phash') = :phash
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                    """
+                ),
+                {"phash": phash_hex},
+            )
+            row = result.fetchone()
+        except Exception as exc:
+            logger.debug(
+                "Failed to fetch phash cache from Postgres",
+                extra={
+                    "phash": phash_hex,
+                    "error": str(exc),
+                    "trace_id": trace_id,
+                },
+            )
+            row = None
+
+        if row:
+            vision_data = row[0]
+            if isinstance(vision_data, str):
+                try:
+                    vision_data = json.loads(vision_data)
+                except Exception:
+                    vision_data = {}
+            context = vision_data.get("context") if isinstance(vision_data, dict) else None
+            cache_key = context.get("phash_cache_key") if isinstance(context, dict) else None
+            if cache_key and self.s3_service:
+                try:
+                    cached_analysis = await self.s3_service.get_json(cache_key)
+                    if cached_analysis:
+                        result_dict = {
+                            "sha256": None,
+                            "s3_key": cache_key,
+                            "analysis": cached_analysis,
+                        }
+                        await self._store_phash_cache(
+                            tenant_id=tenant_id,
+                            phash_hex=phash_hex,
+                            result=result_dict,
+                            cache_key=cache_key,
+                        )
+                        return result_dict, {"source": "postgres", "cache_key": cache_key, "metric_label": "phash_pg"}
+                except Exception as exc:
+                    logger.debug(
+                        "Failed to load phash PG cache from S3",
+                        extra={
+                            "cache_key": cache_key,
+                            "phash": phash_hex,
+                            "error": str(exc),
+                            "trace_id": trace_id,
+                        },
+                    )
+            if isinstance(vision_data, dict):
+                result_dict = {
+                    "sha256": None,
+                    "s3_key": cache_key,
+                    "analysis": vision_data,
+                }
+                await self._store_phash_cache(
+                    tenant_id=tenant_id,
+                    phash_hex=phash_hex,
+                    result=result_dict,
+                    cache_key=cache_key,
+                )
+                return result_dict, {"source": "postgres", "cache_key": cache_key, "metric_label": "phash_pg"}
+
+        return None, {}
+
+    def _build_phash_redis_key(self, tenant_id: str, phash_hex: str) -> str:
+        return f"{self.phash_redis_prefix}:{tenant_id}:{phash_hex}"
+
+    def _extract_field_value(self, fields: Dict[str, Any], key: str) -> Optional[str]:
+        if not isinstance(fields, dict):
+            return None
+        value = fields.get(key)
+        if value is None:
+            value = fields.get(key.encode())
+        if value is None:
+            return None
+        if isinstance(value, bytes):
+            try:
+                return value.decode('utf-8')
+            except UnicodeDecodeError:
+                return None
+        return str(value)
+
     async def _process_pending_messages(self) -> int:
         """
         Context7: Обработка pending сообщений через XAUTOCLAIM с лимитами доставок и DLQ.
@@ -2463,27 +3233,42 @@ async def create_vision_analysis_task(
             using_default=ocr_fallback_enabled
         )
     
+    ocr_engine = vision_config.get("ocr_engine", "paddle").lower()
+
     if ocr_fallback_enabled:
-        # Context7: Используем OpenRouter Vision для OCR fallback
-        # Модель qwen/qwen2.5-vl-32b-instruct:free для полноценного Vision анализа
-        try:
-            from ai_adapters.openrouter_vision import OpenRouterVisionAdapter
-            openrouter_adapter = OpenRouterVisionAdapter(
-                model="qwen/qwen2.5-vl-32b-instruct:free"
-            )
+        if ocr_engine == "openrouter":
+            try:
+                from ai_adapters.openrouter_vision import OpenRouterVisionAdapter
+                openrouter_adapter = OpenRouterVisionAdapter(
+                    model=vision_config.get("openrouter_model", "qwen/qwen2.5-vl-32b-instruct:free")
+                )
+                ocr_fallback = OCRFallbackService(
+                    engine="openrouter",
+                    openrouter_adapter=openrouter_adapter
+                )
+                logger.info(
+                    "OCR fallback initialized with OpenRouter Vision",
+                    model=vision_config.get("openrouter_model", "qwen/qwen2.5-vl-32b-instruct:free")
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to initialize OpenRouter Vision adapter, OCR fallback disabled",
+                    error=str(e)
+                )
+                ocr_fallback = None
+        elif ocr_engine == "paddle":
             ocr_fallback = OCRFallbackService(
-                engine="openrouter",
-                openrouter_adapter=openrouter_adapter
+                engine="paddle",
+                languages=vision_config.get("ocr_languages", "rus+eng"),
+                paddle_endpoint=vision_config.get("paddle_endpoint"),
+                paddle_timeout=vision_config.get("paddle_timeout"),
             )
             logger.info(
-                "OCR fallback initialized with OpenRouter Vision",
-                model="qwen/qwen2.5-vl-32b-instruct:free"
+                "OCR fallback initialized with PaddleOCR",
+                endpoint=vision_config.get("paddle_endpoint")
             )
-        except Exception as e:
-            logger.warning(
-                "Failed to initialize OpenRouter Vision adapter, OCR fallback disabled",
-                error=str(e)
-            )
+        else:
+            logger.warning("Unsupported ocr_engine configured", ocr_engine=ocr_engine)
             ocr_fallback = None
     else:
         logger.info(
@@ -2493,6 +3278,12 @@ async def create_vision_analysis_task(
     
     # DLQ Service
     dlq_service = DLQService(redis_client) if vision_config.get("dlq_enabled", True) else None
+
+    experiment_config_path = os.getenv(
+        "VISION_EXPERIMENT_CONFIG_PATH",
+        os.path.join(os.path.dirname(__file__), "..", "config", "vision_experiments.yml")
+    )
+    experiment_manager = VisionExperimentManager(experiment_config_path)
     
     # Vision Task
     task = VisionAnalysisTask(
@@ -2504,7 +3295,9 @@ async def create_vision_analysis_task(
         vision_adapter=vision_adapter,
         policy_engine=policy_engine,
         ocr_fallback=ocr_fallback,
-        dlq_service=dlq_service
+        dlq_service=dlq_service,
+        local_ocr_primary_enabled=vision_config.get("local_ocr_primary_enabled", False),
+        experiment_manager=experiment_manager
     )
     
     return task

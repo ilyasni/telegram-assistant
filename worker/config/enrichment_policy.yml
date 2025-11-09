@@ -14,6 +14,7 @@ enrichment:
   # для полноценного Vision анализа (OCR + классификация + описание)
   # См. docs/OCR_FALLBACK_LIMITATIONS.md для деталей
   ocr_fallback_enabled: true
+  local_ocr_primary_enabled: true
   
   # Максимальное количество параллельных операций enrichment
   max_concurrent_operations: 5
@@ -36,11 +37,21 @@ crawl4ai:
   enabled: true
   
   # Триггеры для обогащения (теги, которые запускают crawl4ai)
-  # Context7: Короткий список для старта, расширяется по телеметрии
+  # Context7: синхронизированы с фактическими тегами постов (ru/en)
   trigger_tags:
-    - ai
-    - research
-    - report
+    - "ai"
+    - "искусственный интеллект"
+    - "нейросети"
+    - "machine learning"
+    - "машинное обучение"
+    - "generative ai"
+    - "генеративный интеллект"
+    - "robotics"
+    - "робототехника"
+    - "computer vision"
+    - "автоматизация"
+    - "science"
+    - "research"
   
   # Минимальное количество слов для обогащения
   # Context7: Снижено с 500 до 100 для более гибкого обогащения

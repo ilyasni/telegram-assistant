@@ -1,0 +1,18 @@
+services:
+  paddleocr:
+    build:
+      context: .
+      dockerfile: services/paddleocr/Dockerfile
+    volumes:
+      - .:/app
+    environment:
+      LOCAL_OCR_PRELOAD: "${LOCAL_OCR_PRELOAD:-true}"
+    ports:
+      - "${LOCAL_OCR_PORT:-8008}:8008"
+    networks:
+      - telegram-network
+
+networks:
+  telegram-network:
+    external: false
+

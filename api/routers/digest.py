@@ -7,12 +7,13 @@ from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel, Field, field_validator
 from typing import List, Optional
 from uuid import UUID
-from datetime import date, time, datetime
+from datetime import date, time, datetime, timezone
 import structlog
 from sqlalchemy.orm import Session
 from sqlalchemy import and_
 
-from models.database import get_db, User, DigestSettings, DigestHistory
+from models.database import get_db, User, DigestSettings, DigestHistory, UserChannel, Channel
+from api.services.enrichment_trigger_service import upsert_triggers_from_digest
 from config import settings
 
 logger = structlog.get_logger()
@@ -130,6 +131,110 @@ async def get_digest_settings(user_id: UUID, db: Session = Depends(get_db)):
     )
 
 
+def _normalize_channels_filter(
+    raw_channels: Optional[List[str]],
+    user_id: UUID,
+    db: Session
+) -> Optional[List[str]]:
+    """Нормализует список каналов: принимает UUID или Telegram ID и возвращает UUID."""
+    if raw_channels is None:
+        return None
+    if len(raw_channels) == 0:
+        return None
+
+    # Загружаем каналы пользователя с tg_channel_id
+    user_channels = (
+        db.query(UserChannel.channel_id, Channel.tg_channel_id)
+        .join(Channel, Channel.id == UserChannel.channel_id)
+        .filter(UserChannel.user_id == user_id, UserChannel.is_active == True)
+        .all()
+    )
+
+    if not user_channels:
+        return None
+
+    # Строим отображение "alias" -> UUID
+    channel_alias_map = {}
+    for channel_id, tg_channel_id in user_channels:
+        uuid_value = str(channel_id)
+        channel_alias_map[uuid_value] = uuid_value
+
+        if tg_channel_id is not None:
+            tg_str = str(tg_channel_id)
+            channel_alias_map[tg_str] = uuid_value
+
+            stripped = tg_str.lstrip("-")
+            if stripped:
+                channel_alias_map[stripped] = uuid_value
+
+            if tg_str.startswith("-100"):
+                suffix = tg_str[4:]
+                if suffix:
+                    channel_alias_map[suffix] = uuid_value
+                    # Также учитываем вариант с добавленным -100 для положительного ввода
+                    channel_alias_map[f"-100{suffix}"] = uuid_value
+            else:
+                # Пользователь мог передать значение без служебного префикса
+                base = stripped or tg_str
+                channel_alias_map[f"-100{base}"] = uuid_value
+
+    normalized: List[str] = []
+    seen: set[str] = set()
+    invalid_entries: List[str] = []
+
+    for raw_value in raw_channels:
+        if raw_value is None:
+            continue
+
+        candidate = str(raw_value).strip()
+        if not candidate:
+            continue
+
+        mapped_uuid: Optional[str] = None
+
+        # Пробуем UUID напрямую
+        try:
+            uuid_candidate = str(UUID(candidate))
+            mapped_uuid = channel_alias_map.get(uuid_candidate)
+        except ValueError:
+            mapped_uuid = None
+
+        # Если UUID не найден, проверяем alias
+        if mapped_uuid is None:
+            mapped_uuid = channel_alias_map.get(candidate)
+
+        # Дополнительные попытки для числовых значений (например, "139883458")
+        if mapped_uuid is None:
+            digits = candidate.lstrip("+-")
+            if digits.isdigit():
+                positive_form = digits
+                negative_form = f"-{digits}"
+                prefixed_form = f"-100{digits}"
+
+                mapped_uuid = (
+                    channel_alias_map.get(positive_form)
+                    or channel_alias_map.get(negative_form)
+                    or channel_alias_map.get(prefixed_form)
+                )
+
+        if mapped_uuid is None:
+            invalid_entries.append(candidate)
+            continue
+
+        if mapped_uuid not in seen:
+            seen.add(mapped_uuid)
+            normalized.append(mapped_uuid)
+
+    if invalid_entries:
+        invalid_display = ", ".join(invalid_entries[:5])
+        raise HTTPException(
+            status_code=400,
+            detail=f"channels_filter содержит неизвестные каналы: {invalid_display}"
+        )
+
+    return normalized or None
+
+
 @router.put("/settings/{user_id}", response_model=DigestSettingsResponse)
 async def update_digest_settings(
     user_id: UUID,
@@ -176,7 +281,11 @@ async def update_digest_settings(
     if settings_data.topics is not None:
         settings_obj.topics = settings_data.topics
     if settings_data.channels_filter is not None:
-        settings_obj.channels_filter = settings_data.channels_filter
+        settings_obj.channels_filter = _normalize_channels_filter(
+            settings_data.channels_filter,
+            user_id,
+            db
+        )
     if settings_data.max_items_per_digest is not None:
         settings_obj.max_items_per_digest = settings_data.max_items_per_digest
     
@@ -185,6 +294,14 @@ async def update_digest_settings(
         raise HTTPException(
             status_code=400,
             detail="topics обязателен когда enabled=True. Укажите хотя бы одну тему."
+        )
+
+    if settings_obj.topics:
+        updated_triggers = upsert_triggers_from_digest(db, user, settings_obj.topics)
+        logger.info(
+            "Crawl triggers updated from digest settings",
+            user_id=str(user_id),
+            triggers_count=len(updated_triggers.triggers or []),
         )
     
     db.commit()
@@ -257,51 +374,58 @@ async def generate_digest_now(user_id: UUID, request: Request, db: Session = Dep
         raise HTTPException(status_code=404, detail="User not found")
     
     # Получаем tenant_id
-    tenant_id = getattr(request.state, 'tenant_id', None) or str(user.tenant_id)
+    tenant_id = getattr(request.state, 'tenant_id', None)
+    if not tenant_id and user.tenant_id:
+        tenant_id = str(user.tenant_id)
+    if not tenant_id:
+        raise HTTPException(status_code=400, detail="Не задан tenant_id для пользователя")
     
-    # Получаем DigestService
-    from services.digest_service import get_digest_service
-    digest_service = get_digest_service()
-    
+    # Получаем настройки, чтобы убедиться в наличии тем
+    digest_settings = db.query(DigestSettings).filter(DigestSettings.user_id == user_id).first()
+    if not digest_settings or not digest_settings.topics:
+        raise HTTPException(status_code=400, detail="Нет тем для генерации дайджеста. Добавьте topics в настройках.")
+
     try:
-        # Генерируем дайджест
-        digest_content = await digest_service.generate(
-            user_id=user_id,
-            tenant_id=tenant_id,
-            db=db
-        )
-        
-        # Сохраняем в историю
-        digest_history = DigestHistory(
-            user_id=user_id,
-            digest_date=date.today(),
-            content=digest_content.content,
-            posts_count=digest_content.posts_count,
-            topics=digest_content.topics,
-            status="pending"
-        )
-        db.add(digest_history)
-        db.commit()
-        db.refresh(digest_history)
-        
-        logger.info(
-            "Digest generated",
+        from tasks.scheduler_tasks import generate_digest_for_user
+
+        requested_by = getattr(request.state, "user_id", None)
+        if not requested_by and request.client:
+            requested_by = request.client.host
+
+        history = await generate_digest_for_user(
             user_id=str(user_id),
-            digest_id=str(digest_history.id),
-            posts_count=digest_content.posts_count
+            tenant_id=tenant_id,
+            topics=digest_settings.topics,
+            db=db,
+            trigger="manual",
+            requested_by=str(requested_by) if requested_by else None
         )
-        
-        return {
-            "digest_id": str(digest_history.id),
-            "content": digest_content.content,
-            "posts_count": digest_content.posts_count,
-            "topics": digest_content.topics,
-            "sections": digest_content.sections
+
+        if not history:
+            raise HTTPException(status_code=400, detail="Не удалось поставить дайджест в очередь")
+
+        logger.info(
+            "Digest generation scheduled",
+            user_id=str(user_id),
+            digest_id=str(history.id),
+            status=history.status
+        )
+
+        response_payload = {
+            "digest_id": str(history.id),
+            "status": history.status,
+            "queued_at": datetime.now(timezone.utc).isoformat(),
+            "posts_count": history.posts_count,
+            "topics": history.topics,
+            "content": history.content if history.content else None,
+            "sent_at": history.sent_at.isoformat() if history.sent_at else None,
         }
-    
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+
+        return response_payload
+
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error("Error generating digest", error=str(e), user_id=str(user_id))
-        raise HTTPException(status_code=500, detail="Ошибка генерации дайджеста")
+        logger.error("Error scheduling digest generation", error=str(e), user_id=str(user_id))
+        raise HTTPException(status_code=500, detail="Ошибка постановки дайджеста в очередь")
 

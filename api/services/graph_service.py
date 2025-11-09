@@ -104,6 +104,7 @@ class GraphService:
         self,
         query: str,
         topic: Optional[str] = None,
+        tenant_id: Optional[str] = None,
         limit: int = 10,
         max_depth: int = 2
     ) -> List[Dict[str, Any]]:
@@ -115,6 +116,7 @@ class GraphService:
         Args:
             query: Текст запроса (для поиска по темам)
             topic: Тема для фильтрации (опционально)
+            tenant_id: Ограничение по арендатору (обязательно для изоляции данных)
             limit: Максимальное количество результатов
             max_depth: Максимальная глубина обхода графа (2-3 для производительности)
         
@@ -130,44 +132,62 @@ class GraphService:
             async with self._driver.session() as session:
                 # Context7: Параметризованный Cypher запрос
                 # Важно: Neo4j не поддерживает параметры в MATCH patterns для переменной глубины
-                # Используем фиксированную глубину *1..2
+                # Используем фиксированную глубину *1..max_depth
+                tenant_clause = ""
+                related_clause = ""
+                params: Dict[str, Any] = {"limit": limit, "content_property": "content"}
+                if tenant_id:
+                    tenant_clause = "WHERE p.tenant_id = $tenant_id"
+                    related_clause = "WHERE related_p IS NULL OR related_p.tenant_id = $tenant_id"
+                    params["tenant_id"] = str(tenant_id)
                 if topic:
+                    params["topic"] = topic
                     cypher_query = """
-                    MATCH (t:Topic {name: $topic})
+                    MATCH (t:Topic {{name: $topic}})
                     MATCH (t)<-[:HAS_TOPIC]-(p:Post)
-                    OPTIONAL MATCH path = (t)-[:RELATED_TO*1..2]-(related_t:Topic)
+                    {tenant_clause}
+                    OPTIONAL MATCH path = (t)-[:RELATED_TO*1..{max_depth}]-(related_t:Topic)
                     WHERE related_t IS NOT NULL
                     OPTIONAL MATCH (related_t)<-[:HAS_TOPIC]-(related_p:Post)
                     WITH DISTINCT p, related_p, t.name AS topic_name
+                    {related_clause}
                     RETURN p.post_id AS post_id,
-                           p.content AS content,
+                           coalesce(
+                               p[$content_property],
+                               CASE WHEN related_p IS NULL THEN NULL ELSE related_p[$content_property] END,
+                               ''
+                           ) AS content,
                            topic_name,
                            'direct' AS relation_type
                     ORDER BY p.posted_at DESC
                     LIMIT $limit
-                    """
-                    result = await session.run(
-                        cypher_query,
-                        parameters={"topic": topic, "limit": limit}
+                    """.format(
+                        tenant_clause=tenant_clause,
+                        related_clause=related_clause,
+                        max_depth=max_depth
                     )
+                    if not tenant_id:
+                        logger.warning("Graph search executed without tenant filter", topic=topic)
+                    result = await session.run(cypher_query, parameters=params)
                 else:
                     # Поиск по всем темам, связанным с запросом
+                    params["query"] = query
                     cypher_query = """
                     MATCH (t:Topic)
                     WHERE toLower(t.name) CONTAINS toLower($query)
                     MATCH (t)<-[:HAS_TOPIC]-(p:Post)
+                    {tenant_clause}
                     OPTIONAL MATCH (p)-[:IN_CHANNEL]->(c:Channel)
                     RETURN p.post_id AS post_id,
-                           p.content AS content,
+                           coalesce(p[$content_property], '') AS content,
                            collect(DISTINCT t.name) AS topics,
                            c.title AS channel_title
                     ORDER BY p.posted_at DESC
                     LIMIT $limit
-                    """
-                    result = await session.run(
-                        cypher_query,
-                        parameters={"query": query, "limit": limit}
-                    )
+                    """.format(tenant_clause=tenant_clause)
+                    if not tenant_id:
+                        logger.warning("Graph query search executed without tenant filter", query=query[:50])
+                    result = await session.run(cypher_query, parameters=params)
                 
                 posts = []
                 async for record in result:
@@ -286,7 +306,7 @@ class GraphService:
             logger.error("Error updating user interest in graph", error=str(e), user_id=user_id, topic=topic)
             return False
     
-    async def find_similar_topics(self, topic: str, limit: int = 10) -> List[Dict[str, Any]]:
+    async def find_similar_topics(self, topic: str, limit: int = 10, tenant_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         Поиск похожих тем через граф.
         
@@ -295,6 +315,7 @@ class GraphService:
         Args:
             topic: Тема для поиска
             limit: Максимальное количество результатов
+            tenant_id: Ограничение по арендатору (если не передан — поиск глобальный)
         
         Returns:
             Список похожих тем с similarity scores
@@ -307,15 +328,34 @@ class GraphService:
             
             async with self._driver.session() as session:
                 # Context7: Параметризованный Cypher запрос
-                query = """
-                MATCH (t:Topic {name: $topic})-[r:RELATED_TO]-(similar:Topic)
-                RETURN similar.name AS topic,
-                       r.similarity AS similarity
-                ORDER BY r.similarity DESC
-                LIMIT $limit
-                """
+                if tenant_id:
+                    params = {"topic": topic, "limit": limit, "tenant_id": str(tenant_id)}
+                    query = """
+                    MATCH (t:Topic {name: $topic})<-[:HAS_TOPIC]-(p:Post)
+                    WHERE p.tenant_id = $tenant_id
+                    WITH DISTINCT t
+                    MATCH (t)-[r:RELATED_TO]-(similar:Topic)
+                    WHERE EXISTS {
+                        MATCH (similar)<-[:HAS_TOPIC]-(sp:Post)
+                        WHERE sp.tenant_id = $tenant_id
+                    }
+                    RETURN similar.name AS topic,
+                           r.similarity AS similarity
+                    ORDER BY r.similarity DESC
+                    LIMIT $limit
+                    """
+                else:
+                    params = {"topic": topic, "limit": limit}
+                    query = """
+                    MATCH (t:Topic {name: $topic})-[r:RELATED_TO]-(similar:Topic)
+                    RETURN similar.name AS topic,
+                           r.similarity AS similarity
+                    ORDER BY r.similarity DESC
+                    LIMIT $limit
+                    """
+                    logger.warning("find_similar_topics executed without tenant filter", topic=topic)
                 
-                result = await session.run(query, parameters={"topic": topic, "limit": limit})
+                result = await session.run(query, parameters=params)
                 
                 similar_topics = []
                 async for record in result:

@@ -100,7 +100,8 @@ class Neo4jClient:
         channel_id: str,
         expires_at: str,
         enrichment_data: Optional[Dict[str, Any]] = None,
-        indexed_at: str = None
+        indexed_at: str = None,
+        content: Optional[str] = None
     ) -> bool:
         """
         Создание узла поста с expires_at property.
@@ -133,7 +134,8 @@ class Neo4jClient:
                     p.channel_id = $channel_id,
                     p.expires_at = $expires_at,
                     p.indexed_at = $indexed_at,
-                    p.enrichment_data = $enrichment_data
+                    p.enrichment_data = $enrichment_data,
+                    p.content = coalesce($content, p.content)
                 MERGE (u:User {user_id: $effective_user_id})
                 SET u.tenant_id = $tenant_id
                 MERGE (c:Channel {channel_id: $channel_id})
@@ -143,6 +145,10 @@ class Neo4jClient:
                 RETURN p.post_id as post_id
                 """
                 
+                trimmed_content = None
+                if content:
+                    trimmed_content = content[:2048]
+                
                 result = await session.run(
                     query,
                     post_id=post_id,
@@ -151,7 +157,8 @@ class Neo4jClient:
                     channel_id=channel_id,
                     expires_at=expires_at,
                     indexed_at=indexed_at or datetime.now(timezone.utc).isoformat(),
-                    enrichment_data=enrichment_json
+                    enrichment_data=enrichment_json,
+                    content=trimmed_content
                 )
                 
                 record = await result.single()

@@ -90,8 +90,27 @@ class VisionPolicyEngine:
                 "skip_if_lang_not_in": ["ru", "en"],
             },
             "fallback": {
-                "ocr_engine": "tesseract",
-            }
+                "ocr_engine": "paddle",
+            },
+            "prompt_presets": {
+                "default_key": "default",
+                "templates": {
+                    "default": "Верни JSON {\"classification\": \"photo|meme|document|screenshot|infographic|other\", \"description\": \"<=160 симв.\", \"is_meme\": bool, \"labels\": [], \"objects\": [], \"ocr\": {\"text\": \"...\", \"engine\": \"gigachat\"} или null}. Если есть текст — заполни ocr.text. Без пояснений.",
+                    "document": "Документ: JSON как в default. classification='document'. Выдели ключевые заголовки. OCR text обязателен.",
+                    "screenshot": "Скриншот: JSON как в default. classification='screenshot'. Укажи основное содержание интерфейса. OCR text обязателен.",
+                    "photo": "Фото/инфографика: JSON как в default. Сфокусируйся на описании сцены. Если есть текст — добавь его в ocr.",
+                },
+                "mime_mapping": {
+                    "application/pdf": "document",
+                    "application/msword": "document",
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "document",
+                    "image/png": "screenshot",
+                    "image/jpeg": "photo",
+                    "image/jpg": "photo",
+                    "image/webp": "photo",
+                    "image/bmp": "photo",
+                },
+            },
         }
     
     def check_file_size(self, size_bytes: int, mime_type: str) -> Tuple[bool, Optional[str]]:
@@ -262,6 +281,7 @@ class VisionPolicyEngine:
             "reason": None,
             "use_ocr": False,
             "skip": False,
+            "prompt_key": self._resolve_prompt_key(mime_type),
         }
         
         # Проверка 1: MIME тип
@@ -295,4 +315,23 @@ class VisionPolicyEngine:
         vision_policy_decisions_total.labels(decision="allow", reason="policy_passed").inc()
         
         return result
+
+    def _resolve_prompt_key(self, mime_type: str) -> str:
+        presets = self.config.get("prompt_presets", {})
+        default_key = presets.get("default_key", "default")
+        mapping = presets.get("mime_mapping", {})
+        if not mime_type:
+            return default_key
+        mime_lower = mime_type.lower()
+        if mime_lower in mapping:
+            return mapping[mime_lower]
+        family = mime_lower.split("/")[0] + "/*"
+        return mapping.get(family, default_key)
+
+    def get_prompt_template(self, prompt_key: Optional[str] = None) -> Optional[str]:
+        presets = self.config.get("prompt_presets", {})
+        templates = presets.get("templates", {})
+        default_key = presets.get("default_key", "default")
+        key = prompt_key or default_key
+        return templates.get(key) or templates.get(default_key)
 

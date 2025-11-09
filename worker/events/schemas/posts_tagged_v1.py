@@ -22,6 +22,9 @@ class PostTaggedEventV1(BaseEvent):
     
     # Идентификаторы
     post_id: str = Field(..., description="ID поста в системе")
+    tenant_id: Optional[str] = Field(None, description="ID арендатора для персонализации")
+    user_id: Optional[str] = Field(None, description="ID пользователя, для которого обработан пост")
+    channel_id: Optional[str] = Field(None, description="ID канала")
     
     # Результаты тегирования (упрощённая схема)
     tags: List[str] = Field(
@@ -29,6 +32,10 @@ class PostTaggedEventV1(BaseEvent):
         description="Список тегов как строк"
     )
     tags_hash: str = Field(..., description="SHA256 хеш тегов для дедупликации")
+    topics: List[str] = Field(
+        default_factory=list,
+        description="Активные темы пользователя на момент тегирования"
+    )
     
     # Метаданные AI провайдера
     provider: str = Field(default="gigachat", description="AI провайдер (gigachat|openrouter|local)")
@@ -61,8 +68,12 @@ class PostTaggedEventV1(BaseEvent):
                 "occurred_at": "2024-10-24T13:01:00Z",
                 "idempotency_key": "post_789:tagged:v1",
                 "post_id": "post_789",
+                "tenant_id": "tenant_123",
+                "user_id": "user_123",
+                "channel_id": "channel_456",
                 "tags": ["технологии", "искусственный интеллект", "машинное обучение"],
                 "tags_hash": "a1b2c3d4e5f6789...",
+                "topics": ["ai", "машинное обучение"],
                 "provider": "gigachat",
                 "latency_ms": 1250,
                 "metadata": {"model": "GigaChat:latest", "language": "ru"}

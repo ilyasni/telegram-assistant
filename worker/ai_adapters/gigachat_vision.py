@@ -8,9 +8,10 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, BinaryIO
+from typing import Optional, Dict, Any, BinaryIO, Tuple, List
 
 import structlog
+from PIL import Image
 from gigachat import GigaChat
 from gigachat.exceptions import GigaChatException, AuthenticationError, ResponseError
 
@@ -73,6 +74,12 @@ vision_cache_hits_total = Counter(
     'vision_cache_hits_total',
     'Vision cache hits',
     ['cache_type']  # s3 | redis
+)
+
+vision_tokens_estimated_total = Counter(
+    'vision_tokens_estimated_total',
+    'Estimated tokens via GigaChat tokens_count endpoint',
+    ['provider', 'tenant_id']
 )
 
 vision_parsed_total = Counter(
@@ -138,11 +145,53 @@ class GigaChatVisionAdapter:
         self.budget_gate = budget_gate
         self.verify_ssl = verify_ssl
         self.timeout = timeout
+        self.max_output_tokens = int(os.getenv("VISION_MAX_OUTPUT_TOKENS", "512"))
+        self.preprocess_enabled = os.getenv("VISION_PREPROCESS_ENABLED", "true").lower() in {"1", "true", "yes"}
+        self.preprocess_max_dim = int(os.getenv("VISION_PREPROCESS_MAX_DIM", "1024"))
+        self.preprocess_grayscale = os.getenv("VISION_PREPROCESS_GRAYSCALE", "true").lower() in {"1", "true", "yes"}
+        self.roi_crop_enabled = os.getenv("VISION_ROI_CROP_ENABLED", "false").lower() in {"1", "true", "yes"}
+        self.roi_max_dim = int(os.getenv("VISION_ROI_MAX_DIM", "1024"))
+        self.preprocess_quality = int(os.getenv("VISION_PREPROCESS_JPEG_QUALITY", "75"))
+        self.default_prompt = os.getenv(
+            "VISION_DEFAULT_PROMPT",
+            'Верни JSON {"classification": "photo|meme|document|screenshot|infographic|other", '
+            '"description": "<=160 символов", "is_meme": bool, "labels": [], "objects": [], '
+            '"ocr": {"text": "...", "engine": "gigachat"} или null}. '
+            'Если в изображении есть текст, обязательно заполни ocr.text. Без пояснений.',
+        )
+        self.legacy_prompt = os.getenv(
+            "VISION_LEGACY_PROMPT",
+            """Проанализируй изображение или документ и предоставь структурированный JSON со следующей схемой:
+
+{
+  "classification": "photo" | "meme" | "document" | "screenshot" | "infographic" | "other",
+  "description": "краткое текстовое описание содержимого (минимум 5 символов)",
+  "is_meme": true/false,
+  "labels": ["класс1", "класс2", ...],  // максимум 20 классов/атрибутов
+  "objects": ["объект1", "объект2", ...],  // максимум 10 объектов на изображении
+  "scene": "описание сцены/окружения" или null,
+  "ocr": {"text": "извлечённый текст из изображения", "engine": "gigachat", "confidence": 0.0-1.0} или null,
+  "nsfw_score": 0.0-1.0 или null,
+  "aesthetic_score": 0.0-1.0 или null,
+  "dominant_colors": ["#hex1", "#hex2", ...],  // максимум 5 цветов
+  "context": {"emotions": [...], "themes": [...], "relationships": [...]}
+}
+
+ВАЖНО:
+- Если на изображении есть ЛЮБОЙ текст (надписи, подписи, текст в документе, скриншоты), ОБЯЗАТЕЛЬНО заполни поле "ocr" с извлечённым текстом
+- Если текста нет, установи "ocr": null
+- Поле "ocr.text" должно содержать ВЕСЬ видимый текст с изображения, включая мелкий текст
+- Не пропускай текст даже если он частично виден или размыт
+
+Обязательные поля: classification, description, is_meme.
+Ответь ТОЛЬКО валидным JSON без дополнительного текста."""
+        )
+        self.tokens_count_enabled = os.getenv("VISION_TOKENS_COUNT_ENABLED", "true").lower() in {"1", "true", "yes"}
+        self._tokens_count_supported = True
         
         # Context7: Circuit breaker для защиты от каскадных сбоев
         if circuit_breaker is None:
             from shared.utils.circuit_breaker import CircuitBreaker
-            import os
             failure_threshold = int(os.getenv("GIGACHAT_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "5"))
             recovery_timeout = int(os.getenv("GIGACHAT_CIRCUIT_BREAKER_RECOVERY_TIMEOUT", "60"))
             self.circuit_breaker = CircuitBreaker(
@@ -284,7 +333,10 @@ class GigaChatVisionAdapter:
         mime_type: str,
         tenant_id: str,
         trace_id: str,
-        analysis_prompt: Optional[str] = None
+        analysis_prompt: Optional[str] = None,
+        preprocess_enabled: Optional[bool] = None,
+        roi_crop_enabled: Optional[bool] = None,
+        max_output_tokens_override: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         Анализ медиа через GigaChat Vision API.
@@ -302,6 +354,14 @@ class GigaChatVisionAdapter:
         """
         import time
         start_time = time.time()
+        should_preprocess = (
+            self.preprocess_enabled if preprocess_enabled is None else preprocess_enabled
+        )
+        roi_enabled = self.roi_crop_enabled if roi_crop_enabled is None else roi_crop_enabled
+        effective_max_tokens = (
+            self.max_output_tokens if max_output_tokens_override is None else max_output_tokens_override
+        )
+        estimated_tokens: Optional[int] = None
         
         try:
             # Проверка кэша в S3 (если доступен)
@@ -376,58 +436,88 @@ class GigaChatVisionAdapter:
                     raise Exception("Concurrent request limit exceeded")
             
             try:
-                # Context7: Загрузка файла в GigaChat с правильным filename
-                # Передаем mime_type для автоматической генерации filename с расширением
+                processed_content = file_content
+                upload_mime_type = mime_type
+
+                if should_preprocess and mime_type and mime_type.lower().startswith("image/"):
+                    try:
+                        processed_content, upload_mime_type = self._preprocess_image(
+                            file_content=file_content,
+                            mime_type=mime_type,
+                            tenant_id=tenant_id,
+                            post_sha=sha256,
+                            trace_id=trace_id,
+                            roi_crop_enabled=roi_enabled,
+                        )
+                    except Exception as preprocess_error:
+                        logger.warning(
+                            "Vision preprocessing failed, falling back to original image",
+                            error=str(preprocess_error),
+                            mime_type=mime_type,
+                            trace_id=trace_id,
+                        )
+
                 file_id = await self.upload_file(
-                    file_content=file_content,
-                    mime_type=mime_type
+                    file_content=processed_content,
+                    mime_type=upload_mime_type
                 )
-                
-                # Context7 best practice: Улучшенный промпт с явным запросом OCR
-                # Явно указываем, что OCR обязателен, если на изображении есть текст
+
+                # Context7 best practice: короткий промпт с обязательным OCR
                 if not analysis_prompt:
-                    analysis_prompt = """Проанализируй изображение или документ и предоставь структурированный JSON со следующей схемой:
+                    analysis_prompt = self.default_prompt
 
-{
-  "classification": "photo" | "meme" | "document" | "screenshot" | "infographic" | "other",
-  "description": "краткое текстовое описание содержимого (минимум 5 символов)",
-  "is_meme": true/false,
-  "labels": ["класс1", "класс2", ...],  // максимум 20 классов/атрибутов
-  "objects": ["объект1", "объект2", ...],  // максимум 10 объектов на изображении
-  "scene": "описание сцены/окружения" или null,
-  "ocr": {"text": "извлечённый текст из изображения", "engine": "gigachat", "confidence": 0.0-1.0} или null,
-  "nsfw_score": 0.0-1.0 или null,
-  "aesthetic_score": 0.0-1.0 или null,
-  "dominant_colors": ["#hex1", "#hex2", ...],  // максимум 5 цветов
-  "context": {"emotions": [...], "themes": [...], "relationships": [...]}
-}
+                messages_payload = [
+                    {
+                        "role": "user",
+                        "content": analysis_prompt
+                    }
+                ]
 
-ВАЖНО:
-- Если на изображении есть ЛЮБОЙ текст (надписи, подписи, текст в документе, скриншоты), ОБЯЗАТЕЛЬНО заполни поле "ocr" с извлечённым текстом
-- Если текста нет, установи "ocr": null
-- Поле "ocr.text" должно содержать ВЕСЬ видимый текст с изображения, включая мелкий текст
-- Не пропускай текст даже если он частично виден или размыт
+                if self.tokens_count_enabled:
+                    estimated_tokens = await self._estimate_tokens(
+                        messages_payload,
+                        tenant_id=tenant_id,
+                        trace_id=trace_id
+                    )
+                    if estimated_tokens is not None:
+                        vision_tokens_estimated_total.labels(
+                            provider="gigachat",
+                            tenant_id=tenant_id
+                        ).inc(estimated_tokens)
+                        logger.debug(
+                            "Vision tokens pre-count completed",
+                            sha256=sha256,
+                            tenant_id=tenant_id,
+                            estimated_tokens=estimated_tokens,
+                            trace_id=trace_id
+                        )
+                    else:
+                        logger.debug(
+                            "Vision tokens pre-count unavailable",
+                            sha256=sha256,
+                            tenant_id=tenant_id,
+                            trace_id=trace_id
+                        )
 
-Обязательные поля: classification, description, is_meme.
-Ответь ТОЛЬКО валидным JSON без дополнительного текста."""
-                
-                # Context7: Vision анализ через chat с attachments с circuit breaker защитой
                 client = self._get_client()
-                
+
                 async def _call_gigachat_api():
-                    """Внутренняя функция для вызова GigaChat API через circuit breaker."""
-                    return client.chat({
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": analysis_prompt,
-                            "attachments": [file_id]
-                        }
-                    ],
-                    "temperature": 0.1,
-                    "function_call": "auto"  # Для обработки файлов
-                })
-                
+                    """Вызов GigaChat API через circuit breaker с лимитом токенов."""
+                    payload = {
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": analysis_prompt,
+                                "attachments": [file_id],
+                            }
+                        ],
+                        "temperature": 0.1,
+                        "function_call": "auto",
+                    }
+                    if effective_max_tokens and effective_max_tokens > 0:
+                        payload["max_output_tokens"] = effective_max_tokens
+                    return client.chat(payload)
+
                 try:
                     response = await self.circuit_breaker.call_async(_call_gigachat_api)
                 except Exception as cb_error:
@@ -457,6 +547,18 @@ class GigaChatVisionAdapter:
                 # Парсинг ответа (упрощённый, реальный должен парсить JSON)
                 analysis_result = self._parse_vision_response(content, file_id)
                 
+                if estimated_tokens is not None:
+                    try:
+                        analysis_context = analysis_result.setdefault("context", {})
+                        analysis_context["tokens_estimated"] = estimated_tokens
+                    except Exception:
+                        logger.debug(
+                            "Failed to attach token estimate to analysis result",
+                            sha256=sha256,
+                            tenant_id=tenant_id,
+                            trace_id=trace_id
+                        )
+
                 # Context7: Логируем результат парсинга OCR для диагностики
                 has_ocr = bool(analysis_result.get("ocr") and analysis_result["ocr"].get("text"))
                 logger.debug(
@@ -469,7 +571,17 @@ class GigaChatVisionAdapter:
                 )
                 
                 # Учёт токенов
-                tokens_used = getattr(response.usage, 'total_tokens', 0) if hasattr(response, 'usage') else 0
+                usage_payload = None
+                if hasattr(response, 'usage'):
+                    try:
+                        usage_payload = response.usage.model_dump()  # type: ignore[attr-defined]
+                    except AttributeError:
+                        usage_payload = {
+                            "input_tokens": getattr(response.usage, 'input_tokens', None),
+                            "output_tokens": getattr(response.usage, 'output_tokens', None),
+                            "total_tokens": getattr(response.usage, 'total_tokens', None),
+                        }
+                tokens_used = usage_payload.get("total_tokens", 0) if isinstance(usage_payload, dict) else 0
                 if self.budget_gate and tokens_used > 0:
                     await self.budget_gate.record_token_usage(
                         tenant_id=tenant_id,
@@ -482,10 +594,13 @@ class GigaChatVisionAdapter:
                 if self.s3_service and cache_key:
                     try:
                         size_bytes = await self.s3_service.put_json(
-                        data=analysis_result,
-                        s3_key=cache_key,
-                        compress=True
-                    )
+                            data={
+                                **analysis_result,
+                                "usage": usage_payload,
+                            },
+                            s3_key=cache_key,
+                            compress=True,
+                        )
                         logger.debug(
                             "Vision result saved to S3 cache",
                             sha256=sha256,
@@ -493,6 +608,7 @@ class GigaChatVisionAdapter:
                             size_bytes=size_bytes,
                             has_ocr=bool(analysis_result.get("ocr") and analysis_result["ocr"].get("text")),
                             ocr_text_length=len(analysis_result.get("ocr", {}).get("text", "")) if analysis_result.get("ocr") else 0,
+                            usage=usage_payload,
                             trace_id=trace_id
                         )
                     except Exception as e:
@@ -562,6 +678,142 @@ class GigaChatVisionAdapter:
             )
             raise
     
+    def _preprocess_image(
+        self,
+        file_content: bytes,
+        mime_type: Optional[str],
+        tenant_id: str,
+        post_sha: str,
+        trace_id: str,
+        roi_crop_enabled: bool,
+    ) -> Tuple[bytes, str]:
+        if not mime_type or not mime_type.lower().startswith("image/"):
+            return file_content, mime_type or "application/octet-stream"
+
+        image = Image.open(io.BytesIO(file_content))
+        original_mode = image.mode
+        original_size = image.size
+
+        if self.preprocess_grayscale:
+            image = image.convert("L")
+        else:
+            image = image.convert("RGB")
+
+        if roi_crop_enabled:
+            image = self._crop_to_content(image, trace_id=trace_id, sha256=post_sha)
+
+        if self.preprocess_max_dim > 0:
+            max_dim = self.preprocess_max_dim
+            image.thumbnail((max_dim, max_dim), Image.LANCZOS)
+
+        if image.mode != "L":
+            image = image.convert("RGB")
+
+        buffer = io.BytesIO()
+        image.save(
+            buffer,
+            format="JPEG",
+            optimize=True,
+            quality=self.preprocess_quality,
+        )
+        processed_bytes = buffer.getvalue()
+
+        logger.debug(
+            "Vision image preprocessed",
+            tenant_id=tenant_id,
+            sha256=post_sha[:16] + "..." if post_sha else None,
+            trace_id=trace_id,
+            original_mode=original_mode,
+            original_size=list(original_size),
+            new_size=list(image.size),
+            grayscale=self.preprocess_grayscale,
+            bytes_before=len(file_content),
+            bytes_after=len(processed_bytes),
+        )
+
+        return processed_bytes, "image/jpeg"
+
+    def _crop_to_content(self, image: Image.Image, trace_id: str, sha256: Optional[str]) -> Image.Image:
+        bbox = image.getbbox()
+        if not bbox:
+            return image
+
+        cropped = image.crop(bbox)
+        if self.roi_max_dim > 0:
+            cropped.thumbnail((self.roi_max_dim, self.roi_max_dim), Image.LANCZOS)
+
+        logger.debug(
+            "Vision ROI crop applied",
+            trace_id=trace_id,
+            sha256=sha256[:16] + "..." if sha256 else None,
+            bbox=list(bbox),
+            original_size=list(image.size),
+            cropped_size=list(cropped.size),
+        )
+        return cropped
+
+    async def _estimate_tokens(
+        self,
+        messages: List[Dict[str, Any]],
+        tenant_id: str,
+        trace_id: str
+    ) -> Optional[int]:
+        if not self.tokens_count_enabled or not self._tokens_count_supported:
+            return None
+
+        client = self._get_client()
+
+        if not hasattr(client, "tokens_count"):
+            logger.debug(
+                "GigaChat client does not support tokens_count, disabling",
+                tenant_id=tenant_id,
+                trace_id=trace_id
+            )
+            self._tokens_count_supported = False
+            return None
+
+        request_payload = {
+            "model": self.model,
+            "messages": messages
+        }
+
+        async def _call_tokens_count():
+            return client.tokens_count(request_payload)
+
+        try:
+            response = await self.circuit_breaker.call_async(_call_tokens_count)
+        except Exception as exc:
+            logger.debug(
+                "tokens_count request failed",
+                tenant_id=tenant_id,
+                trace_id=trace_id,
+                error=str(exc)
+            )
+            return None
+
+        if not response:
+            return None
+
+        tokens_total = None
+        if isinstance(response, dict):
+            tokens_total = response.get("total_tokens") or response.get("tokens")
+        else:
+            tokens_total = getattr(response, "total_tokens", None)
+
+        try:
+            if tokens_total is not None:
+                return int(tokens_total)
+        except (TypeError, ValueError):
+            pass
+
+        logger.debug(
+            "tokens_count response missing total_tokens",
+            tenant_id=tenant_id,
+            trace_id=trace_id,
+            response=str(response)
+        )
+        return None
+
     def _parse_vision_response(self, content: str, file_id: str) -> Dict[str, Any]:
         """
         Парсинг ответа от GigaChat Vision API с жёстким structured-output.

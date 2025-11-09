@@ -8,7 +8,8 @@ import structlog
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from models.database import get_db, User
-from services.rag_service import get_rag_service, RAGResult, RAGSource
+from api.services.rag_service import get_rag_service, RAGResult, RAGSource
+from api.services.enrichment_trigger_service import update_triggers_from_dialog
 from fastapi import Request
 
 logger = structlog.get_logger()
@@ -87,6 +88,17 @@ async def rag_query(query_data: RAGQuery, request: Request, db: Session = Depend
         sources_count=len(result.sources),
         processing_time_ms=result.processing_time_ms
     )
+
+    try:
+        update_triggers_from_dialog(db, user, query_data.query, result.intent)
+        db.commit()
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        logger.warning(
+            "Failed to update crawl triggers from dialog",
+            user_id=str(query_data.user_id),
+            error=str(exc)
+        )
     
     return RAGResponse(
         query=query_data.query,
@@ -110,7 +122,7 @@ async def get_rag_status(user_id: UUID, request: Request, db: Session = Depends(
     tenant_id = getattr(request.state, 'tenant_id', None) or str(user.tenant_id)
     
     try:
-        from services.rag_service import get_rag_service
+        from api.services.rag_service import get_rag_service
         
         rag_service = get_rag_service()
         

@@ -41,3 +41,7 @@ simhash>=2.1.2
 
 # Markdown parsing
 mistune>=3.0.0
+
+# Testing
+pytest>=7.4.0,<8.0.0
+pytest-asyncio>=0.21.0,<0.22.0

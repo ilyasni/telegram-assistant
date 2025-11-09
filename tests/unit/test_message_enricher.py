@@ -9,13 +9,7 @@ from unittest.mock import MagicMock
 from datetime import datetime, timezone
 
 # Импорт тестируемых функций
-import sys
-import os
-shared_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'telethon-ingest'))
-if shared_path not in sys.path:
-    sys.path.insert(0, shared_path)
-
-from services.message_enricher import (
+from telethon_ingest.services.message_enricher import (
     extract_forwards_details,
     extract_reactions_details,
     extract_replies_details
@@ -90,16 +84,21 @@ def test_extract_reactions_details_custom_emoji():
     """Проверка извлечения custom emoji реакции."""
     message = MagicMock()
     message.reactions = MagicMock()
-    
-    reaction_result = MagicMock()
-    reaction_result.chosen = True
-    reaction_result.reaction = MagicMock()
-    reaction_result.reaction.document_id = 98765
-    
-    message.reactions.results = [reaction_result]
-    
+
+    class Reaction:
+        def __init__(self):
+            self.document_id = 98765
+
+    class ReactionResult:
+        def __init__(self):
+            self.chosen = True
+            self.reaction = Reaction()
+            self.peer_id = None
+
+    message.reactions.results = [ReactionResult()]
+
     reactions = extract_reactions_details(message)
-    
+
     assert len(reactions) == 1
     assert reactions[0]['reaction_type'] == 'custom_emoji'
     assert reactions[0]['reaction_value'] == "98765"
@@ -149,12 +148,16 @@ def test_extract_replies_details_user_reply():
     message = MagicMock()
     message.reply_to = MagicMock()
     message.reply_to.reply_to_msg_id = 33333
-    message.reply_to.reply_to_peer_id = MagicMock()
-    message.reply_to.reply_to_peer_id.user_id = 44444
-    
+
+    class PeerUser:
+        def __init__(self, user_id: int):
+            self.user_id = user_id
+
+    message.reply_to.reply_to_peer_id = PeerUser(user_id=44444)
+
     post_id = "test-post-id-456"
     replies = extract_replies_details(message, post_id)
-    
+
     assert len(replies) == 1
     assert replies[0]['reply_author_tg_id'] == 44444
 

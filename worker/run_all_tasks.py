@@ -7,6 +7,9 @@ import asyncio
 import sys
 import os
 import logging
+from pathlib import Path
+
+import yaml
 
 # Добавляем текущую директорию в путь
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -27,6 +30,12 @@ from tasks.crawl_trigger_task import CrawlTriggerTask
 from tasks.post_persistence_task import PostPersistenceWorker
 from tasks.retagging_task import RetaggingTask
 from tasks.album_assembler_task import AlbumAssemblerTask
+from tasks.digest_worker import (
+    create_digest_worker_task,
+    digest_jobs_processed_total,
+    digest_worker_generation_seconds,
+    digest_worker_send_seconds,
+)
 from run_all_tasks_vision_helper import get_s3_config_from_env, get_vision_config_from_env
 
 async def create_tagging_task():
@@ -63,16 +72,62 @@ async def create_tag_persistence_task():
 async def create_crawl_trigger_task():
     """Создание и запуск crawl trigger task."""
     redis_url = os.getenv("REDIS_URL", "redis://redis:6379")
-    
-    # Триггерные теги из конфигурации
-    trigger_tags = [
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres")
+
+    default_trigger_tags = [
         'longread', 'research', 'paper', 'release', 'law',
         'deepdive', 'analysis', 'report', 'study', 'whitepaper'
     ]
+    trigger_tags = default_trigger_tags
+
+    config_env_path = os.getenv("ENRICHMENT_CONFIG_PATH", "/app/config/enrichment_policy.yml")
+    candidate_paths = [
+        Path(config_env_path),
+        Path(__file__).resolve().parent / "config" / "enrichment_policy.yml",
+        Path(__file__).resolve().parent.parent / "config" / "enrichment_policy.yml",
+    ]
+
+    for path in candidate_paths:
+        if not path:
+            continue
+        if not path.is_absolute():
+            path = (Path(__file__).resolve().parent / path).resolve()
+        if not path.exists():
+            continue
+        try:
+            with path.open("r", encoding="utf-8") as cfg:
+                config = yaml.safe_load(cfg) or {}
+                loaded_tags = config.get("crawl4ai", {}).get("trigger_tags")
+                if isinstance(loaded_tags, list) and loaded_tags:
+                    trigger_tags = [str(tag).strip() for tag in loaded_tags if str(tag).strip()]
+                    trigger_tags = list(dict.fromkeys(trigger_tags))
+                    logger.info(
+                        "Crawl trigger tags loaded from config",
+                        path=str(path),
+                        tags_count=len(trigger_tags)
+                    )
+                else:
+                    logger.debug(
+                        "Crawl trigger tags list empty in config, using defaults",
+                        path=str(path)
+                    )
+            break
+        except Exception as config_error:
+            logger.warning(
+                "Failed to load crawl trigger tags",
+                path=str(path),
+                error=str(config_error)
+            )
+    else:
+        logger.debug(
+            "Using default crawl trigger tags",
+            tags_count=len(trigger_tags)
+        )
     
     task = CrawlTriggerTask(
         redis_url=redis_url,
-        trigger_tags=trigger_tags
+        trigger_tags=trigger_tags,
+        db_dsn=database_url
     )
     await task.start()
 
@@ -281,6 +336,14 @@ async def main():
                 posts_in_queue_total.labels(queue=stream_name, status='new').set(0)
                 stream_pending_size.labels(stream=stream_name).set(0)
         
+        # Инициализация метрик digest worker
+        for stage in ["generate", "send"]:
+            for status in ["success", "failed"]:
+                digest_jobs_processed_total.labels(stage=stage, status=status).inc(0)
+        for status in ["success", "failed"]:
+            digest_worker_generation_seconds.labels(status=status).observe(0)
+            digest_worker_send_seconds.labels(status=status).observe(0)
+
         logger.info("Metrics initialized with zero values")
     except Exception as e:
         logger.warning(f"Failed to initialize metrics: {e}", error=str(e))
@@ -383,6 +446,15 @@ async def main():
     supervisor.register_task(TaskConfig(
         name="album_assembler",
         task_func=create_album_assembler_task,
+        max_retries=5,
+        initial_backoff=1.0,
+        max_backoff=60.0,
+        backoff_multiplier=2.0
+    ))
+    
+    supervisor.register_task(TaskConfig(
+        name="digest_worker",
+        task_func=create_digest_worker_task,
         max_retries=5,
         initial_backoff=1.0,
         max_backoff=60.0,

@@ -66,9 +66,15 @@ def get_vision_config_from_env() -> Dict[str, Any]:
         "max_concurrent": int(os.getenv("GIGACHAT_MAX_CONCURRENT_REQUESTS", "3")),
         "policy_config_path": os.getenv("VISION_POLICY_CONFIG_PATH", "/app/config/vision_policy.yml"),
         "ocr_fallback_enabled": os.getenv("VISION_OCR_FALLBACK_ENABLED", "true").lower() == "true",
-        "ocr_engine": os.getenv("VISION_OCR_ENGINE", "tesseract"),
+        "ocr_engine": os.getenv("VISION_OCR_ENGINE", "paddle"),
         "ocr_languages": os.getenv("VISION_OCR_LANGUAGES", "rus+eng"),
-        "dlq_enabled": os.getenv("VISION_DLQ_ENABLED", "true").lower() == "true"
+        "paddle_endpoint": os.getenv("LOCAL_OCR_ENDPOINT", "http://paddleocr:8008/v1/ocr"),
+        "paddle_timeout": float(os.getenv("LOCAL_OCR_TIMEOUT", "8.0")),
+        "openrouter_model": os.getenv("OPENROUTER_VISION_MODEL", "qwen/qwen2.5-vl-32b-instruct:free"),
+        "local_ocr_primary_enabled": os.getenv("VISION_LOCAL_OCR_PRIMARY_ENABLED", "true").lower() == "true",
+        "dlq_enabled": os.getenv("VISION_DLQ_ENABLED", "true").lower() == "true",
+        "roi_crop_enabled": os.getenv("VISION_ROI_CROP_ENABLED", "false").lower() == "true",
+        "low_priority_queue_enabled": os.getenv("VISION_LOW_PRIORITY_QUEUE_ENABLED", "false").lower() == "true"
     }
     
     return vision_config

@@ -19,7 +19,7 @@ from langchain_core.runnables import RunnableParallel
 from pydantic import BaseModel
 
 from models.database import Post, PostEnrichment, Channel, TrendDetection
-from services.rag_service import RAGService  # Для генерации embedding
+from api.services.rag_service import RAGService  # Для генерации embedding
 from services.graph_service import get_graph_service
 from config import settings
 
@@ -406,7 +406,6 @@ class TrendDetectionService:
                 )
                 
                 # Генерируем embedding для тренда
-                from services.rag_service import RAGService
                 rag_service = RAGService(self.qdrant_url, self.qdrant_client)
                 embedding = await rag_service._generate_embedding(candidate.keyword)
                 if embedding:

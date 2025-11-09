@@ -9,7 +9,7 @@ import logging
 import time
 import uuid
 from typing import Dict, List, Optional, Any, AsyncGenerator
-from datetime import datetime, timezone
+from datetime import datetime, date, timezone
 from dataclasses import dataclass
 import os
 
@@ -93,6 +93,8 @@ STREAMS = {
     # Context7: Album стримы (Phase 2)
     'albums.parsed': 'stream:albums:parsed',
     'album.assembled': 'stream:album:assembled',
+    # Context7: Digest generation pipeline
+    'digests.generate': 'stream:digests:generate',
     # DLQ алиасы
     'posts.parsed.dlq': 'stream:posts:parsed:dlq',
     'posts.tagged.dlq': 'stream:posts:tagged:dlq',
@@ -103,6 +105,7 @@ STREAMS = {
     'posts.vision.analyzed.dlq': 'stream:posts:vision:analyzed:dlq',
     'albums.parsed.dlq': 'stream:albums:parsed:dlq',
     'album.assembled.dlq': 'stream:album:assembled:dlq',
+    'digests.generate.dlq': 'stream:digests:generate:dlq',
 }
 
 # DLQ стримы (legacy, для обратной совместимости)
@@ -117,6 +120,7 @@ DLQ_STREAMS = {
     # Context7: DLQ для альбомов (Phase 2)
     'albums.parsed': 'stream:albums:parsed:dlq',
     'album.assembled': 'stream:album:assembled:dlq',
+    'digests.generate': 'stream:digests:generate:dlq',
 }
 
 # ============================================================================
@@ -177,6 +181,16 @@ class PostDeletedEvent(BaseEvent):
     reason: str  # ttl | user | admin
     qdrant_cleaned: bool = False
     neo4j_cleaned: bool = False
+
+
+class DigestGenerateEvent(BaseEvent):
+    """Событие: запрос генерации дайджеста."""
+    user_id: str
+    tenant_id: str
+    digest_date: date
+    trigger: str = "scheduler"
+    history_id: Optional[str] = None
+    requested_by: Optional[str] = None
 
 # ============================================================================
 # REDIS STREAMS CLIENT

@@ -78,6 +78,15 @@ indexing_autoclaim_messages_total = Counter(
 )
 
 
+class TenantResolutionError(ValueError):
+    """Ошибка разрешения tenant_id для поста при индексации."""
+    pass
+
+
+class ChannelIsolationError(ValueError):
+    """Ошибка соответствия канала целевому арендатору."""
+    pass
+
 class IndexingTask:
     """
     Consumer для обработки posts.enriched событий.
@@ -629,11 +638,30 @@ class IndexingTask:
                              error=error_str)
                 raise  # Пробрасываем для предотвращения ACK в EventConsumer
             else:
-                # Non-retryable ошибки - не пробрасываем, EventConsumer ACK'ит и отправляет в DLQ
+                # Non-retryable ошибки - не пробрасываем, сообщение ACK'ится и вручную отправляется в DLQ
                 logger.error("Non-retryable error, message will be ACKed and sent to DLQ",
                            post_id=post_id,
                            error_category=error_category.value,
                            error=error_str)
+                if self.publisher:
+                    try:
+                        await self.publisher.to_dlq(
+                            "posts.indexed",
+                            {
+                                "post_id": post_id,
+                                "channel_id": post_data.get('channel_id'),
+                                "tenant_id": post_data.get('tenant_id'),
+                                "error_type": error_type,
+                            },
+                            reason=error_category.value,
+                            details=error_str
+                        )
+                    except Exception as dlq_publish_error:
+                        logger.warning(
+                            "Failed to publish indexing error to DLQ",
+                            post_id=post_id,
+                            dlq_error=str(dlq_publish_error)
+                        )
                 # Не пробрасываем исключение - EventConsumer обработает через _handle_failed_message
     
     async def _get_post_data(self, post_id: str) -> Optional[Dict[str, Any]]:
@@ -873,37 +901,63 @@ class IndexingTask:
             tenant_id = post_data.get('tenant_id')
             
             # Context7: Если tenant_id из post_data это 'default' или None, пытаемся получить из event_data
-            if not tenant_id or tenant_id == 'default':
+            if not tenant_id or str(tenant_id).lower() in ('default', 'none'):
                 # Приоритет 1: tenant_id из event_data (если передан)
-                if event_data and event_data.get('tenant_id') and event_data.get('tenant_id') != 'default':
-                    tenant_id = event_data.get('tenant_id')
-                    logger.debug(
-                        "Using tenant_id from event_data in _index_to_qdrant",
-                        post_id=post_id,
-                        tenant_id=tenant_id
-                    )
-                else:
-                    # Приоритет 2: запрос к БД
-                    tenant_id = await self._get_tenant_id_from_post(post_id)
+                if event_data:
+                    event_tenant = event_data.get('tenant_id')
+                    if event_tenant and str(event_tenant).lower() not in ('default', 'none'):
+                        tenant_id = event_tenant
+                        logger.debug(
+                            "Using tenant_id from event_data in _index_to_qdrant",
+                            post_id=post_id,
+                            tenant_id=tenant_id
+                        )
+                        # Обновляем post_data для дальнейших шагов
+                        post_data['tenant_id'] = tenant_id
+                # Приоритет 2: запрос к БД
+                if not tenant_id or str(tenant_id).lower() in ('default', 'none'):
+                    tenant_id_db = await self._get_tenant_id_from_post(post_id)
+                    if tenant_id_db:
+                        tenant_id = tenant_id_db
+                        post_data['tenant_id'] = tenant_id
             
-            # Context7: Если всё ещё не найден, используем fallback на 'default', но логируем предупреждение
-            if not tenant_id or tenant_id == 'default':
-                logger.warning(
-                    "tenant_id not found or is 'default', using 'default' for indexing",
+            tenant_id_str = str(tenant_id) if tenant_id else ""
+            if not tenant_id_str or tenant_id_str.lower() in ('default', 'none'):
+                logger.error(
+                    "Tenant id unresolved for indexing",
                     post_id=post_id,
-                    tenant_id_from_post_data=post_data.get('tenant_id'),
-                    tenant_id_from_event_data=event_data.get('tenant_id') if event_data else None,
+                    original_tenant=post_data.get('tenant_id'),
+                    event_tenant=event_data.get('tenant_id') if event_data else None,
                     channel_id=post_data.get('channel_id')
                 )
-                tenant_id = tenant_id or 'default'
-                # Context7: НЕ выбрасываем исключение, чтобы не прерывать индексацию
-                # Но логируем для диагностики
+                raise TenantResolutionError(f"tenant_id unresolved for post {post_id}")
+            
+            tenant_id = tenant_id_str
+            post_data['tenant_id'] = tenant_id
+            
+            channel_id = post_data.get('channel_id')
+            if not channel_id:
+                logger.error(
+                    "Channel id missing in post data during indexing",
+                    post_id=post_id,
+                    tenant_id=tenant_id
+                )
+                raise ChannelIsolationError(f"channel_id missing for post {post_id}")
+            channel_id_str = str(channel_id)
+            if not await self._channel_belongs_to_tenant(channel_id_str, tenant_id):
+                logger.error(
+                    "Channel does not belong to tenant",
+                    post_id=post_id,
+                    tenant_id=tenant_id,
+                    channel_id=channel_id_str
+                )
+                raise ChannelIsolationError(f"Channel {channel_id_str} is not linked to tenant {tenant_id}")
             
             # Базовый payload с tenant_id для фильтрации
             payload = {
                 "post_id": post_id,
                 "tenant_id": str(tenant_id),  # Context7: обязательное поле для multi-tenant изоляции
-                "channel_id": post_data.get('channel_id'),
+                "channel_id": channel_id_str,
                 "text_short": post_data.get('text', '')[:500],  # Превью для быстрого доступа
                 "telegram_message_id": post_data.get('telegram_message_id'),
                 "created_at": post_data.get('created_at').isoformat() if post_data.get('created_at') else None
@@ -1139,11 +1193,17 @@ class IndexingTask:
                     {"post_id": post_id}
                 )
                 row = result.fetchone()
-                if row and row[0]:
-                    tenant_id_value = str(row[0])
-                    # Context7: Возвращаем значение, даже если 'default' (для единообразия)
-                    # Вызывающий код должен проверять и использовать fallback
-                    return tenant_id_value
+                if row:
+                    tenant_id_value = row[0]
+                    if tenant_id_value:
+                        tenant_id_str = str(tenant_id_value)
+                        if tenant_id_str.lower() not in ('default', 'none'):
+                            return tenant_id_str
+                        logger.warning(
+                            "Resolved tenant_id falls back to default placeholder",
+                            post_id=post_id,
+                            tenant_id=tenant_id_str
+                        )
         except Exception as e:
             logger.debug(
                 "Error getting tenant_id for post",
@@ -1151,6 +1211,44 @@ class IndexingTask:
                 error=str(e)
             )
         return None
+    
+    async def _channel_belongs_to_tenant(self, channel_id: str, tenant_id: str) -> bool:
+        """Проверяет, связан ли канал с указанным tenant."""
+        try:
+            from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+            from sqlalchemy import text
+            import os
+            
+            db_url = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@supabase-db:5432/postgres")
+            if db_url.startswith("postgresql://"):
+                db_url = db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+            
+            engine = create_async_engine(db_url)
+            async_session = async_sessionmaker(engine, expire_on_commit=False)
+            
+            async with async_session() as session:
+                result = await session.execute(
+                    text("""
+                        SELECT EXISTS (
+                            SELECT 1
+                            FROM user_channel uc
+                            JOIN users u ON u.id = uc.user_id
+                            WHERE uc.channel_id = :channel_id::uuid
+                              AND u.tenant_id::text = :tenant_id
+                        )
+                    """),
+                    {"channel_id": channel_id, "tenant_id": tenant_id}
+                )
+                row = result.scalar()
+                return bool(row)
+        except Exception as e:
+            logger.error(
+                "Failed to validate channel tenant mapping",
+                channel_id=channel_id,
+                tenant_id=tenant_id,
+                error=str(e)
+            )
+        return False
     
     async def _get_album_id_for_post(self, post_id: str) -> Optional[int]:
         """Получает album_id для поста из media_group_items."""
@@ -1289,7 +1387,8 @@ class IndexingTask:
                 channel_id=node_data['channel_id'],
                 expires_at=node_data['expires_at'],
                 enrichment_data=node_data.get('enrichment_data'),
-                indexed_at=node_data['indexed_at']
+                indexed_at=node_data['indexed_at'],
+                content=node_data.get('content')
             )
             
             # Context7: Создаём узел альбома и связи если пост из альбома

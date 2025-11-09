@@ -6,8 +6,11 @@ Crawl Trigger Task - Producer для posts.crawl
 """
 import asyncio
 import json
+import os
 import time
-from typing import Dict, Any, Optional
+from typing import Any, Dict, List, Optional
+
+import asyncpg
 import structlog
 from redis.asyncio import Redis
 from prometheus_client import Counter, Gauge, Histogram
@@ -42,6 +45,18 @@ crawl_trigger_policy_skips_total = Counter(
     ['reason']  # фиксированные: no_trigger_tags, no_urls
 )
 
+crawl_trigger_source_total = Counter(
+    'crawl_trigger_source_total',
+    'Trigger source usage',
+    ['source']  # personal, fallback, topics_payload, missing
+)
+
+crawl_trigger_cache_hits_total = Counter(
+    'crawl_trigger_cache_hits_total',
+    'Cache hits for user triggers',
+    ['status']  # hit, miss
+)
+
 class CrawlTriggerTask:
     """Producer для posts.crawl на основе триггерных тегов."""
     
@@ -49,23 +64,38 @@ class CrawlTriggerTask:
         self,
         redis_url: str,
         trigger_tags: list,
+        db_dsn: Optional[str] = None,
         consumer_group: str = "crawl_trigger_workers",
         consumer_name: str = "crawl_trigger_worker_1"
     ):
         self.redis_url = redis_url
+        self.db_dsn = db_dsn or os.getenv("DATABASE_URL", "postgresql://postgres:postgres@supabase-db:5432/postgres")
         self.trigger_tags = trigger_tags
         self.consumer_group = consumer_group
         self.consumer_name = consumer_name
         self.stream_in = "stream:posts:tagged"
         self.stream_out = "stream:posts:crawl"
         self.redis: Optional[Redis] = None
+        self.db_pool: Optional[asyncpg.Pool] = None
+        self._triggers_cache: Dict[str, tuple[float, List[str], str]] = {}
+        self._triggers_cache_ttl = int(os.getenv("CRAWL_TRIGGER_CACHE_TTL", "900"))
+        self._fallback_trigger_tags = [self._normalize_token(tag) for tag in trigger_tags if isinstance(tag, str)]
         
         logger.info("CrawlTriggerTask initialized",
-                   trigger_tags=trigger_tags)
+                   trigger_tags_count=len(self._fallback_trigger_tags))
     
     async def _initialize(self):
         """Инициализация."""
         self.redis = Redis.from_url(self.redis_url, decode_responses=True)
+        try:
+            self.db_pool = await asyncpg.create_pool(
+                self.db_dsn,
+                min_size=1,
+                max_size=5,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to initialize DB pool for CrawlTriggerTask", error=str(exc))
+            self.db_pool = None
         
         # Создание consumer group
         try:
@@ -141,14 +171,20 @@ class CrawlTriggerTask:
         
         post_id = payload.get('post_id')
         tags = payload.get('tags', [])
-        # Парсим tags если это строка JSON
         if isinstance(tags, str):
             try:
                 tags = json.loads(tags)
             except json.JSONDecodeError:
                 logger.warning("Failed to parse tags JSON", tags=tags)
                 tags = []
-        logger.debug("Extracted payload", post_id=post_id, tags=tags)
+        tags = [self._normalize_token(tag) for tag in tags if tag]
+
+        tenant_id = payload.get('tenant_id')
+        user_id = payload.get('user_id')
+        channel_id = payload.get('channel_id')
+        topics_payload = self._normalize_topics_payload(payload.get('topics'))
+
+        logger.debug("Extracted payload", post_id=post_id, tags=tags, user_id=user_id, tenant_id=tenant_id)
         urls = payload.get('urls', [])
         # Парсим urls если это строка JSON
         if isinstance(urls, str):
@@ -162,9 +198,11 @@ class CrawlTriggerTask:
         # Context7: Проверка trigger - обрабатываем все события, включая vision_retag
         trigger = payload.get('trigger')
         is_retagging = (trigger == "vision_retag")
-        
-        # Проверка триггерных тегов
-        has_trigger = any(tag in self.trigger_tags for tag in tags)
+
+        triggers, trigger_source = await self._resolve_triggers(user_id, tenant_id, topics_payload)
+        crawl_trigger_source_total.labels(source=trigger_source).inc()
+
+        has_trigger = any(tag in triggers for tag in tags)
         
         # Context7: Логируем если это retagging для observability
         if is_retagging:
@@ -181,14 +219,30 @@ class CrawlTriggerTask:
                 urls = [f"https://example.com/post/{post_id}"]
                 crawl_trigger_policy_skips_total.labels(reason='no_urls').inc()
             
-            # Публикация в posts.crawl
+            metadata = payload.get('metadata') or {}
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except json.JSONDecodeError:
+                    metadata = {}
+
+            metadata.update({
+                "tenant_id": tenant_id,
+                "user_id": user_id,
+                "channel_id": channel_id,
+                "event_topics": topics_payload,
+                "trigger_source": trigger_source,
+                "trigger_tags_used": triggers[:20],
+                "is_retagging": is_retagging,
+            })
+
             crawl_request = {
                 'post_id': post_id,
                 'urls': urls,
                 'tags': tags,
                 'trigger_reason': 'trigger_tag',
                 'trace_id': trace_id,
-                'metadata': payload.get('metadata', {})
+                'metadata': metadata
             }
             
             await self.redis.xadd(
@@ -209,3 +263,74 @@ class CrawlTriggerTask:
             if not urls:
                 crawl_trigger_policy_skips_total.labels(reason='no_urls').inc()
                 logger.debug("No URLs", post_id=post_id)
+
+    async def _resolve_triggers(
+        self,
+        user_id: Optional[str],
+        tenant_id: Optional[str],
+        topics_payload: List[str] | None,
+    ) -> tuple[List[str], str]:
+        """Получить список триггеров для пользователя с кэшированием."""
+        if not user_id or not self.db_pool:
+            source = "fallback_no_user" if not user_id else "fallback_no_db"
+            return list(self._fallback_trigger_tags), source
+
+        now = time.time()
+        cached = self._triggers_cache.get(user_id)
+        if cached and (now - cached[0]) < self._triggers_cache_ttl:
+            crawl_trigger_cache_hits_total.labels(status='hit').inc()
+            return cached[1], cached[2]
+
+        crawl_trigger_cache_hits_total.labels(status='miss').inc()
+
+        triggers: List[str] = []
+        source = "fallback"
+
+        try:
+            async with self.db_pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT triggers FROM user_crawl_triggers WHERE user_id = $1",
+                    user_id,
+                )
+                if row and row.get("triggers"):
+                    triggers = self._normalize_topics_payload(row.get("triggers"))
+                    source = "personal"
+                elif topics_payload:
+                    triggers = topics_payload
+                    source = "topics_payload"
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to fetch personal triggers",
+                user_id=user_id,
+                tenant_id=tenant_id,
+                error=str(exc)
+            )
+
+        if not triggers:
+            triggers = list(self._fallback_trigger_tags)
+            if source == "personal":
+                source = "fallback"
+
+        self._triggers_cache[user_id] = (now, triggers, source)
+        return triggers, source
+
+    @staticmethod
+    def _normalize_topics_payload(value: Any) -> List[str]:
+        if not value:
+            return []
+        if isinstance(value, list):
+            return [CrawlTriggerTask._normalize_token(item) for item in value if item]
+        if isinstance(value, str):
+            try:
+                decoded = json.loads(value)
+                if isinstance(decoded, list):
+                    return [CrawlTriggerTask._normalize_token(item) for item in decoded if item]
+            except json.JSONDecodeError:
+                return [CrawlTriggerTask._normalize_token(value)]
+        return []
+
+    @staticmethod
+    def _normalize_token(value: Any) -> str:
+        if value is None:
+            return ""
+        return str(value).strip().lower()

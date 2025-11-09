@@ -34,10 +34,28 @@ routing:
 
 # Fallback стратегии
 fallback:
-  ocr_engine: "openrouter"  # openrouter | tesseract | rapidocr
+  ocr_engine: "paddle"  # paddle | openrouter | tesseract | rapidocr
   openrouter_model: "qwen/qwen2.5-vl-32b-instruct:free"  # Модель для OpenRouter Vision
   classification_model: "zero-shot-local"  # Лёгкий классификатор (не используется для OpenRouter)
   
+# Prompt presets (Context7)
+prompt_presets:
+  default_key: default
+  templates:
+    default: "Верни JSON {\"classification\": \"photo|meme|document|screenshot|infographic|other\", \"description\": \"<=160 симв.\", \"is_meme\": bool, \"labels\": [], \"objects\": [], \"ocr\": {\"text\": \"...\", \"engine\": \"gigachat\"} или null}. Если есть текст — заполни ocr.text. Без пояснений."
+    document: "Документ: JSON как в default. classification='document'. Укажи ключевые разделы, обязательный OCR текст."
+    screenshot: "Скриншот: JSON как в default. classification='screenshot'. Опиши основные элементы интерфейса, OCR обязателен."
+    photo: "Фото/инфографика: JSON как в default. classification='photo'. Сделай короткое описание сцены, добавь текст если есть."
+  mime_mapping:
+    application/pdf: document
+    application/msword: document
+    application/vnd.openxmlformats-officedocument.wordprocessingml.document: document
+    image/png: screenshot
+    image/jpeg: photo
+    image/jpg: photo
+    image/webp: photo
+    image/bmp: photo
+
 # Allowed MIME types для GigaChat Vision
 allowed_mime_types:
   images:

@@ -439,19 +439,37 @@ async def callback_digest_generate(callback: CallbackQuery):
             
             if r.status_code == 200:
                 result = r.json()
-                content = result.get("content", "")
+                content = result.get("content")
                 posts_count = result.get("posts_count", 0)
                 topics = result.get("topics", [])
+                status = result.get("status")
+                digest_id = result.get("digest_id")
+
+                if not content:
+                    queued_at = result.get("queued_at")
+                    queued_message = (
+                        "🕒 <b>Дайджест поставлен в очередь</b>\n\n"
+                        f"ID: <code>{digest_id}</code>\n"
+                        f"Статус: <b>{status or 'scheduled'}</b>\n"
+                    )
+                    if queued_at:
+                        queued_message += f"Поставлен: {queued_at}\n"
+                    queued_message += "\nМы пришлём готовый дайджест отдельным сообщением."
+                    await callback.message.answer(queued_message, parse_mode="HTML")
+                    await callback.answer("✅ Дайджест поставлен в очередь")
+                    return
                 
-                # Импортируем функцию конвертации
                 from utils.telegram_formatter import markdown_to_telegram_chunks
-                
-                # Конвертируем markdown в Telegram HTML и разбиваем на чанки
                 chunks = markdown_to_telegram_chunks(content)
                 
-                # Отправляем чанки
                 for idx, chunk in enumerate(chunks):
-                    prefix = f"📰 <b>Дайджест готов!</b>\n\n📊 Постов: {posts_count}\n📝 Темы: {', '.join(topics[:5])}\n\n" if idx == 0 else ""
+                    prefix = (
+                        f"📰 <b>Дайджест готов!</b>\n\n"
+                        f"📊 Постов: {posts_count}\n"
+                        f"📝 Темы: {', '.join(topics[:5])}\n\n"
+                        if idx == 0
+                        else ""
+                    )
                     await callback.message.answer(prefix + chunk, parse_mode="HTML")
                 
                 await callback.answer("✅ Дайджест сгенерирован")

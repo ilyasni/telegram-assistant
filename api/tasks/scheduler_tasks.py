@@ -4,25 +4,37 @@ Context7: Используем APScheduler для планирования за�
 """
 
 import asyncio
-from datetime import datetime, time, timezone
-from typing import List
+from datetime import datetime, date, time, timezone
+from typing import List, Optional
 import structlog
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from prometheus_client import Counter
 from sqlalchemy.orm import Session
 
 from models.database import get_db, DigestSettings, User, TrendDetection, DigestHistory, UserInterest
 from sqlalchemy import and_
-from services.digest_service import get_digest_service
 from services.trend_detection_service import get_trend_detection_service
 from services.user_interest_service import get_user_interest_service
 from services.graph_service import get_graph_service
 from config import settings
+from middleware.rls_middleware import set_tenant_id_in_session
+from worker.event_bus import EventPublisher, RedisStreamsClient, DigestGenerateEvent
+from uuid import UUID
 
 logger = structlog.get_logger()
 
+digest_retry_total = Counter(
+    'digest_retry_total',
+    'Количество повторных попыток отправки дайджеста',
+    ['tenant_id']
+)
+
 # Глобальный scheduler
 scheduler: AsyncIOScheduler = None
+
+_digest_event_publisher: Optional[EventPublisher] = None
+_digest_publisher_lock: asyncio.Lock = asyncio.Lock()
 
 
 def init_scheduler():
@@ -34,109 +46,169 @@ def init_scheduler():
     return scheduler
 
 
-async def generate_digest_for_user(user_id: str, tenant_id: str, db: Session):
-    """Генерация дайджеста для конкретного пользователя."""
+async def _get_digest_event_publisher() -> EventPublisher:
+    """
+    Ленивое создание публикатора событий для очереди дайджестов.
+    
+    Context7: один экземпляр на процесс, защищённый asyncio.Lock.
+    """
+    global _digest_event_publisher
+    if _digest_event_publisher is not None:
+        return _digest_event_publisher
+    
+    async with _digest_publisher_lock:
+        if _digest_event_publisher is None:
+            redis_url = getattr(settings, "redis_url", "redis://redis:6379")
+            client = RedisStreamsClient(redis_url)
+            await client.connect()
+            _digest_event_publisher = EventPublisher(client)
+            logger.info("Digest event publisher initialized", redis_url=redis_url)
+    return _digest_event_publisher
+
+
+async def generate_digest_for_user(
+    user_id: str,
+    tenant_id: str,
+    topics: List[str],
+    db: Session,
+    trigger: str = "scheduler",
+    requested_by: Optional[str] = None
+) -> Optional[DigestHistory]:
+    """
+    Планирует генерацию дайджеста для конкретного пользователя через очередь.
+    
+    Context7: fail-fast при отсутствии tenant_id или тем.
+    """
+    if not tenant_id:
+        logger.warning("Cannot enqueue digest without tenant_id", user_id=user_id)
+        return None
+    
+    if not topics:
+        logger.debug("Skipping digest enqueue for user without topics", user_id=user_id)
+        return None
+    
     try:
-        from uuid import UUID
-        from services.digest_service import get_digest_service
+        if settings.feature_rls_enabled:
+            set_tenant_id_in_session(db, tenant_id)
         
-        digest_service = get_digest_service()
-        digest_content = await digest_service.generate(
-            user_id=UUID(user_id),
+        today = date.today()
+        user_uuid = UUID(user_id)
+        tenant_uuid = UUID(tenant_id)
+        
+        existing = db.query(DigestHistory).filter(
+            and_(
+                DigestHistory.user_id == user_uuid,
+                DigestHistory.digest_date == today
+            )
+        ).order_by(DigestHistory.created_at.desc()).first()
+        
+        force_new = trigger == "manual"
+
+        if existing:
+            if existing.status in {"scheduled", "pending", "processing"}:
+                if force_new:
+                    logger.warning(
+                        "Manual trigger overriding in-flight digest",
+                        user_id=user_id,
+                        digest_id=str(existing.id),
+                        status=existing.status,
+                    )
+                    existing.status = "failed"
+                    existing.sent_at = None
+                    db.commit()
+                    existing = None
+                else:
+                    logger.debug(
+                        "Digest already scheduled or in progress",
+                        user_id=user_id,
+                        digest_id=str(existing.id),
+                        status=existing.status
+                    )
+                    return existing
+
+            if existing and existing.status == "sent":
+                if not force_new:
+                    logger.debug(
+                        "Digest already sent for today, returning existing",
+                        user_id=user_id,
+                        digest_id=str(existing.id),
+                    )
+                    return existing
+                else:
+                    logger.info(
+                        "Manual trigger: creating fresh digest despite existing sent record",
+                        user_id=user_id,
+                        previous_digest_id=str(existing.id),
+                    )
+                    existing = None
+        
+        if existing and existing.status == "failed":
+            digest_history = existing
+            digest_history.status = "pending"
+            digest_history.content = digest_history.content or ""
+            digest_history.posts_count = digest_history.posts_count or 0
+            digest_history.topics = topics
+            digest_history.tenant_id = tenant_uuid
+            db.commit()
+            db.refresh(digest_history)
+            logger.info(
+                "Re-scheduling failed digest",
+                user_id=user_id,
+                digest_id=str(digest_history.id)
+            )
+        else:
+            digest_history = DigestHistory(
+                user_id=user_uuid,
+                tenant_id=tenant_uuid,
+                digest_date=today,
+                content="",
+                posts_count=0,
+                topics=topics,
+                status="pending"
+            )
+            db.add(digest_history)
+            db.commit()
+            db.refresh(digest_history)
+            logger.info(
+                "Digest placeholder created",
+                user_id=user_id,
+                digest_id=str(digest_history.id)
+            )
+        
+        event = DigestGenerateEvent(
+            idempotency_key=f"digest:{user_id}:{today.isoformat()}",
+            user_id=user_id,
             tenant_id=tenant_id,
-            db=db
+            digest_date=today,
+            history_id=str(digest_history.id),
+            trigger=trigger,
+            requested_by=requested_by
         )
         
-        # Сохраняем в историю
-        from datetime import date
-        digest_history = DigestHistory(
-            user_id=UUID(user_id),
-            digest_date=date.today(),
-            content=digest_content.content,
-            posts_count=digest_content.posts_count,
-            topics=digest_content.topics,
-            status="pending"
-        )
-        db.add(digest_history)
+        publisher = await _get_digest_event_publisher()
+        await publisher.publish_event("digests.generate", event)
+        
+        digest_history.status = "pending"
+        digest_history.topics = topics
         db.commit()
         
         logger.info(
-            "Digest generated for user",
+            "Digest generation enqueued",
             user_id=user_id,
-            posts_count=digest_content.posts_count
+            tenant_id=tenant_id,
+            digest_id=str(digest_history.id),
+            trigger=trigger
         )
-        
-        # Отправка дайджеста пользователю через бота
-        try:
-            from models.database import User
-            from datetime import timezone
-            # Context7: Импортируем модуль для доступа к bot
-            import bot.webhook as webhook_module
-            bot = webhook_module.bot
-            
-            user = db.query(User).filter(User.id == UUID(user_id)).first()
-            
-            if user and user.telegram_id:
-                try:
-                    # Импортируем функцию конвертации
-                    from utils.telegram_formatter import markdown_to_telegram_chunks
-                    
-                    # Конвертируем markdown в Telegram HTML и разбиваем на чанки
-                    digest_chunks = markdown_to_telegram_chunks(digest_content.content)
-                    
-                    # Отправляем через бота
-                    if bot:
-                        for idx, chunk in enumerate(digest_chunks):
-                            prefix = f"📰 <b>Ваш дайджест за {digest_history.digest_date}</b>\n\n" if idx == 0 else ""
-                            suffix = f"\n\n📊 <i>Найдено постов: {digest_content.posts_count}</i>" if idx == len(digest_chunks) - 1 and digest_content.posts_count > 0 else ""
-                            
-                            await bot.send_message(
-                                chat_id=user.telegram_id,
-                                text=prefix + chunk + suffix,
-                                parse_mode="HTML"
-                            )
-                        
-                        # Обновляем статус
-                        digest_history.status = "sent"
-                        digest_history.sent_at = datetime.now(timezone.utc)
-                        db.commit()
-                        
-                        logger.info(
-                            "Digest sent to user",
-                            user_id=user_id,
-                            telegram_id=user.telegram_id,
-                            digest_id=str(digest_history.id)
-                        )
-                    else:
-                        logger.warning("Bot not initialized, cannot send digest", user_id=user_id)
-                        digest_history.status = "failed"
-                        db.commit()
-                except Exception as e:
-                    logger.error(
-                        "Error sending digest to user",
-                        user_id=user_id,
-                        telegram_id=user.telegram_id if user else None,
-                        error=str(e)
-                    )
-                    digest_history.status = "failed"
-                    db.commit()
-            else:
-                logger.warning(
-                    "User not found or has no telegram_id",
-                    user_id=user_id,
-                    has_user=bool(user),
-                    has_telegram_id=bool(user and user.telegram_id) if user else False
-                )
-                digest_history.status = "failed"
-                db.commit()
-        except Exception as e:
-            logger.error("Error in digest sending logic", user_id=user_id, error=str(e))
-            # Не меняем статус, если это ошибка в логике отправки
-        
-    except ValueError as e:
-        logger.warning("Cannot generate digest for user", user_id=user_id, error=str(e))
+        return digest_history
+    
     except Exception as e:
-        logger.error("Error generating digest", user_id=user_id, error=str(e))
+        logger.error(
+            "Error enqueueing digest generation",
+            user_id=user_id,
+            tenant_id=tenant_id,
+            error=str(e)
+        )
+        raise
 
 
 async def process_digests_task():
@@ -170,7 +242,17 @@ async def process_digests_task():
                 if not user:
                     continue
                 
+                if not user.tenant_id:
+                    logger.warning(
+                        "Skipping digest scheduling due to missing tenant_id",
+                        user_id=str(setting.user_id)
+                    )
+                    continue
+
                 tenant_id = str(user.tenant_id)
+                
+                if settings.feature_rls_enabled:
+                    set_tenant_id_in_session(db, tenant_id)
                 
                 # Вычисляем локальное время пользователя
                 user_tz = pytz_timezone(setting.schedule_tz)
@@ -197,11 +279,63 @@ async def process_digests_task():
                             DigestHistory.user_id == setting.user_id,
                             DigestHistory.digest_date == today
                         )
-                    ).first()
+                    ).order_by(DigestHistory.created_at.desc()).first()
+
+                    retry_cooldown = getattr(settings, "digest_retry_cooldown_min", 15)
                     
-                    if not existing:
+                    if existing:
+                        if existing.status == "sent":
+                            continue
+
+                        if existing.status in {"scheduled", "pending", "processing"}:
+                            logger.debug(
+                                "Digest already queued, skipping duplicate",
+                                user_id=str(setting.user_id),
+                                digest_id=str(existing.id),
+                                status=existing.status
+                            )
+                            continue
+
+                        if existing.created_at:
+                            created_at = existing.created_at
+                            if created_at.tzinfo is None:
+                                created_at = created_at.replace(tzinfo=timezone.utc)
+                            age_minutes = (current_utc - created_at).total_seconds() / 60.0
+                        else:
+                            age_minutes = float("inf")
+
+                        if age_minutes < retry_cooldown:
+                            logger.debug(
+                                "Skip digest retry due to cooldown",
+                                user_id=str(setting.user_id),
+                                status=existing.status,
+                                age_minutes=age_minutes
+                            )
+                            continue
+
+                        logger.info(
+                            "Re-enqueueing failed digest generation",
+                            user_id=str(setting.user_id),
+                            digest_id=str(existing.id),
+                            status=existing.status
+                        )
+                        digest_retry_total.labels(tenant_id=tenant_id).inc()
+                        await generate_digest_for_user(
+                            user_id=str(setting.user_id),
+                            tenant_id=tenant_id,
+                            topics=setting.topics,
+                            db=db,
+                            trigger="scheduler_retry"
+                        )
+                    else:
                         # Генерируем дайджест
-                        await generate_digest_for_user(str(setting.user_id), tenant_id, db)
+                        await generate_digest_for_user(
+                            user_id=str(setting.user_id),
+                            tenant_id=tenant_id,
+                            topics=setting.topics,
+                            db=db,
+                            trigger="scheduler"
+                        )
             
             except Exception as e:
                 logger.error("Error processing digest for user", user_id=str(setting.user_id), error=str(e))

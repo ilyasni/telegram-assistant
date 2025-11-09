@@ -100,6 +100,10 @@ class TaggingTask:
         self._cache_max_size = 10_000
         self._cache_ttl_sec = 24 * 3600  # 24 часа
         self._processed_counter = 0
+
+        # Кеш пользовательских тем для обогащения событий
+        self._topics_cache: dict[str, tuple[float, List[str]]] = {}
+        self._topics_cache_ttl = int(os.getenv("TAGGING_TOPICS_CACHE_TTL", "900"))
         
         logger.info(f"TaggingTask initialized (group={consumer_group}, consumer={consumer_name})")
     
@@ -380,6 +384,79 @@ class TaggingTask:
                 error=str(e)
             )
             return None
+
+    async def _get_user_topics(self, user_id: Optional[str]) -> List[str]:
+        """Получить активные темы пользователя для обогащения события."""
+        if not user_id:
+            return []
+
+        now = time.time()
+        cached = self._topics_cache.get(user_id)
+        if cached and (now - cached[0]) < self._topics_cache_ttl:
+            return cached[1]
+
+        topics: List[str] = []
+        try:
+            import asyncpg
+
+            db_url = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@supabase-db:5432/postgres")
+            conn = await asyncpg.connect(db_url)
+            try:
+                row = await conn.fetchrow(
+                    """
+                    SELECT base_topics, dialog_topics
+                    FROM user_crawl_triggers
+                    WHERE user_id = $1
+                    """,
+                    user_id,
+                )
+                if row:
+                    base_topics = row.get("base_topics")
+                    dialog_topics = row.get("dialog_topics")
+                    topics = self._normalize_topics_payload(base_topics) or []
+                    extra = self._normalize_topics_payload(dialog_topics)
+                    if extra:
+                        topics.extend(extra)
+                else:
+                    fallback = await conn.fetchrow(
+                        "SELECT topics FROM digest_settings WHERE user_id = $1",
+                        user_id,
+                    )
+                    if fallback:
+                        topics = self._normalize_topics_payload(fallback.get("topics"))
+            finally:
+                await conn.close()
+
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Failed to load user topics", user_id=user_id, error=str(exc))
+            topics = []
+
+        normalized = [topic for topic in (self._prepare_topic(t) for t in topics) if topic]
+        self._topics_cache[user_id] = (now, normalized)
+        return normalized
+
+    @staticmethod
+    def _normalize_topics_payload(value: Any) -> List[str]:
+        """Преобразовать json/jsonb payload в список строк."""
+        if not value:
+            return []
+        if isinstance(value, list):
+            return [str(item) for item in value if item]
+        if isinstance(value, str):
+            try:
+                decoded = json.loads(value)
+                if isinstance(decoded, list):
+                    return [str(item) for item in decoded if item]
+            except json.JSONDecodeError:
+                return [value]
+        return []
+
+    @staticmethod
+    def _prepare_topic(value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = str(value).strip()
+        return normalized or None
     
     async def _tag_post(self, parsed_event: PostParsedEventV1) -> Optional[Any]:
         """
@@ -470,14 +547,20 @@ class TaggingTask:
             if not tags_list:
                 metadata["reason"] = "no_tags"
 
+            topics = await self._get_user_topics(parsed_event.user_id)
+
             tagged_event = PostTaggedEventV1(
                 idempotency_key=f"{parsed_event.post_id}:tagged:v1",
                 post_id=parsed_event.post_id,
+                tenant_id=parsed_event.tenant_id,
+                user_id=parsed_event.user_id,
+                channel_id=parsed_event.channel_id,
                 tags=tags_list,
                 tags_hash=PostTaggedEventV1.compute_hash(tags_list),
                 provider="gigachat",
                 latency_ms=int(processing_time * 1000),
-                metadata=metadata
+                metadata=metadata,
+                topics=topics
             )
             
             # Публикация в Redis Streams

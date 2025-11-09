@@ -354,7 +354,11 @@ class TagPersistenceTask:
             metadata={
                 "provider": event.provider,
                 "latency_ms": event.latency_ms,
-                **(event.metadata or {})
+                **(event.metadata or {}),
+                "tenant_id": event.tenant_id,
+                "user_id": event.user_id,
+                "channel_id": event.channel_id,
+                "topics": event.topics or []
             }
         )
         

@@ -4,11 +4,13 @@ Context7: сбор контента ТОЛЬКО по пользовательс
 """
 
 import time
+from collections import Counter
 from typing import List, Dict, Any, Optional
 from uuid import UUID
 from datetime import datetime, date, timezone
 
 import structlog
+from prometheus_client import Counter as PromCounter, Histogram
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_, func
 from qdrant_client import QdrantClient
@@ -17,14 +19,32 @@ from langchain_gigachat import GigaChat
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableParallel
 from langchain_core.output_parsers import StrOutputParser
-from pydantic import BaseModel
+from pydantic import BaseModel, SecretStr
 
 from models.database import Post, PostEnrichment, Channel, User, DigestSettings, DigestHistory, UserChannel
-from services.rag_service import RAGService  # Для генерации embedding
+from api.services.rag_service import RAGService  # Для генерации embedding
 from services.graph_service import get_graph_service
 from config import settings
 
 logger = structlog.get_logger()
+
+digest_generation_duration_seconds = Histogram(
+    'digest_generation_duration_seconds',
+    'Время генерации пользовательского дайджеста',
+    ['tenant_id']
+)
+
+digest_qdrant_hits_total = PromCounter(
+    'digest_qdrant_hits_total',
+    'Количество постов, извлечённых из Qdrant при генерации дайджеста',
+    ['tenant_id']
+)
+
+digest_graph_hits_total = PromCounter(
+    'digest_graph_hits_total',
+    'Количество постов, извлечённых из графа Neo4j при генерации дайджеста',
+    ['tenant_id']
+)
 
 # ============================================================================
 # PYDANTIC MODELS
@@ -70,16 +90,31 @@ class DigestService:
         # Инициализация GigaChat LLM через langchain-gigachat
         # Context7: Исправлен URL (без /v1) для обработки редиректов прокси
         api_base = openai_api_base or settings.openai_api_base or "http://gpt2giga-proxy:8090"
+        if api_base.endswith("/v1"):
+            api_base = api_base[:-3]
         
         import os
         os.environ.setdefault("OPENAI_API_BASE", api_base)
         
+        credentials_value = getattr(settings, 'gigachat_credentials', '') or os.getenv('GIGACHAT_CREDENTIALS', '')
+        if isinstance(credentials_value, SecretStr):
+            credentials_value = credentials_value.get_secret_value()
+
+        scope_value = getattr(settings, 'gigachat_scope', None) or os.getenv('GIGACHAT_SCOPE', 'GIGACHAT_API_PERS')
+        if isinstance(scope_value, SecretStr):
+            scope_value = scope_value.get_secret_value()
+
         self.llm = GigaChat(
-            credentials=getattr(settings, 'gigachat_credentials', '') or os.getenv('GIGACHAT_CREDENTIALS', ''),
-            scope=getattr(settings, 'gigachat_scope', None) or os.getenv('GIGACHAT_SCOPE', 'GIGACHAT_API_PERS'),
-            model="GigaChat",
+            credentials=credentials_value,
+            scope=scope_value,
             base_url=api_base,
             temperature=0.7,
+            verify_ssl_certs=False,
+        )
+        logger.debug(
+            "GigaChat client initialized",
+            base_url=self.llm.base_url,
+            verify_ssl=self.llm.verify_ssl_certs,
         )
         
         # Context7: Структурированный промпт для генерации дайджеста с executive summary и улучшенной версткой
@@ -202,6 +237,14 @@ class DigestService:
         if not db:
             return []
         
+        if not channel_ids:
+            raise ValueError("Отсутствуют каналы пользователя для подбора постов.")
+        
+        normalized_channel_ids = [str(cid) for cid in channel_ids]
+        if not normalized_channel_ids:
+            raise ValueError("Список каналов пользователя пуст.")
+        channel_id_set = set(normalized_channel_ids)
+        
         all_posts = []
         
         # Для каждой темы собираем посты
@@ -216,7 +259,13 @@ class DigestService:
                     
                     # Проверка существования коллекции
                     collections = self.qdrant_client.get_collections()
-                    if collection_name not in [c.name for c in collections.collections]:
+                    collection_names = [c.name for c in collections.collections]
+                    if "tNone_posts" in collection_names:
+                        logger.error(
+                            "Detected legacy Qdrant collection without tenant binding",
+                            tenant_id=tenant_id
+                        )
+                    if collection_name not in collection_names:
                         logger.warning("Qdrant collection not found", collection=collection_name)
                         continue
                     
@@ -229,11 +278,11 @@ class DigestService:
                         )
                     )
                     
-                    if channel_ids:
+                    if channel_id_set:
                         filter_conditions.append(
                             FieldCondition(
                                 key="channel_id",
-                                match=MatchAny(any=[str(cid) for cid in channel_ids])
+                                match=MatchAny(any=list(channel_id_set))
                             )
                         )
                     
@@ -253,6 +302,14 @@ class DigestService:
                         if post_id:
                             post = db.query(Post).filter(Post.id == post_id).first()
                             if post:
+                                if str(post.channel_id) not in channel_id_set:
+                                    logger.warning(
+                                        "Skipping Qdrant result: channel not in user scope",
+                                        post_id=str(post_id),
+                                        channel_id=str(post.channel_id),
+                                        allowed_channels=list(channel_id_set)
+                                    )
+                                    continue
                                 channel = db.query(Channel).filter(Channel.id == post.channel_id).first()
                                 
                                 all_posts.append({
@@ -264,6 +321,7 @@ class DigestService:
                                     'posted_at': post.posted_at,
                                     'topic': topic,
                                     'score': result.score,
+                                    'source': 'qdrant',
                                     # Context7: Метрики популярности для отображения в дайджесте
                                     'engagement_score': float(post.engagement_score) if post.engagement_score else 0.0,
                                     'views_count': post.views_count or 0,
@@ -276,7 +334,7 @@ class DigestService:
                 try:
                     if await self.graph_service.health_check():
                         # Находим похожие темы через граф
-                        similar_topics = await self.graph_service.find_similar_topics(topic, limit=3)
+                        similar_topics = await self.graph_service.find_similar_topics(topic, limit=3, tenant_id=tenant_id)
                         
                         # Расширяем поиск по связанным темам
                         related_topics = [topic] + [st['topic'] for st in similar_topics if st.get('similarity', 0) > 0.6]
@@ -286,6 +344,7 @@ class DigestService:
                             graph_posts = await self.graph_service.search_related_posts(
                                 query=related_topic,
                                 topic=related_topic,
+                                tenant_id=tenant_id,
                                 limit=limit_per_topic // len(related_topics),
                                 max_depth=getattr(settings, 'neo4j_max_graph_depth', 2)
                             )
@@ -298,7 +357,7 @@ class DigestService:
                                         post = db.query(Post).filter(Post.id == UUID(post_id)).first()
                                         if post:
                                             # Фильтр по каналам пользователя (если указаны)
-                                            if channel_ids and str(post.channel_id) not in channel_ids:
+                                            if str(post.channel_id) not in channel_id_set:
                                                 continue
                                             
                                             channel = db.query(Channel).filter(Channel.id == post.channel_id).first()
@@ -313,6 +372,7 @@ class DigestService:
                                                 'topic': related_topic,
                                                 'score': graph_post.get('score', 0.7),
                                                 'related_topic': related_topic != topic,  # Флаг связанной темы
+                                                'source': 'graph',
                                                 # Context7: Метрики популярности
                                                 'engagement_score': float(post.engagement_score) if post.engagement_score else 0.0,
                                                 'views_count': post.views_count or 0,
@@ -333,14 +393,23 @@ class DigestService:
                     )
                 )
                 
-                if channel_ids:
-                    fts_query = fts_query.filter(Post.channel_id.in_([UUID(cid) for cid in channel_ids]))
+                if channel_id_set:
+                    fts_query = fts_query.filter(Post.channel_id.in_([UUID(cid) for cid in normalized_channel_ids]))
                 
                 fts_posts = fts_query.order_by(Post.posted_at.desc()).limit(limit_per_topic).all()
                 
                 for post in fts_posts:
                     # Проверяем, не добавлен ли уже
                     if not any(p['post_id'] == str(post.id) for p in all_posts):
+                        if str(post.channel_id) not in channel_id_set:
+                            logger.warning(
+                                "Skipping FTS result: channel not in user scope",
+                                post_id=str(post.id),
+                                channel_id=str(post.channel_id),
+                                allowed_channels=list(channel_id_set)
+                            )
+                            continue
+                        
                         channel = db.query(Channel).filter(Channel.id == post.channel_id).first()
                         
                         all_posts.append({
@@ -352,6 +421,7 @@ class DigestService:
                             'posted_at': post.posted_at,
                             'topic': topic,
                             'score': 0.5,  # Средний score для FTS результатов
+                            'source': 'fts',
                             # Context7: Метрики популярности
                             'engagement_score': float(post.engagement_score) if post.engagement_score else 0.0,
                             'views_count': post.views_count or 0,
@@ -439,7 +509,8 @@ class DigestService:
         context_parts = []
         
         for idx, post in enumerate(posts[:max_posts], 1):
-            content = post.get('content', '')
+            # Context7: гарантируем строку даже если БД вернула NULL
+            content = post.get('content') or ""
             # Context7: Увеличиваем лимит для лучшего понимания сути новости (до 500 символов)
             if len(content) > 500:
                 content = content[:500] + "..."
@@ -514,7 +585,9 @@ class DigestService:
         Returns:
             DigestContent с сгенерированным дайджестом
         """
-        start_time = time.time()
+        tenant_id_str = str(tenant_id)
+        start_time = time.perf_counter()
+        source_counter: Counter = Counter()
         
         if digest_date is None:
             digest_date = date.today()
@@ -563,6 +636,13 @@ class DigestService:
             # Используем все каналы пользователя
             channel_ids = [str(uc.channel_id) for uc in user_channels]
         
+        if not channel_ids:
+            logger.warning(
+                "Digest generation aborted: user has no active channels",
+                user_id=str(user_id)
+            )
+            raise ValueError("Нет активных каналов для дайджеста. Добавьте хотя бы один канал перед генерацией.")
+        
         # Собираем посты по темам
         logger.info(
             "Collecting posts for digest",
@@ -580,8 +660,24 @@ class DigestService:
             db=db
         )
         
+        if posts:
+            source_counter = Counter(post.get('source') for post in posts)
+            qdrant_hits = source_counter.get('qdrant', 0)
+            graph_hits = source_counter.get('graph', 0)
+            if qdrant_hits:
+                digest_qdrant_hits_total.labels(tenant_id=tenant_id_str).inc(qdrant_hits)
+            if graph_hits:
+                digest_graph_hits_total.labels(tenant_id=tenant_id_str).inc(graph_hits)
+        else:
+            source_counter = Counter()
+        
         if not posts:
-            logger.warning("No posts found for digest", user_id=str(user_id), topics=topics)
+            logger.warning(
+                "No posts found for digest",
+                user_id=str(user_id),
+                tenant_id=tenant_id_str,
+                topics=topics
+            )
             return DigestContent(
                 content="Не найдено постов по указанным темам за выбранный период.",
                 posts_count=0,
@@ -619,9 +715,13 @@ class DigestService:
             logger.info(
                 "Digest generated",
                 user_id=str(user_id),
+                tenant_id=tenant_id_str,
                 posts_count=len(posts),
                 topics=topics,
-                processing_time_ms=int((time.time() - start_time) * 1000)
+                processing_time_ms=int((time.perf_counter() - start_time) * 1000),
+                qdrant_hits=source_counter.get('qdrant', 0),
+                graph_hits=source_counter.get('graph', 0),
+                fts_hits=source_counter.get('fts', 0)
             )
             
             return DigestContent(
@@ -634,6 +734,9 @@ class DigestService:
         except Exception as e:
             logger.error("Error generating digest", error=str(e), user_id=str(user_id))
             raise
+        finally:
+            duration = time.perf_counter() - start_time
+            digest_generation_duration_seconds.labels(tenant_id=tenant_id_str).observe(duration)
     
     def _parse_sections(self, content: str, topics: List[str]) -> List[Dict[str, Any]]:
         """Парсинг секций из markdown контента."""

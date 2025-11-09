@@ -470,6 +470,42 @@ def _postprocess_spoilers(html_text: str, spoiler_markers: List[str]) -> str:
         escaped_content = escape(content)
         html_text = html_text.replace(marker, f'<tg-spoiler>{escaped_content}</tg-spoiler>')
     
+    html_text = _sanitize_telegram_html(html_text)
+    
+    return html_text
+
+
+def _sanitize_telegram_html(html_text: str) -> str:
+    """
+    Context7 best practice: очищает HTML перед отправкой в Telegram.
+    
+    - Заменяет <br> на перевод строки
+    - Удаляет теги, не входящие в whitelist Telegram
+    - Нормализует лишние пробелы вокруг переводов
+    """
+    if not html_text:
+        return html_text
+    
+    # Заменяем <br> / <br/> на перенос строки
+    html_text = re.sub(r"<br\s*/?>", "\n", html_text, flags=re.IGNORECASE)
+    
+    allowed_tags = TelegramHTMLRenderer.ALLOWED_TAGS
+    
+    def _strip_disallowed(match: re.Match) -> str:
+        tag = match.group(0)
+        tag_name = match.group(1).lower()
+        if tag_name in allowed_tags:
+            return tag
+        # Удаляем тег полностью, оставляя содержимое
+        return ""
+    
+    # Удаляем все открывающие/закрывающие теги вне whitelist
+    html_text = re.sub(r"</?([a-zA-Z0-9\-]+)(?:\s[^>]*)?>", _strip_disallowed, html_text)
+    
+    # Приводим к единообразию количество пустых строк
+    html_text = re.sub(r"\n{3,}", "\n\n", html_text)
+    html_text = html_text.strip()
+    
     return html_text
 
 

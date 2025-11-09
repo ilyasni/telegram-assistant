@@ -363,6 +363,7 @@ class RAGService:
         self,
         query: str,
         user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
         limit: int = 10,
         max_depth: Optional[int] = None
     ) -> List[Dict[str, Any]]:
@@ -400,6 +401,7 @@ class RAGService:
             graph_results = await self.graph_service.search_related_posts(
                 query=query,
                 topic=None,  # Можно извлечь тему из запроса
+                tenant_id=tenant_id,
                 limit=limit * 2,
                 max_depth=max_depth
             )
@@ -459,7 +461,7 @@ class RAGService:
         # Context7: GraphRAG поиск (с fallback при недоступности Neo4j)
         graph_results = []
         try:
-            graph_results = await self._search_neo4j_graph(query, user_id, limit * 2)
+            graph_results = await self._search_neo4j_graph(query, user_id, tenant_id=tenant_id, limit=limit * 2)
         except Exception as e:
             logger.warning("GraphRAG search failed, continuing without graph results", error=str(e))
         
@@ -1083,7 +1085,7 @@ class RAGService:
                 fts_results = await self._search_postgres_fts(
                     query, tenant_id, limit * 2, channel_ids, db
                 )
-                graph_results = await self._search_neo4j_graph(query, str(user_id), limit * 2)
+                graph_results = await self._search_neo4j_graph(query, str(user_id), tenant_id=tenant_id, limit=limit * 2)
                 
                 # Объединяем результаты
                 post_scores = {}
