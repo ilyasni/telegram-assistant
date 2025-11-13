@@ -193,7 +193,22 @@ class ChannelParser:
                     'error': 'no_client_manager'
                 }
             
-            telegram_client = await self.telegram_client_manager.get_client(user_id)
+            try:
+                telegram_id_int = int(user_id)
+            except (TypeError, ValueError):
+                logger.error(
+                    "Invalid telegram_id type for client acquisition",
+                    user_id=user_id
+                )
+                self.stats['errors'] += 1
+                return {
+                    'processed': 0,
+                    'skipped': 0,
+                    'max_date': None,
+                    'error': 'invalid_telegram_id'
+                }
+
+            telegram_client = await self.telegram_client_manager.get_client(telegram_id_int)
             if not telegram_client:
                 logger.error("No telegram client available for user", user_id=user_id)
                 self.stats['errors'] += 1
@@ -1333,7 +1348,16 @@ class ChannelParser:
                     try:
                         # Получаем TelegramClient из telegram_client_manager для MediaProcessor
                         if self.telegram_client_manager:
-                            telegram_client = await self.telegram_client_manager.get_client(user_id)
+                            try:
+                                telegram_id_for_media = int(user_id)
+                            except (TypeError, ValueError):
+                                logger.error(
+                                    "Invalid telegram_id type for media processing",
+                                    user_id=user_id
+                                )
+                                telegram_client = None
+                            else:
+                                telegram_client = await self.telegram_client_manager.get_client(telegram_id_for_media)
                             if telegram_client:
                                 # Обновляем telegram_client в MediaProcessor
                                 self.media_processor.telegram_client = telegram_client

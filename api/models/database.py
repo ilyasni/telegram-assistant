@@ -576,6 +576,7 @@ class Group(Base):
     tenant = relationship("Tenant")
     messages = relationship("GroupMessage", back_populates="group")
     user_subscriptions = relationship("UserGroup", back_populates="group")
+    conversation_windows = relationship("GroupConversationWindow", back_populates="group")
 
 
 class UserGroup(Base):
@@ -600,16 +601,25 @@ class GroupMessage(Base):
     
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     group_id = Column(UUID(as_uuid=True), ForeignKey("groups.id"), nullable=False)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False)
     tg_message_id = Column(BigInteger, nullable=False)
     sender_tg_id = Column(BigInteger)
     sender_username = Column(String(255))
     content = Column(Text)
+    media_urls = Column(JSON, default=list)
+    reply_to = Column(JSON, default=dict)
     posted_at = Column(DateTime, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    has_media = Column(Boolean, default=False)
+    is_service = Column(Boolean, default=False)
+    action_type = Column(String(100))
     
     # Relationships
     group = relationship("Group", back_populates="messages")
     mentions = relationship("GroupMention", back_populates="message")
+    analytics = relationship("GroupMessageAnalytics", back_populates="message", uselist=False)
+    media_map = relationship("GroupMediaMap", back_populates="group_message")
 
 
 class GroupMention(Base):
@@ -628,6 +638,153 @@ class GroupMention(Base):
     # Relationships
     message = relationship("GroupMessage", back_populates="mentions")
     mentioned_user = relationship("User")
+
+
+class GroupMessageAnalytics(Base):
+    """Аналитика по сообщений из групповых чатов."""
+    __tablename__ = "group_message_analytics"
+
+    message_id = Column(UUID(as_uuid=True), ForeignKey("group_messages.id"), primary_key=True)
+    embeddings = Column(JSON, default=list)
+    tags = Column(JSON, default=list)
+    entities = Column(JSON, default=list)
+    sentiment_score = Column(REAL)
+    emotions = Column(JSON, default=dict)
+    moderation_flags = Column(JSON, default=dict)
+    analysed_at = Column(DateTime)
+    metadata_payload = Column(JSON, default=dict)
+
+    # Relationships
+    message = relationship("GroupMessage", back_populates="analytics")
+
+
+class GroupMediaMap(Base):
+    """Связь групповых сообщений с медиа-объектами CAS."""
+    __tablename__ = "group_media_map"
+
+    group_message_id = Column(UUID(as_uuid=True), ForeignKey("group_messages.id", ondelete="CASCADE"), primary_key=True)
+    file_sha256 = Column(String(64), ForeignKey("media_objects.file_sha256"), primary_key=True)
+    position = Column(Integer, server_default="0")
+    meta = Column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+
+    group_message = relationship("GroupMessage", back_populates="media_map")
+    media_object = relationship("MediaObject")
+
+    __table_args__ = (
+        Index("idx_group_media_map_message", "group_message_id"),
+        Index("idx_group_media_map_sha", "file_sha256"),
+    )
+
+
+class GroupConversationWindow(Base):
+    """Агрегированные окна обсуждений в группах."""
+    __tablename__ = "group_conversation_windows"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    group_id = Column(UUID(as_uuid=True), ForeignKey("groups.id"), nullable=False)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False)
+    window_size_hours = Column(Integer, nullable=False)
+    window_start = Column(DateTime, nullable=False)
+    window_end = Column(DateTime, nullable=False)
+    message_count = Column(Integer, default=0)
+    participant_count = Column(Integer, default=0)
+    dominant_emotions = Column(JSON, default=dict)
+    indicators = Column(JSON, default=dict)
+    generated_at = Column(DateTime)
+    status = Column(String(32), default="pending")
+    failure_reason = Column(Text)
+
+    group = relationship("Group", back_populates="conversation_windows")
+    digests = relationship("GroupDigest", back_populates="window")
+
+
+class GroupDigest(Base):
+    """Итоговый дайджест по окну обсуждений группы."""
+    __tablename__ = "group_digests"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    window_id = Column(UUID(as_uuid=True), ForeignKey("group_conversation_windows.id"), nullable=False)
+    requested_by_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"))
+    delivery_channel = Column(String(32), default="telegram")
+    delivery_address = Column(String(255))
+    format = Column(String(32), default="markdown")
+    title = Column(String(255))
+    summary = Column(Text)
+    payload = Column(JSON, default=dict)
+    generated_at = Column(DateTime, default=datetime.utcnow)
+    delivered_at = Column(DateTime)
+    delivery_status = Column(String(32), default="pending")
+    delivery_metadata = Column(JSON, default=dict)
+    evaluation_scores = Column(JSON, default=dict)
+
+    window = relationship("GroupConversationWindow", back_populates="digests")
+    requested_by = relationship("User")
+    topics = relationship("GroupDigestTopic", back_populates="digest")
+    participants = relationship("GroupDigestParticipant", back_populates="digest")
+    metrics = relationship("GroupDigestMetric", back_populates="digest", uselist=False)
+
+
+class GroupDigestTopic(Base):
+    """Тематический блок внутри группового дайджеста."""
+    __tablename__ = "group_digest_topics"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    digest_id = Column(UUID(as_uuid=True), ForeignKey("group_digests.id"), nullable=False)
+    topic = Column(String(255), nullable=False)
+    priority = Column(String(16), default="medium")
+    message_count = Column(Integer, default=0)
+    representative_messages = Column(JSON, default=list)
+    keywords = Column(JSON, default=list)
+    actions = Column(JSON, default=list)
+
+    digest = relationship("GroupDigest", back_populates="topics")
+
+
+class GroupDigestParticipant(Base):
+    """Участники, попавшие в дайджест."""
+    __tablename__ = "group_digest_participants"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    digest_id = Column(UUID(as_uuid=True), ForeignKey("group_digests.id"), nullable=False)
+    participant_tg_id = Column(BigInteger)
+    participant_username = Column(String(255))
+    role = Column(String(50), default="participant")
+    message_count = Column(Integer, default=0)
+    contribution_summary = Column(Text)
+
+    digest = relationship("GroupDigest", back_populates="participants")
+
+
+class GroupDigestMetric(Base):
+    """Метрики настроений и динамики обсуждения."""
+    __tablename__ = "group_digest_metrics"
+
+    digest_id = Column(UUID(as_uuid=True), ForeignKey("group_digests.id"), primary_key=True)
+    sentiment = Column(REAL)
+    stress_index = Column(REAL)
+    collaboration_index = Column(REAL)
+    conflict_index = Column(REAL)
+    enthusiasm_index = Column(REAL)
+    raw_scores = Column(JSON, default=dict)
+    evaluated_at = Column(DateTime, default=datetime.utcnow)
+
+    digest = relationship("GroupDigest", back_populates="metrics")
+
+
+class GroupDiscoveryRequest(Base):
+    """Запрос на обнаружение доступных Telegram-групп для арендатора."""
+    __tablename__ = "group_discovery_requests"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(UUID(as_uuid=True), nullable=False, index=True)
+    user_id = Column(UUID(as_uuid=True), nullable=False)
+    status = Column(String(32), nullable=False, default="pending", index=True)
+    total = Column(Integer, nullable=False, default=0)
+    connected_count = Column(Integer, nullable=False, default=0)
+    results = Column(JSONB, nullable=False, default=list)
+    error = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    completed_at = Column(DateTime)
 
 
 class PostReaction(Base):

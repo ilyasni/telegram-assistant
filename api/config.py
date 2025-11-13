@@ -46,6 +46,23 @@ class Settings(BaseSettings):
             # Если не JSON, парсим как строку через запятую
             return [origin.strip() for origin in v.split(",") if origin.strip()]
         return v
+    
+    @field_validator("digest_agent_canary_tenants", mode="before")
+    @classmethod
+    def parse_digest_canary_tenants(cls, v):
+        """Context7: поддержка строкового и JSON-формата для списков canary-арендаторов."""
+        if isinstance(v, str):
+            cleaned = v.strip()
+            if not cleaned:
+                return []
+            try:
+                parsed = json.loads(cleaned)
+                if isinstance(parsed, list):
+                    return [str(item).strip() for item in parsed if str(item).strip()]
+            except (json.JSONDecodeError, TypeError):
+                pass
+            return [item.strip() for item in cleaned.split(",") if item.strip()]
+        return v
 
     # Bot/Webhook
     telegram_bot_token: str | None = None
@@ -88,6 +105,9 @@ class Settings(BaseSettings):
     feature_rls_enabled: bool = False  # Row Level Security (включать поэтапно)
     feature_identity_enabled: bool = True  # Использование identities вместо прямого telegram_id
     feature_rate_limit_per_user: bool = True  # Per-user/membership rate limiting
+    digest_agent_enabled: bool = False  # Контроль глобального rollout групповых дайджестов
+    digest_agent_canary_tenants: list[str] = []  # Allow-list арендаторов для canary
+    digest_agent_version: str = "v1"
     
     # WebApp auth TTL (Context7)
     webapp_auth_ttl_seconds: int = 900  # 15 минут по умолчанию

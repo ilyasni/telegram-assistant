@@ -85,7 +85,7 @@
             "name": "Prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(storage_bucket_usage_gb{tenant_id=~\"$tenant_id\"}) by (tenant_id)",
+          "expr": "sum(api_storage_bucket_usage_gb{tenant_id=~\"$tenant_id\"}) by (tenant_id)",
           "legendFormat": "Used: {{tenant_id}}",
           "refId": "A"
         }
@@ -463,7 +463,7 @@
             "name": "Prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(rate(storage_quota_violations_total{tenant_id=~\"$tenant_id\"}[5m])) by (tenant_id, reason)",
+          "expr": "sum(rate(api_storage_quota_violations_total{tenant_id=~\"$tenant_id\"}[5m])) by (tenant_id, reason)",
           "legendFormat": "{{tenant_id}} - {{reason}}",
           "refId": "A"
         }
@@ -583,7 +583,7 @@
           "type": "prometheus",
           "uid": "prometheus"
         },
-        "definition": "label_values(storage_bucket_usage_gb, tenant_id)",
+        "definition": "label_values(api_storage_bucket_usage_gb, tenant_id)",
         "description": "Filter by tenant ID",
         "error": null,
         "hide": 0,
@@ -593,7 +593,7 @@
         "name": "tenant_id",
         "options": [],
         "query": {
-          "query": "label_values(storage_bucket_usage_gb, tenant_id)",
+          "query": "label_values(api_storage_bucket_usage_gb, tenant_id)",
           "refId": "StandardVariableQuery"
         },
         "refresh": 1,

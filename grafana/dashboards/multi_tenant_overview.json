@@ -128,7 +128,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(auth_qr_start_total) by (tenant_id)",
+          "expr": "sum(api_auth_qr_start_total) by (tenant_id)",
           "legendFormat": "QR Auth Starts",
           "refId": "A"
         }
@@ -294,7 +294,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(rate(http_requests_total{tenant_id=~\"$tenant_id\"}[5m])) by (tenant_id, method, endpoint, status)",
+          "expr": "sum(rate(api_http_requests_total{tenant_id=~\"$tenant_id\"}[5m])) by (tenant_id, method, endpoint, status)",
           "legendFormat": "{{tenant_id}} - {{method}} {{endpoint}} ({{status}})",
           "refId": "A"
         }
@@ -368,7 +368,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(auth_qr_start_total) by (tenant_id)",
+          "expr": "sum(api_auth_qr_start_total) by (tenant_id)",
           "legendFormat": "{{tenant_id}}",
           "refId": "A"
         },
@@ -378,7 +378,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(auth_qr_success_total) by (tenant_id)",
+          "expr": "sum(api_auth_qr_success_total) by (tenant_id)",
           "legendFormat": "{{tenant_id}} (success)",
           "refId": "B"
         },
@@ -388,7 +388,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(auth_qr_fail_total) by (tenant_id)",
+          "expr": "sum(api_auth_qr_fail_total) by (tenant_id)",
           "legendFormat": "{{tenant_id}} (fail)",
           "refId": "C"
         }
@@ -555,7 +555,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(auth_qr_expired_total) by (tenant_id)",
+          "expr": "sum(api_auth_qr_expired_total) by (tenant_id)",
           "legendFormat": "Expired - {{tenant_id}}",
           "refId": "A"
         }

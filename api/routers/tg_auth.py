@@ -25,13 +25,13 @@ import io
 router = APIRouter(prefix="/tg", tags=["tg_auth"])
 logger = structlog.get_logger()
 
-AUTH_QR_START = Counter("auth_qr_start_total", "QR start attempts", ["tenant_id"])
-AUTH_QR_SUCCESS = Counter("auth_qr_success_total", "QR success", ["tenant_id"])
-AUTH_QR_FAIL = Counter("auth_qr_fail_total", "QR failures", ["tenant_id", "reason"])
-AUTH_QR_DURATION = Histogram("auth_qr_duration_seconds", "QR auth duration", ["tenant_id"])
-AUTH_QR_EXPIRED = Counter("auth_qr_expired_total", "QR sessions expired", ["tenant_id"])
-AUTH_QR_OWNERSHIP_FAIL = Counter("auth_qr_ownership_fail_total", "Ownership check failures")
-AUTH_QR_2FA_REQUIRED = Counter("auth_qr_2fa_required_total", "2FA required count") 
+AUTH_QR_START = Counter("auth_qr_start_total", "QR start attempts", ["tenant_id"], namespace="api")
+AUTH_QR_SUCCESS = Counter("auth_qr_success_total", "QR success", ["tenant_id"], namespace="api")
+AUTH_QR_FAIL = Counter("auth_qr_fail_total", "QR failures", ["tenant_id", "reason"], namespace="api")
+AUTH_QR_DURATION = Histogram("auth_qr_duration_seconds", "QR auth duration", ["tenant_id"], namespace="api")
+AUTH_QR_EXPIRED = Counter("auth_qr_expired_total", "QR sessions expired", ["tenant_id"], namespace="api")
+AUTH_QR_OWNERSHIP_FAIL = Counter("auth_qr_ownership_fail_total", "Ownership check failures", namespace="api")
+AUTH_QR_2FA_REQUIRED = Counter("auth_qr_2fa_required_total", "2FA required count", namespace="api")
 
 # Context7 best practice: async Redis client для неблокирующих операций
 redis_client = redis.from_url(settings.redis_url, decode_responses=True)
@@ -379,9 +379,15 @@ async def qr_png(session_id: str):
     """Context7 best practice: PNG fallback для QR-кода"""
     try:
         # Декодируем session_id (это JWT токен)
-        payload = jwt.decode(session_id, settings.jwt_secret, algorithms=["HS256"], options={"verify_aud": False})
+        payload = jwt.decode(
+            session_id,
+            settings.jwt_secret.get_secret_value(),
+            algorithms=["HS256"],
+            options={"verify_aud": False},
+        )
         tenant_id = _extract_tenant_id(payload)
-    except:
+    except Exception as e:
+        logger.warning("Failed to decode QR session token", error=str(e))
         raise HTTPException(status_code=400, detail="invalid session")
     
     # Context7: Единый префикс t:{tenant}:qr:session

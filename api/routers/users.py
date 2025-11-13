@@ -24,6 +24,7 @@ class UserCreate(BaseModel):
 
 class UserResponse(BaseModel):
     id: UUID
+    tenant_id: UUID
     telegram_id: int
     username: Optional[str] = None
     first_name: Optional[str] = None
@@ -87,6 +88,7 @@ async def get_user_by_telegram_id(
     
     return UserResponse(
         id=user.id,
+        tenant_id=user.tenant_id,
         telegram_id=user.telegram_id,
         username=user.username,
         first_name=user.first_name,
@@ -168,6 +170,7 @@ async def create_user(user_data: UserCreate, db: Session = Depends(get_db)):
 
     return UserResponse(
         id=user.id,
+        tenant_id=user.tenant_id,
         telegram_id=user.telegram_id,
         username=user.username,
         first_name=user.first_name,
@@ -227,6 +230,7 @@ async def update_user(
     
     return UserResponse(
         id=user.id,
+        tenant_id=user.tenant_id,
         telegram_id=user.telegram_id,
         username=user.username,
         first_name=user.first_name,

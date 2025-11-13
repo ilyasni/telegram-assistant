@@ -150,8 +150,18 @@ app_state = {
 }
 
 # Prometheus метрики
-request_count = Counter("http_requests_total", "Total HTTP requests", ["path"])
-request_duration = Histogram("http_request_duration_seconds", "HTTP request duration", ["path"])
+request_count = Counter(
+    "http_requests_total",
+    "Total HTTP requests",
+    ["path"],
+    namespace="telethon"
+)
+request_duration = Histogram(
+    "http_request_duration_seconds",
+    "HTTP request duration",
+    ["path"],
+    namespace="telethon"
+)
 
 # Context7 best practice: метрики для мониторинга крашей и критических событий
 crash_signals_total = Counter(

@@ -28,58 +28,67 @@ logger = structlog.get_logger()
 crawl_success_rate = Gauge(
     'crawl_success_rate',
     'Success rate of crawls',
-    ['host']
+    ['host'],
+    namespace='crawl4ai'
 )
 
 crawl_latency_seconds = Histogram(
     'crawl_latency_seconds',
     'Crawl latency',
-    ['host', 'status']
+    ['host', 'status'],
+    namespace='crawl4ai'
 )
 
 crawl_skip_reasons_total = Counter(
     'crawl_skip_reasons_total',
     'Skip reasons',
-    ['reason']
+    ['reason'],
+    namespace='crawl4ai'
 )
 
 # [C7-ID: CRAWL4AI-CACHE-002] - HTTP cache метрики
 cache_hits_total = Counter(
     'cache_hits_total',
     'Total cache hits',
-    ['type']
+    ['type'],
+    namespace='crawl4ai'
 )
 
 cache_misses_total = Counter(
     'cache_misses_total',
     'Total cache misses',
-    ['type']
+    ['type'],
+    namespace='crawl4ai'
 )
 
 # Rate limiting метрики
 rate_limit_hits_total = Counter(
     'rate_limit_hits_total',
     'Total rate limit hits',
-    ['host']
+    ['host'],
+    namespace='crawl4ai'
 )
 
 # Новые метрики с правильным неймингом
 crawl_cache_size_current = Gauge(
-    'crawl_cache_size_current',
-    'HTTP cache size (entries count)'
+    'cache_size_current',
+    'HTTP cache size (entries count)',
+    namespace='crawl4ai'
 )
 
 crawl_policy_explain_reasons_total = Counter(
-    'crawl_policy_explain_reasons_total',
+    'policy_explain_reasons_total',
     'Policy explain reasons',
-    ['reason']  # no_urls, no_trigger_tags, below_word_count, robots_disallow
+    ['reason'],  # no_urls, no_trigger_tags, below_word_count, robots_disallow
+    namespace='crawl4ai'
 )
 
 # Context7: Метрики для сохранения в S3
 crawl_persist_total = Counter(
-    'crawl_persist_total',
+    'persist_total',
     'Total crawl persistence operations',
-    ['status', 'destination']  # status: success|error|cache_hit, destination: s3|redis
+    ['status', 'destination'],  # status: success|error|cache_hit, destination: s3|redis
+    namespace='crawl4ai'
 )
 
 # ============================================================================

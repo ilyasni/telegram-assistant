@@ -28,14 +28,17 @@ TG_WEBHOOK_REQUESTS = Counter(
     "tg_webhook_requests_total",
     "Telegram webhook requests processed",
     ["outcome"],  # ok | dedup | unauthorized | error
+    namespace="api",
 )
 TG_UPDATES_DEDUPLICATED = Counter(
     "tg_updates_deduplicated_total",
     "Telegram updates deduplicated (update_id seen)",
+    namespace="api",
 )
 TG_WEBHOOK_LATENCY = Histogram(
     "tg_webhook_latency_seconds",
     "Telegram webhook handling latency (seconds)",
+    namespace="api",
 )
 
 
@@ -148,6 +151,9 @@ async def set_bot_commands() -> None:
             BotCommand(command="login", description="Войти в систему"),
             BotCommand(command="add_channel", description="Добавить канал"),
             BotCommand(command="my_channels", description="Мои каналы"),
+            BotCommand(command="groups", description="Мои группы"),
+            BotCommand(command="group_discovery", description="Поиск групп"),
+            BotCommand(command="group_digest", description="Дайджесты по группам"),
             BotCommand(command="ask", description="Задать вопрос"),
             BotCommand(command="search", description="Поиск по каналам"),
             BotCommand(command="recommend", description="Получить рекомендации"),

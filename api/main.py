@@ -43,13 +43,32 @@ logger = structlog.get_logger()
 
 # Prometheus метрики
 # Context7: Добавляем tenant_id и tier для multi-tenant мониторинга
-REQUEST_COUNT = Counter('http_requests_total', 'Total HTTP requests', ['method', 'endpoint', 'status', 'tenant_id', 'tier'])
-REQUEST_DURATION = Histogram('http_request_duration_seconds', 'HTTP request duration', ['method', 'endpoint', 'tenant_id'])
+REQUEST_COUNT = Counter(
+    'http_requests_total',
+    'Total HTTP requests',
+    ['method', 'endpoint', 'status', 'tenant_id', 'tier'],
+    namespace='api'
+)
+REQUEST_DURATION = Histogram(
+    'http_request_duration_seconds',
+    'HTTP request duration',
+    ['method', 'endpoint', 'tenant_id'],
+    namespace='api'
+)
 
 # Новые метрики для SSL и Neo4j
 from prometheus_client import Gauge
-ssl_cert_not_after = Gauge('ssl_cert_not_after', 'SSL certificate expiration timestamp (epoch seconds)', ['domain'])
-neo4j_connections_active = Gauge('neo4j_connections_active', 'Active Neo4j connections')
+ssl_cert_not_after = Gauge(
+    'ssl_cert_not_after',
+    'SSL certificate expiration timestamp (epoch seconds)',
+    ['domain'],
+    namespace='api'
+)
+neo4j_connections_active = Gauge(
+    'neo4j_connections_active',
+    'Active Neo4j connections',
+    namespace='api'
+)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -314,7 +333,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 # Подключение роутеров
 # Подключаем критичные роутеры
-from routers import health, channels, tg_auth, tg_webapp_auth, users, sessions, session_management, posts
+from routers import health, channels, tg_auth, tg_webapp_auth, users, sessions, session_management, posts, groups
 from routers import storage  # Context7: Storage Quota Management API
 from routers import admin  # [C7-ID: api-admin-001] Admin panel API
 from routers import admin_invites  # Admin invites management
@@ -334,6 +353,7 @@ app.include_router(admin.router)  # [C7-ID: api-admin-001] Admin panel API
 app.include_router(admin_invites.router)  # Admin invites management
 app.include_router(rag.router, prefix="/api")  # RAG API endpoints
 app.include_router(digest.router, prefix="/api")  # Digest API endpoints
+app.include_router(groups.router, prefix="/api")  # Groups & group digests
 app.include_router(trends.router, prefix="/api")  # Trends API endpoints
 app.include_router(bot_router, prefix="/tg")
 

@@ -496,6 +496,7 @@ services:
       NEO4J_USER: ${NEO4J_USER:-neo4j}
       NEO4J_PASSWORD: ${NEO4J_PASSWORD:-changeme}
       JWT_SECRET: ${JWT_SECRET:-dev-secret}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
       # AI Provider Configuration with Fallback
       # Primary: GigaChat через gpt2giga-proxy
       OPENAI_API_BASE: ${OPENAI_API_BASE:-http://gpt2giga-proxy:8090/v1}
@@ -539,6 +540,7 @@ services:
       # EmbeddingsGigaR возвращает 2560 измерений
       EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-2560}
       EMBED_DIM: ${EMBED_DIM:-${EMBEDDING_DIMENSION:-2560}}
+      INDEXING_CONCURRENCY: ${INDEXING_CONCURRENCY:-1}
       # Dispatch smoke to validate routing before handler
       DISPATCH_SMOKE: ${DISPATCH_SMOKE:-false}
       # Force temporary handler for debugging

@@ -86,6 +86,55 @@ class TelegramClientManager:
         self._system_version = "Linux 6.8.12"
         self._app_version = "1.0.0"
         
+    @staticmethod
+    def _normalize_telegram_id_value(value: Any) -> Optional[str]:
+        """
+        Context7: приведение Telegram ID к строке с цифрами.
+        Возвращает None, если нормализация невозможна.
+        """
+        if value is None:
+            return None
+
+        # Раскрываем вложенные объекты Telethon (User/Peer/UserId)
+        for attr in ("user_id", "id"):
+            if hasattr(value, attr):
+                try:
+                    value = getattr(value, attr)
+                except Exception:
+                    break
+
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return None
+            if stripped.startswith("+"):
+                stripped = stripped[1:]
+            return stripped
+
+        if isinstance(value, (int,)):
+            return str(value)
+
+        try:
+            return str(int(value))
+        except Exception:
+            try:
+                return str(value)
+            except Exception:
+                return None
+
+    def _resolve_client_key(self, telegram_id: Any) -> Any:
+        """
+        Возвращает ключ для внутренних map (_clients, _reconnect_attempts и т.д.).
+        Предпочитаем int, если ID состоит из цифр.
+        """
+        normalized = self._normalize_telegram_id_value(telegram_id)
+        if normalized and normalized.lstrip("-").isdigit():
+            try:
+                return int(normalized)
+            except Exception:
+                pass
+        return normalized or telegram_id
+
     async def get_client(self, telegram_id: int) -> Optional[TelegramClient]:
         """
         Получить клиент с auto-reconnect.
@@ -93,62 +142,137 @@ class TelegramClientManager:
         Returns:
             TelegramClient или None если не удалось подключиться
         """
-        client = self._clients.get(telegram_id)
+        key = self._resolve_client_key(telegram_id)
+
+        # Совместимость: проверяем несколько вариантов ключей (int/str)
+        client = self._clients.get(key)
+        if not client and isinstance(key, int):
+            client = self._clients.get(str(key))
+        elif not client and isinstance(key, str) and key.lstrip("-").isdigit():
+            client = self._clients.get(int(key))
         
         if client and client.is_connected():
             return client
             
         # Попытка переподключения
-        return await self._connect_or_reconnect(telegram_id)
+        return await self._connect_or_reconnect(key)
     
     async def _connect_or_reconnect(self, telegram_id: int) -> Optional[TelegramClient]:
         """
         Подключение или переподключение клиента.
         """
+        requested_id_str = self._normalize_telegram_id_value(telegram_id)
+        if not requested_id_str or not requested_id_str.lstrip("-").isdigit():
+            logger.warning(
+                "Unable to normalize telegram_id, using raw value",
+                telegram_id=telegram_id,
+            )
+            requested_id_str = str(telegram_id)
+
         try:
-            # Получаем сессию из БД
-            session_string = await self._get_session_from_db(telegram_id)
-            if not session_string:
-                logger.warning("No session found for user", telegram_id=telegram_id)
-                return None
-                
-            # Создаем клиент
-            client = await self._create_client(telegram_id, session_string)
-            
-            # Подключаемся
-            await client.connect()
-            
-            # Проверяем авторизацию
-            if not await client.is_user_authorized():
-                logger.error("Client not authorized", telegram_id=telegram_id)
-                # [C7-ID: INGEST-AUTH-STATUS-001] Запишем статус в Redis для наблюдаемости
+            requested_id_int = int(requested_id_str)
+        except Exception:
+            logger.error(
+                "Failed to cast telegram_id to int",
+                telegram_id=telegram_id,
+                normalized=requested_id_str,
+            )
+            return None
+
+        session_key = f"telegram:session:{requested_id_int}"
+        try:
+            for attempt in (1, 2):
+                use_cache = attempt == 1
+                session_string = await self._get_session_from_db(requested_id_int, use_cache=use_cache)
+                if not session_string:
+                    logger.warning(
+                        "No session found for user",
+                        telegram_id=requested_id_int,
+                        attempt=attempt,
+                    )
+                    return None
+
+                client = await self._create_client(requested_id_int, session_string)
+                await client.connect()
+
+                if not await client.is_user_authorized():
+                    logger.error("Client not authorized", telegram_id=requested_id_int)
+                    try:
+                        await self._redis.setex(f"ingest:auth:{requested_id_int}", 600, "unauthorized")
+                    except Exception:
+                        pass
+                    await client.disconnect()
+                    telethon_authorized_clients.set(max(0, telethon_authorized_clients._value.get() - 1))
+                    return None
+
                 try:
-                    await self._redis.setex(f"ingest:auth:{telegram_id}", 600, "unauthorized")
+                    me = await client.get_me()
+                except Exception as me_err:
+                    logger.error(
+                        "Failed to fetch self info for client",
+                        telegram_id=requested_id_int,
+                        error=str(me_err),
+                    )
+                    await client.disconnect()
+                    return None
+
+                session_telegram_id = getattr(me, "id", None)
+                session_id_str = self._normalize_telegram_id_value(session_telegram_id)
+
+                if session_id_str and session_id_str.lstrip("-").isdigit():
+                    try:
+                        session_id_normalized = int(session_id_str)
+                    except Exception:
+                        session_id_normalized = session_id_str
+                else:
+                    session_id_normalized = session_id_str
+
+                if session_id_normalized != requested_id_int:
+                    logger.error(
+                        "Session telegram_id mismatch",
+                        requested_telegram_id=requested_id_int,
+                        session_telegram_id=session_telegram_id,
+                        requested_id_type=type(requested_id_int).__name__,
+                        session_telegram_id_type=type(session_telegram_id).__name__,
+                        session_id_normalized=session_id_normalized,
+                        requested_id_normalized=requested_id_int,
+                        attempt=attempt,
+                        session_repr=repr(session_telegram_id),
+                    )
+                    await client.disconnect()
+                    try:
+                        await self._redis.delete(session_key)
+                    except Exception:
+                        pass
+                    continue
+
+                self._clients[requested_id_int] = client
+                # На случай старых ключей (str) очищаем
+                self._clients.pop(str(requested_id_int), None)
+                self._last_success[requested_id_int] = time.time()
+                self._reconnect_attempts[requested_id_int] = 0
+                self._reconnect_backoffs[requested_id_int] = 1.0
+
+                logger.info("Client connected successfully", telegram_id=requested_id_int)
+                try:
+                    await self._redis.setex(f"ingest:auth:{requested_id_int}", 600, "authorized")
                 except Exception:
                     pass
-                await client.disconnect()
-                telethon_authorized_clients.set(max(0, telethon_authorized_clients._value.get() - 1))
-                return None
-                
-            # Сохраняем клиент
-            self._clients[telegram_id] = client
-            self._last_success[telegram_id] = time.time()
-            self._reconnect_attempts[telegram_id] = 0
-            self._reconnect_backoffs[telegram_id] = 1.0
-            
-            logger.info("Client connected successfully", telegram_id=telegram_id)
-            # Отметим авторизацию
-            try:
-                await self._redis.setex(f"ingest:auth:{telegram_id}", 600, "authorized")
-            except Exception:
-                pass
-            telethon_authorized_clients.set(1)
-            return client
-            
+                telethon_authorized_clients.set(len(self._clients))
+                return client
+
+            logger.error(
+                "Failed to connect client due to session mismatch",
+                telegram_id=requested_id_int,
+            )
+            return None
+
         except Exception as e:
-            logger.error("Failed to connect client", 
-                        telegram_id=telegram_id, 
-                        error=str(e))
+            logger.error(
+                "Failed to connect client",
+                telegram_id=requested_id_int,
+                error=str(e),
+            )
             return None
     
     async def _create_client(self, telegram_id: int, session_string: str) -> TelegramClient:
@@ -185,21 +309,20 @@ class TelegramClientManager:
         from config import settings
         return (settings.master_api_id, settings.master_api_hash)
     
-    async def _get_session_from_db(self, telegram_id: int) -> Optional[str]:
+    async def _get_session_from_db(self, telegram_id: int, use_cache: bool = True) -> Optional[str]:
         """
         Context7: Получение сессии: Redis -> fallback БД -> запись в Redis.
         """
-        # 1) Redis fast-path
-        try:
-            session_key = f"telegram:session:{telegram_id}"
-            session_string = await self._redis.get(session_key)
-            if session_string:
-                # Context7: безопасное декодирование (bytes или str)
-                if isinstance(session_string, bytes):
-                    return session_string.decode('utf-8')
-                return session_string
-        except Exception as e:
-            logger.error("Failed to get session from Redis", telegram_id=telegram_id, error=str(e))
+        session_key = f"telegram:session:{telegram_id}"
+        if use_cache:
+            try:
+                session_string = await self._redis.get(session_key)
+                if session_string:
+                    if isinstance(session_string, bytes):
+                        return session_string.decode("utf-8")
+                    return session_string
+            except Exception as e:
+                logger.error("Failed to get session from Redis", telegram_id=telegram_id, error=str(e))
         
         # 2) Fallback A: если miniapp записал session_id в tg:qr:session:<id>
         try:
@@ -232,14 +355,30 @@ class TelegramClientManager:
             with self._db.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
                     """
-                    SELECT session_string_enc
-                    FROM telegram_sessions
-                    WHERE status IN ('authorized','active')
-                    ORDER BY updated_at DESC
+                    SELECT ts.session_string_enc
+                    FROM telegram_sessions ts
+                    JOIN users u ON u.id::uuid = ts.user_id::uuid
+                    WHERE ts.status IN ('authorized','active')
+                      AND u.telegram_id = %s
+                    ORDER BY ts.updated_at DESC
                     LIMIT 1
-                    """
+                    """,
+                    (telegram_id,)
                 )
                 row = cur.fetchone()
+                if not row:
+                    cur.execute(
+                        """
+                        SELECT telegram_session_enc AS session_string_enc
+                        FROM users
+                        WHERE telegram_id = %s
+                          AND telegram_auth_status = 'authorized'
+                        ORDER BY telegram_auth_updated_at DESC
+                        LIMIT 1
+                        """,
+                        (telegram_id,)
+                    )
+                    row = cur.fetchone()
                 if not row:
                     return None
                 session_dec = decrypt_session(row['session_string_enc'])

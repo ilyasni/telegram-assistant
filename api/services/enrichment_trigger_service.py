@@ -19,7 +19,7 @@ DEFAULT_DIALOG_TTL_HOURS = int(os.getenv("CRAWL_TRIGGER_DIALOG_TTL_HOURS", "72")
 MAX_DIALOG_TOPICS = int(os.getenv("CRAWL_TRIGGER_DIALOG_MAX", "20"))
 MAX_TRIGGERS = int(os.getenv("CRAWL_TRIGGER_MAX_TOTAL", "60"))
 
-_WORD_RE = re.compile(r"[\\w\\-+#]{3,}", re.IGNORECASE | re.UNICODE)
+_WORD_RE = re.compile(r"[\w#+-]{3,}", re.IGNORECASE | re.UNICODE)
 
 
 def _normalize_single(value: str) -> Optional[str]:
@@ -29,7 +29,7 @@ def _normalize_single(value: str) -> Optional[str]:
     if not cleaned:
         return None
     cleaned = cleaned.replace("_", " ").replace("ё", "е")
-    cleaned = re.sub(r"\\s+", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned)
     return cleaned.lower()
 
 
@@ -96,7 +96,7 @@ def _heuristic_expand(topics: Sequence[str]) -> List[str]:
         if not normalized:
             continue
         tokens.append(normalized)
-        parts = re.split(r"[\\s,/|]+", normalized)
+        parts = re.split(r"[\s,/|]+", normalized)
         for part in parts:
             if len(part) >= 3:
                 tokens.append(part)

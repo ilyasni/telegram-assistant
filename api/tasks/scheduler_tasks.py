@@ -4,15 +4,25 @@ Context7: Используем APScheduler для планирования за�
 """
 
 import asyncio
-from datetime import datetime, date, time, timezone
+from datetime import datetime, date, time, timezone, timedelta
 from typing import List, Optional
 import structlog
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from prometheus_client import Counter
+from prometheus_client import Counter, REGISTRY
 from sqlalchemy.orm import Session
 
-from models.database import get_db, DigestSettings, User, TrendDetection, DigestHistory, UserInterest
+from models.database import (
+    get_db,
+    DigestSettings,
+    User,
+    TrendDetection,
+    DigestHistory,
+    UserInterest,
+    Group,
+    GroupConversationWindow,
+    GroupMessage,
+)
 from sqlalchemy import and_
 from services.trend_detection_service import get_trend_detection_service
 from services.user_interest_service import get_user_interest_service
@@ -24,11 +34,51 @@ from uuid import UUID
 
 logger = structlog.get_logger()
 
-digest_retry_total = Counter(
-    'digest_retry_total',
-    'Количество повторных попыток отправки дайджеста',
-    ['tenant_id']
-)
+
+def _normalize_tenant_id(tenant_id: Optional[str]) -> Optional[str]:
+    """Context7: нормализация tenant_id для сравнения в feature-flagах rollout."""
+    if not tenant_id:
+        return None
+    try:
+        return str(UUID(str(tenant_id))).lower()
+    except (ValueError, TypeError):
+        return str(tenant_id).strip().lower()
+
+
+def _is_group_digest_enabled_for_tenant(tenant_id: str) -> bool:
+    """Контроль feature-flag: глобальный toggle или canary allow-list."""
+    if settings.digest_agent_enabled:
+        return True
+    normalized = _normalize_tenant_id(tenant_id)
+    if normalized is None:
+        return False
+    allow_list = {
+        _normalize_tenant_id(t)
+        for t in getattr(settings, "digest_agent_canary_tenants", []) or []
+    }
+    return normalized in allow_list
+
+def _register_digest_retry_counter() -> Counter:
+    metric_name = 'api_digest_retry_total'
+    existing = REGISTRY._names_to_collectors.get(metric_name)
+    if existing is not None:
+        return existing  # type: ignore[return-value]
+    try:
+        return Counter(
+            'digest_retry_total',
+            'Количество повторных попыток отправки дайджеста',
+            ['tenant_id'],
+            namespace='api',
+        )
+    except ValueError as exc:
+        if "Duplicated timeseries" in str(exc):
+            existing = REGISTRY._names_to_collectors.get(metric_name)
+            if existing is not None:
+                return existing  # type: ignore[return-value]
+        raise
+
+
+digest_retry_counter = _register_digest_retry_counter()
 
 # Глобальный scheduler
 scheduler: AsyncIOScheduler = None
@@ -211,6 +261,128 @@ async def generate_digest_for_user(
         raise
 
 
+async def enqueue_group_digest(
+    tenant_id: str,
+    user_id: str,
+    group_id: str,
+    window_size_hours: int,
+    delivery_channel: str = "telegram",
+    delivery_format: str = "telegram_html",
+    trigger: str = "manual",
+    requested_by: Optional[str] = None,
+):
+    """Публикация события на генерацию дайджеста по группе."""
+    if not _is_group_digest_enabled_for_tenant(tenant_id):
+        logger.info(
+            "Group digest rollout blocked for tenant",
+            tenant_id=tenant_id,
+            trigger=trigger,
+        )
+        raise PermissionError("Group digest feature is disabled for this tenant")
+
+    if window_size_hours not in (4, 6, 12, 24):
+        raise ValueError("window_size_hours должен быть одним из значений: 4, 6, 12 или 24")
+
+    db = next(get_db())
+    try:
+        tenant_uuid = UUID(tenant_id)
+        group_uuid = UUID(group_id)
+        user_uuid = UUID(user_id)
+        requested_by_uuid = UUID(requested_by) if requested_by else user_uuid
+
+        group: Optional[Group] = (
+            db.query(Group)
+            .filter(Group.id == group_uuid, Group.tenant_id == tenant_uuid)
+            .first()
+        )
+        if not group:
+            raise ValueError("Группа не найдена или принадлежит другому арендатору")
+
+        now_utc = datetime.now(timezone.utc)
+        window_start = now_utc - timedelta(hours=window_size_hours)
+        window_end = now_utc
+
+        messages_query = (
+            db.query(GroupMessage)
+            .filter(
+                GroupMessage.group_id == group_uuid,
+                GroupMessage.posted_at >= window_start,
+                GroupMessage.posted_at <= window_end,
+            )
+        )
+        message_count = messages_query.count()
+        participant_count = (
+            messages_query.distinct(GroupMessage.sender_tg_id)
+            .count()
+        )
+
+        window = GroupConversationWindow(
+            group_id=group_uuid,
+            tenant_id=tenant_uuid,
+            window_size_hours=window_size_hours,
+            window_start=window_start,
+            window_end=window_end,
+            message_count=message_count,
+            participant_count=participant_count,
+            status="queued",
+        )
+        db.add(window)
+        db.commit()
+        db.refresh(window)
+
+        digest_history = DigestHistory(
+            user_id=user_uuid,
+            tenant_id=tenant_uuid,
+            digest_date=window_end.date(),
+            content="",
+            posts_count=0,
+            topics=[],
+            status="pending",
+        )
+        db.add(digest_history)
+        db.commit()
+        db.refresh(digest_history)
+
+        event = DigestGenerateEvent(
+            idempotency_key=f"group-digest:{group_id}:{window.id}",
+            user_id=user_id,
+            tenant_id=tenant_id,
+            digest_date=window_end.date(),
+            history_id=str(digest_history.id),
+            trigger=trigger,
+            requested_by=str(requested_by_uuid),
+            context="group",
+            group_id=group_id,
+            group_window_id=str(window.id),
+            window_size_hours=window_size_hours,
+            delivery_channel=delivery_channel,
+            delivery_format=delivery_format,
+        )
+
+        publisher = await _get_digest_event_publisher()
+        await publisher.publish_event("digests.generate", event)
+
+        logger.info(
+            "Group digest generation enqueued",
+            tenant_id=tenant_id,
+            user_id=user_id,
+            group_id=group_id,
+            window_id=str(window.id),
+            history_id=str(digest_history.id),
+            trigger=trigger,
+        )
+
+        return {
+            "history_id": str(digest_history.id),
+            "group_window_id": str(window.id),
+            "message_count": message_count,
+            "participant_count": participant_count,
+        }
+
+    finally:
+        db.close()
+
+
 async def process_digests_task():
     """
     Периодическая задача для генерации дайджестов.
@@ -319,7 +491,7 @@ async def process_digests_task():
                             digest_id=str(existing.id),
                             status=existing.status
                         )
-                        digest_retry_total.labels(tenant_id=tenant_id).inc()
+                        digest_retry_counter.labels(tenant_id=tenant_id).inc()
                         await generate_digest_for_user(
                             user_id=str(setting.user_id),
                             tenant_id=tenant_id,

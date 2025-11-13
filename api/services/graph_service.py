@@ -306,6 +306,76 @@ class GraphService:
             logger.error("Error updating user interest in graph", error=str(e), user_id=user_id, topic=topic)
             return False
     
+    async def upsert_group_conversation(
+        self,
+        tenant_id: str,
+        group_id: str,
+        digest_id: str,
+        generated_at: str,
+        window_size_hours: int,
+        topics: List[Dict[str, Any]],
+        participants: List[Dict[str, Any]],
+        metrics: Dict[str, Any],
+    ) -> None:
+        """Обновление графа для группового дайджеста (участники, темы, метрики)."""
+        try:
+            if not self._driver:
+                await self.connect()
+
+            await self._ping()
+
+            async with self._driver.session() as session:
+                params: Dict[str, Any] = {
+                    "tenant_id": tenant_id,
+                    "group_id": group_id,
+                    "digest_id": digest_id,
+                    "generated_at": generated_at,
+                    "window_size_hours": window_size_hours,
+                    "metrics": metrics or {},
+                    "topics": [
+                        {
+                            "name": topic.get("topic") or "Без названия",
+                            "priority": topic.get("priority", "medium"),
+                        }
+                        for topic in topics or []
+                    ],
+                    "participants": participants or [],
+                }
+
+                cypher = """
+                MERGE (g:Group {group_id: $group_id, tenant_id: $tenant_id})
+                MERGE (c:Conversation {digest_id: $digest_id})
+                SET c.generated_at = datetime($generated_at),
+                    c.window_size_hours = $window_size_hours,
+                    c.metrics = $metrics
+                MERGE (g)-[:HAS_CONVERSATION]->(c)
+                WITH c
+                UNWIND $topics AS topic
+                MERGE (t:Topic {name: topic.name})
+                MERGE (c)-[ct:COVERS_TOPIC]->(t)
+                SET ct.priority = topic.priority
+                WITH c
+                UNWIND $participants AS participant
+                MERGE (p:Participant {participant_key: participant.key})
+                SET p.telegram_id = participant.telegram_id,
+                    p.username = participant.username,
+                    p.last_seen_at = datetime($generated_at)
+                MERGE (p)-[rel:PARTICIPATED_IN]->(c)
+                SET rel.role = participant.role,
+                    rel.message_count = participant.message_count,
+                    rel.summary = participant.summary
+                """
+
+                await session.run(cypher, parameters=params)
+
+        except Exception as e:
+            logger.error(
+                "Failed to upsert group conversation into graph",
+                error=str(e),
+                tenant_id=tenant_id,
+                digest_id=digest_id,
+            )
+    
     async def find_similar_topics(self, topic: str, limit: int = 10, tenant_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         Поиск похожих тем через граф.

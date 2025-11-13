@@ -4,19 +4,24 @@ import asyncio
 import logging
 import os
 import uuid
-from typing import List, Optional, Any
+from typing import List, Optional, Any, Dict, Set
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, AuthKeyError
+from telethon.utils import get_peer_id
 import structlog
 import redis.asyncio as redis
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from config import settings
-from services.events import publish_post_created, STREAM_POST_CREATED
+from services.events import (
+    publish_post_created,
+    STREAM_POST_CREATED,
+    STREAM_GROUP_MESSAGE_CREATED,
+)
 
 logger = structlog.get_logger()
 
@@ -59,6 +64,7 @@ class TelegramIngestionService:
                     connect_timeout=10  # таймаут 10 секунд
                 )
             )
+            self.db_connection.autocommit = False
             logger.info("Database connected")
             
             # Context7: Получаем клиент через TelegramClientManager
@@ -86,9 +92,14 @@ class TelegramIngestionService:
             
             # Загрузка активных каналов (неблокирующая)
             asyncio.create_task(self._load_active_channels())
+            # Загрузка активных групп
+            asyncio.create_task(self._load_active_groups())
+            # Синхронизация истории групп
+            asyncio.create_task(self._group_sync_worker())
             
             # Context7 best practice: исторический парсинг для отладки (неблокирующий)
             asyncio.create_task(self._start_historical_parsing())
+            asyncio.create_task(self._group_discovery_worker())
             
             self.is_running = True
             logger.info("Telegram ingestion service started with Context7 components")
@@ -207,6 +218,442 @@ class TelegramIngestionService:
                         
         except Exception as e:
             logger.error("Failed to load channels", error=str(e))
+
+    async def _load_active_groups(self):
+        """Загрузка активных групп из БД для подписки на события."""
+        try:
+            with self.db_connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute("""
+                    SELECT id, tenant_id, tg_chat_id, username, title
+                    FROM groups
+                    WHERE is_active = true
+                """)
+                groups = cursor.fetchall() or []
+
+            for group in groups:
+                try:
+                    entity = None
+                    if group.get("username"):
+                        clean_username = group["username"].lstrip("@")
+                        entity = await self.client.get_entity(clean_username)
+                    elif group.get("tg_chat_id"):
+                        entity = await self.client.get_entity(int(group["tg_chat_id"]))
+
+                    logger.info(
+                        "Loaded group for real-time ingest",
+                        group_id=group["id"],
+                        tg_chat_id=group.get("tg_chat_id"),
+                        username=group.get("username"),
+                        title=group.get("title"),
+                        entity_type=type(entity).__name__ if entity else None,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Failed to load group entity",
+                        group_id=group.get("id"),
+                        tg_chat_id=group.get("tg_chat_id"),
+                        error=str(e),
+                    )
+        except Exception as e:
+            logger.error("Failed to load groups", error=str(e))
+
+    async def _group_sync_worker(self):
+        """Периодическая синхронизация истории сообщений групп."""
+        poll_interval = int(os.getenv("GROUP_SYNC_INTERVAL_SEC", "180"))
+        max_messages = int(os.getenv("GROUP_SYNC_LIMIT", "200"))
+        lookback_hours = int(os.getenv("GROUP_SYNC_LOOKBACK_HOURS", "24"))
+
+        while True:
+            if not self.is_running or not self.client or not self.db_connection:
+                await asyncio.sleep(poll_interval)
+                continue
+
+            try:
+                with self.db_connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                    cursor.execute(
+                        """
+                        SELECT id, tenant_id, tg_chat_id, username, title
+                        FROM groups
+                        WHERE is_active = true
+                        """
+                    )
+                    groups = cursor.fetchall() or []
+            except Exception as fetch_err:
+                logger.error("Failed to load groups for sync", error=str(fetch_err))
+                try:
+                    self.db_connection.rollback()
+                except Exception:
+                    pass
+                await asyncio.sleep(poll_interval)
+                continue
+
+            lookback_threshold = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+
+            for group in groups:
+                tg_chat_id = group.get("tg_chat_id")
+                if tg_chat_id is None:
+                    continue
+
+                try:
+                    entity = await self.client.get_entity(int(tg_chat_id))
+                except Exception as entity_err:
+                    logger.warning(
+                        "Failed to resolve group entity for sync",
+                        error=str(entity_err),
+                        group_id=group.get("id"),
+                        tg_chat_id=tg_chat_id,
+                    )
+                    continue
+
+                processed = 0
+                try:
+                    async for message in self.client.iter_messages(entity, limit=max_messages):
+                        message_date = getattr(message, "date", None)
+                        if isinstance(message_date, datetime):
+                            msg_dt = (
+                                message_date.replace(tzinfo=timezone.utc)
+                                if message_date.tzinfo is None
+                                else message_date.astimezone(timezone.utc)
+                            )
+                            if msg_dt < lookback_threshold:
+                                break
+
+                        await self._process_group_message(message, group)
+                        processed += 1
+                except Exception as sync_err:
+                    logger.warning(
+                        "Group sync iteration failed",
+                        error=str(sync_err),
+                        group_id=group.get("id"),
+                        tg_chat_id=tg_chat_id,
+                    )
+                    continue
+
+                if processed:
+                    logger.info(
+                        "Group history synced",
+                        group_id=group.get("id"),
+                        tg_chat_id=tg_chat_id,
+                        processed=processed,
+                        lookback_hours=lookback_hours,
+                    )
+
+            await asyncio.sleep(poll_interval)
+
+    async def _group_discovery_worker(self):
+        """Обработка запросов на discovery групп из БД."""
+        poll_interval = int(os.getenv("GROUP_DISCOVERY_POLL_INTERVAL_SEC", "20"))
+        max_dialogs = int(os.getenv("GROUP_DISCOVERY_DIALOG_LIMIT", "300"))
+
+        while True:
+            if not self.is_running or not self.client or not self.db_connection:
+                await asyncio.sleep(poll_interval)
+                continue
+
+            request_row = None
+            try:
+                with self.db_connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                    cursor.execute(
+                        """
+                        SELECT id, tenant_id, user_id
+                        FROM group_discovery_requests
+                        WHERE status = 'pending'
+                        ORDER BY created_at
+                        LIMIT 1
+                        FOR UPDATE SKIP LOCKED
+                        """
+                    )
+                    request_row = cursor.fetchone()
+                    if not request_row:
+                        self.db_connection.rollback()
+                        await asyncio.sleep(poll_interval)
+                        continue
+
+                    cursor.execute(
+                        """
+                        UPDATE group_discovery_requests
+                        SET status = 'processing'
+                        WHERE id = %s
+                        """,
+                        (request_row["id"],),
+                    )
+                    self.db_connection.commit()
+            except Exception as fetch_err:
+                logger.error("Failed to fetch discovery request", error=str(fetch_err))
+                try:
+                    self.db_connection.rollback()
+                except Exception:
+                    pass
+                await asyncio.sleep(poll_interval)
+                continue
+
+            if not request_row:
+                await asyncio.sleep(poll_interval)
+                continue
+
+            request_id = request_row["id"]
+            tenant_id = request_row["tenant_id"]
+            user_uuid = request_row.get("user_id")
+            target_telegram_id: Optional[int] = None
+            target_client: Optional[TelegramClient] = None
+
+            try:
+                with self.db_connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                    cursor.execute(
+                        """
+                        SELECT telegram_id
+                        FROM users
+                        WHERE id = %s
+                        """,
+                        (user_uuid,),
+                    )
+                    user_row = cursor.fetchone()
+
+                if not user_row or user_row.get("telegram_id") is None:
+                    with self.db_connection.cursor() as cursor:
+                        cursor.execute(
+                            """
+                            UPDATE group_discovery_requests
+                            SET status = %s,
+                                error = %s,
+                                completed_at = NOW()
+                            WHERE id = %s
+                            """,
+                            (
+                                "failed",
+                                "telegram_id_not_found",
+                                request_id,
+                            ),
+                        )
+                        self.db_connection.commit()
+                    continue
+
+                target_telegram_id = int(user_row["telegram_id"])
+                if not self.client_manager:
+                    raise RuntimeError("client_manager_not_configured")
+
+                target_client = await self.client_manager.get_client(target_telegram_id)
+                if not target_client:
+                    with self.db_connection.cursor() as cursor:
+                        cursor.execute(
+                            """
+                            UPDATE group_discovery_requests
+                            SET status = %s,
+                                error = %s,
+                                completed_at = NOW()
+                            WHERE id = %s
+                            """,
+                            (
+                                "failed",
+                                "telegram_client_unavailable",
+                                request_id,
+                            ),
+                        )
+                        self.db_connection.commit()
+                    continue
+
+            except Exception as session_err:
+                logger.error(
+                    "Group discovery failed to acquire user session",
+                    request_id=request_id,
+                    tenant_id=tenant_id,
+                    user_id=user_uuid,
+                    error=str(session_err),
+                )
+                try:
+                    with self.db_connection.cursor() as cursor:
+                        cursor.execute(
+                            """
+                            UPDATE group_discovery_requests
+                            SET status = %s,
+                                error = %s,
+                                completed_at = NOW()
+                            WHERE id = %s
+                            """,
+                            (
+                                "failed",
+                                "session_unavailable",
+                                request_id,
+                            ),
+                        )
+                        self.db_connection.commit()
+                except Exception:
+                    try:
+                        self.db_connection.rollback()
+                    except Exception:
+                        pass
+                continue
+
+            try:
+                existing_map: Dict[int, Dict[str, Any]] = {}
+                with self.db_connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                    cursor.execute(
+                        """
+                        SELECT id, tg_chat_id
+                        FROM groups
+                        WHERE tenant_id = %s
+                    """,
+                        (tenant_id,),
+                    )
+                    for row in cursor.fetchall() or []:
+                        if row.get("tg_chat_id") is not None:
+                            existing_map[int(row["tg_chat_id"])] = {
+                                "group_id": str(row["id"])
+                            }
+
+                results: List[Dict[str, Any]] = []
+                seen_chat_ids: Set[int] = set()
+
+                async def _collect_dialogs(dialog_iter):
+                    async for dialog in dialog_iter:
+                        entity = dialog.entity
+                        is_group_dialog = bool(getattr(dialog, "is_group", False))
+                        is_supergroup = bool(getattr(entity, "megagroup", False) or getattr(entity, "gigagroup", False))
+                        is_broadcast = bool(getattr(entity, "broadcast", False))
+                        if not (is_group_dialog or is_supergroup):
+                            continue
+                        if is_broadcast and not is_supergroup:
+                            continue
+                        if getattr(entity, "left", False):
+                            continue
+                        try:
+                            tg_chat_id = int(get_peer_id(entity))
+                        except Exception:
+                            continue
+                        if tg_chat_id in seen_chat_ids:
+                            continue
+                        seen_chat_ids.add(tg_chat_id)
+
+                        username = getattr(entity, "username", None)
+                        title = getattr(entity, "title", None) or getattr(entity, "first_name", "") or ""
+                        is_megagroup = bool(getattr(entity, "megagroup", False))
+                        is_gigagroup = bool(getattr(entity, "gigagroup", False))
+                        participants_count = getattr(entity, "participants_count", None)
+                        is_private = username is None
+                        is_connected = tg_chat_id in existing_map
+                        connected_group_id = existing_map.get(tg_chat_id, {}).get("group_id")
+                        category = "supergroup" if is_supergroup else "group"
+
+                        results.append(
+                            {
+                                "tg_chat_id": tg_chat_id,
+                                "title": title,
+                                "username": username,
+                                "is_megagroup": is_megagroup,
+                                "is_gigagroup": is_gigagroup,
+                                "is_channel": False,
+                                "is_broadcast": is_broadcast,
+                                "category": category,
+                                "is_private": is_private,
+                                "participants_count": participants_count,
+                                "is_connected": is_connected,
+                                "connected_group_id": connected_group_id,
+                                "invite_required": is_private and not username,
+                            }
+                        )
+
+                await _collect_dialogs(target_client.iter_dialogs(limit=max_dialogs))
+
+                include_archived = os.getenv("GROUP_DISCOVERY_INCLUDE_ARCHIVED", "true").lower() in {"1", "true", "yes"}
+                if include_archived:
+                    await _collect_dialogs(target_client.iter_dialogs(limit=max_dialogs, archived=True))
+
+                total = len(results)
+                connected_count = sum(1 for item in results if item.get("is_connected"))
+
+                with self.db_connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        UPDATE group_discovery_requests
+                        SET status = %s,
+                            total = %s,
+                            connected_count = %s,
+                            results = %s::jsonb,
+                            error = NULL,
+                            completed_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (
+                            "completed",
+                            total,
+                            connected_count,
+                            json.dumps(results, ensure_ascii=False),
+                            request_id,
+                        ),
+                    )
+                    self.db_connection.commit()
+
+                logger.info(
+                    "Group discovery completed",
+                    request_id=request_id,
+                    tenant_id=tenant_id,
+                    total=total,
+                    connected_count=connected_count,
+                )
+
+            except FloodWaitError as flood_err:
+                wait_seconds = int(getattr(flood_err, "seconds", 30))
+                logger.warning(
+                    "Group discovery hit FloodWait",
+                    request_id=request_id,
+                    wait_seconds=wait_seconds,
+                )
+                try:
+                    with self.db_connection.cursor() as cursor:
+                        cursor.execute(
+                            """
+                            UPDATE group_discovery_requests
+                            SET status = %s,
+                                error = %s,
+                                completed_at = NOW()
+                            WHERE id = %s
+                            """,
+                            (
+                                "failed",
+                                f"FloodWait: retry after {wait_seconds}s",
+                                request_id,
+                            ),
+                        )
+                        self.db_connection.commit()
+                except Exception as update_err:
+                    logger.error("Failed to update discovery request after FloodWait", error=str(update_err))
+                    try:
+                        self.db_connection.rollback()
+                    except Exception:
+                        pass
+                await asyncio.sleep(wait_seconds)
+            except Exception as discovery_err:
+                logger.error(
+                    "Group discovery failed",
+                    request_id=request_id,
+                    error=str(discovery_err),
+                )
+                try:
+                    with self.db_connection.cursor() as cursor:
+                        cursor.execute(
+                            """
+                            UPDATE group_discovery_requests
+                            SET status = %s,
+                                error = %s,
+                                completed_at = NOW()
+                            WHERE id = %s
+                            """,
+                            (
+                                "failed",
+                                str(discovery_err),
+                                request_id,
+                            ),
+                        )
+                        self.db_connection.commit()
+                except Exception as update_err:
+                    logger.error("Failed to set discovery request failed status", error=str(update_err))
+                    try:
+                        self.db_connection.rollback()
+                    except Exception:
+                        pass
+                await asyncio.sleep(poll_interval)
+            finally:
+                await asyncio.sleep(0.1)
 
     async def _start_historical_parsing(self):
         """Context7 best practice: исторический парсинг сообщений за последние 24 часа.
@@ -550,7 +997,15 @@ class TelegramIngestionService:
             # Получение информации о канале из БД
             channel_info = await self._get_channel_info(channel.id)
             if not channel_info:
-                logger.warning("Channel not found in database", telegram_id=channel.id)
+                # Попытка найти группу
+                group_info = await self._get_group_info(channel.id)
+                if group_info:
+                    await self._process_group_message(message, group_info)
+                else:
+                    logger.warning(
+                        "Chat not registered as channel or group",
+                        telegram_chat_id=channel.id
+                    )
                 return
             
             # Context7 best practice: извлекаем все данные из сообщения
@@ -708,6 +1163,349 @@ class TelegramIngestionService:
             except:
                 pass
             return None
+
+    async def _get_group_info(self, telegram_id: int) -> Optional[dict]:
+        """Получение информации о группе из БД."""
+        try:
+            with self.db_connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute("""
+                    SELECT id, tenant_id, tg_chat_id, username, title, settings
+                    FROM groups
+                    WHERE tg_chat_id = %s AND is_active = true
+                """, (telegram_id,))
+                row = cursor.fetchone()
+                return row
+        except Exception as e:
+            logger.error("Failed to get group info", error=str(e))
+            try:
+                self.db_connection.rollback()
+            except Exception:
+                pass
+            return None
+
+    async def _process_group_message(self, message, group_info: dict):
+        """Обработка сообщения из Telegram-группы."""
+        group_message_uuid = str(uuid.uuid4())
+        try:
+            message_data = await self._extract_group_message_data(message, group_info)
+            message_data["id"] = group_message_uuid
+
+            media_files: List[Any] = []
+            if self.media_processor and message.media and self.client:
+                try:
+                    self.media_processor.telegram_client = self.client
+                    media_files = await self.media_processor.process_message_media(
+                        message=message,
+                        post_id=group_message_uuid,
+                        trace_id=message_data["trace_id"],
+                        tenant_id=str(group_info.get("tenant_id")),
+                        channel_id=str(group_info.get("id")),
+                    )
+                    if media_files:
+                        message_data["media_files"] = media_files
+                        message_data["has_media"] = True
+                except Exception as media_err:
+                    logger.warning(
+                        "Failed to process group media",
+                        error=str(media_err),
+                        group_id=group_info.get("id"),
+                        trace_id=message_data["trace_id"],
+                        exc_info=True,
+                    )
+
+            group_message_id = await self._save_group_message(message_data)
+
+            if media_files:
+                try:
+                    await self._save_group_media_to_cas_sync(group_message_id, media_files, message_data["trace_id"])
+                except Exception as cas_err:
+                    logger.warning(
+                        "Failed to save group media to CAS",
+                        error=str(cas_err),
+                        group_message_id=group_message_id,
+                        exc_info=True,
+                    )
+
+            await self._publish_group_message_event(group_message_id, message_data, group_info)
+
+            logger.info(
+                "Group message processed",
+                group_message_id=group_message_id,
+                group_id=group_info.get("id"),
+                tenant_id=group_info.get("tenant_id"),
+                tg_message_id=message.id,
+                has_media=bool(message_data.get("has_media")),
+            )
+        except Exception as e:
+            logger.error(
+                "Failed to process group message",
+                error=str(e),
+                group_id=group_info.get("id"),
+                tg_message_id=message.id,
+            )
+
+    async def _extract_group_message_data(self, message, group_info: dict) -> dict:
+        """Извлечение данных сообщения группы."""
+        tenant_id = str(group_info.get("tenant_id"))
+        group_id = str(group_info.get("id"))
+        media_urls = await self._extract_media_urls(message)
+
+        sender_tg_id = None
+        sender_username = None
+
+        try:
+            if getattr(message, "from_id", None):
+                sender_tg_id = getattr(message.from_id, "user_id", None) or getattr(message.from_id, "channel_id", None)
+        except Exception:
+            sender_tg_id = None
+
+        try:
+            sender = getattr(message, "sender", None)
+            if sender:
+                sender_username = getattr(sender, "username", None)
+                if not sender_tg_id:
+                    sender_tg_id = getattr(sender, "id", None)
+            elif sender_tg_id and self.client:
+                entity = await self.client.get_entity(sender_tg_id)
+                sender_username = getattr(entity, "username", None)
+        except Exception as e:
+            logger.debug("Failed to resolve group sender entity", error=str(e))
+
+        reply_to_info = None
+        try:
+            if getattr(message, "reply_to", None):
+                reply_to_peer = getattr(message.reply_to, "reply_to_peer_id", None)
+                reply_peer_id = None
+                if reply_to_peer:
+                    reply_peer_id = getattr(reply_to_peer, "chat_id", None) or getattr(reply_to_peer, "channel_id", None) or getattr(reply_to_peer, "user_id", None)
+                reply_to_info = {
+                    "message_id": getattr(message.reply_to, "reply_to_msg_id", None),
+                    "chat_id": reply_peer_id,
+                }
+        except Exception:
+            reply_to_info = None
+
+        mentions = self._extract_mentions(message)
+        indicators_stub = {
+            "tone": "unknown",
+            "conflict": None,
+            "collaboration": None,
+            "stress": None,
+            "enthusiasm": None,
+        }
+
+        posted_at = message.date.replace(tzinfo=timezone.utc) if message.date and message.date.tzinfo is None else message.date or datetime.now(timezone.utc)
+        if posted_at is None:
+            posted_at = datetime.now(timezone.utc)
+        created_at = datetime.now(timezone.utc)
+
+        message_data = {
+            "group_id": group_id,
+            "tenant_id": tenant_id,
+            "tg_message_id": message.id,
+            "sender_tg_id": sender_tg_id,
+            "sender_username": sender_username,
+            "content": message.message or message.text or "",
+            "media_urls": media_urls,
+            "reply_to": reply_to_info,
+            "mentions": mentions,
+            "has_media": bool(media_urls),
+            "is_service": bool(getattr(message, "action", None)),
+            "action_type": getattr(getattr(message, "action", None), "__class__", type(None)).__name__,
+            "posted_at": posted_at,
+            "created_at": created_at,
+            "indicators": indicators_stub,
+            "trace_id": f"{tenant_id}:{group_id}:{message.id}",
+        }
+
+        return message_data
+
+    def _extract_mentions(self, message) -> list[dict]:
+        """Извлечение упоминаний пользователей из сообщения."""
+        mentions: list[dict] = []
+        try:
+            entities = getattr(message, "entities", []) or []
+            if not entities:
+                return mentions
+            for entity in entities:
+                entity_type = entity.__class__.__name__
+                if entity_type in {"MessageEntityMention", "MessageEntityMentionName"}:
+                    mention_text = message.message[entity.offset : entity.offset + entity.length] if message.message else ""
+                    mentions.append(
+                        {
+                            "type": entity_type,
+                            "text": mention_text,
+                            "user_id": getattr(entity, "user_id", None),
+                        }
+                    )
+        except Exception as e:
+            logger.debug("Failed to extract mentions", error=str(e))
+        return mentions
+
+    async def _save_group_message(self, message_data: dict) -> str:
+        """Сохранение сообщения группы и связанных записей."""
+        try:
+            with self.db_connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO group_messages (
+                        id,
+                        group_id,
+                        tenant_id,
+                        tg_message_id,
+                        sender_tg_id,
+                        sender_username,
+                        content,
+                        media_urls,
+                        reply_to,
+                        posted_at,
+                        created_at,
+                        updated_at,
+                        has_media,
+                        is_service,
+                        action_type
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s,
+                        %s, %s::jsonb, %s::jsonb, %s, %s,
+                        NOW(), %s, %s, %s
+                    )
+                    ON CONFLICT (group_id, tg_message_id)
+                    DO UPDATE SET
+                        content = EXCLUDED.content,
+                        media_urls = EXCLUDED.media_urls,
+                        reply_to = EXCLUDED.reply_to,
+                        sender_tg_id = EXCLUDED.sender_tg_id,
+                        sender_username = EXCLUDED.sender_username,
+                        has_media = EXCLUDED.has_media,
+                        is_service = EXCLUDED.is_service,
+                        action_type = EXCLUDED.action_type,
+                        posted_at = EXCLUDED.posted_at,
+                        updated_at = NOW()
+                    RETURNING id
+                    """,
+                    (
+                        message_data.get("id"),
+                        message_data["group_id"],
+                        message_data["tenant_id"],
+                        message_data["tg_message_id"],
+                        message_data["sender_tg_id"],
+                        message_data["sender_username"],
+                        message_data["content"],
+                        json.dumps(message_data.get("media_urls", [])),
+                        json.dumps(message_data.get("reply_to")),
+                        message_data.get("posted_at"),
+                        message_data.get("created_at"),
+                        message_data.get("has_media", False),
+                        message_data.get("is_service", False),
+                        message_data.get("action_type"),
+                    ),
+                )
+
+                row = cursor.fetchone()
+                group_message_id = row[0]
+
+                # Mentions
+                if message_data.get("mentions"):
+                    for mention in message_data["mentions"]:
+                        cursor.execute(
+                            """
+                            INSERT INTO group_mentions (
+                                group_message_id,
+                                mentioned_user_tg_id,
+                                context_snippet,
+                                is_processed,
+                                created_at
+                            ) VALUES (
+                                %s, %s, %s, %s, NOW()
+                            )
+                            ON CONFLICT (group_message_id, mentioned_user_tg_id) DO NOTHING
+                            """,
+                            (
+                                group_message_id,
+                                mention.get("user_id"),
+                                mention.get("text"),
+                                False,
+                            ),
+                        )
+
+                # Стартовая запись в analytics (placeholder)
+                cursor.execute(
+                    """
+                    INSERT INTO group_message_analytics (
+                        message_id,
+                        embeddings,
+                        tags,
+                        entities,
+                        sentiment_score,
+                        emotions,
+                        moderation_flags,
+                        analysed_at,
+                        metadata_payload
+                    )
+                    VALUES (
+                        %s,
+                        NULL,
+                        NULL,
+                        NULL,
+                        NULL,
+                        NULL,
+                        NULL,
+                        NULL,
+                        %s::jsonb
+                    )
+                    ON CONFLICT (message_id) DO NOTHING
+                    """,
+                    (
+                        group_message_id,
+                        json.dumps({"status": "pending"}),
+                    ),
+                )
+
+                self.db_connection.commit()
+                return str(group_message_id)
+        except Exception as e:
+            try:
+                self.db_connection.rollback()
+            except Exception:
+                pass
+            logger.error(
+                "Failed to save group message",
+                error=str(e),
+                group_id=message_data.get("group_id"),
+                tg_message_id=message_data.get("tg_message_id"),
+            )
+            raise
+
+    async def _publish_group_message_event(self, group_message_id: str, message_data: dict, group_info: dict):
+        """Публикация события group.message.created в Redis Stream."""
+        try:
+            payload = {
+                "group_message_id": str(group_message_id),
+                "group_id": str(group_info.get("id")),
+                "tenant_id": str(group_info.get("tenant_id")),
+                "tg_message_id": str(message_data.get("tg_message_id")),
+                "content": message_data.get("content", ""),
+                "posted_at": message_data.get("posted_at"),
+                "trace_id": message_data.get("trace_id"),
+                "sender_tg_id": str(message_data.get("sender_tg_id") or ""),
+                "sender_username": message_data.get("sender_username") or "",
+                "has_media": str(message_data.get("has_media", False)),
+                "mentions": json.dumps(message_data.get("mentions", [])),
+            }
+
+            event_data = {
+                key: value if isinstance(value, str) else json.dumps(value)
+                for key, value in payload.items()
+                if value is not None
+            }
+
+            await self.redis_client.xadd(STREAM_GROUP_MESSAGE_CREATED, event_data)
+        except Exception as e:
+            logger.warning(
+                "Failed to publish group message event",
+                error=str(e),
+                group_message_id=group_message_id,
+            )
 
     async def _get_channel_info_by_id(self, channel_id: str) -> Optional[dict]:
         """Получение информации о канале по ID из БД."""
@@ -914,6 +1712,79 @@ class TelegramIngestionService:
                 error=str(e),
                 trace_id=trace_id,
                 exc_info=True
+            )
+            raise
+    
+    async def _save_group_media_to_cas_sync(self, group_message_id: str, media_files: List[Any], trace_id: str):
+        """Сохранение медиа для групповых сообщений в CAS (media_objects + group_media_map)."""
+        if not media_files or not group_message_id:
+            return
+        try:
+            s3_bucket = self.media_processor.s3_service.bucket_name if self.media_processor else None
+            if not s3_bucket:
+                logger.warning("S3 bucket not available for group CAS save", group_message_id=group_message_id)
+                return
+
+            with self.db_connection.cursor() as cursor:
+                for media_file in media_files:
+                    cursor.execute(
+                        """
+                        INSERT INTO media_objects (
+                            file_sha256, mime, size_bytes, s3_key, s3_bucket,
+                            first_seen_at, last_seen_at, refs_count
+                        ) VALUES (
+                            %s, %s, %s, %s, %s,
+                            NOW(), NOW(), 1
+                        )
+                        ON CONFLICT (file_sha256) DO UPDATE SET
+                            last_seen_at = NOW(),
+                            refs_count = media_objects.refs_count + 1,
+                            s3_key = EXCLUDED.s3_key,
+                            s3_bucket = EXCLUDED.s3_bucket
+                        """,
+                        (
+                            media_file.sha256,
+                            media_file.mime_type,
+                            media_file.size_bytes,
+                            media_file.s3_key,
+                            s3_bucket,
+                        ),
+                    )
+
+                for idx, media_file in enumerate(media_files):
+                    cursor.execute(
+                        """
+                        INSERT INTO group_media_map (
+                            group_message_id, file_sha256, position, meta
+                        ) VALUES (
+                            %s, %s, %s, %s::jsonb
+                        )
+                        ON CONFLICT (group_message_id, file_sha256) DO NOTHING
+                        """,
+                        (
+                            group_message_id,
+                            media_file.sha256,
+                            idx,
+                            json.dumps(
+                                {
+                                    "s3_key": media_file.s3_key,
+                                    "s3_bucket": s3_bucket,
+                                    "mime_type": media_file.mime_type,
+                                    "size_bytes": media_file.size_bytes,
+                                }
+                            ),
+                        ),
+                    )
+
+                self.db_connection.commit()
+        except Exception as e:
+            self.db_connection.rollback()
+            logger.error(
+                "Failed to save group media to CAS",
+                group_message_id=group_message_id,
+                error=str(e),
+                trace_id=trace_id,
+                exc_info=True,
             )
             raise
     

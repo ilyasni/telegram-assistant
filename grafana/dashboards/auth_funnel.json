@@ -84,7 +84,7 @@
             "name": "Prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(rate(auth_qr_start_total[5m]))",
+          "expr": "sum(rate(api_auth_qr_start_total[5m]))",
           "legendFormat": "QR Started",
           "refId": "A"
         },
@@ -95,7 +95,7 @@
             "name": "Prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(rate(auth_qr_published_total[5m]))",
+          "expr": "sum(rate(telethon_auth_qr_published_total[5m]))",
           "legendFormat": "QR Published",
           "refId": "B"
         },
@@ -106,7 +106,7 @@
             "name": "Prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(rate(auth_qr_success_total[5m]))",
+          "expr": "sum(rate(api_auth_qr_success_total[5m]))",
           "legendFormat": "QR Authorized",
           "refId": "C"
         }
@@ -177,7 +177,7 @@
             "name": "Prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(rate(auth_qr_success_total[5m])) / sum(rate(auth_qr_start_total[5m])) * 100",
+          "expr": "sum(rate(api_auth_qr_success_total[5m])) / sum(rate(api_auth_qr_start_total[5m])) * 100",
           "legendFormat": "Success Rate %",
           "refId": "A"
         }
@@ -248,7 +248,7 @@
             "name": "Prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(rate(auth_qr_fail_total[5m]))",
+          "expr": "sum(rate(api_auth_qr_fail_total[5m]))",
           "legendFormat": "Errors/min",
           "refId": "A"
         }
@@ -337,7 +337,7 @@
             "name": "Prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(rate(auth_qr_start_total[1m]))",
+          "expr": "sum(rate(api_auth_qr_start_total[1m]))",
           "legendFormat": "Started",
           "refId": "A"
         },
@@ -348,7 +348,7 @@
             "name": "Prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(rate(auth_qr_published_total[1m]))",
+          "expr": "sum(rate(telethon_auth_qr_published_total[1m]))",
           "legendFormat": "Published",
           "refId": "B"
         },
@@ -359,7 +359,7 @@
             "name": "Prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(rate(auth_qr_success_total[1m]))",
+          "expr": "sum(rate(api_auth_qr_success_total[1m]))",
           "legendFormat": "Authorized",
           "refId": "C"
         },
@@ -370,7 +370,7 @@
             "name": "Prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(rate(auth_qr_expired_total[1m]))",
+          "expr": "sum(rate(api_auth_qr_expired_total[1m]))",
           "legendFormat": "Expired",
           "refId": "D"
         }
@@ -564,7 +564,7 @@
             "name": "Prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(rate(rate_limit_hits_total[1m]))",
+          "expr": "sum(rate(telethon_rate_limit_hits_total[1m]))",
           "legendFormat": "Rate Limit Hits/min",
           "refId": "A"
         }
@@ -775,7 +775,7 @@
             "name": "Prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))",
+          "expr": "histogram_quantile(0.95, sum(rate(api_http_request_duration_seconds_bucket[5m])) by (le))",
           "legendFormat": "P95 Response Time",
           "refId": "A"
         },
@@ -786,7 +786,7 @@
             "name": "Prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))",
+          "expr": "histogram_quantile(0.50, sum(rate(api_http_request_duration_seconds_bucket[5m])) by (le))",
           "legendFormat": "P50 Response Time",
           "refId": "B"
         }

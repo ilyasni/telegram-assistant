@@ -39,6 +39,12 @@ erDiagram
   GROUPS ||--o{ USER_GROUP : has
   GROUP_MESSAGES ||--o{ GROUP_MENTIONS : has
   USERS ||--o{ GROUP_MENTIONS : mentioned
+  GROUP_MESSAGES ||--o{ GROUP_MESSAGE_ANALYTICS : analysed
+  GROUPS ||--o{ GROUP_CONVERSATION_WINDOWS : windowed
+  GROUP_CONVERSATION_WINDOWS ||--o{ GROUP_DIGESTS : produces
+  GROUP_DIGESTS ||--o{ GROUP_DIGEST_TOPICS : contains
+  GROUP_DIGESTS ||--o{ GROUP_DIGEST_PARTICIPANTS : includes
+  GROUP_DIGESTS ||--|| GROUP_DIGEST_METRICS : has
 
   TENANTS {
     uuid id PK
@@ -153,6 +159,8 @@ erDiagram
     bigint sender_tg_id
     text sender_username
     text content
+    jsonb media_urls
+    jsonb reply_to
     timestamptz posted_at
     timestamptz created_at
   }
@@ -165,6 +173,76 @@ erDiagram
     boolean is_processed
     timestamptz processed_at
     timestamptz created_at
+  }
+  GROUP_MESSAGE_ANALYTICS {
+    uuid message_id PK/FK
+    jsonb embeddings
+    jsonb tags
+    jsonb entities
+    numeric sentiment_score
+    jsonb emotions
+    jsonb moderation_flags
+    timestamptz analysed_at
+    jsonb metadata
+  }
+  GROUP_CONVERSATION_WINDOWS {
+    uuid id PK
+    uuid group_id FK
+    uuid tenant_id FK
+    interval window_size
+    timestamptz window_start
+    timestamptz window_end
+    integer message_count
+    integer participant_count
+    jsonb dominant_emotions
+    jsonb indicators
+    timestamptz generated_at
+    text status
+    text failure_reason
+  }
+  GROUP_DIGESTS {
+    uuid id PK
+    uuid window_id FK
+    uuid requested_by_user_id FK
+    text delivery_channel
+    text format
+    text title
+    text summary
+    jsonb payload
+    timestamptz generated_at
+    timestamptz delivered_at
+    text delivery_status
+    jsonb delivery_metadata
+    jsonb evaluation_scores
+  }
+  GROUP_DIGEST_TOPICS {
+    uuid id PK
+    uuid digest_id FK
+    text topic
+    text priority -- high/medium/low
+    integer message_count
+    jsonb representative_messages
+    jsonb keywords
+    jsonb actions
+  }
+  GROUP_DIGEST_PARTICIPANTS {
+    uuid id PK
+    uuid digest_id FK
+    bigint participant_tg_id
+    text participant_username
+    text role -- initiator, expert, moderator etc.
+    integer message_count
+    jsonb contribution_summary
+  }
+  GROUP_DIGEST_METRICS {
+    uuid digest_id PK/FK
+    numeric sentiment
+    numeric stress_index
+    numeric collaboration_index
+    numeric conflict_index
+    numeric enthusiasm_index
+    jsonb raw_scores
+    timestamptz evaluated_at
   }
   POST_REACTIONS {
     uuid id PK
@@ -272,11 +350,13 @@ erDiagram
 - `last_checked_at` — время последней проверки
 
 #### `group_messages`
-Сообщения из групповых чатов.
+Сообщения из групповых чатов. Содержит текст, медиа и контекст (ответы, пересылки).
 
 **Ключевые поля:**
 - `sender_tg_id` — ID отправителя
 - `content` — текст сообщения
+- `reply_to` — JSONB (ID исходного сообщения, тип ссылки)
+- `media_urls` — JSONB массив медиа-контента
 
 #### `group_mentions`
 Упоминания пользователей в группах.
@@ -285,6 +365,62 @@ erDiagram
 - `mentioned_user_tg_id` — ID упомянутого пользователя
 - `context_snippet` — контекст упоминания
 - `is_processed` — флаг обработки
+
+#### `group_message_analytics`
+Результаты обогащения групповых сообщений (эмбеддинги, эмоции, модерация).
+
+**Ключевые поля:**
+- `embeddings` — JSONB с вектором GigaChat
+- `sentiment_score` — агрегированная оценка настроения [-1;1]
+- `emotions` — JSONB карта (joy, stress, conflict и т.п.)
+- `moderation_flags` — флаги безопасности/токсичности
+
+#### `group_conversation_windows`
+Агрегированные окна обсуждения (4/6/12/24 часа).
+
+**Ключевые поля:**
+- `window_size` — размер окна (`interval`)
+- `window_start` / `window_end` — границы окна
+- `message_count` — число сообщений в окне
+- `indicators` — JSONB (conflict/collaboration/stress/enthusiasm)
+- `status` — состояние (`pending`, `ready`, `failed`)
+- `failure_reason` — причина отказа (для мониторинга)
+
+#### `group_digests`
+Итоговый дайджест, готовый к доставке пользователю.
+
+**Ключевые поля:**
+- `window_id` — ссылка на окно
+- `requested_by_user_id` — инициатор
+- `delivery_channel` — `telegram`, `email`, `webhook`
+- `summary` — текстовое резюме
+- `payload` — полная структура (Markdown/JSON)
+- `delivery_status` — `pending`, `sent`, `failed`
+- `evaluation_scores` — результаты автоматической проверки качества
+
+#### `group_digest_topics`
+Тематические блоки дайджеста (как в примере пользователя).
+
+**Ключевые поля:**
+- `topic` — ключевая тема
+- `priority` — приоритет (`high`/`medium`/`low`)
+- `message_count` — количество сообщений
+- `representative_messages` — выдержки/ссылки на сообщения
+
+#### `group_digest_participants`
+Активные участники группы, попавшие в дайджест.
+
+**Ключевые поля:**
+- `participant_tg_id` / `participant_username`
+- `role` — роль участника (инициатор/эксперт/оппонент и т.п.)
+- `contribution_summary` — текстовое описание вклада
+
+#### `group_digest_metrics`
+Финальные метрики настроения и интеракций.
+
+**Ключевые поля:**
+- `sentiment`, `stress_index`, `collaboration_index`, `conflict_index`, `enthusiasm_index`
+- `raw_scores` — подробный JSON с результатами агентов
 
 ## Индексная стратегия
 
@@ -296,10 +432,16 @@ erDiagram
 CREATE INDEX ix_posts_channel_id ON posts(channel_id);
 CREATE INDEX ix_post_enrichment_post_id ON post_enrichment(post_id);
 CREATE INDEX ix_groups_tenant_id ON groups(tenant_id);
+CREATE INDEX ix_group_messages_group_time ON group_messages(group_id, posted_at DESC);
+CREATE INDEX ix_group_conversation_windows_tenant ON group_conversation_windows(tenant_id, window_end DESC);
+CREATE INDEX ix_group_digest_topics_digest ON group_digest_topics(digest_id);
+CREATE INDEX ix_group_digest_participants_digest ON group_digest_participants(digest_id);
 
 -- Временные запросы
 CREATE INDEX ix_posts_posted_at ON posts(posted_at DESC);
 CREATE INDEX ix_posts_channel_posted ON posts(channel_id, posted_at DESC);
+CREATE INDEX ix_group_messages_posted_at ON group_messages(posted_at DESC);
+CREATE INDEX ix_group_conversation_windows_status ON group_conversation_windows(status) WHERE status <> 'ready';
 ```
 
 #### GIN индексы для JSONB
@@ -322,6 +464,8 @@ CREATE INDEX ix_groups_active ON groups(is_active) WHERE is_active = true;
 CREATE UNIQUE INDEX ux_channels_tg ON channels(tg_channel_id);
 CREATE UNIQUE INDEX ux_posts_chan_msg ON posts(channel_id, tg_message_id);
 CREATE UNIQUE INDEX ux_group_messages ON group_messages(group_id, tg_message_id);
+CREATE UNIQUE INDEX ux_group_conversation_windows ON group_conversation_windows(group_id, window_start, window_end);
+CREATE UNIQUE INDEX ux_group_digest_window_format ON group_digests(window_id, format);
 ```
 
 ## RLS политики
@@ -360,6 +504,30 @@ USING (
           AND u.telegram_id = (current_setting('app.current_user_tg_id', true)::BIGINT)
           AND u.tenant_id = (current_setting('app.current_tenant_id', true)::UUID)
           AND uc.is_active = true
+    )
+);
+```
+
+#### Политика для group_conversation_windows
+```sql
+CREATE POLICY group_windows_by_tenant ON group_conversation_windows
+FOR SELECT TO authenticated
+USING (
+    tenant_id = (current_setting('app.current_tenant_id', true)::UUID)
+);
+```
+
+#### Политика для group_digests
+```sql
+CREATE POLICY group_digests_by_user ON group_digests
+FOR SELECT TO authenticated
+USING (
+    EXISTS (
+        SELECT 1
+        FROM users u
+        WHERE u.id = group_digests.requested_by_user_id
+          AND u.telegram_id = (current_setting('app.current_user_tg_id', true)::BIGINT)
+          AND u.tenant_id = (current_setting('app.current_tenant_id', true)::UUID)
     )
 );
 ```

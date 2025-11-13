@@ -25,25 +25,29 @@ logger = structlog.get_logger()
 storage_bucket_usage_gb = Gauge(
     'storage_bucket_usage_gb',
     'Total S3 bucket usage in GB',
-    ['content_type']  # media | vision | crawl
+    ['content_type'],  # media | vision | crawl
+    namespace='api'
 )
 
 storage_quota_violations_total = Counter(
     'storage_quota_violations_total',
     'Quota violation attempts',
-    ['tenant_id', 'reason']  # bucket_full | tenant_limit | type_limit
+    ['tenant_id', 'reason'],  # bucket_full | tenant_limit | type_limit
+    namespace='api'
 )
 
 storage_emergency_cleanups_total = Counter(
     'storage_emergency_cleanups_total',
     'Emergency cleanup runs',
-    ['trigger_reason']
+    ['trigger_reason'],
+    namespace='api'
 )
 
 storage_cleanup_freed_gb = Histogram(
     'storage_cleanup_freed_gb',
     'Storage freed by cleanup operations',
-    ['cleanup_type']  # emergency | lru | ttl
+    ['cleanup_type'],  # emergency | lru | ttl
+    namespace='api'
 )
 
 # ============================================================================

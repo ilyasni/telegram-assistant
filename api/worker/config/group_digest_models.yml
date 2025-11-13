@@ -1,0 +1,203 @@
+# ============================================================================
+# GROUP DIGEST MODEL CONFIGURATION
+# ============================================================================
+# Версия: 1
+# Назначение: описание моделей GigaChat и ограничений для мультиагентного
+#             пайплайна дайджестов Telegram-групп.
+# Контекст: поддерживает мультимодельный роутинг (Base/Pro), квоты стоимости,
+#           fallback стратегии и лимиты окна.
+# ============================================================================
+
+version: 1
+
+models:
+  base:
+    default: "GigaChat-2"
+    env: "DIGEST_MODEL_BASE"
+  pro:
+    default: "GigaChat-2-Pro"
+    env: "DIGEST_MODEL_PRO"
+  embeddings:
+    default: "EmbeddingsGigaR"
+    env: "DIGEST_EMBEDDINGS_MODEL"
+
+temperatures:
+  base:
+    default: 0.1
+  synthesis:
+    default: 0.3
+    env: "DIGEST_TEMPERATURE_SYNTH"
+
+tokens:
+  synthesis_max:
+    default: 3500
+    env: "DIGEST_MAXTOK_SYNTH"
+
+limits:
+  min_messages:
+    default: 8
+    env: "DIGEST_MIN_MESSAGES"
+  max_messages:
+    default: 1000
+    env: "DIGEST_MAX_MESSAGES"
+  chunk_size:
+    default: 250
+    env: "DIGEST_CHUNK_SIZE"
+  thread_max_len:
+    default: 20
+    env: "DIGEST_THREAD_MAX_LEN"
+  max_retries:
+    default: 3
+
+quotas:
+  pro_invocations_per_tenant:
+    default: 50
+    env: "DIGEST_PRO_QUOTA_PER_TENANT"
+  pro_token_budget:
+    default: 400000
+    env: "DIGEST_PRO_TOKEN_QUOTA"
+  quota_window_hours:
+    default: 24
+
+fallbacks:
+  pro_to_base:
+    enabled: true
+    metric: "digest_synthesis_fallback_total"
+    reason: "gigachat_pro_unavailable"
+    downgrade_model: "@base"
+
+resilience:
+  retry:
+    max_attempts:
+      default: 3
+      env: "DIGEST_RETRY_MAX_ATTEMPTS"
+    initial_interval:
+      default: 0.5
+      env: "DIGEST_RETRY_INTERVAL"
+    backoff_factor:
+      default: 2.0
+      env: "DIGEST_RETRY_BACKOFF"
+    max_interval:
+      default: 30.0
+      env: "DIGEST_RETRY_MAX_INTERVAL"
+    jitter: true
+  circuit_breaker:
+    failure_threshold:
+      default: 4
+      env: "DIGEST_CIRCUIT_FAILURE_THRESHOLD"
+    recovery_timeout:
+      default: 60
+      env: "DIGEST_CIRCUIT_RECOVERY_SECONDS"
+
+context:
+  similarity_threshold:
+    default: 0.88
+    env: "DIGEST_CONTEXT_SIMILARITY"
+  soft_similarity_threshold:
+    default: 0.76
+    env: "DIGEST_CONTEXT_SOFT_SIMILARITY"
+  dedup_time_gap_minutes:
+    default: 120
+    env: "DIGEST_CONTEXT_DEDUP_TIME"
+  max_context_messages:
+    default: 400
+    env: "DIGEST_CONTEXT_MAX_MESSAGES"
+  top_ranked:
+    default: 150
+    env: "DIGEST_CONTEXT_TOP_RANKED"
+  recency_half_life_minutes:
+    default: 180
+    env: "DIGEST_CONTEXT_HALF_LIFE"
+  scoring:
+    recency_weight:
+      default: 0.5
+      env: "DIGEST_CONTEXT_RECENCY_WEIGHT"
+    reply_weight:
+      default: 0.25
+      env: "DIGEST_CONTEXT_REPLY_WEIGHT"
+    length_weight:
+      default: 0.15
+      env: "DIGEST_CONTEXT_LENGTH_WEIGHT"
+    reactions_weight:
+      default: 0.1
+      env: "DIGEST_CONTEXT_REACTIONS_WEIGHT"
+    media_weight:
+      default: 0.12
+      env: "DIGEST_CONTEXT_MEDIA_WEIGHT"
+
+context_storage:
+  enabled:
+    default: false
+    env: "DIGEST_CONTEXT_STORAGE_ENABLED"
+  base_url:
+    default: ""
+    env: "DIGEST_CONTEXT_STORAGE_URL"
+  api_key:
+    default: ""
+    env: "DIGEST_CONTEXT_STORAGE_TOKEN"
+  namespace_prefix:
+    default: "group-digest"
+    env: "DIGEST_CONTEXT_STORAGE_NAMESPACE"
+  timeout:
+    default: 5.0
+    env: "DIGEST_CONTEXT_STORAGE_TIMEOUT"
+  history_windows:
+    default: 3
+    env: "DIGEST_CONTEXT_STORAGE_HISTORY_WINDOWS"
+  history_message_limit:
+    default: 150
+    env: "DIGEST_CONTEXT_STORAGE_HISTORY_MESSAGES"
+
+agents:
+  segmenter_agent:
+    model: "GigaChat-2-Pro"
+    temperature: 0.1
+    max_tokens: 2500
+  segmenter_agent_repair:
+    model: "GigaChat-2-Pro"
+    temperature: 0.0
+    max_tokens: 1800
+  topic_agent:
+    model: "GigaChat-2-Max"
+    temperature: 0.15
+    max_tokens: 3500
+  topic_agent_repair:
+    model: "GigaChat-2-Max"
+    temperature: 0.05
+    max_tokens: 2800
+  roles_agent:
+    model: "GigaChat-2-Pro"
+    temperature: 0.12
+    max_tokens: 2200
+  roles_agent_repair:
+    model: "GigaChat-2-Pro"
+    temperature: 0.05
+    max_tokens: 2000
+  emotion_agent:
+    model: "@base"
+    temperature: 0.1
+    max_tokens: 900
+  emotion_agent_repair:
+    model: "@base"
+    temperature: 0.0
+    max_tokens: 600
+  synthesis_agent:
+    model: "GigaChat-2-Max"
+    temperature: 0.28
+    max_tokens: 4500
+  synthesis_agent_retry:
+    model: "GigaChat-2-Pro"
+    temperature: 0.18
+    max_tokens: 3200
+  evaluation_agent:
+    model: "@base"
+    temperature: 0.0
+    max_tokens: 800
+  evaluation_agent_repair:
+    model: "@base"
+    temperature: 0.0
+    max_tokens: 600
+
+# ============================================================================
+# END OF FILE
+

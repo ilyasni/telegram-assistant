@@ -37,6 +37,13 @@ try:
 except Exception as e:
     logger.warning("Failed to include digest handlers router", error=str(e))
 
+try:
+    from bot.handlers.group_handlers import router as group_router
+    router.include_router(group_router)
+    logger.info("Group handlers router included")
+except Exception as e:
+    logger.warning("Failed to include group handlers router", error=str(e))
+
 
 def _kb_login():
     """Клавиатура для авторизации: только Mini App (QR)."""
@@ -57,6 +64,7 @@ def _kb_main_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Мои каналы", callback_data="menu:channels")],
         [InlineKeyboardButton(text="➕ Добавить канал", callback_data="menu:add_channel")],
+        [InlineKeyboardButton(text="👥 Мои группы", callback_data="menu:groups")],
         [InlineKeyboardButton(text="🔍 Поиск", callback_data="menu:search")],
         [InlineKeyboardButton(text="📰 Дайджесты", callback_data="digest:menu")],
         [InlineKeyboardButton(text="📈 Тренды", callback_data="trends:menu")],
@@ -165,6 +173,10 @@ async def cmd_help(msg: Message):
 
 /search <i>запрос</i> — Поиск по содержимому каналов
 Пример: <code>/search машинное обучение</code>
+
+<b>👥 Группы</b>
+/groups — Показать подключённые группы
+/group_discovery — Найти доступные чаты и подключить новые
 
 /recommend <i>запрос</i> — Получить рекомендации
 Пример: <code>/recommend интересные новости про AI</code>
