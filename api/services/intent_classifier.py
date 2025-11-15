@@ -165,29 +165,11 @@ class IntentClassifier:
                 return cached_result
         
         try:
-            # Формируем промпт
-            formatted_prompt = self.prompt.format(query=query)
-            
-            # Вызываем LLM
-            # Context7: Проверяем, что formatted_prompt - это объект промпта, а не строка
-            if isinstance(formatted_prompt, str):
-                logger.error("formatted_prompt is a string, not a prompt object", query=query[:50])
-                # Fallback: используем дефолтный intent
-                return IntentResponse(intent="search", confidence=0.2)
-            
-            # Context7: Получаем messages из промпта
-            # ChatPromptTemplate.format() возвращает объект с методом format_messages()
-            if hasattr(formatted_prompt, 'format_messages'):
-                # Если это еще не форматированный промпт, форматируем его
-                try:
-                    messages = formatted_prompt.format_messages(query=query)
-                except Exception:
-                    # Если уже отформатирован, используем messages напрямую
-                    messages = formatted_prompt.messages if hasattr(formatted_prompt, 'messages') else []
-            elif hasattr(formatted_prompt, 'messages'):
-                messages = formatted_prompt.messages
-            else:
-                logger.error("formatted_prompt has no messages attribute", query=query[:50], type=type(formatted_prompt).__name__)
+            # Формируем сообщения для промпта (LangChain ChatPromptTemplate)
+            try:
+                messages = self.prompt.format_messages(query=query)
+            except Exception as format_error:
+                logger.error("Failed to format intent prompt", error=str(format_error), query=query[:50])
                 return IntentResponse(intent="search", confidence=0.2)
             
             if not messages:

@@ -7,6 +7,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from bot.states import DigestStates, AddChannelStates, ChannelManagementStates, SearchStates
+import html
 import httpx
 import structlog
 import re
@@ -783,11 +784,39 @@ async def _rag_query(msg: Message, question: str, intent_override: Optional[str]
         # Конвертируем markdown ответ в Telegram HTML и разбиваем на чанки
         # Context7: Ссылки уже включены inline в ответ через промпты LLM
         answer_chunks = markdown_to_telegram_chunks(answer)
+        answer_has_sources_section = "источ" in answer.lower() or "source" in answer.lower()
         
         # Context7: Улучшенное форматирование предупреждения о низкой уверенности
         confidence_text = ""
         if confidence < 0.5:
             confidence_text = "\n\n━━━━━━━━━━\n⚠️ <i>Уверенность в ответе низкая. Попробуйте уточнить запрос.</i>"
+        
+        def _shorten_source_snippet(value: Optional[str], limit: int = 160) -> str:
+            if not value:
+                return ""
+            normalized = value.replace("\n", " ").strip()
+            if len(normalized) <= limit:
+                return normalized
+            return normalized[:limit].rstrip() + "…"
+        
+        formatted_sources = []
+        for source in sources[:5]:
+            title = source.get("channel_title") or "Источник"
+            safe_title = html.escape(title)
+            snippet_preview = _shorten_source_snippet(source.get("content"))
+            safe_preview = html.escape(snippet_preview) if snippet_preview else ""
+            permalink = source.get("permalink")
+            if permalink:
+                entry = f"• <a href=\"{permalink}\">{safe_title}</a>"
+            else:
+                entry = f"• {safe_title}"
+            if safe_preview:
+                entry = f"{entry} — {safe_preview}"
+            formatted_sources.append(entry)
+        
+        sources_block = ""
+        if formatted_sources and not answer_has_sources_section:
+            sources_block = "\n\n<b>Источники</b>\n" + "\n".join(formatted_sources)
         
         # Отправляем чанки с улучшенным форматированием
         for idx, chunk in enumerate(answer_chunks):
@@ -803,7 +832,7 @@ async def _rag_query(msg: Message, question: str, intent_override: Optional[str]
             
             # Добавляем предупреждение только в последний чанк
             if is_last:
-                text += confidence_text
+                text += confidence_text + sources_block
             
             if idx == 0:
                 # Первый чанк - редактируем сообщение загрузки

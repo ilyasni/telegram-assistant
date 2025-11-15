@@ -3,15 +3,17 @@ RAG Service для интеллектуального поиска и ответ
 Context7 best practice: intent-based routing, hybrid search, context assembly, response generation
 """
 
+import asyncio
 import time
 import json
 import hashlib
+from collections import defaultdict
 from typing import List, Dict, Any, Optional
 from uuid import UUID
 from datetime import datetime, timezone
 
 import structlog
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 from sqlalchemy import text
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue
@@ -22,7 +24,7 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.messages import HumanMessage, AIMessage
 from pydantic import BaseModel
 
-from models.database import Post, PostEnrichment, Channel, User
+from models.database import Post, PostEnrichment, User
 from services.intent_classifier import get_intent_classifier, IntentResponse
 from services.searxng_service import get_searxng_service
 from services.graph_service import get_graph_service
@@ -127,13 +129,19 @@ class RAGService:
         # Используем MessagesPlaceholder для динамического добавления истории
         ask_prompt = ChatPromptTemplate.from_messages([
             ("system", """Ты — эксперт по анализу контента из Telegram каналов.
-Ответь на вопрос пользователя на основе предоставленного контекста.
-Используй только информацию из контекста. Если информации недостаточно, скажи об этом.
+Ответь на вопрос пользователя, используя только предоставленный контекст/историю.
+Если информации недостаточно, честно сообщи об этом и предложи уточнить запрос.
 
-ВАЖНО: Всегда включай ссылки на источники прямо в текст ответа в формате markdown [название канала](ссылка).
-Ссылки должны быть рядом с упоминанием информации из этого источника.
+Формат ответа (Markdown, строго соблюдай):
+1. **Заголовок** одной строкой.
+2. **Ключевые факты** — маркированный список до 4 пунктов, каждый пункт заверши ссылкой вида [канал](URL).
+3. **Что дальше** — (опционально) список конкретных действий.
+4. **Источники** — повтори ссылки списком `• [канал](URL) — краткое пояснение`.
+   Если в контексте есть пометки `🖼` (vision) или `🕸` (Crawl4AI), явно укажи визуальные и веб-находки отдельной строкой.
+   Если встречаются строки `[Внешний источник ...]`, вынеси их в подпункт «Внешние источники».
 
-Если есть история предыдущих вопросов и ответов, используй её для лучшего понимания контекста текущего вопроса."""),
+Ссылки всегда размещай рядом с утверждением. Не выдумывай факты.
+Используй историю диалога (conversation_history), если она передана."""),
             # Context7: Динамически добавляем историю разговора если она есть
             MessagesPlaceholder(variable_name="conversation_history", optional=True),
             ("human", "Контекст:\n{context}\n\nВопрос: {query}\n\nОтвет:")
@@ -141,52 +149,64 @@ class RAGService:
         
         search_prompt = ChatPromptTemplate.from_messages([
             ("system", """Ты — помощник по поиску информации в Telegram каналах.
-Проанализируй найденные посты и предоставь краткое резюме результатов поиска.
-Укажи наиболее релевантные посты с их источниками.
+Сформируй структурированный обзор результатов.
 
-ВАЖНО: Всегда включай ссылки на источники прямо в текст ответа в формате markdown [название канала](ссылка).
-Ссылки должны быть рядом с упоминанием информации из этого источника.
+Формат (Markdown):
+1. **Запрос** — коротко перефразируй вопрос.
+2. **Результаты** — маркированный список: `[канал](URL): тезис`. Если в контексте у этого пункта есть строки, начинающиеся с `🖼`, `📷` или `🕸`, добавь после тезиса подпункт «Признаки визуальных сигналов» и процитируй эти строки. Если таких строк нет — полностью пропусти подпункт (не пиши «нет данных»).
+3. **Внешние источники** — добавляй только если в контексте есть записи `[Внешний источник …]`.
+4. **Источники** — выведи один раз в конце, перечислив только ссылки, которые уже упомянуты выше (Context7: не дублируем).
 
-Если есть история предыдущих вопросов и ответов, используй её для лучшего понимания контекста текущего запроса."""),
+Не добавляй чужой информации, используй контекст и историю диалога."""),
             MessagesPlaceholder(variable_name="conversation_history", optional=True),
             ("human", "Найденные посты:\n{context}\n\nЗапрос: {query}\n\nРезюме:")
         ])
         
         recommend_prompt = ChatPromptTemplate.from_messages([
             ("system", """Ты — помощник по рекомендации контента.
-На основе найденных постов предложи пользователю наиболее интересный и релевантный контент.
-Объясни, почему эти посты могут быть интересны.
+На основе найденных постов предложи релевантные материалы и объясни ценность каждого.
 
-ВАЖНО: Всегда включай ссылки на источники прямо в текст ответа в формате markdown [название канала](ссылка).
-Ссылки должны быть рядом с упоминанием каждого рекомендуемого поста.
+Формат:
+1. **Заголовок**.
+2. **Рекомендации** — нумерованный список: `[канал](URL) — причина + упоминание vision/crawl, если есть`.
+3. **Что почитать дополнительно** — (опционально) список внешних источников.
+4. **Источники** — отдельный список ссылок.
 
-Если есть история предыдущих вопросов и ответов, используй её для понимания интересов пользователя."""),
+Учитывай историю пользователя (conversation_history), не дублируй факты."""),
             MessagesPlaceholder(variable_name="conversation_history", optional=True),
             ("human", "Найденные посты:\n{context}\n\nЗапрос: {query}\n\nРекомендации:")
         ])
         
         trend_prompt = ChatPromptTemplate.from_messages([
             ("system", """Ты — аналитик трендов.
-Проанализируй найденные посты и определи основные тренды и темы.
-Предоставь краткий анализ популярных тем и их развития.
+Выдели ключевые темы, метрики и сигналы из предоставленного контекста.
 
-ВАЖНО: Всегда включай ссылки на источники прямо в текст ответа в формате markdown [название канала](ссылка).
-Ссылки должны быть рядом с упоминанием информации из этого источника.
+Формат:
+1. **Заголовок**.
+2. **Тренды** — маркированный список. Для каждого тренда укажи:
+   - краткое описание и ссылку `[канал](URL)`.
+   - Если в соответствующем блоке контекста есть строки `🖼`, `📷` или `🕸`, добавь подпункт «Признаки визуальных сигналов» и процитируй их; если строк нет — пропусти подпункт.
+3. **Что наблюдать** — список рекомендаций/метрик.
+4. **Источники** — единый список ссылок (только те, что использованы в ответе). Отдельный блок «Внешние источники» выводи лишь при наличии `[Внешний источник …]` в контексте.
 
-Если есть история предыдущих вопросов и ответов, используй её для понимания контекста анализа."""),
+Всегда отделяй внешние источники в подпункт, если контекст содержит `[Внешний источник]`."""),
             MessagesPlaceholder(variable_name="conversation_history", optional=True),
             ("human", "Посты для анализа:\n{context}\n\nЗапрос: {query}\n\nАнализ трендов:")
         ])
         
         digest_prompt = ChatPromptTemplate.from_messages([
             ("system", """Ты — составитель дайджестов новостей.
-Создай краткий дайджест на основе найденных постов, сгруппированный по темам.
-Каждая тема должна содержать 3-5 ключевых пунктов.
+Сформируй структурированный дайджест из найденных постов.
 
-ВАЖНО: Всегда включай ссылки на источники прямо в текст ответа в формате markdown [название канала](ссылка).
-Ссылки должны быть рядом с упоминанием каждой новости или темы.
+Формат:
+1. **Заголовок дайджеста**.
+2. Для каждой темы:
+   - `### Тема` (с кратким описанием).
+   - `• [канал](URL): факт`. Если у темы в контексте есть строки `🖼`, `📷` или `🕸`, добавь подсписок «Признаки визуальных сигналов» и процитируй эти строки. Если таких строк нет — не вставляй подпункт.
+3. **Внешние источники** — только если в контексте встречаются `[Внешний источник …]`.
+4. **Источники** — единый список ссылок из ответа (Context7: не дублировать то же самое в нескольких блоках).
 
-Если есть история предыдущих вопросов и ответов, используй её для понимания предпочтений пользователя."""),
+Темы и факты должны ссылаться на контекст. Не придумывай данные."""),
             MessagesPlaceholder(variable_name="conversation_history", optional=True),
             ("human", "Посты для дайджеста:\n{context}\n\nЗапрос: {query}\n\nДайджест:")
         ])
@@ -595,44 +615,193 @@ class RAGService:
         results: List[Dict[str, Any]],
         db: Session
     ) -> tuple[str, List[RAGSource]]:
-        """Сборка контекста из найденных постов."""
-        sources = []
-        context_parts = []
+        """Сборка контекста из найденных постов с обогащениями Vision/Crawl."""
+        max_context_posts = 5
+        ordered_results: List[Dict[str, Any]] = []
+        post_ids: List[UUID] = []
+        post_ids_str: List[str] = []
         
-        for idx, result in enumerate(results[:5]):  # Берем топ-5 для контекста
-            post_id = result['post_id']
-            post = db.query(Post).filter(Post.id == post_id).first()
-            
+        for result in results[:max_context_posts]:
+            post_id_raw = result.get("post_id")
+            if not post_id_raw:
+                continue
+            try:
+                post_uuid = UUID(str(post_id_raw))
+            except (ValueError, TypeError):
+                continue
+            ordered_results.append(result)
+            post_ids.append(post_uuid)
+            post_ids_str.append(str(post_uuid))
+        
+        if not ordered_results:
+            return "", []
+        
+        posts = (
+            db.query(Post)
+            .options(selectinload(Post.channel))
+            .filter(Post.id.in_(post_ids))
+            .all()
+        )
+        post_map = {str(post.id): post for post in posts}
+        
+        enrichments = db.query(PostEnrichment).filter(
+            PostEnrichment.post_id.in_(post_ids),
+            PostEnrichment.kind.in_(("vision", "vision_ocr", "crawl", "general"))
+        ).all()
+        enrichment_map: defaultdict[str, dict[str, PostEnrichment]] = defaultdict(dict)
+        for enrichment in enrichments:
+            enrichment_map[str(enrichment.post_id)][enrichment.kind] = enrichment
+        
+        context_parts: List[str] = []
+        sources: List[RAGSource] = []
+        
+        for idx, result in enumerate(ordered_results):
+            post = post_map.get(str(result.get("post_id")))
             if not post:
                 continue
             
-            channel = db.query(Channel).filter(Channel.id == post.channel_id).first()
+            channel = post.channel
             channel_title = channel.title if channel else "Неизвестный канал"
             channel_username = channel.username if channel else None
             
-            content = post.content or ""
+            content = (post.content or "").strip()
             if len(content) > 500:
-                content = content[:500] + "..."
+                content = content[:500].rstrip() + "…"
+            if not content:
+                content = "Без текста, доступно только медиа/обогащения."
             
-            # Context7: Добавляем ссылку в контекст для inline использования
+            enrichment_bundle = enrichment_map.get(str(post.id), {})
+            enrichment_snippets = self._render_enrichment_snippets(enrichment_bundle)
+            
+            if post.grouped_id and not any(snippet.startswith("📷") for snippet in enrichment_snippets):
+                enrichment_snippets.insert(0, "📷 Альбом из нескольких медиа")
+            
+            enrichment_text = ""
+            if enrichment_snippets:
+                enrichment_text = "\n" + "\n".join(enrichment_snippets)
+            
             permalink = post.telegram_post_url or ""
             if permalink:
-                context_parts.append(f"[{idx + 1}] [{channel_title}]({permalink}): {content}")
+                entry = f"[{idx + 1}] [{channel_title}]({permalink}): {content}{enrichment_text}"
             else:
-                context_parts.append(f"[{idx + 1}] {channel_title}: {content}")
+                entry = f"[{idx + 1}] {channel_title}: {content}{enrichment_text}"
+            context_parts.append(entry)
             
-            sources.append(RAGSource(
-                post_id=str(post_id),
-                channel_id=str(post.channel_id),
-                channel_title=channel_title,
-                channel_username=channel_username,
-                content=content,
-                score=result.get('hybrid_score', result.get('score', 0.0)),
-                permalink=post.telegram_post_url
-            ))
+            source_content = content
+            if enrichment_snippets:
+                source_content = f"{content}\n" + "\n".join(enrichment_snippets)
+            
+            sources.append(
+                RAGSource(
+                    post_id=str(post.id),
+                    channel_id=str(post.channel_id),
+                    channel_title=channel_title,
+                    channel_username=channel_username,
+                    content=source_content,
+                    score=result.get("hybrid_score", result.get("score", 0.0)),
+                    permalink=post.telegram_post_url
+                )
+            )
         
         context = "\n\n".join(context_parts)
         return context, sources
+
+    def _render_enrichment_snippets(
+        self,
+        enrichment_bundle: Optional[Dict[str, PostEnrichment]]
+    ) -> List[str]:
+        """Формирует дополнительные блоки текста из Vision/Crawl4AI обогащений."""
+        snippets: List[str] = []
+        if not enrichment_bundle:
+            return snippets
+        
+        def _append_unique(
+            prefix: str,
+            text_value: Optional[str],
+            limit: int = 280,
+            skip_values: Optional[List[str]] = None
+        ) -> None:
+            if not text_value:
+                return
+            normalized = text_value.strip()
+            if not normalized:
+                return
+            if skip_values and normalized.lower() in skip_values:
+                return
+            short_text = self._shorten_text(normalized, limit)
+            if short_text and not any(snippet.startswith(prefix) for snippet in snippets):
+                snippets.append(f"{prefix} {short_text}")
+        
+        vision = enrichment_bundle.get("vision")
+        if vision and isinstance(getattr(vision, "data", None), dict):
+            data = vision.data or {}
+            caption = data.get("summary") or data.get("description") or data.get("caption")
+            _append_unique(
+                "🖼",
+                caption,
+                skip_values=[
+                    "изображение без описания",
+                    "image without description",
+                    "no description",
+                ]
+            )
+            labels = data.get("labels")
+            if isinstance(labels, list) and labels:
+                normalized_labels = ", ".join(str(label) for label in labels[:5] if label)
+                _append_unique("🏷 Теги:", normalized_labels, limit=200)
+            ocr_payload = data.get("ocr")
+            ocr_text = None
+            if isinstance(ocr_payload, dict):
+                ocr_text = ocr_payload.get("text")
+            elif isinstance(ocr_payload, str):
+                ocr_text = ocr_payload
+            cleaned_ocr = self._normalize_ocr_text(ocr_text)
+            _append_unique("🔤 OCR:", cleaned_ocr, limit=240, skip_values=[""])
+        
+        vision_ocr = enrichment_bundle.get("vision_ocr")
+        if vision_ocr and isinstance(getattr(vision_ocr, "data", None), dict):
+            ocr_text = vision_ocr.data.get("text") or vision_ocr.data.get("raw_text")
+            cleaned_ocr = self._normalize_ocr_text(ocr_text)
+            _append_unique("🔤 OCR:", cleaned_ocr, limit=240, skip_values=[""])
+        
+        crawl = enrichment_bundle.get("crawl") or enrichment_bundle.get("general")
+        if crawl and isinstance(getattr(crawl, "data", None), dict):
+            crawl_data = crawl.data or {}
+            crawl_excerpt = crawl_data.get("md_excerpt") or crawl_data.get("markdown")
+            _append_unique("🕸 Crawl4AI:", crawl_excerpt, limit=320)
+            crawl_summary = crawl_data.get("summary")
+            _append_unique("📰", crawl_summary, limit=240)
+        
+        album_size = None
+        for enrichment in enrichment_bundle.values():
+            size = getattr(enrichment, "album_size", None)
+            if size:
+                album_size = max(album_size or 0, size)
+        if album_size:
+            snippets.append(f"📷 Альбом: {album_size} медиа")
+        
+        return snippets
+
+    @staticmethod
+    def _shorten_text(value: Optional[str], limit: int = 280) -> str:
+        """Обрезает текст до заданной длины с добавлением многоточия."""
+        if not value:
+            return ""
+        trimmed = value.strip()
+        if len(trimmed) <= limit:
+            return trimmed
+        return trimmed[:limit].rstrip() + "…"
+    
+    @staticmethod
+    def _normalize_ocr_text(value: Optional[str]) -> str:
+        """Нормализует OCR-текст: убирает капслок и лишние пробелы."""
+        if not value:
+            return ""
+        normalized = " ".join(value.split())
+        # Если текст полностью в ВЕРХНЕМ регистре, переводим в предложение
+        if normalized.isupper():
+            normalized = normalized.capitalize()
+        return normalized
     
     async def _should_enrich_with_searxng(
         self,
@@ -665,9 +834,13 @@ class RAGService:
             )
             return False
         
-        # Если результатов нет - используем fallback (не обогащение)
+        # Если результатов нет - используем внешнее обогащение как fallback
         if not search_results:
-            return False
+            logger.debug(
+                "Enrichment triggered: no channel results",
+                confidence=confidence
+            )
+            return True
         
         # Проверка 1: Низкая уверенность
         if confidence < settings.searxng_enrichment_confidence_threshold:
@@ -731,11 +904,15 @@ class RAGService:
         
         try:
             # Context7: Параллельный запрос к SearXNG (не блокирует основной flow)
-            searxng_response = await self.searxng_service.search(
-                query=query,
-                user_id=user_id,
-                lang=lang,
-                score_threshold=0.5  # Фильтруем только релевантные результаты
+            searxng_timeout = getattr(settings, "searxng_timeout_seconds", 8)
+            searxng_response = await asyncio.wait_for(
+                self.searxng_service.search(
+                    query=query,
+                    user_id=user_id,
+                    lang=lang,
+                    score_threshold=0.5  # Фильтруем только релевантные результаты
+                ),
+                timeout=searxng_timeout
             )
             
             if searxng_response.results:
@@ -773,6 +950,12 @@ class RAGService:
             else:
                 logger.debug("Enrichment: no external results found", query=query[:50])
         
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Enrichment failed due to timeout",
+                query=query[:50],
+                timeout_seconds=getattr(settings, "searxng_timeout_seconds", 8)
+            )
         except Exception as e:
             # Context7: Graceful degradation - ошибки не влияют на основной ответ
             logger.warning(

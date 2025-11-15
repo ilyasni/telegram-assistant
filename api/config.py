@@ -122,6 +122,7 @@ class Settings(BaseSettings):
     searxng_cache_ttl: int = 3600  # TTL кэша в секундах
     searxng_max_results: int = 5
     searxng_rate_limit_per_user: int = 10  # Запросов в минуту на пользователя
+    searxng_timeout_seconds: int = 8  # Глобальный таймаут ожидания ответа SearXNG
     # Context7: BasicAuth для SearXNG (если требуется)
     searxng_user: str = ""
     searxng_password: SecretStr = SecretStr("")  # SecretStr для безопасности

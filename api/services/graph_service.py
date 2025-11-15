@@ -149,7 +149,7 @@ class GraphService:
                     OPTIONAL MATCH path = (t)-[:RELATED_TO*1..{max_depth}]-(related_t:Topic)
                     WHERE related_t IS NOT NULL
                     OPTIONAL MATCH (related_t)<-[:HAS_TOPIC]-(related_p:Post)
-                    WITH DISTINCT p, related_p, t.name AS topic_name
+                    WITH DISTINCT p, related_p, t.name AS topic_name, p.posted_at AS post_posted_at
                     {related_clause}
                     RETURN p.post_id AS post_id,
                            coalesce(
@@ -159,7 +159,7 @@ class GraphService:
                            ) AS content,
                            topic_name,
                            'direct' AS relation_type
-                    ORDER BY p.posted_at DESC
+                    ORDER BY post_posted_at DESC
                     LIMIT $limit
                     """.format(
                         tenant_clause=tenant_clause,
@@ -177,12 +177,12 @@ class GraphService:
                     WHERE toLower(t.name) CONTAINS toLower($query)
                     MATCH (t)<-[:HAS_TOPIC]-(p:Post)
                     {tenant_clause}
-                    OPTIONAL MATCH (p)-[:IN_CHANNEL]->(c:Channel)
                     RETURN p.post_id AS post_id,
                            coalesce(p[$content_property], '') AS content,
                            collect(DISTINCT t.name) AS topics,
-                           c.title AS channel_title
-                    ORDER BY p.posted_at DESC
+                           p.channel_title AS channel_title,
+                           p.posted_at AS post_posted_at
+                    ORDER BY post_posted_at DESC
                     LIMIT $limit
                     """.format(tenant_clause=tenant_clause)
                     if not tenant_id:
