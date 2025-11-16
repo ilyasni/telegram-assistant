@@ -16,6 +16,7 @@ from .posts_deleted_v1 import PostDeletedEventV1
 from .channels_v1 import ChannelSubscribedEventV1
 from .albums_parsed_v1 import AlbumParsedEventV1
 from .album_assembled_v1 import AlbumAssembledEventV1
+from .trends_emerging_v1 import TrendEmergingEventV1
 
 # Context7: Vision events для S3 + Vision integration
 try:
@@ -37,6 +38,7 @@ __all__ = [
     'ChannelSubscribedEventV1',
     'AlbumParsedEventV1',
     'AlbumAssembledEventV1',
+    'TrendEmergingEventV1',
 ]
 
 # Context7: Добавляем Vision events в __all__ если они доступны

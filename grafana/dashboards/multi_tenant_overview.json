@@ -58,7 +58,9 @@
         "justifyMode": "auto",
         "orientation": "auto",
         "reduceOptions": {
-          "calcs": ["lastNotNull"],
+          "calcs": [
+            "lastNotNull"
+          ],
           "fields": "",
           "values": false
         },
@@ -115,7 +117,9 @@
         "justifyMode": "auto",
         "orientation": "auto",
         "reduceOptions": {
-          "calcs": ["lastNotNull"],
+          "calcs": [
+            "lastNotNull"
+          ],
           "fields": "",
           "values": false
         },
@@ -194,7 +198,10 @@
       "id": 3,
       "options": {
         "legend": {
-          "calcs": ["lastNotNull", "max"],
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
           "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
@@ -277,7 +284,10 @@
       "id": 4,
       "options": {
         "legend": {
-          "calcs": ["lastNotNull", "max"],
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
           "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
@@ -352,7 +362,9 @@
       "id": 5,
       "options": {
         "legend": {
-          "calcs": ["lastNotNull"],
+          "calcs": [
+            "lastNotNull"
+          ],
           "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
@@ -454,7 +466,11 @@
       "id": 6,
       "options": {
         "legend": {
-          "calcs": ["lastNotNull", "max", "mean"],
+          "calcs": [
+            "lastNotNull",
+            "max",
+            "mean"
+          ],
           "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
@@ -539,7 +555,9 @@
       "id": 7,
       "options": {
         "legend": {
-          "calcs": ["lastNotNull"],
+          "calcs": [
+            "lastNotNull"
+          ],
           "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
@@ -567,7 +585,11 @@
   "refresh": "30s",
   "schemaVersion": 42,
   "style": "dark",
-  "tags": ["telegram-assistant", "multi-tenant", "monitoring"],
+  "tags": [
+    "telegram-assistant",
+    "multi-tenant",
+    "monitoring"
+  ],
   "templating": {
     "list": [
       {
@@ -637,11 +659,22 @@
     "to": "now"
   },
   "timepicker": {
-    "refresh_intervals": ["15s", "30s", "1m", "5m", "15m", "30m", "1h", "2h", "6h", "12h", "24h"]
+    "refresh_intervals": [
+      "15s",
+      "30s",
+      "1m",
+      "5m",
+      "15m",
+      "30m",
+      "1h",
+      "2h",
+      "6h",
+      "12h",
+      "24h"
+    ]
   },
   "timezone": "browser",
   "title": "Multi-Tenant Overview (Context7)",
   "uid": "multi-tenant-overview",
   "version": 1
 }
-

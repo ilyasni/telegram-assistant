@@ -109,6 +109,7 @@ from worker.services.group_context_service import (
 )
 from worker.prompts.group_digest import (
     digest_composer_prompt_v1,
+    digest_composer_prompt_v2,
     digest_composer_retry_prompt_v1,
     emotion_analyzer_prompt_v1,
     emotion_analyzer_repair_prompt_v1,
@@ -129,7 +130,7 @@ _ENV_CONFIG_PATH = os.getenv("DIGEST_MODEL_CONFIG_PATH")
 DEFAULT_CONFIG_PATH = Path(_ENV_CONFIG_PATH) if _ENV_CONFIG_PATH else Path("worker/config/group_digest_models.yml")
 
 ESTIMATED_TOKENS_PER_CHAR = 0.25  # Эвристика: 4 символа ≈ 1 токен
-QUALITY_THRESHOLD = float(os.getenv("DIGEST_QUALITY_THRESHOLD", "0.7"))
+# QUALITY_THRESHOLD теперь читается из конфига через GroupDigestConfig.quality_checks.quality_threshold
 LOG_SAMPLE_RATE = max(0.0, float(os.getenv("DIGEST_LOG_SAMPLE_RATE", "0.01")))
 
 
@@ -318,6 +319,16 @@ class ContextStorageConfig:
 
 
 @dataclass
+class QualityChecksConfig:
+    """Конфигурация проверок качества дайджеста."""
+    min_messages_for_topics: int
+    min_topics_required: int
+    quality_threshold: float
+    micro_window_threshold: int
+    large_window_threshold: int
+
+
+@dataclass
 class GroupDigestConfig:
     """Глобальная конфигурация мультиагентного пайплайна."""
 
@@ -337,6 +348,7 @@ class GroupDigestConfig:
     resilience: ResilienceConfig
     context: ContextConfig
     context_storage: ContextStorageConfig
+    quality_checks: QualityChecksConfig
     agents: Dict[str, AgentSpec] = field(default_factory=dict)
 
     def resolve_model(self, alias: str) -> str:
@@ -445,6 +457,9 @@ class GroupDigestState(TypedDict, total=False):
     synthesis_retry_used: bool
     baseline_snapshot: Dict[str, Any]
     baseline_delta: Dict[str, Any]
+    digest_mode: str  # micro, normal, large
+    prompt_version: str  # версия промпта (digest_composer_prompt_v1/v2)
+    pipeline_version: str  # версия пайплайна (group_digest_v1/v2)
 
 
 def _resolve_entry(entry: Any, cast_type, default):
@@ -581,6 +596,15 @@ def load_group_digest_config(reload: bool = False) -> GroupDigestConfig:
         history_message_limit=int(_resolve_entry(storage_section.get("history_message_limit", {}), int, 150)),
     )
 
+    quality_checks_section = raw.get("quality_checks", {})
+    quality_checks_config = QualityChecksConfig(
+        min_messages_for_topics=int(_resolve_entry(quality_checks_section.get("min_messages_for_topics", {}), int, 20)),
+        min_topics_required=int(_resolve_entry(quality_checks_section.get("min_topics_required", {}), int, 1)),
+        quality_threshold=float(_resolve_entry(quality_checks_section.get("quality_threshold", {}), float, 0.7)),
+        micro_window_threshold=int(_resolve_entry(quality_checks_section.get("micro_window_threshold", {}), int, 20)),
+        large_window_threshold=int(_resolve_entry(quality_checks_section.get("large_window_threshold", {}), int, 150)),
+    )
+
     config = GroupDigestConfig(
         base_model=base_model,
         pro_model=pro_model,
@@ -610,6 +634,7 @@ def load_group_digest_config(reload: bool = False) -> GroupDigestConfig:
         ),
         context=context_config,
         context_storage=context_storage_config,
+        quality_checks=quality_checks_config,
         agents={},
     )
 
@@ -689,13 +714,31 @@ digest_synthesis_fallback_total = PromCounter(
 digest_skipped_total = PromCounter(
     "digest_skipped_total",
     "Пропущенные дайджесты и причины",
-    ["reason"],
+    ["reason", "tenant_id", "mode"],
 )
 
 digest_messages_processed_total = PromCounter(
     "digest_messages_processed_total",
     "Количество обработанных сообщений по арендаторам (метрика нагрузки)",
     ["tenant"],
+)
+
+digest_topics_empty_total = PromCounter(
+    "digest_topics_empty_total",
+    "Количество случаев, когда темы пустые или недостаточны",
+    ["reason", "tenant_id", "mode"],
+)
+
+digest_pre_quality_failed_total = PromCounter(
+    "digest_pre_quality_failed_total",
+    "Rule-based проверки качества, которые не прошли",
+    ["check", "tenant_id"],
+)
+
+digest_mode_total = PromCounter(
+    "digest_mode_total",
+    "Распределение дайджестов по режимам (micro/normal/large)",
+    ["mode", "tenant_id", "window_size_hours"],
 )
 
 digest_pro_quota_exceeded_total = PromCounter(
@@ -1060,8 +1103,12 @@ class GroupDigestOrchestrator:
             "emotion_agent": emotion_analyzer_prompt_v1(),
             "roles_agent": role_classifier_prompt_v1(),
             "topic_agent": topic_synthesizer_prompt_v1(),
-            "synthesis_agent": digest_composer_prompt_v1(),
+            "synthesis_agent": digest_composer_prompt_v2(),  # Используем v2 по умолчанию
             "evaluation_agent": quality_evaluator_prompt_v1(),
+        }
+        # Сохраняем v1 как fallback
+        self._prompts_v1: Dict[str, ChatPromptTemplate] = {
+            "synthesis_agent": digest_composer_prompt_v1(),
         }
         self._repair_prompts: Dict[str, ChatPromptTemplate] = {
             "segmenter_agent": semantic_segmenter_repair_prompt_v1(),
@@ -1104,7 +1151,7 @@ class GroupDigestOrchestrator:
             "emotion_agent": {"prompt_id": "EMOTION_ANALYZER_PROMPT_V1", "prompt_version": "v1"},
             "roles_agent": {"prompt_id": "ROLE_CLASSIFIER_PROMPT_V1", "prompt_version": "v1"},
             "topic_agent": {"prompt_id": "TOPIC_SYNTHESIZER_PROMPT_V1", "prompt_version": "v1"},
-            "synthesis_agent": {"prompt_id": "DIGEST_COMPOSER_PROMPT_V1", "prompt_version": "v1"},
+            "synthesis_agent": {"prompt_id": "DIGEST_COMPOSER_PROMPT_V2", "prompt_version": "v2"},
             "synthesis_agent_retry": {"prompt_id": "DIGEST_COMPOSER_RETRY_PROMPT_V1", "prompt_version": "v1"},
             "evaluation_agent": {"prompt_id": "QUALITY_EVALUATOR_PROMPT_V1", "prompt_version": "v1"},
             "delivery_manager": {"prompt_id": "DELIVERY_MANAGER_V1", "prompt_version": "v1", "model_id": "system"},
@@ -1387,7 +1434,25 @@ class GroupDigestOrchestrator:
         return repaired
 
     def _normalize_summary_html(self, raw: str) -> str:
+        """Нормализация HTML дайджеста с проверкой на пустые формулировки."""
         summary_html = (raw or "").strip()
+        
+        # Первый грубый фильтр: regexp-проверка на пустые формулировки (не единственный критерий)
+        empty_phrases_patterns = [
+            r"Основные темы:\s*Не выявлены",
+            r"из-за отсутствия данных",
+            r"не были зафиксированы из-за отсутствия подробных данных",
+            r"конкретные детали и решения не были зафиксированы",
+        ]
+        for pattern in empty_phrases_patterns:
+            if re.search(pattern, summary_html, re.IGNORECASE):
+                logger.warning(
+                    "digest_empty_phrase_detected",
+                    pattern=pattern,
+                    snippet=summary_html[:200],
+                )
+                # Не отклоняем сразу, это только первый фильтр - дополняется структурными проверками
+        
         if len(summary_html) > 4096:
             summary_html = summary_html[:4093] + "..."
         if summary_html and not summary_html.startswith("📊"):
@@ -1424,6 +1489,15 @@ class GroupDigestOrchestrator:
             return int(count)
         except (TypeError, ValueError):
             return 0
+
+    def _select_digest_mode(self, message_count: int) -> str:
+        """Определяет режим генерации дайджеста по размеру окна."""
+        if message_count <= self.config.quality_checks.micro_window_threshold:
+            return "micro"
+        elif message_count > self.config.quality_checks.large_window_threshold:
+            return "large"
+        else:
+            return "normal"
 
     @staticmethod
     def _select_media_highlights(state: GroupDigestState, limit: int = 4) -> List[Dict[str, Any]]:
@@ -1574,7 +1648,7 @@ class GroupDigestOrchestrator:
             sanitized_messages = context_result.sanitized_messages
             message_total = len(sanitized_messages)
             if message_total == 0:
-                digest_skipped_total.labels(reason="empty_window").inc()
+                digest_skipped_total.labels(reason="empty_window", tenant_id=tenant_id or "unknown", mode="unknown").inc()
                 result = {
                     "trace_id": trace_id,
                     "tenant_id": tenant_id,
@@ -1595,7 +1669,8 @@ class GroupDigestOrchestrator:
                 return result
 
             if message_total < self.config.min_messages:
-                digest_skipped_total.labels(reason="too_few_messages").inc()
+                # Режим ещё не определён, используем "unknown"
+                digest_skipped_total.labels(reason="too_few_messages", tenant_id=tenant_id or "unknown", mode="unknown").inc()
                 result = {
                     "trace_id": trace_id,
                     "tenant_id": tenant_id,
@@ -1641,6 +1716,19 @@ class GroupDigestOrchestrator:
             window_info["message_count"] = message_total
             window_info["chunk_count"] = max(1, math.ceil(message_total / max(1, self.config.chunk_size)))
             window_info["trace_id"] = trace_id
+
+            # Определяем режим генерации дайджеста
+            digest_mode = self._select_digest_mode(message_total)
+            state["digest_mode"] = digest_mode
+            state["pipeline_version"] = "group_digest_v2"
+            
+            # Метрика распределения по режимам
+            window_size_hours = window_info.get("window_size_hours", 0) or 0
+            digest_mode_total.labels(
+                mode=digest_mode,
+                tenant_id=tenant_id or "unknown",
+                window_size_hours=str(window_size_hours),
+            ).inc()
 
             if self._context_storage_client and window_info.get("window_id"):
                 try:
@@ -1711,6 +1799,29 @@ class GroupDigestOrchestrator:
             cached = self._load_cached_stage(state, "segmenter_agent")
             if cached:
                 return cached
+            
+            # Для micro-режима пропускаем сегментацию, создаём один общий сегмент
+            digest_mode = state.get("digest_mode", "normal")
+            if digest_mode == "micro":
+                sanitized = state.get("sanitized_messages", [])
+                if sanitized:
+                    # Один общий сегмент из всех сообщений
+                    semantic_units = [
+                        {
+                            "kind": "meta",
+                            "text": " ".join(msg.get("content", "")[:100] for msg in sanitized[:5]),
+                            "msg_ids": [str(msg.get("message_id", "")) for msg in sanitized[:10]],
+                            "offset_range": [0, len(sanitized)],
+                            "confidence": 0.5,
+                        }
+                    ]
+                else:
+                    semantic_units = []
+                
+                result = {"semantic_units": semantic_units}
+                self._store_stage_payload(state, "segmenter_agent", result, model_id="heuristic")
+                return result
+            
             threads = state.get("threads") or []
             if not threads:
                 result = {"semantic_units": []}
@@ -1791,6 +1902,35 @@ class GroupDigestOrchestrator:
             cached = self._load_cached_stage(state, "emotion_agent")
             if cached:
                 return cached
+            
+            # Для micro-режима используем упрощённую эвристику
+            digest_mode = state.get("digest_mode", "normal")
+            if digest_mode == "micro":
+                # Простая эвристика на основе сообщений
+                sanitized = state.get("sanitized_messages", [])
+                profile = {
+                    "tone": "neutral",
+                    "intensity": 0.5,
+                    "conflict": 0.0,
+                    "collaboration": 0.5,
+                    "stress": 0.0,
+                    "enthusiasm": 0.5,
+                    "notes": "Упрощённая оценка для малого окна.",
+                }
+                metrics_payload = {
+                    "tone": profile["tone"],
+                    "intensity": profile["intensity"],
+                    "conflict": profile["conflict"],
+                    "collaboration": profile["collaboration"],
+                    "stress": profile["stress"],
+                    "enthusiasm": profile["enthusiasm"],
+                    "description": profile["notes"],
+                }
+                result = {"emotion_profile": profile, "metrics": metrics_payload}
+                state["emotion_profile"] = profile
+                state["metrics"] = metrics_payload
+                self._store_stage_payload(state, "emotion_agent", result, model_id="heuristic")
+                return result
             prompt = self._prompts["emotion_agent"]
             messages_sample = build_conversation_excerpt(state.get("sanitized_messages") or [], limit=40)
             variables = {
@@ -1881,6 +2021,35 @@ class GroupDigestOrchestrator:
             cached = self._load_cached_stage(state, "roles_agent")
             if cached:
                 return cached
+            
+            # Для micro-режима используем упрощённую эвристику
+            digest_mode = state.get("digest_mode", "normal")
+            if digest_mode == "micro":
+                # Простая эвристика: топ участник по сообщениям = инициатор
+                participant_stats = state.get("participant_stats", [])
+                if participant_stats:
+                    top_participant = max(participant_stats, key=lambda p: p.get("message_count", 0))
+                    participants_payload = [
+                        {
+                            "telegram_id": top_participant.get("telegram_id"),
+                            "username": top_participant.get("username"),
+                            "role": "инициатор темы",
+                            "message_count": top_participant.get("message_count", 0),
+                            "summary": "Наиболее активный участник обсуждения.",
+                        }
+                    ]
+                else:
+                    participants_payload = []
+                
+                result = {
+                    "role_profile": [],
+                    "participants": participants_payload,
+                }
+                state["role_profile"] = []
+                state["participants"] = participants_payload
+                self._store_stage_payload(state, "roles_agent", result, model_id="heuristic")
+                return result
+            
             prompt = self._prompts["roles_agent"]
             variables = {
                 "participant_stats": json.dumps(state.get("participant_stats", []), ensure_ascii=False),
@@ -2015,6 +2184,42 @@ class GroupDigestOrchestrator:
             cached = self._load_cached_stage(state, "topic_agent")
             if cached:
                 return cached
+            
+            # Для micro-режима используем упрощённую keyword-based тему
+            digest_mode = state.get("digest_mode", "normal")
+            if digest_mode == "micro":
+                # Простая keyword-based тема
+                keyword_topics = self._context_service.build_keyword_topics(
+                    state.get("sanitized_messages") or [],
+                    state.get("media_highlights") or [],
+                    limit=1,  # Только одна тема для micro
+                )
+                if keyword_topics:
+                    topics = keyword_topics
+                else:
+                    # Fallback: одна общая тема
+                    message_count = state.get("message_total", 0)
+                    topics = [
+                        {
+                            "title": "Короткое обсуждение",
+                            "priority": "medium",
+                            "msg_count": message_count,
+                            "threads": [],
+                            "summary": f"Обсуждение из {message_count} сообщений.",
+                            "signals": {"source": "micro_mode"},
+                            "decision": "Требуется зафиксировать итоговое решение.",
+                            "status": "watch",
+                            "owners": "Активные участники группы",
+                            "blockers": [],
+                            "actions": [],
+                        }
+                    ]
+                
+                result = {"topics": topics}
+                state["topics"] = topics
+                self._store_stage_payload(state, "topic_agent", result, model_id="heuristic")
+                return result
+            
             prompt = self._prompts["topic_agent"]
             variables = {
                 "semantic_units": json.dumps(state.get("semantic_units", []), ensure_ascii=False),
@@ -2082,13 +2287,43 @@ class GroupDigestOrchestrator:
                             "signals": {"source": "fallback"},
                         }
                     )
-            elif all(topic.get("title") == "Общее обсуждение" for topic in topics):
+            elif all(topic.get("title") in {"Общее обсуждение", "Разное", "Без темы"} for topic in topics):
+                # Rule-based guard: если все темы общие, принудительно запускаем fallback
                 heuristic_topics = self._context_service.build_keyword_topics(
                     state.get("sanitized_messages") or [],
                     state.get("media_highlights") or [],
                 )
                 if heuristic_topics:
                     topics = heuristic_topics
+            
+            # Rule-based guard: проверка на минимальное количество тем
+            message_count = state.get("message_total", 0)
+            min_messages_for_topics = self.config.quality_checks.min_messages_for_topics
+            min_topics_required = self.config.quality_checks.min_topics_required
+            
+            if message_count >= min_messages_for_topics and len(topics) < min_topics_required:
+                # Считаем ошибкой, принудительно запускаем fallback
+                reason = f"topics_too_few:got_{len(topics)}_required_{min_topics_required}"
+                logger.warning(
+                    "digest_topics_too_few",
+                    message_count=message_count,
+                    topics_count=len(topics),
+                    min_required=min_topics_required,
+                )
+                tenant_id = state.get("tenant_id", "unknown")
+                mode = state.get("digest_mode", "normal")
+                digest_topics_empty_total.labels(reason=reason, tenant_id=tenant_id, mode=mode).inc()
+                
+                fallback_topics = self._context_service.build_keyword_topics(
+                    state.get("sanitized_messages") or [],
+                    state.get("media_highlights") or [],
+                )
+                if fallback_topics:
+                    topics = fallback_topics
+                else:
+                    # Если fallback не помог, всё равно добавляем ошибку
+                    state.setdefault("errors", []).append(reason)
+            
             result = {"topics": topics}
             state["topics"] = topics
             self._store_stage_payload(state, "topic_agent", result, model_id=model_id)
@@ -2129,14 +2364,34 @@ class GroupDigestOrchestrator:
             period = self._resolve_period(window)
             message_count = self._resolve_message_count(state, window)
 
+            # Вычисляем baseline_delta для v2 промпта (используем текущие темы и метрики)
+            baseline_snapshot_obj = self._get_baseline_snapshot(state)
+            current_metrics = state.get("metrics", {})
+            current_topics = state.get("topics", [])
+            baseline_delta = compute_delta(
+                baseline_snapshot_obj,
+                current_topics,
+                current_metrics,
+            )
+            state["baseline_delta"] = baseline_delta
+            
+            # Ограничиваем участников до top-3 для v2 промпта
+            participants_all = state.get("participants", [])
+            participants_top3 = sorted(
+                participants_all,
+                key=lambda p: p.get("message_count", 0),
+                reverse=True
+            )[:3]
+
             variables = {
                 "window_json": json.dumps(window, ensure_ascii=False),
                 "topics_json": json.dumps(state.get("topics", []), ensure_ascii=False),
-                "participants_json": json.dumps(state.get("participants", []), ensure_ascii=False),
+                "participants_json": json.dumps(participants_top3, ensure_ascii=False),  # Только top-3
                 "role_profile_json": json.dumps(state.get("role_profile", []), ensure_ascii=False),
                 "metrics_json": json.dumps(state.get("metrics", {}), ensure_ascii=False),
-            "media_highlights_json": json.dumps(self._select_media_highlights(state, limit=4), ensure_ascii=False),
+                "media_highlights_json": json.dumps(self._select_media_highlights(state, limit=4), ensure_ascii=False),
                 "media_stats_json": json.dumps(self._resolve_media_stats(state), ensure_ascii=False),
+                "baseline_delta": json.dumps(baseline_delta, ensure_ascii=False),  # Для v2 промпта
                 "baseline_digest": baseline_dict.get("summary_html") or "Нет предыдущего дайджеста.",
                 "group_title": group_title,
                 "period": period,
@@ -2169,14 +2424,80 @@ class GroupDigestOrchestrator:
             state["baseline_snapshot"] = baseline_dict
             state["synthesis_attempts"] = state.get("synthesis_attempts", 0) + 1
             state.setdefault("synthesis_retry_used", False)
+            
+            # Версионирование промпта
+            state["prompt_version"] = "digest_composer_prompt_v2"
 
             result = {
                 "summary_html": summary_html,
                 "summary": summary_html,
                 "baseline_snapshot": baseline_dict,
+                "prompt_version": "digest_composer_prompt_v2",
             }
             self._store_stage_payload(state, "synthesis_agent", result, model_id=model_id)
             return result
+
+    def _pre_quality_checks(self, state: GroupDigestState) -> Dict[str, Any]:
+        """Rule-based проверки качества перед LLM-judge."""
+        digest_html = state.get("summary_html", "")
+        topics = state.get("topics", [])
+        participants = state.get("participants", [])
+        message_count = state.get("message_total", 0)
+        sanitized_messages = state.get("sanitized_messages", [])
+        
+        checks = {
+            "needs_corrective_synthesis": False,
+            "issues": [],
+            "keyword_coverage": 0.0,
+        }
+        
+        # Проверка 1: наличие тем
+        min_messages_for_topics = self.config.quality_checks.min_messages_for_topics
+        min_topics_required = self.config.quality_checks.min_topics_required
+        if message_count >= min_messages_for_topics and len(topics) < min_topics_required:
+            checks["needs_corrective_synthesis"] = True
+            checks["issues"].append(f"topics_too_few:got_{len(topics)}_required_{min_topics_required}")
+        
+        # Проверка 2: TF-IDF ключевых слов и покрытие в дайджесте
+        if sanitized_messages and digest_html:
+            try:
+                from collections import Counter
+                # Простой TF-IDF: частотность слов в сообщениях
+                all_words = []
+                for msg in sanitized_messages[:50]:  # Ограничиваем для производительности
+                    content = msg.get("content", "")
+                    if content:
+                        # Простая токенизация (можно улучшить)
+                        words = re.findall(r'\b\w{3,}\b', content.lower())
+                        all_words.extend(words)
+                
+                if all_words:
+                    word_freq = Counter(all_words)
+                    top_keywords = [word for word, _ in word_freq.most_common(20)]
+                    
+                    # Покрытие: сколько ключевых слов встречается в дайджесте
+                    digest_lower = digest_html.lower()
+                    matched_keywords = [kw for kw in top_keywords if kw in digest_lower]
+                    coverage = len(matched_keywords) / len(top_keywords) if top_keywords else 0.0
+                    checks["keyword_coverage"] = coverage
+                    
+                    if coverage < 0.3:  # Меньше 30% покрытия
+                        checks["issues"].append(f"low_keyword_coverage:{coverage:.2f}")
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("pre_quality_checks_tfidf_failed", error=str(exc))
+        
+        # Проверка 3: наличие действий и участников
+        has_actions = any(
+            topic.get("actions") and len(topic.get("actions", [])) > 0
+            for topic in topics
+        )
+        if not has_actions and message_count >= min_messages_for_topics:
+            checks["issues"].append("no_actions_in_topics")
+        
+        if not participants:
+            checks["issues"].append("no_participants")
+        
+        return checks
 
     def _node_quality(self, state: GroupDigestState) -> Dict[str, Any]:
         if state.get("skip"):
@@ -2185,6 +2506,30 @@ class GroupDigestOrchestrator:
             cached = self._load_cached_stage(state, "evaluation_agent")
             if cached:
                 return cached
+            
+            # Rule-based checks перед LLM-judge
+            pre_checks = self._pre_quality_checks(state)
+            tenant_id = state.get("tenant_id", "unknown")
+            if pre_checks.get("needs_corrective_synthesis"):
+                issues = pre_checks.get("issues", [])
+                logger.warning(
+                    "digest_pre_quality_failed",
+                    issues=issues,
+                    tenant_id=tenant_id,
+                )
+                # Логируем каждую проблему как отдельную метрику
+                for issue in issues:
+                    check_name = issue.split(":")[0] if ":" in issue else issue
+                    digest_pre_quality_failed_total.labels(check=check_name, tenant_id=tenant_id).inc()
+                
+                # Отправляем на corrective synthesis без LLM-judge
+                baseline_snapshot = self._get_baseline_snapshot(state)
+                baseline_digest = baseline_snapshot.summary_html if baseline_snapshot else (state.get("baseline_snapshot", {}) or {}).get("summary_html", "")
+                corrective = self._attempt_corrective_synthesis(state, baseline_digest=baseline_digest or "Нет предыдущего дайджеста.")
+                if corrective:
+                    state["summary_html"] = corrective["summary_html"]
+                    state["summary"] = corrective["summary_html"]
+            
             prompt = self._prompts["evaluation_agent"]
             model_id = "unknown"
             tenant_id = state.get("tenant_id", "")
@@ -2254,7 +2599,8 @@ class GroupDigestOrchestrator:
             digest_quality_score.labels(metric="overall").set(quality_score)
 
             min_score = min(metrics["faithfulness"], metrics["coherence"], metrics["coverage"], metrics["focus"], quality_score)
-            quality_pass = min_score >= QUALITY_THRESHOLD
+            quality_threshold = self.config.quality_checks.quality_threshold
+            quality_pass = min_score >= quality_threshold
             errors = list(state.get("errors", []))
 
             if not quality_pass and not state.get("synthesis_retry_used"):
@@ -2279,12 +2625,18 @@ class GroupDigestOrchestrator:
                             digest_quality_score.labels(metric=key).set(metrics[key])
                         digest_quality_score.labels(metric="overall").set(quality_score)
                         min_score = min(metrics["faithfulness"], metrics["coherence"], metrics["coverage"], metrics["focus"], quality_score)
-                        quality_pass = min_score >= QUALITY_THRESHOLD
+                        quality_threshold = self.config.quality_checks.quality_threshold
+                        quality_pass = min_score >= quality_threshold
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("evaluation_retry_failed", error=str(exc))
 
             if not quality_pass:
-                digest_skipped_total.labels(reason="quality_below_threshold").inc()
+                mode = state.get("digest_mode", "normal")
+                digest_skipped_total.labels(
+                    reason="quality_below_threshold",
+                    tenant_id=tenant_id or "unknown",
+                    mode=mode,
+                ).inc()
                 errors.append(f"quality_below_threshold:{min_score:.2f}")
                 self._record_dlq_event(
                     state,
@@ -2293,12 +2645,8 @@ class GroupDigestOrchestrator:
                     error_details=f"{min_score:.2f}",
                 )
 
-            baseline_snapshot = self._get_baseline_snapshot(state)
-            baseline_delta = compute_delta(
-                baseline_snapshot,
-                state.get("topics", []),
-                {**metrics, "quality_score": quality_score},
-            )
+            # baseline_delta уже вычислен в _node_synthesis, используем его
+            baseline_delta = state.get("baseline_delta", {})
             result = {
                 "evaluation": metrics,
                 "quality_pass": quality_pass,

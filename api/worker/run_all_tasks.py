@@ -67,6 +67,9 @@ CrawlTriggerTask = _import_task("crawl_trigger_task", "CrawlTriggerTask")
 PostPersistenceWorker = _import_task("post_persistence_task", "PostPersistenceWorker")
 RetaggingTask = _import_task("retagging_task", "RetaggingTask")
 AlbumAssemblerTask = _import_task("album_assembler_task", "AlbumAssemblerTask")
+TrendDetectionWorker = _import_task("trends_worker", "TrendDetectionWorker")
+TrendEditorAgent = _import_task("trends_editor_agent", "TrendEditorAgent")
+create_trend_editor_agent = _import_task("trends_editor_agent", "create_trend_editor_agent")
 
 digest_worker = _import_task("digest_worker")
 create_digest_worker_task = getattr(digest_worker, "create_digest_worker_task")
@@ -258,6 +261,28 @@ async def create_album_assembler_task():
     except Exception as e:
         logger.error(f"Failed to create AlbumAssemblerTask: {e}", exc_info=True)
         raise
+
+
+async def create_trend_worker_task():
+    """Создание и запуск TrendDetectionWorker (reactive тренды)."""
+    redis_url = os.getenv("REDIS_URL", "redis://redis:6379")
+    database_url = os.getenv(
+        "DATABASE_URL",
+        "postgresql+asyncpg://postgres:postgres@supabase-db:5432/postgres",
+    )
+    qdrant_url = os.getenv("QDRANT_URL", "http://qdrant:6333")
+    worker = TrendDetectionWorker(
+        redis_url=redis_url,
+        database_url=database_url,
+        qdrant_url=qdrant_url,
+    )
+    await worker.start()
+
+
+async def create_trend_editor_agent_task():
+    """Context7: Создание и запуск TrendEditorAgent (редактор карточек трендов)."""
+    agent = await create_trend_editor_agent()
+    await agent.start()
 
 async def create_vision_analysis_task():
     """Context7: Создание и запуск Vision Analysis Task."""
@@ -486,6 +511,25 @@ async def main():
     supervisor.register_task(TaskConfig(
         name="album_assembler",
         task_func=create_album_assembler_task,
+        max_retries=5,
+        initial_backoff=1.0,
+        max_backoff=60.0,
+        backoff_multiplier=2.0
+    ))
+
+    supervisor.register_task(TaskConfig(
+        name="trend_detection",
+        task_func=create_trend_worker_task,
+        max_retries=5,
+        initial_backoff=1.0,
+        max_backoff=60.0,
+        backoff_multiplier=2.0
+    ))
+    
+    # Context7: Trend Editor Agent для улучшения качества карточек
+    supervisor.register_task(TaskConfig(
+        name="trend_editor",
+        task_func=create_trend_editor_agent_task,
         max_retries=5,
         initial_backoff=1.0,
         max_backoff=60.0,

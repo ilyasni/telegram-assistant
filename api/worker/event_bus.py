@@ -115,6 +115,8 @@ STREAMS = {
     # Context7: Digest generation pipeline
     'digests.generate': 'stream:digests:generate',
     'digest.context.prepared': 'stream:digests:context:prepared',
+    # Context7: Trend detection streams
+    'trends.emerging': 'stream:trends:emerging',
     # DLQ алиасы
     'posts.parsed.dlq': 'stream:posts:parsed:dlq',
     'posts.tagged.dlq': 'stream:posts:tagged:dlq',
@@ -127,6 +129,7 @@ STREAMS = {
     'album.assembled.dlq': 'stream:album:assembled:dlq',
     'digests.generate.dlq': 'stream:digests:generate:dlq',
     'digest.context.prepared.dlq': 'stream:digests:context:prepared:dlq',
+    'trends.emerging.dlq': 'stream:trends:emerging:dlq',
 }
 
 # DLQ стримы (legacy, для обратной совместимости)
@@ -143,6 +146,7 @@ DLQ_STREAMS = {
     'album.assembled': 'stream:album:assembled:dlq',
     'digests.generate': 'stream:digests:generate:dlq',
     'digest.context.prepared': 'stream:digests:context:prepared:dlq',
+    'trends.emerging': 'stream:trends:emerging:dlq',
 }
 
 # ============================================================================

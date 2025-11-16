@@ -4,8 +4,10 @@ Context7: Используем APScheduler для планирования за�
 """
 
 import asyncio
+import os
 from datetime import datetime, date, time, timezone, timedelta
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
+import json
 import structlog
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -17,22 +19,59 @@ from models.database import (
     DigestSettings,
     User,
     TrendDetection,
+    TrendCluster,
+    TrendMetrics,
     DigestHistory,
     UserInterest,
     Group,
     GroupConversationWindow,
     GroupMessage,
+    ChatTrendSubscription,
+    UserTrendProfile,
 )
 from sqlalchemy import and_
 from services.trend_detection_service import get_trend_detection_service
 from services.user_interest_service import get_user_interest_service
 from services.graph_service import get_graph_service
+from services.user_trend_profile_service import get_user_trend_profile_service
+import sys
+from pathlib import Path
 from config import settings
 from middleware.rls_middleware import set_tenant_id_in_session
 from worker.event_bus import EventPublisher, RedisStreamsClient, DigestGenerateEvent
 from uuid import UUID
 
 logger = structlog.get_logger()
+
+# Добавляем api/worker в путь для импорта
+worker_dir = Path(__file__).resolve().parent.parent / "worker"
+if str(worker_dir) not in sys.path:
+    sys.path.insert(0, str(worker_dir))
+
+# Context7: Условный импорт Threshold Tuner Agent (требует asyncpg, который может быть недоступен в API)
+try:
+    from trends_threshold_tuner import create_threshold_tuner_agent
+    THRESHOLD_TUNER_AVAILABLE = True
+except (ImportError, ModuleNotFoundError) as e:
+    # Используем print для логирования, так как logger может быть еще не определен
+    import warnings
+    warnings.warn(f"Threshold Tuner Agent not available: {e}", ImportWarning)
+    create_threshold_tuner_agent = None
+    THRESHOLD_TUNER_AVAILABLE = False
+
+SUBSCRIPTION_FREQUENCY_DELTA = {
+    "1h": timedelta(hours=1),
+    "3h": timedelta(hours=3),
+    "daily": timedelta(days=1),
+}
+
+SUBSCRIPTION_WINDOW_LABEL = {
+    "1h": "1h",
+    "3h": "3h",
+    "daily": "3h",
+}
+
+STABLE_WINDOW_DELTA = timedelta(days=7)
 
 
 def _normalize_tenant_id(tenant_id: Optional[str]) -> Optional[str]:
@@ -554,6 +593,329 @@ async def detect_trends_task():
         logger.error("Error in trend detection task", error=str(e))
 
 
+async def trends_stable_task():
+    """
+    Почасовая агрегирующая задача: подтверждение стабильных трендов.
+    
+    Context7: Использует trend_metrics для вычисления baseline и переносит
+    emerging кластеры в таблицу TrendDetection.
+    """
+    db = None
+    try:
+        db = next(get_db())
+        min_freq = getattr(settings, "trend_stable_min_freq", 30)
+        min_sources = getattr(settings, "trend_stable_min_sources", 3)
+        min_burst = getattr(settings, "trend_stable_min_burst", 1.5)
+
+        clusters = db.query(TrendCluster).filter(
+            TrendCluster.status.in_(["emerging", "stable"])
+        ).all()
+
+        promoted = 0
+        updated = 0
+
+        for cluster in clusters:
+            metrics = (
+                db.query(TrendMetrics)
+                .filter(TrendMetrics.cluster_id == cluster.id)
+                .order_by(TrendMetrics.metrics_at.desc())
+                .first()
+            )
+            if not metrics:
+                continue
+
+            if (metrics.freq_long or 0) < min_freq:
+                continue
+            if (metrics.source_diversity or 0) < min_sources:
+                continue
+            if (metrics.burst_score or 0) < min_burst:
+                continue
+
+            if cluster.status != "stable":
+                cluster.status = "stable"
+                updated += 1
+
+            if not cluster.resolved_trend_id:
+                trend = TrendDetection(
+                    trend_keyword=cluster.label or cluster.primary_topic or "trend",
+                    trend_embedding=cluster.trend_embedding,
+                    frequency_count=metrics.freq_long or metrics.freq_short,
+                    growth_rate=metrics.rate_of_change or metrics.burst_score,
+                    engagement_score=None,
+                    first_mentioned_at=cluster.first_detected_at,
+                    last_mentioned_at=cluster.last_activity_at,
+                    channels_affected=[],
+                    posts_sample=[],
+                    status="active",
+                )
+                db.add(trend)
+                db.flush()
+                cluster.resolved_trend_id = trend.id
+                promoted += 1
+
+        if promoted or updated:
+            db.commit()
+        else:
+            db.rollback()
+
+        logger.info(
+            "Trends stable task completed",
+            clusters_checked=len(clusters),
+            clusters_promoted=promoted,
+            clusters_updated=updated,
+            thresholds={
+                "min_freq": min_freq,
+                "min_sources": min_sources,
+                "min_burst": min_burst,
+            },
+        )
+    except Exception as e:
+        if db:
+            db.rollback()
+        logger.error("Error in trends_stable_task", error=str(e), exc_info=True)
+
+
+async def update_user_trend_profiles_task():
+    """
+    Ежедневная задача для обновления профилей интересов пользователей.
+    
+    Context7: Анализ взаимодействий за последние 30 дней через LLM для построения профилей.
+    """
+    db = None
+    try:
+        db = next(get_db())
+        personalizer_enabled = os.getenv("TREND_PERSONALIZER_ENABLED", "true").lower() == "true"
+        if not personalizer_enabled:
+            logger.debug("Trend personalizer disabled, skipping profile update")
+            return
+
+        # Получаем пользователей с взаимодействиями за последние 30 дней
+        cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+        from models.database import TrendInteraction
+        users_with_interactions = (
+            db.query(TrendInteraction.user_id)
+            .filter(TrendInteraction.created_at >= cutoff)
+            .distinct()
+            .all()
+        )
+
+        updated = 0
+        failed = 0
+        profile_service = get_user_trend_profile_service(db)
+
+        for (user_id,) in users_with_interactions:
+            try:
+                profile = await profile_service.build_profile_agent(user_id, days=30)
+                profile_service.save_profile(user_id, profile)
+                updated += 1
+            except Exception as exc:
+                failed += 1
+                logger.warning(
+                    "trend_profile_update_failed",
+                    user_id=str(user_id),
+                    error=str(exc),
+                )
+
+        logger.info(
+            "User trend profiles updated",
+            total_users=len(users_with_interactions),
+            updated=updated,
+            failed=failed,
+        )
+    except Exception as e:
+        if db:
+            db.rollback()
+        logger.error("Error in update_user_trend_profiles_task", error=str(e), exc_info=True)
+    finally:
+        if db:
+            db.close()
+
+
+async def analyze_trend_thresholds_task():
+    """
+    Еженедельная задача для анализа и оптимизации порогов трендов.
+    
+    Context7: Offline-анализ эффективности порогов, предложения для ручного review.
+    """
+    tuner = None
+    try:
+        tuner_enabled = os.getenv("TREND_THRESHOLD_TUNER_ENABLED", "true").lower() == "true"
+        if not tuner_enabled:
+            logger.debug("Threshold tuner disabled, skipping analysis")
+            return
+
+        if not THRESHOLD_TUNER_AVAILABLE or create_threshold_tuner_agent is None:
+            logger.warning("Threshold Tuner Agent not available (asyncpg missing), skipping")
+            return
+
+        tuner = await create_threshold_tuner_agent()
+        suggestions = await tuner.analyze_all_thresholds(period_days=30)
+
+        logger.info(
+            "Trend thresholds analyzed",
+            suggestions_count=len(suggestions),
+            thresholds_analyzed=[s.get("threshold_name") for s in suggestions],
+        )
+    except Exception as e:
+        logger.error("Error in analyze_trend_thresholds_task", error=str(e), exc_info=True)
+    finally:
+        if tuner:
+            await tuner.close()
+
+def _cluster_card_payload(cluster: TrendCluster) -> Dict[str, Any]:
+    payload = cluster.card_payload or {}
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except json.JSONDecodeError:
+            payload = {}
+    stats = payload.get("stats") or {}
+    stats.setdefault("mentions", cluster.window_mentions or 0)
+    stats.setdefault("baseline", cluster.freq_baseline or 0)
+    stats.setdefault("burst_score", cluster.burst_score)
+    stats.setdefault("sources", cluster.sources_count or cluster.source_diversity or 0)
+    stats.setdefault("channels", cluster.channels_count or cluster.source_diversity or 0)
+    payload["stats"] = stats
+    time_window = payload.get("time_window")
+    if not time_window and cluster.window_start and cluster.window_end:
+        duration_minutes = max(
+            1, int((cluster.window_end - cluster.window_start).total_seconds() // 60)
+        )
+        time_window = {
+            "from": cluster.window_start.isoformat(),
+            "to": cluster.window_end.isoformat(),
+            "duration_minutes": duration_minutes,
+        }
+    payload["time_window"] = time_window or {}
+    payload.setdefault("title", cluster.label or cluster.primary_topic or "Без названия")
+    payload.setdefault("summary", cluster.summary)
+    payload.setdefault("why_important", cluster.why_important)
+    payload.setdefault("keywords", cluster.keywords or [])
+    payload.setdefault("topics", cluster.topics or [])
+    return payload
+
+
+def _matches_topics(candidates: List[str], topics_filter: List[str]) -> bool:
+    if not topics_filter:
+        return True
+    haystack = " ".join(candidates).lower()
+    return any(topic in haystack for topic in topics_filter)
+
+
+def _fetch_emerging_cards(
+    db: Session,
+    now_utc: datetime,
+    window_delta: timedelta,
+    topics_filter: List[str],
+    limit: int = 5,
+) -> List[Dict[str, Any]]:
+    cutoff = now_utc - window_delta
+    clusters = (
+        db.query(TrendCluster)
+        .filter(TrendCluster.status == "emerging")
+        .filter(TrendCluster.last_activity_at >= cutoff)
+        .order_by(TrendCluster.burst_score.desc().nullslast(), TrendCluster.last_activity_at.desc())
+        .limit(limit * 2)
+        .all()
+    )
+    cards: List[Dict[str, Any]] = []
+    for cluster in clusters:
+        card = _cluster_card_payload(cluster)
+        topics = card.get("topics", []) + card.get("keywords", [])
+        if _matches_topics(topics, topics_filter):
+            cards.append(card)
+        if len(cards) >= limit:
+            break
+    return cards
+
+
+def _fetch_stable_trends(
+    db: Session,
+    now_utc: datetime,
+    topics_filter: List[str],
+    limit: int = 5,
+) -> List[TrendDetection]:
+    trends = (
+        db.query(TrendDetection)
+        .filter(TrendDetection.detected_at >= now_utc - STABLE_WINDOW_DELTA)
+        .order_by(
+            TrendDetection.engagement_score.desc().nullslast(),
+            TrendDetection.detected_at.desc(),
+        )
+        .limit(limit * 2)
+        .all()
+    )
+    if not topics_filter:
+        return trends[:limit]
+    filtered: List[TrendDetection] = []
+    for trend in trends:
+        haystack = " ".join([trend.trend_keyword or ""] + (trend.channels_affected or [])).lower()
+        if _matches_topics([haystack], topics_filter):
+            filtered.append(trend)
+        if len(filtered) >= limit:
+            break
+    return filtered
+
+
+def _format_emerging_section(cards: List[Dict[str, Any]], window_label: str) -> str:
+    lines = [f"🔥 <b>Горячие тренды за {window_label}</b>"]
+    if not cards:
+        lines.append("— Нет всплесков")
+        return "\n".join(lines)
+    for card in cards:
+        stats = card.get("stats", {})
+        mentions = stats.get("mentions", "—")
+        baseline = stats.get("baseline", "—")
+        burst = stats.get("burst_score")
+        burst_text = f"{burst:.1f}×" if isinstance(burst, (int, float)) else "—"
+        lines.append(
+            f"<b>{card.get('title')}</b>\n"
+            f"• {card.get('why_important') or card.get('summary') or '—'}\n"
+            f"• ⏱ {mentions} vs {baseline} | ⚡ {burst_text} | 🗞 {stats.get('sources', '—')}"
+        )
+    return "\n".join(lines)
+
+
+def _format_stable_section(trends: List[TrendDetection]) -> str:
+    lines = ["🧊 <b>Устойчивые тренды за 7 дней</b>"]
+    if not trends:
+        lines.append("— Нет устойчивых трендов")
+        return "\n".join(lines)
+    for trend in trends:
+        growth = trend.growth_rate
+        growth_text = f"{growth:.1%}" if isinstance(growth, (int, float)) else "—"
+        lines.append(
+            f"<b>{trend.trend_keyword}</b>\n"
+            f"• Частота: {trend.frequency_count} | Рост: {growth_text}"
+        )
+    return "\n".join(lines)
+
+
+def _build_trend_digest_message(
+    subscription: ChatTrendSubscription,
+    db: Session,
+    now_utc: datetime,
+) -> Optional[str]:
+    topics_filter = [topic.lower() for topic in (subscription.topics or [])]
+    window_label = SUBSCRIPTION_WINDOW_LABEL.get(subscription.frequency, "3h")
+    window_delta = SUBSCRIPTION_FREQUENCY_DELTA.get(
+        subscription.frequency, timedelta(hours=3)
+    )
+    emerging_cards = _fetch_emerging_cards(db, now_utc, window_delta, topics_filter, limit=3)
+    stable_trends = _fetch_stable_trends(db, now_utc, topics_filter, limit=3)
+    if not emerging_cards and not stable_trends:
+        return None
+    header = f"📡 <b>Trend Digest · {subscription.frequency}</b>"
+    sections = [
+        header,
+        "",
+        _format_emerging_section(emerging_cards, window_label),
+        "",
+        _format_stable_section(stable_trends),
+    ]
+    return "\n".join(sections)
+
+
 async def send_trend_alerts_to_users(trends: List, db: Session):
     """
     Отправка уведомлений о трендах пользователям через Telegram.
@@ -660,6 +1022,63 @@ async def send_trend_alerts_to_users(trends: List, db: Session):
         if 'db' in locals():
             db.rollback()
 
+
+async def send_trend_digest_subscriptions_task():
+    """Рассылка тренд-дайджестов подписанным чатам."""
+    db = None
+    try:
+        db = next(get_db())
+        now_utc = datetime.now(timezone.utc)
+        subscriptions = (
+            db.query(ChatTrendSubscription)
+            .filter(ChatTrendSubscription.is_active.is_(True))
+            .all()
+        )
+        if not subscriptions:
+            return
+        due: List[ChatTrendSubscription] = []
+        for subscription in subscriptions:
+            delta = SUBSCRIPTION_FREQUENCY_DELTA.get(
+                subscription.frequency, timedelta(hours=3)
+            )
+            last_sent = subscription.last_sent_at
+            if not last_sent or now_utc - last_sent >= delta:
+                due.append(subscription)
+        if not due:
+            return
+        from bot.webhook import bot
+
+        if not bot:
+            logger.warning("Bot not initialized, cannot send trend digests")
+            return
+
+        sent = 0
+        for subscription in due:
+            message = _build_trend_digest_message(subscription, db, now_utc)
+            if not message:
+                continue
+            try:
+                await bot.send_message(subscription.chat_id, message, parse_mode="HTML")
+                subscription.last_sent_at = now_utc
+                db.commit()
+                sent += 1
+            except Exception as exc:
+                db.rollback()
+                logger.error(
+                    "Failed to send trend digest",
+                    chat_id=subscription.chat_id,
+                    frequency=subscription.frequency,
+                    error=str(exc),
+                )
+        if sent:
+            logger.info("Trend digests sent", subscriptions=sent)
+    except Exception as exc:
+        logger.error("Error in send_trend_digest_subscriptions_task", error=str(exc), exc_info=True)
+        if db:
+            db.rollback()
+    finally:
+        if db:
+            db.close()
 
 async def sync_user_interests_to_neo4j_task():
     """
@@ -803,7 +1222,50 @@ def setup_scheduled_tasks():
         replace_existing=True
     )
     
-    logger.info("Scheduled tasks configured", tasks=["process_digests", "detect_trends", "sync_user_interests"])
+    scheduler.add_job(
+        trends_stable_task,
+        trigger=CronTrigger(minute=0),  # каждый час
+        id="trends_stable",
+        name="Promote stable trends",
+        replace_existing=True
+    )
+
+    # Context7: Обновление профилей интересов пользователей ежедневно в 02:00 UTC
+    scheduler.add_job(
+        update_user_trend_profiles_task,
+        trigger=CronTrigger(hour=2, minute=0),  # 02:00 UTC
+        id="update_user_trend_profiles",
+        name="Update user trend profiles",
+        replace_existing=True
+    )
+
+    # Context7: Анализ порогов трендов еженедельно в воскресенье в 03:00 UTC
+    scheduler.add_job(
+        analyze_trend_thresholds_task,
+        trigger=CronTrigger(day_of_week=6, hour=3, minute=0),  # Воскресенье 03:00 UTC
+        id="analyze_trend_thresholds",
+        name="Analyze trend thresholds",
+        replace_existing=True
+    )
+
+    scheduler.add_job(
+        send_trend_digest_subscriptions_task,
+        trigger=CronTrigger(minute="*/5"),
+        id="trend_digest_subscriptions",
+        name="Send trend digest subscriptions",
+        replace_existing=True,
+    )
+    
+    logger.info(
+        "Scheduled tasks configured",
+        tasks=[
+            "process_digests",
+            "detect_trends",
+            "sync_user_interests",
+            "trends_stable",
+            "trend_digest_subscriptions",
+        ],
+    )
 
 
 def start_scheduler():

@@ -857,7 +857,7 @@ class DigestSettings(Base):
     
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
     enabled = Column(Boolean, nullable=False, default=True)
-    schedule_time = Column(Time, nullable=False, server_default="09:00:00")
+    schedule_time = Column(Time, nullable=False, server_default="12:00:00")
     schedule_tz = Column(String(255), nullable=False, default="Europe/Moscow")
     frequency = Column(String(20), nullable=False, default="daily")  # daily, weekly, monthly
     topics = Column(JSONB, nullable=False, default=[])  # Массив тематик/тегов, указанных пользователем (обязательно для генерации)
@@ -1019,4 +1019,192 @@ class TrendAlert(Base):
         Index('idx_trend_alerts_user_id', 'user_id'),
         Index('idx_trend_alerts_trend_id', 'trend_id'),
         Index('idx_trend_alerts_sent_at', 'sent_at', postgresql_ops={'sent_at': 'DESC'}),
+    )
+
+
+class TrendCluster(Base):
+    """Горячие кластеры трендов (emerging/stable)."""
+    __tablename__ = "trend_clusters"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    cluster_key = Column(String(64), nullable=False, unique=True)
+    status = Column(String(32), nullable=False, default="emerging")  # emerging/stable/archived
+    label = Column(String(255), nullable=True)
+    summary = Column(Text, nullable=True)
+    keywords = Column(JSONB, nullable=False, default=[])
+    primary_topic = Column(String(255), nullable=True)
+    novelty_score = Column(REAL, nullable=True)
+    coherence_score = Column(REAL, nullable=True)
+    source_diversity = Column(Integer, nullable=True)
+    trend_embedding = Column(VectorType(dimensions=1536), nullable=True)
+    window_start = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    window_end = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    window_mentions = Column(Integer, nullable=False, server_default="0")
+    freq_baseline = Column(Integer, nullable=False, server_default="0")
+    burst_score = Column(REAL, nullable=True)
+    sources_count = Column(Integer, nullable=False, server_default="0")
+    channels_count = Column(Integer, nullable=False, server_default="0")
+    why_important = Column(Text, nullable=True)
+    topics = Column(JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb"))
+    card_payload = Column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
+    first_detected_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    last_activity_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+    resolved_trend_id = Column(UUID(as_uuid=True), ForeignKey("trends_detection.id", ondelete="SET NULL"), nullable=True)
+    # Context7: Поля для мультиагентной системы улучшения качества
+    quality_score = Column(REAL, nullable=True)
+    quality_flags = Column(JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb"))
+    editor_notes = Column(Text, nullable=True)
+    taxonomy_categories = Column(JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb"))
+    last_edited_at = Column(DateTime(timezone=True), nullable=True)
+
+    resolved_trend = relationship("TrendDetection", backref="clusters")
+
+    __table_args__ = (
+        Index('idx_trend_clusters_status', 'status'),
+        Index('idx_trend_clusters_last_activity', 'last_activity_at', postgresql_ops={'last_activity_at': 'DESC'}),
+        Index('idx_trend_clusters_novelty', 'novelty_score', postgresql_ops={'novelty_score': 'DESC NULLS LAST'}),
+        Index('idx_trend_clusters_quality_score', 'quality_score', postgresql_ops={'quality_score': 'DESC NULLS LAST'}),
+    )
+
+
+class TrendClusterPost(Base):
+    """Примеры постов внутри кластера тренда."""
+    __tablename__ = "trend_cluster_posts"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    cluster_id = Column(UUID(as_uuid=True), ForeignKey("trend_clusters.id", ondelete="CASCADE"), nullable=False)
+    post_id = Column(UUID(as_uuid=True), ForeignKey("posts.id", ondelete="CASCADE"), nullable=False)
+    channel_id = Column(UUID(as_uuid=True), ForeignKey("channels.id", ondelete="SET NULL"), nullable=True)
+    channel_title = Column(Text, nullable=True)
+    content_snippet = Column(Text, nullable=True)
+    posted_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    cluster = relationship("TrendCluster", backref="sample_posts")
+    post = relationship("Post")
+    channel = relationship("Channel")
+
+    __table_args__ = (
+        UniqueConstraint("cluster_id", "post_id", name="uq_trend_cluster_post"),
+        Index("idx_trend_cluster_posts_cluster_time", "cluster_id", "posted_at", "created_at"),
+    )
+
+
+class ChatTrendSubscription(Base):
+    """Подписки чатов на автоматические дайджесты трендов."""
+    __tablename__ = "chat_trend_subscriptions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    chat_id = Column(BigInteger, nullable=False)
+    frequency = Column(String(16), nullable=False)
+    topics = Column(JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb"))
+    last_sent_at = Column(DateTime(timezone=True), nullable=True)
+    is_active = Column(Boolean, nullable=False, server_default=text("true"))
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("chat_id", "frequency", name="uq_trend_subscription_chat_frequency"),
+        Index("idx_trend_subscription_active", "is_active"),
+        Index("idx_trend_subscription_last_sent", "last_sent_at"),
+    )
+
+
+class TrendMetrics(Base):
+    """Срез метрик по кластерам трендов (time-series baseline)."""
+    __tablename__ = "trend_metrics"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    cluster_id = Column(UUID(as_uuid=True), ForeignKey("trend_clusters.id", ondelete="CASCADE"), nullable=False)
+    freq_short = Column(Integer, nullable=False, default=0)
+    freq_long = Column(Integer, nullable=False, default=0)
+    freq_baseline = Column(Integer, nullable=True)
+    rate_of_change = Column(REAL, nullable=True)
+    burst_score = Column(REAL, nullable=True)
+    ewm_score = Column(REAL, nullable=True)
+    source_diversity = Column(Integer, nullable=True)
+    coherence_score = Column(REAL, nullable=True)
+    window_short_minutes = Column(Integer, nullable=False, default=5)
+    window_long_minutes = Column(Integer, nullable=False, default=60)
+    metrics_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    cluster = relationship("TrendCluster", backref="metrics")
+
+    __table_args__ = (
+        UniqueConstraint('cluster_id', 'metrics_at', name='uq_trend_metrics_cluster_snapshot'),
+        Index('idx_trend_metrics_cluster', 'cluster_id'),
+        Index('idx_trend_metrics_metrics_at', 'metrics_at', postgresql_ops={'metrics_at': 'DESC'}),
+    )
+
+
+class UserTrendProfile(Base):
+    """Профили интересов пользователей для персонализации трендов.
+    
+    Context7: Гибридное хранение - PostgreSQL для быстрых запросов,
+    синхронизация с Neo4j для графовых рекомендаций.
+    """
+    __tablename__ = "user_trend_profiles"
+    
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    preferred_topics = Column(JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb"))
+    ignored_topics = Column(JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb"))
+    preferred_categories = Column(JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb"))
+    typical_time_windows = Column(JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb"))
+    interaction_stats = Column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
+    last_updated = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+    
+    user = relationship("User", backref="trend_profile")
+    
+    __table_args__ = (
+        Index('idx_user_trend_profiles_last_updated', 'last_updated', postgresql_ops={'last_updated': 'DESC'}),
+    )
+
+
+class TrendInteraction(Base):
+    """Взаимодействия пользователей с трендами.
+    
+    Context7: Отслеживание для построения профилей интересов и оценки релевантности.
+    """
+    __tablename__ = "trend_interactions"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    cluster_id = Column(UUID(as_uuid=True), ForeignKey("trend_clusters.id", ondelete="CASCADE"), nullable=False)
+    interaction_type = Column(String(32), nullable=False)  # 'view', 'click_details', 'dismiss', 'save'
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    
+    user = relationship("User", backref="trend_interactions")
+    cluster = relationship("TrendCluster", backref="interactions")
+    
+    __table_args__ = (
+        Index('idx_trend_interactions_user_id', 'user_id'),
+        Index('idx_trend_interactions_cluster_id', 'cluster_id'),
+        Index('idx_trend_interactions_type', 'interaction_type'),
+        Index('idx_trend_interactions_created_at', 'created_at', postgresql_ops={'created_at': 'DESC'}),
+        Index('idx_trend_interactions_user_cluster', 'user_id', 'cluster_id'),
+    )
+
+
+class TrendThresholdSuggestion(Base):
+    """Предложения по оптимизации порогов трендов от Threshold Tuner Agent.
+    
+    Context7: Offline-анализ эффективности порогов, предложения для ручного review.
+    """
+    __tablename__ = "trend_threshold_suggestions"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    threshold_name = Column(String(64), nullable=False)  # 'TREND_FREQ_RATIO_THRESHOLD'
+    current_value = Column(REAL, nullable=False)
+    suggested_value = Column(REAL, nullable=False)
+    reasoning = Column(Text, nullable=True)
+    confidence = Column(REAL, nullable=True)
+    analysis_period_start = Column(DateTime(timezone=True), nullable=False)
+    analysis_period_end = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    status = Column(String(32), nullable=False, server_default="'pending'")  # 'pending', 'accepted', 'rejected'
+    
+    __table_args__ = (
+        Index('idx_trend_threshold_suggestions_status', 'status'),
+        Index('idx_trend_threshold_suggestions_created_at', 'created_at', postgresql_ops={'created_at': 'DESC'}),
+        Index('idx_trend_threshold_suggestions_threshold_name', 'threshold_name'),
     )

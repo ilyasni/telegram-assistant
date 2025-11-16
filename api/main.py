@@ -365,16 +365,56 @@ app.mount("/tg/app", StaticFiles(directory="/app/webapp", html=True), name="mini
 app.mount("/app", StaticFiles(directory="/app/webapp", html=True), name="miniapp_compat")
 
 # Без редиректа: /tg/app -> index.html
+ADMIN_START_PARAMS = {"admin", "admin_panel", "admin_login"}
+
+
+def _resolve_miniapp_entry(request: Request):
+    start_param = (
+        request.query_params.get("startapp")
+        or request.query_params.get("mode")
+        or request.query_params.get("tgWebAppStartParam")
+    )
+    if start_param and start_param in ADMIN_START_PARAMS:
+        return "webapp/admin.html"
+    return "webapp/qr.html"
+
+
 @app.get("/tg/app")
-async def miniapp_no_slash_tg():
+async def miniapp_no_slash_tg(request: Request):
     from fastapi.responses import FileResponse
-    return FileResponse("webapp/index.html")
+    target = _resolve_miniapp_entry(request)
+    return FileResponse(target)
 
 # Совместимость: /app/ -> index.html
 @app.get("/app/")
-async def miniapp_root_compat():
+async def miniapp_root_compat(request: Request):
     from fastapi.responses import FileResponse
-    return FileResponse("webapp/index.html")
+    target = _resolve_miniapp_entry(request)
+    return FileResponse(target)
+
+
+@app.get("/tg/app/qr")
+async def serve_qr_app():
+    from fastapi.responses import FileResponse
+    return FileResponse("webapp/qr.html")
+
+
+@app.get("/tg/app/admin")
+async def serve_admin_app():
+    from fastapi.responses import FileResponse
+    return FileResponse("webapp/admin.html")
+
+
+@app.get("/app/qr")
+async def serve_qr_app_compat():
+    from fastapi.responses import FileResponse
+    return FileResponse("webapp/qr.html")
+
+
+@app.get("/app/admin")
+async def serve_admin_app_compat():
+    from fastapi.responses import FileResponse
+    return FileResponse("webapp/admin.html")
 
 # Channels Mini App
 @app.get("/app/channels")

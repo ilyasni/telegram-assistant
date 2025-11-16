@@ -49,6 +49,23 @@ limits:
   max_retries:
     default: 3
 
+quality_checks:
+  min_messages_for_topics:
+    default: 20
+    env: "DIGEST_MIN_MESSAGES_FOR_TOPICS"
+  min_topics_required:
+    default: 1
+    env: "DIGEST_MIN_TOPICS_REQUIRED"
+  quality_threshold:
+    default: 0.7
+    env: "DIGEST_QUALITY_THRESHOLD"
+  micro_window_threshold:
+    default: 20
+    env: "DIGEST_MICRO_WINDOW_THRESHOLD"
+  large_window_threshold:
+    default: 150
+    env: "DIGEST_LARGE_WINDOW_THRESHOLD"
+
 quotas:
   pro_invocations_per_tenant:
     default: 50

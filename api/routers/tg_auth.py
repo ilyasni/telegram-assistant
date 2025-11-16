@@ -17,10 +17,13 @@ import base64
 import json
 import redis.asyncio as redis
 import structlog
+from sqlalchemy.orm import Session
+from urllib.parse import parse_qsl, unquote
 from prometheus_client import Counter, Histogram
 from config import settings
 import qrcode
 import io
+from models.database import get_db, Identity, User
 
 router = APIRouter(prefix="/tg", tags=["tg_auth"])
 logger = structlog.get_logger()
@@ -47,10 +50,11 @@ class MiniAppLink(BaseModel):
 
 
 class QrStart(BaseModel):
-    tenant_id: str
+    tenant_id: str | None = None
     session_token: str | None = None
     invite_code: str | None = None
     init_data: str | None = None  # Telegram MiniApp initData для извлечения telegram_user_id
+    token: str | None = None  # Fallback JWT от бота
 
 
 def verify_telegram_init_data(init_data: str, bot_token: str) -> bool:
@@ -63,6 +67,118 @@ def verify_telegram_init_data(init_data: str, bot_token: str) -> bool:
         return hmac.compare_digest(computed_hash, provided_hash)
     except Exception:
         return False
+
+
+def resolve_tenant_from_init_data(init_data: str, db: Session) -> str:
+    """Context7: Надёжное извлечение tenant_id из initData (fallback для Mini App)."""
+    if not init_data:
+        raise HTTPException(status_code=400, detail="init_data is required to resolve tenant_id")
+
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    if not bot_token:
+        logger.error("TELEGRAM_BOT_TOKEN is not configured")
+        raise HTTPException(status_code=500, detail="bot token not configured")
+
+    is_valid = verify_telegram_init_data(init_data, bot_token)
+    logger.info(
+        "verify_initdata_signature",
+        init_data_length=len(init_data),
+        has_hash="hash=" in init_data,
+        is_valid=is_valid,
+    )
+
+    if not is_valid:
+        logger.warning("initData signature check failed while resolving tenant", init_data_length=len(init_data))
+        raise HTTPException(status_code=401, detail="invalid initData signature")
+
+    parsed = dict(parse_qsl(init_data))
+    user_str = parsed.get("user")
+    if not user_str:
+        raise HTTPException(status_code=400, detail="user data missing in initData")
+
+    auth_date_raw = parsed.get("auth_date")
+    ttl_seconds = getattr(settings, "webapp_auth_ttl_seconds", 900) or 900
+    if not auth_date_raw:
+        logger.warning("initData missing auth_date", init_data_length=len(init_data))
+        raise HTTPException(status_code=400, detail="auth_date missing in initData")
+    try:
+        auth_date = int(auth_date_raw)
+    except (TypeError, ValueError):
+        logger.warning("initData invalid auth_date", auth_date=auth_date_raw)
+        raise HTTPException(status_code=400, detail="invalid auth_date value")
+
+    now_ts = int(time.time())
+    if auth_date > now_ts + 60:
+        logger.warning("initData auth_date is in the future", auth_date=auth_date, now=now_ts)
+        raise HTTPException(status_code=401, detail="invalid auth_date")
+    if now_ts - auth_date > ttl_seconds:
+        logger.warning(
+            "initData auth_date expired",
+            auth_date=auth_date,
+            now=now_ts,
+            ttl=ttl_seconds,
+            age=now_ts - auth_date,
+        )
+        raise HTTPException(status_code=401, detail="initData expired")
+
+    try:
+        user_data = json.loads(user_str)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="invalid user payload in initData")
+
+    telegram_id = user_data.get("id")
+    if not telegram_id:
+        raise HTTPException(status_code=400, detail="telegram_id missing in initData user payload")
+
+    identity = db.query(Identity).filter(Identity.telegram_id == telegram_id).first()
+    if not identity:
+        raise HTTPException(status_code=404, detail="identity not found for telegram_id")
+
+    membership = db.query(User).filter(User.identity_id == identity.id).first()
+    if not membership or not membership.tenant_id:
+        raise HTTPException(status_code=403, detail="tenant binding not found for identity")
+
+    logger.info(
+        "tenant_resolved_from_initdata",
+        telegram_id=telegram_id,
+        tenant_id=str(membership.tenant_id),
+    )
+    return str(membership.tenant_id)
+
+
+def resolve_tenant_from_token(token: str, db: Session) -> tuple[str, str | None]:
+    if not token:
+        raise HTTPException(status_code=400, detail="token is required to resolve tenant_id")
+    try:
+        payload = jwt.decode(
+            token,
+            settings.jwt_secret.get_secret_value(),
+            algorithms=["HS256"],
+            audience="qr_webapp",
+            options={"require": ["tenant_id", "session_id"], "verify_aud": True}
+        )
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="token expired")
+    except jwt.InvalidTokenError as exc:
+        logger.warning("Invalid fallback token", error=str(exc))
+        raise HTTPException(status_code=401, detail="invalid token")
+
+    tenant_id = payload.get("tenant_id")
+    telegram_id = payload.get("telegram_id")
+    purpose = payload.get("purpose")
+
+    if purpose not in (None, "qr_login"):
+        raise HTTPException(status_code=400, detail="invalid token purpose")
+    if not tenant_id:
+        raise HTTPException(status_code=400, detail="tenant_id missing in token")
+
+    logger.info(
+        "tenant_resolved_from_token",
+        tenant_id=str(tenant_id),
+        telegram_id=str(telegram_id) if telegram_id else None,
+    )
+
+    return str(tenant_id), str(telegram_id) if telegram_id is not None else None
 
 
 def issue_session_token(tenant_id: str, ttl_seconds: int = None) -> str:
@@ -170,9 +286,35 @@ async def miniapp_link(body: MiniAppLink):
 
 @router.post("/qr/start")
 @router.post("/qr-auth/init")  # Алиас для обратной совместимости
-async def qr_start(body: QrStart, request: Request):
+async def qr_start(body: QrStart, request: Request, db: Session = Depends(get_db)):
+    raw_body = await request.body()
+    logger.warning(
+        "qr_start_raw_body",
+        content_type=request.headers.get("content-type"),
+        body_len=len(raw_body),
+        body_preview=raw_body[:200].decode("utf-8", errors="ignore") if raw_body else "",
+    )
+
     tenant_id = body.tenant_id
     ip = request.client.host
+    token_fallback_telegram_id: str | None = None
+
+    logger.warning(
+        "qr_start_raw_request",
+        provided_tenant=tenant_id,
+        has_init_data=bool(body.init_data),
+        init_data_length=len(body.init_data) if body.init_data else 0,
+        content_type=request.headers.get("content-type"),
+    )
+
+    if not tenant_id:
+        if body.init_data:
+            tenant_id = resolve_tenant_from_init_data(body.init_data, db)
+        elif body.token:
+            tenant_id, resolved_telegram_id = resolve_tenant_from_token(body.token, db)
+            token_fallback_telegram_id = resolved_telegram_id
+        else:
+            raise HTTPException(status_code=400, detail="init_data or token required")
     
     # Строгий rate limiting для QR start
     if not await ratelimit_strict(f"qr:start:{ip}"):
@@ -184,6 +326,8 @@ async def qr_start(body: QrStart, request: Request):
     # Context7: Извлекаем telegram_user_id из initData если предоставлен
     # Context7 best practice: это необходимо для корректной проверки существующих сессий для новых пользователей
     telegram_user_id = None
+    if token_fallback_telegram_id:
+        telegram_user_id = token_fallback_telegram_id
     
     # Context7: детальное логирование для отладки
     logger.info("QR start request received", 
@@ -204,7 +348,6 @@ async def qr_start(body: QrStart, request: Request):
         try:
             # Парсим initData для извлечения user_id
             # Context7: декодируем URL-encoded строку user
-            from urllib.parse import unquote
             parsed = dict(kv.split("=", 1) for kv in body.init_data.split("&") if "=" in kv)
             logger.debug("Parsed init_data keys", keys=list(parsed.keys())[:5], tenant_id=tenant_id)
             

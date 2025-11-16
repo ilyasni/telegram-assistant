@@ -12,10 +12,11 @@ import time
 from typing import Optional
 from urllib.parse import parse_qsl
 from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 import structlog
 from sqlalchemy.orm import Session
 from models.database import get_db, User, Identity
+from routers.tg_auth import resolve_tenant_from_token  # type: ignore  # noqa: E402
 from config import settings
 
 logger = structlog.get_logger()
@@ -24,7 +25,14 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 class WebAppAuthRequest(BaseModel):
     """Запрос на аутентификацию WebApp."""
-    init_data: str = Field(..., description="Telegram WebApp initData")
+    init_data: str | None = Field(default=None, description="Telegram WebApp initData")
+    token: str | None = Field(default=None, description="Fallback JWT token")
+
+    @model_validator(mode="after")
+    def check_payload(cls, data):
+        if not data.init_data and not data.token:
+            raise ValueError("init_data or token must be provided")
+        return data
 
 class WebAppAuthResponse(BaseModel):
     """Ответ с JWT токеном."""
@@ -91,113 +99,166 @@ async def verify_webapp_init_data(body: WebAppAuthRequest, db: Session = Depends
     Возвращает короткоживущий JWT (5-10 мин) с tenant_id, membership_id, identity_id, tier.
     """
     try:
-        init_data = body.init_data
-        bot_token = settings.telegram_bot_token
-        
-        if not bot_token:
-            raise HTTPException(status_code=500, detail="Bot token not configured")
-        
-        # Парсинг initData
-        parsed = dict(parse_qsl(init_data))
-        hash_received = parsed.pop('hash', None)
-        
-        if not hash_received:
-            raise HTTPException(status_code=401, detail="Missing hash in initData")
-        
-        # Сортировка и формирование data_check_string
-        data_check_arr = [f"{k}={v}" for k, v in sorted(parsed.items())]
-        data_check_string = "\n".join(data_check_arr)
-        
-        # HMAC-SHA256 верификация
-        secret_key = hmac.new(
-            b"WebAppData",
-            bot_token.encode(),
-            hashlib.sha256
-        ).digest()
-        
-        hash_calculated = hmac.new(
-            secret_key,
-            data_check_string.encode(),
-            hashlib.sha256
-        ).hexdigest()
-        
-        if hash_calculated != hash_received:
-            logger.warning("Invalid WebApp initData signature",
-                          received_hash=hash_received[:8] + "...",
-                          calculated_hash=hash_calculated[:8] + "...")
-            raise HTTPException(status_code=401, detail="Invalid signature")
-        
-        # Проверка auth_date по конфигу (Context7): WEBAPP_AUTH_TTL_SECONDS (по умолчанию 900с)
-        auth_date = int(parsed.get('auth_date', 0))
-        current_time = int(time.time())
+        if body.init_data:
+            init_data = body.init_data
+            bot_token = settings.telegram_bot_token
+            
+            if not bot_token:
+                raise HTTPException(status_code=500, detail="Bot token not configured")
+            
+            parsed = dict(parse_qsl(init_data))
+            hash_received = parsed.pop('hash', None)
+            
+            if not hash_received:
+                raise HTTPException(status_code=401, detail="Missing hash in initData")
+            
+            data_check_arr = [f"{k}={v}" for k, v in sorted(parsed.items())]
+            data_check_string = "\n".join(data_check_arr)
+            
+            secret_key = hmac.new(
+                b"WebAppData",
+                bot_token.encode(),
+                hashlib.sha256
+            ).digest()
+            
+            hash_calculated = hmac.new(
+                secret_key,
+                data_check_string.encode(),
+                hashlib.sha256
+            ).hexdigest()
+            
+            if hash_calculated != hash_received:
+                logger.warning(
+                    "Invalid WebApp initData signature",
+                    received_hash=hash_received[:8] + "...",
+                    calculated_hash=hash_calculated[:8] + "...",
+                )
+                raise HTTPException(status_code=401, detail="Invalid signature")
+            
+            auth_date = int(parsed.get('auth_date', 0))
+            current_time = int(time.time())
 
-        ttl_seconds = int(getattr(settings, 'webapp_auth_ttl_seconds', 900))
-        if current_time - auth_date > ttl_seconds:
-            logger.warning("WebApp initData expired",
-                          auth_date=auth_date,
-                          current_time=current_time,
-                          age_seconds=current_time - auth_date,
-                          ttl_seconds=ttl_seconds)
-            raise HTTPException(status_code=401, detail="Init data expired")
-        
-        # Извлечение user данных
-        user_data_str = parsed.get('user', '{}')
-        try:
-            user_data = json.loads(user_data_str)
-        except json.JSONDecodeError:
-            raise HTTPException(status_code=400, detail="Invalid user data")
-        
-        user_id = user_data.get('id')
-        if not user_id:
-            raise HTTPException(status_code=400, detail="Missing user ID")
-        
-        # Context7: Находим identity и membership для JWT payload
-        identity = db.query(Identity).filter(Identity.telegram_id == user_id).first()
-        membership = None
-        tenant_id = None
-        membership_id = None
-        tier = None
-        
-        # [C7-ID: security-admin-003] Извлекаем role из membership
-        role = None
-        if identity:
-            # Берём первую membership (в будущем можно выбирать по invite_code или другому критерию)
-            membership = db.query(User).filter(User.identity_id == identity.id).first()
-            if membership:
-                tenant_id = str(membership.tenant_id)
-                membership_id = str(membership.id)
-                tier = membership.tier or "free"
-                role = membership.role or "user"  # [C7-ID: security-admin-003]
-        
-        # Генерация JWT с расширенным payload
+            ttl_seconds = int(getattr(settings, 'webapp_auth_ttl_seconds', 900))
+            if current_time - auth_date > ttl_seconds:
+                logger.warning(
+                    "WebApp initData expired",
+                    auth_date=auth_date,
+                    current_time=current_time,
+                    age_seconds=current_time - auth_date,
+                    ttl_seconds=ttl_seconds,
+                )
+                raise HTTPException(status_code=401, detail="Init data expired")
+            
+            user_data_str = parsed.get('user', '{}')
+            try:
+                user_data = json.loads(user_data_str)
+            except json.JSONDecodeError:
+                raise HTTPException(status_code=400, detail="Invalid user data")
+            
+            user_id = user_data.get('id')
+            if not user_id:
+                raise HTTPException(status_code=400, detail="Missing user ID")
+            
+            identity = db.query(Identity).filter(Identity.telegram_id == user_id).first()
+            membership = None
+            tenant_id = None
+            membership_id = None
+            tier = None
+            role = None
+            if identity:
+                membership = db.query(User).filter(User.identity_id == identity.id).first()
+                if membership:
+                    tenant_id = str(membership.tenant_id)
+                    membership_id = str(membership.id)
+                    tier = membership.tier or "free"
+                    role = membership.role or "user"
+            
+            jwt_token = create_jwt(
+                user_id=user_id,
+                tenant_id=tenant_id,
+                membership_id=membership_id,
+                identity_id=str(identity.id) if identity else None,
+                tier=tier,
+                role=role,
+                audience="webapp",
+                exp_minutes=10
+            )
+            
+            logger.info(
+                "WebApp authentication successful",
+                user_id=user_id,
+                tenant_id=tenant_id,
+                membership_id=membership_id,
+                identity_id=str(identity.id) if identity else None,
+                tier=tier,
+                role=role,
+                username=user_data.get('username'),
+                role_in_jwt=role,
+            )
+            
+            return WebAppAuthResponse(
+                access_token=jwt_token,
+                token_type="bearer",
+                expires_in=600
+            )
+
+        # Fallback: одноразовый JWT из URL
+        tenant_id_token, telegram_id = resolve_tenant_from_token(body.token, db)
+        if not telegram_id:
+            raise HTTPException(status_code=400, detail="telegram_id missing in token")
+
+        identity = db.query(Identity).filter(Identity.telegram_id == int(telegram_id)).first()
+        if not identity:
+            raise HTTPException(status_code=404, detail="identity not found for telegram_id")
+
+        membership_query = db.query(User).filter(User.identity_id == identity.id)
+        if tenant_id_token:
+            membership_query = membership_query.filter(User.tenant_id == tenant_id_token)
+        membership = membership_query.first()
+        if not membership:
+            raise HTTPException(status_code=403, detail="membership not found for identity")
+
+        tenant_id = str(membership.tenant_id)
+        membership_id = str(membership.id)
+        tier = membership.tier or "free"
+        role = membership.role or "user"
+
+        if role != "admin":
+            logger.warning(
+                "WebApp fallback token used by non-admin user",
+                telegram_id=telegram_id,
+                tenant_id=tenant_id,
+                role=role,
+            )
+            raise HTTPException(status_code=403, detail="Admin privileges required")
+
         jwt_token = create_jwt(
-            user_id=user_id,
+            user_id=int(telegram_id),
             tenant_id=tenant_id,
             membership_id=membership_id,
-            identity_id=str(identity.id) if identity else None,
+            identity_id=str(identity.id),
             tier=tier,
-            role=role,  # [C7-ID: security-admin-003]
+            role=role,
             audience="webapp",
             exp_minutes=10
         )
-        
-        # [C7-ID: security-admin-003] Логирование для отладки
-        logger.info("WebApp authentication successful",
-                   user_id=user_id,
-                   tenant_id=tenant_id,
-                   membership_id=membership_id,
-                   identity_id=str(identity.id) if identity else None,
-                   tier=tier,
-                   role=role,  # [C7-ID: security-admin-003]
-                   username=user_data.get('username'),
-                   role_in_jwt=role)  # Дополнительное логирование для отладки
-        
+
+        logger.info(
+            "WebApp authentication via fallback token successful",
+            telegram_id=telegram_id,
+            tenant_id=tenant_id,
+            membership_id=membership_id,
+            identity_id=str(identity.id),
+            tier=tier,
+            role=role,
+        )
+
         return WebAppAuthResponse(
             access_token=jwt_token,
             token_type="bearer",
             expires_in=600
         )
-        
+
     except HTTPException:
         raise
     except Exception as e:

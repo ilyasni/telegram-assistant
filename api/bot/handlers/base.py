@@ -12,8 +12,12 @@ import httpx
 import structlog
 import re
 import io
+import uuid
+import jwt
+import time
 from typing import Optional
 from datetime import datetime
+from urllib.parse import urljoin, urlencode, urlparse, parse_qsl, urlunparse
 from config import settings
 from utils.telegram_formatter import markdown_to_telegram_chunks
 
@@ -22,6 +26,90 @@ router = Router()
 
 # API base URL
 API_BASE = "http://api:8000"
+
+# Mini App configuration
+DEFAULT_MINIAPP_HOST = settings.bot_public_url.rstrip("/") if settings.bot_public_url else "https://produman.studio"
+MINIAPP_ROOT_URL = urljoin(DEFAULT_MINIAPP_HOST + "/", "tg/app/")
+MINIAPP_ADMIN_START_PARAM = "admin"
+QR_TOKEN_AUDIENCE = "qr_webapp"
+
+
+def _append_query_params(url: str, params: dict[str, str | int | None]) -> str:
+    """Добавляет query-параметры к URL, сохраняя существующие значения."""
+    if not params:
+        return url
+
+    filtered = {k: v for k, v in params.items() if v not in (None, "", [])}
+    if not filtered:
+        return url
+
+    parsed = urlparse(url)
+    existing = dict(parse_qsl(parsed.query))
+    existing.update({k: str(v) for k, v in filtered.items()})
+    new_query = urlencode(existing)
+    return urlunparse(parsed._replace(query=new_query))
+
+
+def _miniapp_entry_url(entry: str = "") -> str:
+    """Возвращает URL для конкретного entry-поинта Mini App."""
+    if not entry:
+        return MINIAPP_ROOT_URL
+    return urljoin(MINIAPP_ROOT_URL, entry)
+
+
+def _generate_qr_fallback_token(tenant_id: str, telegram_id: int | None) -> str:
+    """Генерирует короткоживущий JWT для fallback-аутентификации в Mini App."""
+    secret = settings.jwt_secret.get_secret_value()
+    session_id = str(uuid.uuid4())
+    ttl_seconds = int(getattr(settings, "webapp_auth_ttl_seconds", 900) or 900)
+    now_ts = int(time.time())
+
+    payload = {
+        "tenant_id": str(tenant_id),
+        "session_id": session_id,
+        "purpose": "qr_login",
+        "aud": QR_TOKEN_AUDIENCE,
+        "iat": now_ts,
+        "exp": now_ts + ttl_seconds,
+    }
+    if telegram_id:
+        payload["telegram_id"] = int(telegram_id)
+
+    token = jwt.encode(payload, secret, algorithm=settings.jwt_algorithm)
+    return token
+
+
+def _build_miniapp_url(entry: str, tenant_id: str | None, telegram_id: int | None, extra_params: Optional[dict[str, str]] = None) -> str:
+    """Формирует URL Mini App с безопасным fallback-токеном."""
+    base_url = _miniapp_entry_url(entry)
+    params: dict[str, str | int | None] = dict(extra_params or {})
+
+    if tenant_id:
+        try:
+            params["token"] = _generate_qr_fallback_token(str(tenant_id), telegram_id)
+        except Exception as exc:
+            logger.warning(
+                "Failed to generate MiniApp fallback token",
+                error=str(exc),
+                tenant_id=str(tenant_id),
+                telegram_id=str(telegram_id) if telegram_id is not None else None,
+            )
+
+    return _append_query_params(base_url, params)
+
+
+def _resolve_qr_webapp_url(tenant_id: str | None, telegram_id: int | None, invite_code: str | None = None) -> str:
+    """Возвращает URL для входа в QR Mini App с учётом инвайта и токена."""
+    params: dict[str, str] = {}
+    if invite_code:
+        params["invite"] = invite_code
+    return _build_miniapp_url("", tenant_id, telegram_id, params)
+
+
+def _resolve_admin_webapp_url(tenant_id: str | None, telegram_id: int | None) -> str:
+    """Возвращает URL для админского entry-поинта Mini App."""
+    params = {"tgWebAppStartParam": MINIAPP_ADMIN_START_PARAM}
+    return _build_miniapp_url("admin.html", tenant_id, telegram_id, params)
 
 # Подключение роутеров из подмодулей
 try:
@@ -46,17 +134,19 @@ except Exception as e:
     logger.warning("Failed to include group handlers router", error=str(e))
 
 
-def _kb_login():
-    """Клавиатура для авторизации: только Mini App (QR)."""
+def _kb_login(url: Optional[str] = None):
+    """Клавиатура для авторизации: открывает Mini App."""
+    target_url = url or MINIAPP_ROOT_URL
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Открыть Mini App (QR)", web_app={"url": "https://produman.studio/tg/app/"})]
+        [InlineKeyboardButton(text="Открыть QR аутентификацию", web_app={"url": target_url})]
     ])
 
 
-def _kb_login_with_invite(invite_code: str):
+def _kb_login_with_invite(invite_code: str, url: Optional[str] = None):
     """Клавиатура для авторизации с инвайт-кодом."""
+    target_url = url or _resolve_qr_webapp_url(None, None, invite_code)
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Открыть Mini App (QR)", web_app={"url": f"https://produman.studio/tg/app/?invite={invite_code}"})]
+        [InlineKeyboardButton(text="Открыть QR аутентификацию", web_app={"url": target_url})]
     ])
 
 
@@ -111,6 +201,7 @@ async def cmd_start(msg: Message):
     """Обработчик команды /start."""
     try:
         # 1) Попытка проверить/создать/обновить пользователя — но UX не блокируем
+        user_payload: Optional[dict] = None
         try:
             async with httpx.AsyncClient(timeout=5) as client:
                 r = await client.get(f"{API_BASE}/api/users/{msg.from_user.id}")
@@ -122,25 +213,53 @@ async def cmd_start(msg: Message):
                 }
                 if r.status_code == 404:
                     # Пользователь не найден - создаем
-                    await client.post(f"{API_BASE}/api/users/", json=user_data)
+                    created = await client.post(f"{API_BASE}/api/users/", json=user_data)
+                    if created.status_code in (200, 201):
+                        user_payload = created.json()
+                    else:
+                        logger.warning(
+                            "Failed to bootstrap user on /start",
+                            user_id=msg.from_user.id,
+                            status_code=created.status_code,
+                            response=created.text[:200] if hasattr(created, "text") else None,
+                        )
                 elif r.status_code == 200:
                     # Пользователь существует - обновляем данные
-                    await client.put(f"{API_BASE}/api/users/{msg.from_user.id}", json=user_data)
+                    user_payload = r.json()
+                    try:
+                        updated = await client.put(f"{API_BASE}/api/users/{msg.from_user.id}", json=user_data)
+                        if updated.status_code == 200:
+                            user_payload = updated.json()
+                    except Exception as update_error:
+                        logger.warning(
+                            "Failed to update user on /start",
+                            user_id=msg.from_user.id,
+                            error=str(update_error),
+                        )
+                else:
+                    logger.warning(
+                        "Unexpected status while fetching user on /start",
+                        user_id=msg.from_user.id,
+                        status_code=r.status_code,
+                    )
         except Exception as e:
             logger.warning("User bootstrap failed (non-blocking)", error=str(e))
 
         # 2) Всегда показываем приветствие и Mini App кнопку (baseline-first UX)
+        tenant_id = str(user_payload.get("tenant_id")) if user_payload and user_payload.get("tenant_id") else None
+        webapp_url = _resolve_qr_webapp_url(tenant_id, msg.from_user.id)
         await msg.answer(
-            "Ассистент.\nИспользуйте кнопку ниже для входа.",
-            reply_markup=_kb_login()
+            "Откройте Telegram в браузере и нажмите кнопку ниже для отображения QR-кода и подключения к боту.",
+            reply_markup=_kb_login(webapp_url)
         )
         
     except Exception as e:
         logger.error("Error in cmd_start (fallback path)", error=str(e))
         # Даже при ошибке показываем Mini App, чтобы не блокировать вход
+        fallback_url = _resolve_qr_webapp_url(None, msg.from_user.id)
         await msg.answer(
-            "Ассистент.\nИспользуйте кнопку ниже для входа.",
-            reply_markup=_kb_login()
+            "Откройте Telegram в браузере и нажмите кнопку ниже для отображения QR-кода и подключения к боту.",
+            reply_markup=_kb_login(fallback_url)
         )
 
 
@@ -160,7 +279,6 @@ async def cmd_help(msg: Message):
 <b>🚀 Основные команды</b>
 /start — Начать работу с ботом
 /help — Показать эту справку
-/login [INVITE_CODE] — Войти в систему (с инвайт-кодом или без)
 
 <b>📺 Управление каналами</b>
 /add_channel @channel_name — Добавить канал для отслеживания
@@ -190,9 +308,6 @@ async def cmd_help(msg: Message):
 <b>💎 Подписка</b>
 /subscription — Информация о вашей подписке и лимитах
 
-<b>👑 Администрирование</b>
-/admin — Открыть админ-панель (только для администраторов)
-
 <b>💡 Советы</b>
 • Задавайте вопросы естественным языком
 • Используйте голосовые сообщения для быстрого ввода
@@ -200,96 +315,23 @@ async def cmd_help(msg: Message):
 • Результаты поиска включают ссылки на источники
 
 <b>📝 Примечание</b>
-Для входа в систему используйте Mini App через кнопку внизу или команду /login."""
+Для входа в систему используйте Mini App через кнопку внизу (команда /login временно отключена)."""
     
     await msg.answer(
         help_text,
         parse_mode="HTML",
-        reply_markup=_kb_login()
+        reply_markup=_kb_login(_resolve_qr_webapp_url(None, msg.from_user.id))
     )
 
 
 @router.message(Command("login"))
-async def cmd_login(msg: Message):
-    """Обработчик команды /login с поддержкой инвайт-кодов."""
-    args = msg.text.split()
-    
-    # Если передан инвайт-код, валидируем его
-    if len(args) > 1:
-        invite_code = args[1]
-        logger.info("Login with invite code", user_id=msg.from_user.id, invite_code=invite_code)
-        
-        # Валидация инвайт-кода
-        try:
-            async with httpx.AsyncClient(timeout=5) as client:
-                # Проверяем инвайт-код через API
-                response = await client.get(f"{API_BASE}/api/admin/invites/{invite_code}")
-                
-                if response.status_code == 200:
-                    invite_data = response.json()
-                    logger.info("Valid invite code", invite_code=invite_code, tenant_id=invite_data.get('tenant_id'))
-                    
-                    # Открываем Mini App с валидным инвайтом
-                    await msg.answer(
-                        f"✅ <b>Инвайт-код принят</b>\n\n"
-                        f"Открываем Mini App для авторизации...",
-                        reply_markup=_kb_login_with_invite(invite_code)
-                    )
-                elif response.status_code == 404:
-                    await msg.answer(
-                        "❌ <b>Неверный инвайт-код</b>\n\n"
-                        "Проверьте правильность кода и попробуйте снова.",
-                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                            [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data="login:retry")]
-                        ])
-                    )
-                elif response.status_code == 410:
-                    await msg.answer(
-                        "❌ <b>Инвайт-код истёк</b>\n\n"
-                        "Срок действия кода истёк. Обратитесь к администратору.",
-                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                            [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data="login:retry")]
-                        ])
-                    )
-                else:
-                    await msg.answer(
-                        "❌ <b>Ошибка проверки инвайт-кода</b>\n\n"
-                        "Попробуйте позже или обратитесь к поддержке.",
-                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                            [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data="login:retry")]
-                        ])
-                    )
-                    
-        except httpx.TimeoutException:
-            logger.warning("Timeout checking invite code", user_id=msg.from_user.id, invite_code=invite_code)
-            await msg.answer(
-                "⏱️ <b>Таймаут проверки</b>\n\n"
-                "Сервер не отвечает. Попробуйте позже.",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data="login:retry")]
-                ])
-            )
-        except Exception as e:
-            logger.error("Error checking invite code", user_id=msg.from_user.id, invite_code=invite_code, error=str(e))
-            await msg.answer(
-                "❌ <b>Ошибка системы</b>\n\n"
-                "Попробуйте позже или обратитесь к поддержке.",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data="login:retry")]
-                ])
-            )
-    else:
-        # Обычный логин без инвайт-кода
-        await msg.answer(
-            "🔐 <b>Вход в систему</b>\n\n"
-            "Для входа используйте команду:\n"
-            "<code>/login INVITE_CODE</code>\n\n"
-            "Или нажмите кнопку ниже для входа через Mini App:",
-            reply_markup=_kb_login()
-        )
-
-
-# Удалена дублированная функция - используется версия ниже
+async def cmd_login_disabled(msg: Message):
+    """Временная заглушка для /login."""
+    await msg.answer(
+        "🔧 <b>Команда /login временно недоступна</b>\n\n"
+        "Используй /start — там есть актуальная кнопка Mini App.",
+        reply_markup=_kb_login(_resolve_qr_webapp_url(None, msg.from_user.id))
+    )
 
 
 @router.message(Command("my_channels"))
@@ -389,15 +431,16 @@ async def cmd_admin(msg: Message):
             # Проверяем роль админа
             user_role = user.get('role', 'user')
             is_admin = user_role == 'admin'
+            tenant_id_value = str(user.get('tenant_id')) if user.get('tenant_id') else None
+            webapp_url = _resolve_admin_webapp_url(tenant_id_value, msg.from_user.id)
             
-            # Context7: Логирование для отладки
-            webapp_url = "https://produman.studio/tg/app/"
+            # Context7: Логирование для отладки без раскрытия токена
             logger.info(
                 "Admin panel access requested",
                 telegram_id=msg.from_user.id,
                 user_role=user_role,
                 is_admin=is_admin,
-                webapp_url=webapp_url
+                has_token=bool(tenant_id_value)
             )
             
             if not is_admin:
@@ -432,11 +475,10 @@ async def cmd_admin(msg: Message):
 @router.callback_query(F.data == "qr:start")
 async def on_qr_start(cb: CallbackQuery):
     """Фолбэк: предлагаем открыть Mini App (QR живёт в Mini App)."""
+    webapp_url = _resolve_qr_webapp_url(None, cb.from_user.id if cb.from_user else None)
     await cb.message.answer(
         "Откройте Mini App для сканирования QR-кода.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Открыть Mini App (QR)", web_app={"url": "https://produman.studio/tg/app/"})]
-        ])
+        reply_markup=_kb_login(webapp_url)
     )
     await cb.answer()
 
@@ -444,12 +486,13 @@ async def on_qr_start(cb: CallbackQuery):
 @router.callback_query(F.data == "login:retry")
 async def on_login_retry(cb: CallbackQuery):
     """Фолбэк: повторная попытка входа."""
+    webapp_url = _resolve_qr_webapp_url(None, cb.from_user.id if cb.from_user else None)
     await cb.message.edit_text(
         "🔐 <b>Вход в систему</b>\n\n"
         "Для входа используйте команду:\n"
         "<code>/login INVITE_CODE</code>\n\n"
         "Или нажмите кнопку ниже для входа через Mini App:",
-        reply_markup=_kb_login()
+        reply_markup=_kb_login(webapp_url)
     )
     await cb.answer()
 
@@ -457,12 +500,27 @@ async def on_login_retry(cb: CallbackQuery):
 @router.callback_query(F.data == "admin:retry")
 async def on_admin_retry(cb: CallbackQuery):
     """Фолбэк: повторная попытка открытия админ-панели."""
+    webapp_url = _resolve_admin_webapp_url(None, cb.from_user.id)
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.get(f"{API_BASE}/api/users/{cb.from_user.id}")
+            if r.status_code == 200:
+                user = r.json()
+                tenant_id_value = str(user.get('tenant_id')) if user.get('tenant_id') else None
+                webapp_url = _resolve_admin_webapp_url(tenant_id_value, cb.from_user.id)
+    except Exception as error:
+        logger.warning(
+            "Failed to resolve admin token on retry",
+            error=str(error),
+            user_id=cb.from_user.id,
+        )
+
     await cb.message.edit_text(
         "👑 <b>Админ-панель</b>\n\n"
         "Откройте Mini App для доступа к админ-панели.\n"
         "Доступ будет предоставлен только администраторам.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="👑 Открыть админ-панель", web_app={"url": "https://produman.studio/tg/app/"})]
+            [InlineKeyboardButton(text="👑 Открыть админ-панель", web_app={"url": webapp_url})]
         ])
     )
     await cb.answer()

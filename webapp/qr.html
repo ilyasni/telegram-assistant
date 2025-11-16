@@ -1,0 +1,783 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Telegram Assistant — QR вход</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <style>
+        :root {
+            --tg-bg-color: #ffffff;
+            --tg-text-color: #000000;
+            --tg-button-color: #2481cc;
+            --tg-button-text-color: #ffffff;
+            --tg-hint-color: #999999;
+            --tg-link-color: #2481cc;
+            --tg-section-bg-color: #f8f8f8;
+            --tg-header-bg-color: #ffffff;
+            --tg-destructive-color: #ff3b30;
+            --tg-accent-color: #2481cc;
+        }
+
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --tg-bg-color: #17212b;
+                --tg-text-color: #f5f5f5;
+                --tg-button-color: #5288c1;
+                --tg-button-text-color: #ffffff;
+                --tg-hint-color: #708499;
+                --tg-link-color: #6ab3f3;
+                --tg-section-bg-color: #232e3c;
+                --tg-header-bg-color: #17212b;
+                --tg-destructive-color: #ec3942;
+                --tg-accent-color: #6ab2f2;
+            }
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background-color: var(--tg-bg-color);
+            color: var(--tg-text-color);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .container {
+            max-width: 400px;
+            margin: 0 auto;
+            padding: 20px;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            overflow: hidden;
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 32px;
+        }
+
+        .header h1 {
+            font-size: 24px;
+            font-weight: 600;
+            margin-bottom: 8px;
+            color: var(--tg-text-color);
+        }
+
+        .header p {
+            font-size: 16px;
+            color: var(--tg-hint-color);
+        }
+
+        .status {
+            text-align: center;
+            padding: 16px;
+            border-radius: 12px;
+            margin-bottom: 24px;
+            font-weight: 500;
+            transition: all 0.3s ease;
+            min-height: 60px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .status.loading {
+            background-color: var(--tg-section-bg-color);
+            color: var(--tg-text-color);
+        }
+
+        .status.success {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+
+        .status.error {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+
+        .qr-container {
+            text-align: center;
+            margin-bottom: 24px;
+            min-height: 300px;
+            opacity: 0;
+            visibility: hidden;
+            transition: opacity 0.3s ease, visibility 0.3s ease;
+        }
+
+        .qr-container.show {
+            opacity: 1;
+            visibility: visible;
+        }
+
+        .qr-code {
+            background-color: var(--tg-section-bg-color);
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 16px;
+            width: 300px;
+            height: 300px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 16px auto;
+        }
+
+        .qr-code img {
+            width: 260px;
+            height: 260px;
+            border-radius: 8px;
+            object-fit: contain;
+        }
+
+        .qr-code canvas {
+            width: 260px;
+            height: 260px;
+            border-radius: 8px;
+        }
+
+        .qr-instructions {
+            color: var(--tg-hint-color);
+            font-size: 14px;
+            margin-top: 12px;
+        }
+
+        .button {
+            background-color: var(--tg-button-color);
+            color: var(--tg-button-text-color);
+            border: none;
+            border-radius: 12px;
+            padding: 16px 24px;
+            font-size: 16px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            width: 100%;
+            margin-top: 16px;
+            min-height: 56px;
+            opacity: 0;
+            visibility: hidden;
+            transition: opacity 0.3s ease, visibility 0.3s ease;
+        }
+
+        .button.show {
+            opacity: 1;
+            visibility: visible;
+        }
+
+        .button:hover {
+            opacity: 0.9;
+            transform: translateY(-1px);
+        }
+
+        .button:active {
+            transform: translateY(0);
+        }
+
+        .button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        @media (max-width: 480px) {
+            .container {
+                padding: 16px;
+            }
+
+            .header h1 {
+                font-size: 20px;
+            }
+
+            .qr-code {
+                padding: 16px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div id="qr-auth-section" class="container">
+        <div class="header">
+            <h1>🔐 Авторизация</h1>
+            <p>Перейдите в Настройки → Устройства и отсканируйте QR-код</p>
+        </div>
+
+        <div id="status" class="status loading">
+            Инициализация...
+        </div>
+
+        <div id="qr-container" class="qr-container">
+            <div class="qr-code" id="qr-code">
+                <div style="color: var(--tg-hint-color); font-size: 16px;">Загрузка QR-кода...</div>
+            </div>
+            <div class="qr-instructions">
+                Отсканируйте QR-код в Telegram
+            </div>
+        </div>
+
+        <button id="cancel-btn" class="button" onclick="cancelAuth()">
+            Отменить
+        </button>
+    </div>
+
+    <script>
+        (function() {
+            'use strict';
+
+            const API_BASE = (window.location.origin.includes('produman.studio') || window.location.origin.startsWith('https://produman.studio'))
+                ? 'https://produman.studio'
+                : '';
+            const urlParams = new URLSearchParams(window.location.search);
+            const fallbackToken = urlParams.get('token') || '';
+            let sessionToken = null;
+            let statusCheckInterval = null;
+            let tenantId = null;
+            let telegramUserId = null;
+            let cachedInitData = '';
+            let cachedInitDataUnsafe = null;
+            let cachedAuthPayload = null;
+
+            function getThemeColors() {
+                if (window.Telegram && window.Telegram.WebApp && window.Telegram.WebApp.themeParams) {
+                    const theme = window.Telegram.WebApp.themeParams;
+                    return {
+                        bgColor: theme.bg_color || '#ffffff',
+                        textColor: theme.text_color || '#000000',
+                        buttonColor: theme.button_color || '#2481cc',
+                        buttonTextColor: theme.button_text_color || '#ffffff',
+                        hintColor: theme.hint_color || '#999999',
+                        linkColor: theme.link_color || '#2481cc',
+                        sectionBgColor: theme.section_bg_color || '#f8f8f8',
+                        headerBgColor: theme.header_bg_color || '#ffffff',
+                        destructiveColor: theme.destructive_text_color || '#ff3b30',
+                        accentColor: theme.accent_text_color || '#2481cc'
+                    };
+                }
+                return null;
+            }
+
+            function applyTheme() {
+                const theme = getThemeColors();
+                if (theme) {
+                    const root = document.documentElement;
+                    root.style.setProperty('--tg-bg-color', theme.bgColor);
+                    root.style.setProperty('--tg-text-color', theme.textColor);
+                    root.style.setProperty('--tg-button-color', theme.buttonColor);
+                    root.style.setProperty('--tg-button-text-color', theme.buttonTextColor);
+                    root.style.setProperty('--tg-hint-color', theme.hintColor);
+                    root.style.setProperty('--tg-link-color', theme.linkColor);
+                    root.style.setProperty('--tg-section-bg-color', theme.sectionBgColor);
+                    root.style.setProperty('--tg-header-bg-color', theme.headerBgColor);
+                    root.style.setProperty('--tg-destructive-color', theme.destructiveColor);
+                    root.style.setProperty('--tg-accent-color', theme.accentColor);
+                }
+            }
+
+            function initTelegramWebApp() {
+                if (window.Telegram && window.Telegram.WebApp) {
+                    window.Telegram.WebApp.ready();
+                    window.Telegram.WebApp.expand();
+                    window.Telegram.WebApp.setHeaderColor('bg_color');
+                    window.Telegram.WebApp.setBackgroundColor('bg_color');
+                    applyTheme();
+                    if (window.Telegram.WebApp.onEvent) {
+                        window.Telegram.WebApp.onEvent('themeChanged', applyTheme);
+                    }
+                }
+            }
+
+            function getInitDataFromUrl() {
+                try {
+                    const searchParams = new URLSearchParams(window.location.search);
+                    const tgParam = searchParams.get('tgWebAppData');
+                    if (tgParam) {
+                        const decoded = decodeURIComponent(tgParam);
+                        if (decoded && decoded.includes('=')) {
+                            console.log('[QR] initData extracted from URL search, length:', decoded.length);
+                            return decoded;
+                        }
+                    }
+
+                    if (window.location.hash && window.location.hash.includes('tgWebAppData=')) {
+                        const hashParams = new URLSearchParams(window.location.hash.replace('#', ''));
+                        const tgParamHash = hashParams.get('tgWebAppData');
+                        if (tgParamHash) {
+                            const decodedHash = decodeURIComponent(tgParamHash);
+                            if (decodedHash && decodedHash.includes('=')) {
+                                console.log('[QR] initData extracted from URL hash, length:', decodedHash.length);
+                                return decodedHash;
+                            }
+                        }
+                    }
+                } catch (error) {
+                    console.error('[QR] Failed to extract initData from URL:', error);
+                }
+                return '';
+            }
+
+            function sortObjectDeep(value) {
+                if (Array.isArray(value)) {
+                    return value.map(sortObjectDeep);
+                }
+                if (value && typeof value === 'object') {
+                    const sorted = {};
+                    Object.keys(value)
+                        .sort()
+                        .forEach((key) => {
+                            sorted[key] = sortObjectDeep(value[key]);
+                        });
+                    return sorted;
+                }
+                return value;
+            }
+
+            function buildInitDataFromUnsafe(unsafe) {
+                if (!unsafe || typeof unsafe !== 'object') {
+                    return '';
+                }
+                const parts = [];
+                Object.keys(unsafe).sort().forEach((key) => {
+                    const value = unsafe[key];
+                    if (value === undefined || value === null) {
+                        return;
+                    }
+                    if (typeof value === 'object') {
+                        parts.push(`${key}=${encodeURIComponent(JSON.stringify(sortObjectDeep(value)))}`);
+                    } else {
+                        parts.push(`${key}=${encodeURIComponent(String(value))}`);
+                    }
+                });
+                if (parts.length === 0) {
+                    return '';
+                }
+                return parts.join('&');
+            }
+
+            function isValidInitData(data) {
+                if (!data || typeof data !== 'string') {
+                    return false;
+                }
+                const trimmed = data.trim();
+                if (trimmed.length === 0 || trimmed === '{}') {
+                    return false;
+                }
+                return trimmed.includes('=');
+            }
+
+            function getInitData() {
+                if (cachedInitData && isValidInitData(cachedInitData)) {
+                    return cachedInitData;
+                }
+
+                const urlInitData = getInitDataFromUrl();
+                if (isValidInitData(urlInitData)) {
+                    cachedInitData = urlInitData;
+                    return cachedInitData;
+                }
+                if (window.Telegram?.WebApp?.initData && isValidInitData(window.Telegram.WebApp.initData)) {
+                    cachedInitData = window.Telegram.WebApp.initData;
+                    return cachedInitData;
+                }
+
+                const unsafe = getInitDataUnsafe();
+                if (unsafe) {
+                    const built = buildInitDataFromUnsafe(unsafe);
+                    if (isValidInitData(built)) {
+                        cachedInitData = built;
+                        console.log('[QR] Built initData from initDataUnsafe, length:', cachedInitData.length);
+                        return cachedInitData;
+                    }
+                }
+
+                return '';
+            }
+
+            async function waitForInitData(maxAttempts = 20, delayMs = 150) {
+                for (let attempt = 0; attempt < maxAttempts; attempt++) {
+                    const data = getInitData();
+                    if (isValidInitData(data)) {
+                        return data;
+                    }
+                    await new Promise(resolve => setTimeout(resolve, delayMs));
+                }
+                return '';
+            }
+
+            function getInitDataUnsafe() {
+                if (cachedInitDataUnsafe) {
+                    return cachedInitDataUnsafe;
+                }
+                if (window.Telegram?.WebApp?.initDataUnsafe) {
+                    cachedInitDataUnsafe = window.Telegram.WebApp.initDataUnsafe;
+                    return cachedInitDataUnsafe;
+                }
+                return null;
+            }
+
+            function parseJWT(token) {
+                if (!token) {
+                    throw new Error('JWT token is empty');
+                }
+                const parts = token.split('.');
+                if (parts.length !== 3) {
+                    throw new Error('Invalid token format');
+                }
+                let payloadBase64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+                while (payloadBase64.length % 4) {
+                    payloadBase64 += '=';
+                }
+                const decoded = atob(payloadBase64);
+                return JSON.parse(decoded);
+            }
+
+            function extractContextFromInitData(initData) {
+                const result = { userId: null, tenant: null };
+
+                if (initData) {
+                    try {
+                        const params = new URLSearchParams(initData);
+                        const userParam = params.get('user');
+                        if (userParam) {
+                            const userData = JSON.parse(decodeURIComponent(userParam));
+                            if (userData?.id) {
+                                console.log('[QR] telegram_user_id found (initData):', userData.id);
+                                result.userId = userData.id;
+                                result.tenant = String(userData.id);
+                            }
+                        }
+                    } catch (error) {
+                        console.error('[QR] Failed to parse initData:', error);
+                    }
+                }
+
+                if (!result.userId) {
+                    const unsafe = getInitDataUnsafe();
+                    if (unsafe?.user?.id) {
+                        console.log('[QR] telegram_user_id found (initDataUnsafe):', unsafe.user.id);
+                        result.userId = unsafe.user.id;
+                        result.tenant = String(unsafe.user.id);
+                    }
+                }
+
+                return result;
+            }
+
+            async function resolveTenantContext() {
+                if (tenantId) {
+                    return tenantId;
+                }
+
+                const initData = getInitData();
+                const extracted = extractContextFromInitData(initData);
+                if (extracted.userId) {
+                    telegramUserId = extracted.userId;
+                }
+                if (extracted.tenant) {
+                    tenantId = extracted.tenant;
+                    console.log('[QR] tenant_id extracted from initData / unsafe:', tenantId);
+                    return tenantId;
+                }
+
+                if (!cachedAuthPayload && initData) {
+                    try {
+                        const authUrl = `${API_BASE || ''}/api/auth/telegram-webapp`;
+                        const authResponse = await fetch(authUrl, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ init_data: initData })
+                        });
+                        if (authResponse.ok) {
+                            const authData = await authResponse.json();
+                            try {
+                                cachedAuthPayload = parseJWT(authData.access_token);
+                                window.accessToken = authData.access_token;
+                                if (!tenantId && cachedAuthPayload?.tenant_id) {
+                                    tenantId = cachedAuthPayload.tenant_id;
+                                    console.log('[QR] tenant_id extracted from JWT:', tenantId);
+                                    return tenantId;
+                                }
+                                if (!telegramUserId && cachedAuthPayload?.sub) {
+                                    telegramUserId = cachedAuthPayload.sub;
+                                }
+                            } catch (jwtError) {
+                                console.error('[QR] Failed to parse JWT payload:', jwtError);
+                            }
+                        } else {
+                            console.warn('[QR] /api/auth/telegram-webapp failed:', authResponse.status);
+                        }
+                    } catch (authError) {
+                        console.error('[QR] Auth endpoint error:', authError);
+                    }
+                }
+
+                if (initData) {
+                    try {
+                        const response = await fetch(`${API_BASE || ''}/tg/miniapp/init`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ init_data: initData })
+                        });
+
+                        if (response.ok) {
+                            const data = await response.json();
+                            if (data?.tenant_id) {
+                                tenantId = data.tenant_id;
+                                console.log('[QR] tenant_id received from /tg/miniapp/init:', tenantId);
+                                return tenantId;
+                            }
+                        } else {
+                            console.warn('[QR] /tg/miniapp/init failed:', response.status);
+                        }
+                    } catch (error) {
+                        console.error('[QR] init endpoint error:', error);
+                    }
+                }
+
+                if (!tenantId && telegramUserId) {
+                    tenantId = String(telegramUserId);
+                    console.log('[QR] Using telegram_user_id as tenant_id fallback:', tenantId);
+                    return tenantId;
+                }
+
+                console.warn('[QR] tenant_id could not be resolved client-side');
+                return null;
+            }
+
+            function updateStatus(message, type = 'loading') {
+                const statusEl = document.getElementById('status');
+                statusEl.textContent = message;
+                statusEl.className = `status ${type}`;
+            }
+
+            function showQR() {
+                document.getElementById('qr-container').classList.add('show');
+                document.getElementById('cancel-btn').classList.add('show');
+            }
+
+            function hideQR() {
+                document.getElementById('qr-container').classList.remove('show');
+                document.getElementById('cancel-btn').classList.remove('show');
+            }
+
+            async function createSession() {
+                try {
+                    updateStatus('Создание сессии...', 'loading');
+
+                    const initData = await waitForInitData(30, 150);
+                    const payload = {};
+
+                    if (isValidInitData(initData)) {
+                        cachedInitData = initData;
+                        const resolvedTenantId = await resolveTenantContext();
+                        payload.init_data = initData;
+                        if (resolvedTenantId) {
+                            payload.tenant_id = resolvedTenantId;
+                        }
+                    } else if (fallbackToken) {
+                        console.warn('[QR] initData unavailable, using fallback token');
+                        updateStatus('Запуск через одноразовый токен...', 'loading');
+                        payload.token = fallbackToken;
+                    } else {
+                        console.error('[QR] initData remains empty after waiting and no fallback token');
+                        updateStatus('Ошибка: не удалось получить данные Telegram WebApp. Открой Mini App из Telegram.', 'error');
+                        return;
+                    }
+
+                    const response = await fetch(`${API_BASE || ''}/tg/qr/start`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Cache-Control': 'no-cache, no-store, must-revalidate',
+                            'Pragma': 'no-cache'
+                        },
+                        body: JSON.stringify(payload)
+                    });
+
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                    }
+
+                    const data = await response.json();
+                    sessionToken = data.session_token;
+
+                    const url = new URL(location.href);
+                    url.searchParams.set('session_id', sessionToken);
+                    history.replaceState(null, '', url.toString());
+
+                    if (data.qr_url) {
+                        showQR();
+                        renderQR(data.qr_url);
+                        updateStatus('Отсканируйте QR-код в Telegram', 'loading');
+                    } else {
+                        updateStatus('Ожидание QR-кода...', 'loading');
+                    }
+
+                    return data;
+                } catch (error) {
+                    console.error('[QR] Create session error:', error);
+                    updateStatus(`Ошибка: ${error.message}`, 'error');
+                    showDebugInfo({ reason: 'create_session_error' });
+                    throw error;
+                }
+            }
+
+            function renderQR(qrUrl) {
+                const qrCodeDiv = document.getElementById('qr-code');
+
+                const img = document.createElement('img');
+                img.style.width = '260px';
+                img.style.height = '260px';
+                img.style.borderRadius = '8px';
+                img.style.objectFit = 'contain';
+
+                img.onload = () => {
+                    console.log('[QR] QR Code loaded successfully');
+                    qrCodeDiv.innerHTML = '';
+                    qrCodeDiv.appendChild(img);
+                };
+
+                img.onerror = () => {
+                    console.error('[QR] QR Code load failed');
+                    qrCodeDiv.innerHTML = '<div style="color: var(--tg-destructive-color); font-size: 16px;">Ошибка загрузки QR-кода</div>';
+                };
+
+                img.src = `${API_BASE}/tg/qr/png/${sessionToken}?t=${Date.now()}`;
+            }
+
+            async function checkStatus() {
+                if (!sessionToken) return;
+
+                try {
+                    const response = await fetch(`${API_BASE}/tg/qr/status`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Cache-Control': 'no-cache, no-store, must-revalidate',
+                            'Pragma': 'no-cache'
+                        },
+                        body: JSON.stringify({ session_token: sessionToken })
+                    });
+
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                    }
+
+                    const data = await response.json();
+
+                    if (data.status === 'authorized') {
+                        updateStatus('✅ Авторизация успешна!', 'success');
+                        hideQR();
+                        clearInterval(statusCheckInterval);
+
+                        setTimeout(() => {
+                            if (window.Telegram && window.Telegram.WebApp) {
+                                window.Telegram.WebApp.close();
+                            }
+                        }, 2000);
+                    } else if (data.status === 'failed') {
+                        updateStatus(`❌ Ошибка: ${data.reason || 'Неизвестная ошибка'}`, 'error');
+                        hideQR();
+                        clearInterval(statusCheckInterval);
+                    } else if (data.status === 'expired') {
+                        updateStatus('⏰ Сессия истекла', 'error');
+                        hideQR();
+                        clearInterval(statusCheckInterval);
+                    } else if (data.qr_url) {
+                        showQR();
+                        renderQR(data.qr_url);
+
+                        if (data.status === 'awaiting_scan') {
+                            updateStatus('Отсканируйте QR-код в Telegram', 'loading');
+                        } else if (data.status === 'in_progress') {
+                            updateStatus('Подключение к Telegram...', 'loading');
+                        } else {
+                            updateStatus('Готово к сканированию', 'loading');
+                        }
+                    } else if (data.status === 'pending') {
+                        updateStatus('Ожидание QR-кода...', 'loading');
+                    } else if (data.status === 'in_progress') {
+                        updateStatus('Подключение к Telegram...', 'loading');
+                    }
+                } catch (error) {
+                    console.error('[QR] Status check error:', error);
+                    updateStatus(`Ошибка проверки статуса: ${error.message}`, 'error');
+                    clearInterval(statusCheckInterval);
+                }
+            }
+
+            async function cancelAuth() {
+                if (sessionToken) {
+                    try {
+                        await fetch(`${API_BASE || ''}/tg/qr/cancel`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ session_token: sessionToken })
+                        });
+                    } catch (error) {
+                        console.error('[QR] Cancel auth error:', error);
+                    }
+                }
+
+                hideQR();
+                updateStatus('Авторизация отменена', 'loading');
+                clearInterval(statusCheckInterval);
+            }
+
+            document.addEventListener('DOMContentLoaded', async () => {
+                initTelegramWebApp();
+
+                if (window.Telegram && window.Telegram.WebApp) {
+                    await new Promise(resolve => {
+                        if (window.Telegram.WebApp.isReady) {
+                            resolve();
+                        } else {
+                            window.Telegram.WebApp.ready();
+                            setTimeout(resolve, 100);
+                        }
+                    });
+                }
+
+                const urlParams = new URLSearchParams(location.search);
+                const existingSessionId = urlParams.get('session_id');
+
+                if (existingSessionId) {
+                    sessionToken = existingSessionId;
+                    updateStatus('Проверка сессии...', 'loading');
+                    showQR();
+                    statusCheckInterval = setInterval(checkStatus, 2000);
+                } else {
+                    try {
+                        await createSession();
+                        statusCheckInterval = setInterval(checkStatus, 2000);
+                    } catch (error) {
+                        console.error('[QR] Initialization error:', error);
+                    }
+                }
+            });
+
+            window.addEventListener('beforeunload', () => {
+                if (statusCheckInterval) {
+                    clearInterval(statusCheckInterval);
+                }
+            });
+
+            window.cancelAuth = cancelAuth;
+        })();
+    </script>
+</body>
+</html>
+

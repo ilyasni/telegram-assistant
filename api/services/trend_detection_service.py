@@ -10,7 +10,7 @@ from datetime import datetime, date, timedelta, timezone
 
 import structlog
 from sqlalchemy.orm import Session
-from sqlalchemy import func, desc, text as sa_text
+from sqlalchemy import func, desc, text as sa_text, and_
 from qdrant_client import QdrantClient
 from langchain_gigachat import GigaChat
 from langchain_core.prompts import ChatPromptTemplate
@@ -100,6 +100,18 @@ class TrendDetectionService:
         
         logger.info("Trend Detection Service initialized", qdrant_url=qdrant_url)
     
+    @staticmethod
+    def _normalize_embedding_dim(embedding: List[float], target_dim: int = 1536) -> List[float]:
+        """Приводит embedding к размерности target_dim (обрезка или padding нулями)."""
+        if not embedding:
+            return []
+        if len(embedding) > target_dim:
+            return embedding[:target_dim]
+        if len(embedding) < target_dim:
+            padding = [0.0] * (target_dim - len(embedding))
+            return embedding + padding
+        return embedding
+    
     async def _analyze_engagement(self, posts_data: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Анализ engagement метрик через LLM (Engagement Analyzer Agent)."""
         prompt = ChatPromptTemplate.from_messages([
@@ -163,17 +175,45 @@ class TrendDetectionService:
             cutoff_date = datetime.now(timezone.utc) - timedelta(days=days)
             
             # Context7: Посты удаляются физически из БД, поле deleted отсутствует
-            posts = db.query(Post).join(PostEnrichment).filter(
-                Post.posted_at >= cutoff_date
-            ).order_by(desc(Post.posted_at)).limit(10000).all()  # Ограничение для производительности
+            posts = (
+                db.query(Post)
+                .filter(Post.posted_at >= cutoff_date)
+                .order_by(desc(Post.posted_at))
+                .limit(10000)
+                .all()
+            )  # Ограничение для производительности
             
             posts_data = []
             for post in posts:
-                enrichment = db.query(PostEnrichment).filter(
-                    PostEnrichment.post_id == post.id
-                ).first()
+                enrichment = (
+                    db.query(PostEnrichment)
+                    .filter(
+                        PostEnrichment.post_id == post.id,
+                        PostEnrichment.kind == "classify",
+                    )
+                    .first()
+                )
                 
                 channel = db.query(Channel).filter(Channel.id == post.channel_id).first()
+
+                keywords = []
+                topics = []
+                if enrichment:
+                    enrichment_data = enrichment.data or {}
+                    if isinstance(enrichment_data, dict):
+                        topics = enrichment_data.get("topics") or []
+                        keywords = (
+                            enrichment_data.get("keywords")
+                            or enrichment_data.get("tags")
+                            or []
+                        )
+                    if not keywords:
+                        keywords = enrichment.tags or []
+                if enrichment and not topics:
+                    # legacy fallback
+                    topics = enrichment.tags or []
+                keywords = list(keywords) if isinstance(keywords, list) else [keywords]
+                topics = list(topics) if isinstance(topics, list) else [topics]
                 
                 posts_data.append({
                     'post_id': str(post.id),
@@ -186,8 +226,8 @@ class TrendDetectionService:
                     'forwards_count': post.forwards_count or 0,
                     'replies_count': post.replies_count or 0,
                     'engagement_score': float(post.engagement_score) if post.engagement_score else 0.0,
-                    'topics': enrichment.topics if enrichment and enrichment.topics else [],
-                    'keywords': enrichment.keywords if enrichment and enrichment.keywords else []
+                    'topics': topics,
+                    'keywords': keywords
                 })
             
             # Context7: Дедупликация альбомов - оставляем только первый пост из альбома с наивысшим engagement_score
@@ -408,6 +448,7 @@ class TrendDetectionService:
                 # Генерируем embedding для тренда
                 rag_service = RAGService(self.qdrant_url, self.qdrant_client)
                 embedding = await rag_service._generate_embedding(candidate.keyword)
+                embedding = self._normalize_embedding_dim(embedding)
                 if embedding:
                     # Сохраняем embedding (VectorType автоматически конвертирует list в vector)
                     trend.trend_embedding = embedding
