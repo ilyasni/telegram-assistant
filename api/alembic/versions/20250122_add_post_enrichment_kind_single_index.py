@@ -12,7 +12,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision = '20250122_add_pe_kind_single'
-down_revision = '20251116_trend_agents'  # Context7: Исправлено на последнюю существующую ревизию
+down_revision = '20250121_add_source_field'  # Context7: Исправлено - зависит от предыдущей январской миграции
 branch_labels = None
 depends_on = None
 

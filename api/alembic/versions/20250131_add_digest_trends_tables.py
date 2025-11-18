@@ -263,9 +263,20 @@ def downgrade() -> None:
     Откат миграции: удаление всех таблиц и constraints.
     """
     
+    # Context7: Проверяем существование constraint перед удалением (исправление асимметрии)
+    conn = op.get_bind()
+    result = conn.execute(sa.text("""
+        SELECT conname FROM pg_constraint 
+        WHERE conrelid = 'media_group_items'::regclass 
+        AND contype = 'u'
+        AND conname = 'ux_media_group_items_post_media'
+    """))
+    existing_constraint = result.fetchone()
+    
     # Удаляем индексы и constraints для media_group_items
     op.execute("DROP INDEX IF EXISTS idx_media_group_items_post_position")
-    op.drop_constraint('ux_media_group_items_post_media', 'media_group_items', type_='unique')
+    if existing_constraint:
+        op.drop_constraint('ux_media_group_items_post_media', 'media_group_items', type_='unique')
     
     # Удаляем таблицы
     op.drop_table('trend_alerts')

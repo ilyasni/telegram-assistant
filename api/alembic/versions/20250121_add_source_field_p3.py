@@ -15,7 +15,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision = '20250121_add_source_field'
-down_revision = '20251116_trend_agents'
+down_revision = '20250202_install_pgvector'  # Context7: Исправлено - последняя миграция до ноября 2025
 branch_labels = None
 depends_on = None
 
