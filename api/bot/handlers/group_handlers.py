@@ -11,6 +11,7 @@ import math
 import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from uuid import UUID
 
 import httpx
 import structlog
@@ -958,17 +959,97 @@ async def cb_group_digest_trigger(callback: CallbackQuery, state: FSMContext):
     tenant_id = data.get("group_digest_tenant_id")
     user_id = data.get("group_digest_user_id")
 
-    if not tenant_id or not user_id:
+    # Context7: Детальное логирование для диагностики
+    logger.debug(
+        "Group digest trigger - initial state check",
+        telegram_id=callback.from_user.id,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        tenant_id_type=type(tenant_id).__name__ if tenant_id is not None else "None",
+        user_id_type=type(user_id).__name__ if user_id is not None else "None",
+    )
+
+    # Context7: Проверка на None и пустые строки
+    if tenant_id is None or user_id is None or not str(tenant_id).strip() or not str(user_id).strip():
         user_ctx = await _get_user_context(callback.from_user.id)
         if not user_ctx:
             await callback.answer("❌ Пользователь не найден", show_alert=True)
             return
-        tenant_id = str(user_ctx["tenant_id"])
-        user_id = str(user_ctx["id"])
+        
+        # Context7: Валидация tenant_id и user_id перед использованием
+        tenant_id_raw = user_ctx.get("tenant_id")
+        user_id_raw = user_ctx.get("id")
+        
+        if not tenant_id_raw or not user_id_raw:
+            logger.error(
+                "Missing tenant_id or user_id in user context",
+                telegram_id=callback.from_user.id,
+                has_tenant_id=tenant_id_raw is not None,
+                has_user_id=user_id_raw is not None,
+            )
+            await callback.answer("❌ Ошибка: отсутствует tenant_id или user_id", show_alert=True)
+            return
+        
+        # Context7: Проверка формата UUID перед конвертацией в строку
+        try:
+            # Валидируем, что это валидный UUID
+            UUID(str(tenant_id_raw))
+            UUID(str(user_id_raw))
+        except (ValueError, TypeError) as e:
+            logger.error(
+                "Invalid UUID format for tenant_id or user_id",
+                telegram_id=callback.from_user.id,
+                tenant_id=tenant_id_raw,
+                user_id=user_id_raw,
+                error=str(e),
+            )
+            await callback.answer("❌ Ошибка: невалидный формат tenant_id или user_id", show_alert=True)
+            return
+        
+        tenant_id = str(tenant_id_raw)
+        user_id = str(user_id_raw)
         await state.update_data(
             group_digest_tenant_id=tenant_id,
             group_digest_user_id=user_id,
         )
+
+    # Context7: Дополнительная валидация перед отправкой запроса
+    # Проверяем на None и пустые строки после всех преобразований
+    tenant_id_str = str(tenant_id).strip() if tenant_id is not None else ""
+    user_id_str = str(user_id).strip() if user_id is not None else ""
+    
+    if not tenant_id_str or not user_id_str:
+        logger.error(
+            "tenant_id or user_id is empty before request",
+            telegram_id=callback.from_user.id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            tenant_id_str=tenant_id_str,
+            user_id_str=user_id_str,
+        )
+        await callback.answer("❌ Ошибка: tenant_id или user_id пуст", show_alert=True)
+        return
+    
+    # Context7: Проверка формата UUID перед отправкой
+    try:
+        tenant_uuid = UUID(tenant_id_str)
+        user_uuid = UUID(user_id_str)
+        # Обновляем значения на валидированные UUID строки
+        tenant_id = str(tenant_uuid)
+        user_id = str(user_uuid)
+    except (ValueError, TypeError) as e:
+        logger.error(
+            "Invalid UUID format before API request",
+            telegram_id=callback.from_user.id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            tenant_id_str=tenant_id_str,
+            user_id_str=user_id_str,
+            error=str(e),
+            error_type=type(e).__name__,
+        )
+        await callback.answer("❌ Ошибка: невалидный формат tenant_id или user_id", show_alert=True)
+        return
 
     _, groups_map = await _load_group_digest_groups(state, tenant_id, force_refresh=False)
     group = groups_map.get(group_id)
@@ -979,14 +1060,71 @@ async def cb_group_digest_trigger(callback: CallbackQuery, state: FSMContext):
         await callback.answer("❌ Группа не найдена", show_alert=True)
         return
 
+    # Context7: Финальная проверка перед формированием payload
+    if not tenant_id or not user_id:
+        logger.error(
+            "tenant_id or user_id is empty before payload creation",
+            telegram_id=callback.from_user.id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+        await callback.answer("❌ Ошибка: tenant_id или user_id пуст", show_alert=True)
+        return
+    
+    # Context7: Убеждаемся, что значения - это строки UUID (не None, не пустые)
+    tenant_id_final = str(tenant_id).strip()
+    user_id_final = str(user_id).strip()
+    
+    if not tenant_id_final or not user_id_final:
+        logger.error(
+            "tenant_id or user_id is empty after string conversion",
+            telegram_id=callback.from_user.id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            tenant_id_final=tenant_id_final,
+            user_id_final=user_id_final,
+        )
+        await callback.answer("❌ Ошибка: tenant_id или user_id пуст после конвертации", show_alert=True)
+        return
+    
+    # Context7: Проверяем формат UUID еще раз перед отправкой
+    try:
+        UUID(tenant_id_final)
+        UUID(user_id_final)
+    except (ValueError, TypeError) as e:
+        logger.error(
+            "Invalid UUID format in final check",
+            telegram_id=callback.from_user.id,
+            tenant_id_final=tenant_id_final,
+            user_id_final=user_id_final,
+            error=str(e),
+        )
+        await callback.answer("❌ Ошибка: невалидный формат tenant_id или user_id", show_alert=True)
+        return
+    
     payload = {
-        "tenant_id": tenant_id,
-        "user_id": user_id,
+        "tenant_id": tenant_id_final,
+        "user_id": user_id_final,
         "window_size_hours": window_size,
         "delivery_channel": "telegram",
         "delivery_format": "telegram_html",
         "trigger": "bot_manual_group",
     }
+
+    # Context7: Детальное логирование payload перед отправкой
+    logger.info(
+        "Group digest trigger - sending request",
+        telegram_id=callback.from_user.id,
+        group_id=group_id,
+        tenant_id=tenant_id_final,
+        user_id=user_id_final,
+        window_size=window_size,
+        payload_tenant_id=payload.get("tenant_id"),
+        payload_user_id=payload.get("user_id"),
+        payload_tenant_id_type=type(payload.get("tenant_id")).__name__,
+        payload_user_id_type=type(payload.get("user_id")).__name__,
+        payload_json=str(payload),
+    )
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -998,26 +1136,55 @@ async def cb_group_digest_trigger(callback: CallbackQuery, state: FSMContext):
             group_id=group_id,
             window_size=window_size,
             error=str(exc),
+            error_type=type(exc).__name__,
         )
         await callback.answer("❌ Ошибка запроса к API", show_alert=True)
         return
 
     if resp.status_code not in (200, 202):
         message = resp.text.strip() or resp.reason_phrase or "Не удалось запустить дайджест"
-        try:
-            error_payload = resp.json()
-            if isinstance(error_payload, dict):
-                detail = error_payload.get("detail") or error_payload.get("message")
-                if detail:
-                    message = str(detail)
-        except Exception:
-            pass
+        
+        # Context7: Улучшенная обработка ошибок валидации (422)
+        if resp.status_code == 422:
+            try:
+                error_payload = resp.json()
+                if isinstance(error_payload, dict):
+                    detail = error_payload.get("detail")
+                    if isinstance(detail, list) and len(detail) > 0:
+                        # Извлекаем первую ошибку валидации
+                        first_error = detail[0]
+                        if isinstance(first_error, dict):
+                            error_msg = first_error.get("msg", "")
+                            error_loc = first_error.get("loc", [])
+                            if error_loc:
+                                field_name = " → ".join(str(loc) for loc in error_loc)
+                                message = f"Ошибка валидации {field_name}: {error_msg}"
+                            else:
+                                message = error_msg
+                    elif isinstance(detail, str):
+                        message = detail
+            except Exception:
+                pass
+        
+        # Context7: Обработка других типов ошибок
+        if resp.status_code != 422:
+            try:
+                error_payload = resp.json()
+                if isinstance(error_payload, dict):
+                    detail = error_payload.get("detail") or error_payload.get("message")
+                    if detail:
+                        message = str(detail)
+            except Exception:
+                pass
+        
         logger.warning(
             "Group digest API returned error",
             tenant_id=tenant_id,
             group_id=group_id,
+            window_size=window_size,
             status_code=resp.status_code,
             response=resp.text[:500],
+            error_message=message,
         )
         await callback.answer(f"❌ {message}", show_alert=True)
         return

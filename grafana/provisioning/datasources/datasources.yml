@@ -16,3 +16,6 @@ datasources:
       cacheLevel: "High"
       disableRecordingRules: false
       incrementalQueryOverlapWindow: 10m
+      # Context7: Timeout для запросов Prometheus (в секундах)
+      # Предотвращает зависание dashboard при медленных запросах
+      queryTimeout: "60s"

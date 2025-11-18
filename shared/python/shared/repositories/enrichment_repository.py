@@ -192,15 +192,13 @@ class EnrichmentRepository:
             if self._is_asyncpg:
                 # asyncpg.Pool
                 async with self.db_session.acquire() as conn:
+                    # Context7: Убрана ссылка на несуществующую колонку enriched_at
                     await conn.execute("""
                         INSERT INTO post_enrichment (
                             post_id, kind, provider, params_hash, data, status, error,
-                            updated_at, enriched_at
+                            updated_at
                         ) VALUES (
-                            $1, $2, $3, $4, $5::jsonb, $6, $7, $8, COALESCE(
-                                (SELECT enriched_at FROM post_enrichment WHERE post_id = $1 AND kind = $2),
-                                $8
-                            )
+                            $1, $2, $3, $4, $5::jsonb, $6, $7, $8
                         )
                         ON CONFLICT (post_id, kind) DO UPDATE SET
                             provider = EXCLUDED.provider,
@@ -223,85 +221,26 @@ class EnrichmentRepository:
                         updated_at
                     )
                     
-                    # Context7: Обновление legacy полей для обратной совместимости после основного upsert
-                    # Синхронизируем legacy поля из data JSONB для всех kinds
-                    if kind == 'vision':
-                        # Context7: Проверяем, что данные сохранились правильно после upsert
-                        check_row = await conn.fetchrow("""
-                            SELECT data, params_hash 
-                            FROM post_enrichment 
-                            WHERE post_id = $1 AND kind = 'vision'
-                        """, post_id)
-                        
-                        if check_row:
-                            saved_data = check_row['data']
-                            saved_params_hash = check_row['params_hash']
-                            saved_has_ocr = bool(saved_data and saved_data.get("ocr") and isinstance(saved_data.get("ocr"), dict) and saved_data["ocr"].get("text"))
-                            logger.debug(
-                                "Enrichment saved to DB - verification",
-                                post_id=post_id,
-                                kind=kind,
-                                params_hash_saved=bool(saved_params_hash),
-                                params_hash_value=saved_params_hash[:16] + "..." if saved_params_hash else None,
-                                has_ocr_saved=saved_has_ocr,
-                                ocr_text_length=len(saved_data.get("ocr", {}).get("text", "")) if saved_data and saved_data.get("ocr") else 0,
-                                trace_id=trace_id
-                            )
-                        
-                        await conn.execute("""
-                            UPDATE post_enrichment
-                            SET 
-                                vision_description = COALESCE($1::jsonb->>'description', $1::jsonb->>'caption', vision_description),
-                                vision_classification = COALESCE(($1::jsonb->'labels')::jsonb, vision_classification),
-                                vision_is_meme = COALESCE(($1::jsonb->>'is_meme')::boolean, vision_is_meme),
-                                vision_ocr_text = COALESCE($1::jsonb->'ocr'->>'text', vision_ocr_text),
-                                vision_analyzed_at = COALESCE(
-                                    CASE WHEN $1::jsonb->>'analyzed_at' IS NOT NULL 
-                                    THEN ($1::jsonb->>'analyzed_at')::timestamp 
-                                    ELSE NULL END,
-                                    vision_analyzed_at,
-                                    $2
-                                )
-                            WHERE post_id = $3 AND kind = 'vision'
-                        """, data_jsonb, updated_at, post_id)
-                    elif kind in ('crawl', 'general'):
-                        # Context7: Синхронизация crawl_md для crawl и general kinds
-                        await conn.execute("""
-                            UPDATE post_enrichment
-                            SET 
-                                crawl_md = COALESCE(
-                                    NULLIF($1::jsonb->>'crawl_md', ''),
-                                    NULLIF($1::jsonb->'enrichment_data'->'crawl_data'->>'crawl_md', ''),
-                                    crawl_md
-                                ),
-                                summary = COALESCE(
-                                    NULLIF($1::jsonb->>'summary', ''),
-                                    NULLIF($1::jsonb->'enrichment_data'->>'summary', ''),
-                                    summary
-                                )
-                            WHERE post_id = $2 AND kind = $3
-                        """, data_jsonb, post_id, kind)
-                    elif kind == 'tags':
-                        # Context7: Синхронизация tags для tags kind
-                        # Используем ARRAY(SELECT jsonb_array_elements_text(...)) для преобразования JSONB массива в text[]
-                        await conn.execute("""
-                            UPDATE post_enrichment
-                            SET 
-                                tags = COALESCE(
-                                    CASE 
-                                        WHEN $1::jsonb->'tags' IS NOT NULL AND jsonb_typeof($1::jsonb->'tags') = 'array'
-                                        THEN ARRAY(SELECT jsonb_array_elements_text($1::jsonb->'tags'))
-                                        ELSE NULL
-                                    END,
-                                    CASE 
-                                        WHEN $1::jsonb->'enrichment_data'->'tags' IS NOT NULL AND jsonb_typeof($1::jsonb->'enrichment_data'->'tags') = 'array'
-                                        THEN ARRAY(SELECT jsonb_array_elements_text($1::jsonb->'enrichment_data'->'tags'))
-                                        ELSE NULL
-                                    END,
-                                    tags
-                                )
-                            WHERE post_id = $2 AND kind = 'tags'
-                        """, data_jsonb, post_id)
+                    # Context7: Legacy поля удалены из БД миграцией 20251117_remove_legacy
+                    # Все данные хранятся только в data JSONB
+                    # Проверяем, что данные сохранились правильно после upsert
+                    check_row = await conn.fetchrow("""
+                        SELECT data, params_hash 
+                        FROM post_enrichment 
+                        WHERE post_id = $1 AND kind = $2
+                    """, post_id, kind)
+                    
+                    if check_row:
+                        saved_data = check_row['data']
+                        saved_params_hash = check_row['params_hash']
+                        logger.debug(
+                            "Enrichment saved to DB - verification",
+                            post_id=post_id,
+                            kind=kind,
+                            params_hash_saved=bool(saved_params_hash),
+                            params_hash_value=saved_params_hash[:16] + "..." if saved_params_hash else None,
+                            trace_id=trace_id
+                        )
             
             elif self._is_sqlalchemy:
                 # SQLAlchemy AsyncSession
@@ -309,16 +248,14 @@ class EnrichmentRepository:
                 
                 # Context7: Используем CAST вместо :: для совместимости с SQLAlchemy
                 await self.db_session.execute(
+                    # Context7: Убрана ссылка на несуществующую колонку enriched_at
                     text("""
                         INSERT INTO post_enrichment (
                             post_id, kind, provider, params_hash, data, status, error,
-                            updated_at, enriched_at
+                            updated_at
                         ) VALUES (
                             :post_id, :kind, :provider, :params_hash, CAST(:data AS jsonb), :status, :error,
-                            :updated_at, COALESCE(
-                                (SELECT enriched_at FROM post_enrichment WHERE post_id = :post_id_sub AND kind = :kind_sub),
-                                :updated_at_sub
-                            )
+                            :updated_at
                         )
                         ON CONFLICT (post_id, kind) DO UPDATE SET
                             provider = EXCLUDED.provider,
@@ -326,69 +263,9 @@ class EnrichmentRepository:
                             data = EXCLUDED.data,
                             status = EXCLUDED.status,
                             error = EXCLUDED.error,
-                            updated_at = EXCLUDED.updated_at,
-                            -- Context7: Синхронизация legacy полей для обратной совместимости (vision)
-                            vision_description = CASE 
-                                WHEN EXCLUDED.kind = 'vision' THEN COALESCE(EXCLUDED.data->>'description', EXCLUDED.data->>'caption', post_enrichment.vision_description)
-                                ELSE post_enrichment.vision_description
-                            END,
-                            vision_classification = CASE 
-                                WHEN EXCLUDED.kind = 'vision' THEN COALESCE(EXCLUDED.data->'labels', post_enrichment.vision_classification)
-                                ELSE post_enrichment.vision_classification
-                            END,
-                            vision_is_meme = CASE 
-                                WHEN EXCLUDED.kind = 'vision' THEN COALESCE((EXCLUDED.data->>'is_meme')::boolean, post_enrichment.vision_is_meme)
-                                ELSE post_enrichment.vision_is_meme
-                            END,
-                            vision_ocr_text = CASE 
-                                WHEN EXCLUDED.kind = 'vision' THEN COALESCE(EXCLUDED.data->'ocr'->>'text', post_enrichment.vision_ocr_text)
-                                ELSE post_enrichment.vision_ocr_text
-                            END,
-                            vision_analyzed_at = CASE 
-                                WHEN EXCLUDED.kind = 'vision' THEN COALESCE(
-                                    CASE 
-                                        WHEN EXCLUDED.data->>'analyzed_at' IS NOT NULL 
-                                        THEN (EXCLUDED.data->>'analyzed_at')::timestamp 
-                                        ELSE NULL
-                                    END, 
-                                    post_enrichment.vision_analyzed_at, 
-                                    EXCLUDED.updated_at
-                                )
-                                ELSE post_enrichment.vision_analyzed_at
-                            END,
-                            -- Context7: Синхронизация legacy полей для crawl/general kinds
-                            crawl_md = CASE 
-                                WHEN EXCLUDED.kind IN ('crawl', 'general') THEN COALESCE(
-                                    NULLIF(EXCLUDED.data->>'crawl_md', ''),
-                                    NULLIF(EXCLUDED.data->'enrichment_data'->'crawl_data'->>'crawl_md', ''),
-                                    post_enrichment.crawl_md
-                                )
-                                ELSE post_enrichment.crawl_md
-                            END,
-                            summary = CASE 
-                                WHEN EXCLUDED.kind IN ('crawl', 'general') THEN COALESCE(
-                                    NULLIF(EXCLUDED.data->>'summary', ''),
-                                    NULLIF(EXCLUDED.data->'enrichment_data'->>'summary', ''),
-                                    post_enrichment.summary
-                                )
-                                ELSE post_enrichment.summary
-                            END,
-                            tags = CASE 
-                                WHEN EXCLUDED.kind = 'tags' THEN COALESCE(
-                                    CASE 
-                                        WHEN EXCLUDED.data->'tags' IS NOT NULL AND jsonb_typeof(EXCLUDED.data->'tags') = 'array'
-                                        THEN (SELECT array_agg(value) FROM jsonb_array_elements_text(EXCLUDED.data->'tags') AS value)
-                                        ELSE NULL
-                                    END,
-                                    CASE 
-                                        WHEN EXCLUDED.data->'enrichment_data'->'tags' IS NOT NULL AND jsonb_typeof(EXCLUDED.data->'enrichment_data'->'tags') = 'array'
-                                        THEN (SELECT array_agg(value) FROM jsonb_array_elements_text(EXCLUDED.data->'enrichment_data'->'tags') AS value)
-                                        ELSE NULL
-                                    END,
-                                    post_enrichment.tags
-                                )
-                                ELSE post_enrichment.tags
-                            END
+                            updated_at = EXCLUDED.updated_at
+                            -- Context7: Legacy поля удалены из БД миграцией 20251117_remove_legacy
+                            -- Все данные хранятся только в data JSONB
                     """),
                     {
                         "post_id": post_id,

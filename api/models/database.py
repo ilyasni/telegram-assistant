@@ -3,7 +3,7 @@
 from sqlalchemy import create_engine, Column, String, Integer, Boolean, DateTime, Text, JSON, BigInteger, ForeignKey, UniqueConstraint, Index, CheckConstraint, PrimaryKeyConstraint, func, text, event, REAL, Time, Date, Computed, TypeDecorator
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship, Session
-from sqlalchemy.dialects.postgresql import UUID, JSONB
+from sqlalchemy.dialects.postgresql import UUID, JSONB, BYTEA
 from sqlalchemy.dialects.postgresql.base import ischema_names
 import json
 import uuid
@@ -189,6 +189,7 @@ class User(Base):
         back_populates="user",
         cascade="all, delete-orphan"
     )
+    feedback = relationship("UserFeedback", foreign_keys="UserFeedback.user_id", back_populates="user", cascade="all, delete-orphan")
 
     # Индексы/ограничения: окончательный UNIQUE(tenant_id, identity_id) накатывается миграцией
     __table_args__ = (
@@ -221,6 +222,38 @@ class UserAuditLog(Base):
     )
 
 
+class UserFeedback(Base):
+    """Модель feedback от пользователей.
+    
+    Context7: Хранение комментариев и пожеланий пользователей с поддержкой статусов
+    и multi-tenant изоляции.
+    """
+    __tablename__ = "user_feedback"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
+    message = Column(Text, nullable=False)
+    status = Column(String(20), nullable=False, server_default="pending")  # pending, in_progress, resolved, closed
+    admin_notes = Column(Text, nullable=True)
+    resolved_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+    
+    # Relationships
+    user = relationship("User", foreign_keys=[user_id], back_populates="feedback")
+    tenant = relationship("Tenant")
+    resolver = relationship("User", foreign_keys=[resolved_by])
+    
+    __table_args__ = (
+        CheckConstraint("status IN ('pending', 'in_progress', 'resolved', 'closed')", name="ck_user_feedback_status"),
+        Index("ix_user_feedback_user_id", "user_id"),
+        Index("ix_user_feedback_tenant_id", "tenant_id"),
+        Index("ix_user_feedback_status", "status"),
+        Index("ix_user_feedback_created_at", "created_at"),
+    )
+
+
 class Channel(Base):
     """Модель канала (глобальный)."""
     __tablename__ = "channels"
@@ -238,6 +271,86 @@ class Channel(Base):
     # Relationships
     posts = relationship("Post", back_populates="channel")
     user_subscriptions = relationship("UserChannel", back_populates="channel")
+
+
+class TelegramEntity(Base):
+    """Модель Telegram сущности (Context7 P1.2: entity-level metadata)."""
+    __tablename__ = "tg_entities"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    peer_id = Column(BigInteger, nullable=False)  # Telegram peer ID
+    peer_type = Column(String(20), nullable=False)  # 'user', 'channel', 'chat', 'supergroup'
+    access_hash = Column(BigInteger, nullable=True)  # Access hash для API доступа
+    username = Column(String(255), nullable=True)
+    title = Column(Text, nullable=True)  # Название (для каналов/чатов)
+    first_name = Column(String(255), nullable=True)  # Имя (для пользователей)
+    last_name = Column(String(255), nullable=True)  # Фамилия (для пользователей)
+    avatar_hash = Column(String(64), nullable=True)  # SHA256 хеш аватара
+    bio = Column(Text, nullable=True)  # Описание/био
+    restrictions = Column(JSONB, nullable=True)  # Ограничения доступа
+    is_verified = Column(Boolean, nullable=True)
+    is_premium = Column(Boolean, nullable=True)  # Premium статус (для пользователей)
+    is_scam = Column(Boolean, nullable=True)
+    is_fake = Column(Boolean, nullable=True)
+    is_bot = Column(Boolean, nullable=True)
+    is_channel = Column(Boolean, nullable=True)
+    is_broadcast = Column(Boolean, nullable=True)
+    is_megagroup = Column(Boolean, nullable=True)
+    is_restricted = Column(Boolean, nullable=True)
+    is_min = Column(Boolean, nullable=True)
+    dc_id = Column(Integer, nullable=True)  # DataCenter ID
+    participants_count = Column(Integer, nullable=True)
+    members_count = Column(Integer, nullable=True)
+    admins_count = Column(Integer, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+    last_seen_at = Column(DateTime(timezone=True), nullable=True)
+    entity_metadata = Column(JSONB, nullable=True)  # Дополнительные метаданные
+    
+    # Relationships
+    admins = relationship("TelegramEntityAdmin", back_populates="entity", cascade="all, delete-orphan")
+    
+    __table_args__ = (
+        UniqueConstraint("peer_id", "peer_type", name="uq_tg_entities_peer"),
+        Index("idx_tg_entities_peer_id", "peer_id"),
+        Index("idx_tg_entities_peer_type", "peer_type"),
+        Index("idx_tg_entities_username", "username", postgresql_where=text("username IS NOT NULL")),
+        Index("idx_tg_entities_access_hash", "access_hash", postgresql_where=text("access_hash IS NOT NULL")),
+        Index("idx_tg_entities_last_seen", "last_seen_at", postgresql_where=text("last_seen_at IS NOT NULL"), postgresql_ops={"last_seen_at": "DESC"}),
+    )
+
+
+class TelegramEntityAdmin(Base):
+    """Модель администратора Telegram сущности (Context7 P1.2)."""
+    __tablename__ = "tg_entity_admins"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    entity_id = Column(UUID(as_uuid=True), ForeignKey("tg_entities.id", ondelete="CASCADE"), nullable=False)
+    admin_peer_id = Column(BigInteger, nullable=False)  # Telegram ID администратора
+    admin_peer_type = Column(String(20), nullable=False)  # 'user', 'bot'
+    role = Column(String(50), nullable=True)  # Роль (owner, admin, moderator)
+    rights = Column(JSONB, nullable=True)  # Права администратора
+    rank = Column(String(255), nullable=True)  # Ранг/титул
+    promoted_by = Column(BigInteger, nullable=True)  # Кто назначил администратора
+    is_self = Column(Boolean, nullable=True)
+    can_edit = Column(Boolean, nullable=True)
+    can_delete = Column(Boolean, nullable=True)
+    can_ban = Column(Boolean, nullable=True)
+    can_invite = Column(Boolean, nullable=True)
+    can_change_info = Column(Boolean, nullable=True)
+    can_post_messages = Column(Boolean, nullable=True)  # Для каналов
+    can_edit_messages = Column(Boolean, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+    
+    # Relationships
+    entity = relationship("TelegramEntity", back_populates="admins")
+    
+    __table_args__ = (
+        UniqueConstraint("entity_id", "admin_peer_id", name="uq_tg_entity_admins_entity_admin"),
+        Index("idx_tg_entity_admins_entity_id", "entity_id"),
+        Index("idx_tg_entity_admins_admin_peer_id", "admin_peer_id"),
+    )
 
 
 class Post(Base):
@@ -282,6 +395,20 @@ class Post(Base):
     
     # Context7: Поле для связи постов с альбомами (Telegram grouped_id)
     grouped_id = Column(BigInteger, nullable=True, index=True)
+    
+    # Context7 P1.1: Быстрые поля для forwards (для прямого доступа без JOIN)
+    forward_from_peer_id = Column(JSONB, nullable=True)  # Peer ID источника форварда (JSONB для гибкости)
+    forward_from_chat_id = Column(BigInteger, nullable=True)  # Chat ID источника форварда (упрощённый доступ)
+    forward_from_message_id = Column(BigInteger, nullable=True)  # Message ID источника форварда
+    forward_date = Column(DateTime(timezone=True), nullable=True)  # Дата оригинального сообщения
+    forward_from_name = Column(Text, nullable=True)  # Имя автора оригинального сообщения
+    
+    # Context7 P1.1: Дополнительные поля для replies (thread_id, forum_topic_id)
+    thread_id = Column(BigInteger, nullable=True)  # ID треда (для каналов с комментариями)
+    forum_topic_id = Column(BigInteger, nullable=True)  # ID топика форума
+    
+    # Context7 P3: Поле source для различения источников (channel/group/dm/persona)
+    source = Column(String(20), nullable=True, server_default="channel")  # channel|group|dm|persona
     
     # Relationships
     channel = relationship("Channel", back_populates="posts")
@@ -329,8 +456,8 @@ class EncryptionKey(Base):
 
 
 class TelegramSession(Base):
-    """Зашифрованные Telethon StringSession на арендатора/пользователя."""
-    __tablename__ = "telegram_sessions"
+    """Зашифрованные Telethon StringSession на арендатора/пользователя (старая схема для QR-авторизации)."""
+    __tablename__ = "telegram_sessions_legacy"  # Переименовано для обратной совместимости
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False)
@@ -346,6 +473,37 @@ class TelegramSession(Base):
         UniqueConstraint("tenant_id", "user_id", "status", name="uq_session_active", deferrable=True, initially="DEFERRED"),
         Index("ix_telegram_sessions_tenant", "tenant_id"),
         Index("ix_telegram_sessions_status", "status"),
+    )
+
+
+class TelegramSessionV2(Base):
+    """Зашифрованные Telethon StringSession с multi-tenant поддержкой через identity_id (Context7 P0.1)."""
+    __tablename__ = "telegram_sessions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    identity_id = Column(UUID(as_uuid=True), ForeignKey("identities.id", ondelete="CASCADE"), nullable=False)
+    telegram_id = Column(BigInteger, nullable=False)  # Dual-write для обратной совместимости
+    session_string_enc = Column(Text, nullable=False)  # Зашифрованная сессия (StringSession.save())
+    s3_key = Column(String(512), nullable=True)  # Опционально: путь в S3 для .session файла
+    s3_bucket = Column(String(255), nullable=True)
+    dc_id = Column(Integer, nullable=False)  # DataCenter ID
+    auth_key_enc = Column(BYTEA(), nullable=True)  # Опционально: зашифрованный auth_key
+    session_key_id = Column(BigInteger, nullable=True)
+    is_active = Column(Boolean, server_default=text("true"), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+    last_used_at = Column(DateTime(timezone=True), nullable=True)  # Для архивации неиспользуемых сессий
+    expires_at = Column(DateTime(timezone=True), nullable=True)
+
+    # Relationships
+    identity = relationship("Identity", backref="telegram_sessions")
+
+    __table_args__ = (
+        # Multi-tenant: UNIQUE(identity_id, dc_id) - одна Identity может иметь сессии в разных DC
+        UniqueConstraint("identity_id", "dc_id", name="ux_telegram_sessions_identity_dc"),
+        Index("idx_sessions_identity_id", "identity_id", postgresql_where=text("is_active = true")),
+        Index("idx_sessions_telegram_id", "telegram_id", postgresql_where=text("is_active = true")),
+        Index("idx_sessions_last_used", "last_used_at", postgresql_where=text("is_active = true")),
     )
 
 
@@ -404,35 +562,9 @@ class PostEnrichment(Base):
     vision_labels_agg = Column(JSONB, nullable=True)  # Агрегированные метки vision из всех элементов альбома
     ocr_present = Column(Boolean, default=False)  # Наличие OCR текста в альбоме
     
-    # Legacy поля (deprecated, будут удалены после миграции)
-    tags = Column(JSONB, default=[])  # DEPRECATED: использовать data->'tags'
-    vision_labels = Column(JSONB, default=[])  # DEPRECATED: использовать data->'labels'
-    ocr_text = Column(Text)  # DEPRECATED: использовать data->'ocr'->>'text'
-    crawl_md = Column(Text)  # DEPRECATED: использовать data->>'crawl_md'
-    enrichment_provider = Column(String(50))  # DEPRECATED: использовать provider
-    enriched_at = Column(DateTime, default=datetime.utcnow)  # DEPRECATED: использовать created_at
-    enrichment_latency_ms = Column(Integer)  # DEPRECATED: использовать data->>'latency_ms'
-    enrichment_metadata = Column(JSONB, default={})  # DEPRECATED: использовать data
-    summary = Column(Text)  # DEPRECATED: использовать data->>'caption' или data->>'summary'
-    
-    # Legacy Vision поля (deprecated)
-    vision_classification = Column(JSONB)  # DEPRECATED: использовать data->'labels'
-    vision_description = Column(Text)  # DEPRECATED: использовать data->>'caption'
-    vision_ocr_text = Column(Text)  # DEPRECATED: использовать data->'ocr'->>'text'
-    vision_is_meme = Column(Boolean, default=False)  # DEPRECATED: использовать data->>'is_meme'
-    vision_context = Column(JSONB)  # DEPRECATED: использовать data->'context'
-    vision_provider = Column(String(50))  # DEPRECATED: использовать provider
-    vision_model = Column(String(100))  # DEPRECATED: использовать data->>'model'
-    vision_analyzed_at = Column(DateTime)  # DEPRECATED: использовать created_at
-    vision_file_id = Column(String(255))  # DEPRECATED: использовать data->>'file_id'
-    vision_tokens_used = Column(Integer, default=0)  # DEPRECATED: использовать data->>'tokens_used'
-    vision_cost_microunits = Column(Integer, default=0)  # DEPRECATED: использовать data->>'cost_microunits'
-    vision_analysis_reason = Column(String(50))  # DEPRECATED: использовать data->>'analysis_reason'
-    
-    # Legacy S3 references (deprecated)
-    s3_media_keys = Column(JSONB, default=[])  # DEPRECATED: использовать post_media_map + media_objects
-    s3_vision_keys = Column(JSONB, default=[])  # DEPRECATED: использовать data->'s3_keys'
-    s3_crawl_keys = Column(JSONB, default=[])  # DEPRECATED: использовать data->'s3_keys'
+    # Context7: Legacy поля удалены из БД миграцией 20251117_remove_legacy
+    # Все данные хранятся только в data JSONB
+    # Используйте data->'tags', data->'labels', data->'ocr'->>'text' и т.д.
     
     # Relationships
     post = relationship("Post", back_populates="enrichment")
@@ -615,11 +747,19 @@ class GroupMessage(Base):
     is_service = Column(Boolean, default=False)
     action_type = Column(String(100))
     
+    # Context7 P3: Поле source для различения источников (group/dm/persona)
+    source = Column(String(20), nullable=True, server_default="group")  # group|dm|persona
+    
     # Relationships
     group = relationship("Group", back_populates="messages")
     mentions = relationship("GroupMention", back_populates="message")
     analytics = relationship("GroupMessageAnalytics", back_populates="message", uselist=False)
     media_map = relationship("GroupMediaMap", back_populates="group_message")
+    
+    # Context7: UNIQUE constraint для поддержки ON CONFLICT в telegram_client.py
+    __table_args__ = (
+        UniqueConstraint('group_id', 'tg_message_id', name='ux_group_messages_group_tg_message'),
+    )
 
 
 class GroupMention(Base):
@@ -811,7 +951,7 @@ class PostReaction(Base):
 
 
 class PostForward(Base):
-    """Модель репоста поста."""
+    """Модель репоста поста (Context7 P1.1: расширено для поддержки всех полей MessageFwdHeader)."""
     __tablename__ = "post_forwards"
     
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -823,12 +963,20 @@ class PostForward(Base):
     forwarded_at = Column(DateTime, default=datetime.utcnow)
     created_at = Column(DateTime, default=datetime.utcnow)
     
+    # Context7 P1.1: Дополнительные поля из MessageFwdHeader
+    from_id = Column(JSONB, nullable=True)  # Peer ID источника (JSONB для гибкости: user_id/channel_id/chat_id)
+    from_name = Column(Text, nullable=True)  # Имя автора (если доступно)
+    post_author_signature = Column(Text, nullable=True)  # Подпись автора (для каналов)
+    saved_from_peer = Column(JSONB, nullable=True)  # Peer ID источника сохранённого форварда
+    saved_from_msg_id = Column(BigInteger, nullable=True)  # Message ID сохранённого форварда
+    psa_type = Column(String(255), nullable=True)  # Тип публичного объявления
+    
     # Relationships
     post = relationship("Post", back_populates="forwards")
 
 
 class PostReply(Base):
-    """Модель комментария/ответа на пост."""
+    """Модель комментария/ответа на пост (Context7 P1.1: расширено для поддержки thread_id)."""
     __tablename__ = "post_replies"
     
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -841,6 +989,9 @@ class PostReply(Base):
     reply_content = Column(Text)
     reply_posted_at = Column(DateTime, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Context7 P1.1: Поддержка thread_id для каналов с комментариями
+    thread_id = Column(BigInteger, nullable=True)  # ID треда (для каналов с комментариями)
     
     # Relationships
     post = relationship("Post", back_populates="replies", foreign_keys=[post_id])

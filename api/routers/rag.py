@@ -41,7 +41,11 @@ class RAGResponse(BaseModel):
 
 @router.post("/query", response_model=RAGResponse)
 async def rag_query(query_data: RAGQuery, request: Request, db: Session = Depends(get_db)):
-    """Выполнить RAG-поиск по контенту каналов пользователя."""
+    """
+    Выполнить RAG-поиск по контенту каналов пользователя.
+    
+    Context7: Проверяет статус индексации перед запросом для предотвращения пустых результатов.
+    """
     # Проверить существование пользователя
     user = db.query(User).filter(User.id == query_data.user_id).first()
     if not user:
@@ -52,6 +56,68 @@ async def rag_query(query_data: RAGQuery, request: Request, db: Session = Depend
     
     # Получаем RAG Service
     rag_service = get_rag_service()
+    
+    # Context7: Проверка статуса индексации перед запросом
+    collection_name = f"t{tenant_id}_posts"
+    try:
+        collections = rag_service.qdrant_client.get_collections()
+        collection_exists = collection_name in [c.name for c in collections.collections]
+        
+        if collection_exists:
+            collection_info = rag_service.qdrant_client.get_collection(collection_name)
+            indexed_count = collection_info.points_count if collection_info else 0
+            
+            # Если индексированных постов нет или очень мало, возвращаем информативный ответ
+            if indexed_count == 0:
+                logger.warning(
+                    "RAG query attempted but no indexed posts",
+                    user_id=str(query_data.user_id),
+                    tenant_id=tenant_id,
+                    collection_name=collection_name
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "error": "Indexation not ready",
+                        "message": "Индексация контента еще не завершена. Попробуйте позже.",
+                        "status": "not_indexed",
+                        "indexed_posts": 0
+                    }
+                )
+            
+            # Если индексированных постов мало, предупреждаем в логах
+            if indexed_count < 10:
+                logger.warning(
+                    "RAG query with low indexed posts count",
+                    user_id=str(query_data.user_id),
+                    tenant_id=tenant_id,
+                    indexed_count=indexed_count
+                )
+        else:
+            logger.warning(
+                "RAG query attempted but collection does not exist",
+                user_id=str(query_data.user_id),
+                tenant_id=tenant_id,
+                collection_name=collection_name
+            )
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "Indexation not started",
+                    "message": "Индексация контента еще не начата. Попробуйте позже.",
+                    "status": "not_started"
+                }
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Если проверка индексации не удалась, продолжаем запрос (fail-open)
+        logger.warning(
+            "Failed to check indexation status, continuing with query",
+            user_id=str(query_data.user_id),
+            tenant_id=tenant_id,
+            error=str(e)
+        )
     
     # Выполняем RAG запрос
     result = await rag_service.query(

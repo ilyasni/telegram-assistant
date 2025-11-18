@@ -60,6 +60,11 @@ class Settings:
     # Logging
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
     log_format: str = os.getenv("LOG_FORMAT", "json")
+    
+    # Context7: OCR Enhancement Configuration - улучшение качества OCR текста
+    ocr_enhancement_enabled: bool = os.getenv("OCR_ENHANCEMENT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+    ocr_spell_llm_fallback_enabled: bool = os.getenv("OCR_SPELL_LLM_FALLBACK_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+    ocr_entity_extraction_enabled: bool = os.getenv("OCR_ENTITY_EXTRACTION_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 
 
 settings = Settings()

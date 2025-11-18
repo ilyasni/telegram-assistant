@@ -133,6 +133,31 @@ ocr_local_latency_seconds = Histogram(
     ['engine', 'mode']  # mode: primary | fallback
 )
 
+# Context7: Дополнительные метрики для мониторинга Vision анализа
+vision_analysis_duration_seconds = Histogram(
+    'vision_analysis_duration_seconds',
+    'Vision analysis duration (API call time)',
+    buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0]
+)
+
+vision_analysis_tokens_total = Counter(
+    'vision_analysis_tokens_total',
+    'Total tokens used for Vision analysis',
+    ['provider', 'model']
+)
+
+vision_analysis_errors_total = Counter(
+    'vision_analysis_errors_total',
+    'Total Vision analysis errors',
+    ['error_type']  # error_type: parse_error, api_error, timeout, quota_exceeded, etc.
+)
+
+vision_albums_processed_total = Counter(
+    'vision_albums_processed_total',
+    'Total albums processed by Vision',
+    ['status']  # status: success, failed, skipped
+)
+
 
 class VisionAnalysisTask:
     """
@@ -423,9 +448,6 @@ class VisionAnalysisTask:
                 
             except asyncio.CancelledError:
                 break
-            except Exception as e:
-                logger.error("VisionAnalysisTask error", error=str(e), exc_info=True)
-                await asyncio.sleep(5)
     
     async def stop(self):
         """Остановка Vision Analysis Task."""
@@ -478,6 +500,7 @@ class VisionAnalysisTask:
                     exc_info=True
                 )
                 vision_worker_processed_total.labels(status="error", reason="parse_error").inc()
+                vision_analysis_errors_total.labels(error_type="parse_error").inc()
                 # Context7: Не падаем на одном плохом событии - возвращаем False, чтобы не делать ACK
                 return False
             
@@ -485,21 +508,27 @@ class VisionAnalysisTask:
             post_id = event.post_id
             trace_id = event.trace_id
             
-            # Context7: Если tenant_id из события равен 'default', пытаемся получить из БД
+            # Context7: Определяем, является ли это альбомом (post_id начинается с "album:")
+            is_album = post_id.startswith("album:") if post_id else False
+            
+            # Context7: Получение tenant_id и channel_username из БД для оптимизации
+            channel_username = None
             if not tenant_id or tenant_id == 'default':
                 try:
                     from sqlalchemy import text
-                    tenant_id_result = await self.db.execute(
+                    channel_info_result = await self.db.execute(
                         text("""
-                            SELECT COALESCE(
-                                (SELECT u.tenant_id::text FROM users u 
-                                 JOIN user_channel uc ON uc.user_id = u.id 
-                                 WHERE uc.channel_id = c.id 
-                                 LIMIT 1),
-                                CAST(pe_tags.data->>'tenant_id' AS text),
-                                CAST(c.settings->>'tenant_id' AS text),
-                                'default'
-                            ) as tenant_id
+                            SELECT 
+                                COALESCE(
+                                    (SELECT u.tenant_id::text FROM users u 
+                                     JOIN user_channel uc ON uc.user_id = u.id 
+                                     WHERE uc.channel_id = c.id 
+                                     LIMIT 1),
+                                    CAST(pe_tags.data->>'tenant_id' AS text),
+                                    CAST(c.settings->>'tenant_id' AS text),
+                                    'default'
+                                ) as tenant_id,
+                                c.username as channel_username
                             FROM posts p
                             JOIN channels c ON c.id = p.channel_id
                             LEFT JOIN post_enrichment pe_tags 
@@ -509,18 +538,21 @@ class VisionAnalysisTask:
                         """),
                         {"post_id": post_id}
                     )
-                    row = tenant_id_result.fetchone()
-                    if row and row[0] and row[0] != 'default':
-                        tenant_id = str(row[0])
+                    row = channel_info_result.fetchone()
+                    if row:
+                        if row[0] and row[0] != 'default':
+                            tenant_id = str(row[0])
+                        channel_username = row[1] if row[1] else None
                         logger.debug(
-                            "Using tenant_id from DB in vision_analysis_task",
+                            "Using tenant_id and channel_username from DB in vision_analysis_task",
                             post_id=post_id,
                             tenant_id=tenant_id,
+                            channel_username=channel_username,
                             trace_id=trace_id
                         )
                 except Exception as e:
                     logger.debug(
-                        "Failed to get tenant_id from DB in vision_analysis_task",
+                        "Failed to get tenant_id and channel_username from DB in vision_analysis_task",
                         post_id=post_id,
                         error=str(e),
                         trace_id=trace_id
@@ -626,8 +658,9 @@ class VisionAnalysisTask:
                 
                 try:
                     # Context7: Проверка политики Vision с детальным логированием
-                    # Сначала проверяем budget gate для определения quota_exhausted
+                    # Проверяем budget gate для определения quota_exhausted (один раз для оптимизации)
                     quota_exhausted = False
+                    budget_check = None
                     if self.budget_gate:
                         budget_check = await self.budget_gate.check_budget(
                             tenant_id=tenant_id,
@@ -640,7 +673,7 @@ class VisionAnalysisTask:
                             "mime_type": media_file.mime_type,
                             "size_bytes": media_file.size_bytes
                         },
-                        channel_username=None,  # TODO: получить из БД
+                        channel_username=channel_username,  # Context7: получено из БД выше
                         quota_exhausted=quota_exhausted
                     )
                     prompt_template = self.policy_engine.get_prompt_template(policy_result.get("prompt_key"))
@@ -711,12 +744,14 @@ class VisionAnalysisTask:
                             },
                         )
 
-                    # Context7: Проверка budget gate с детальным логированием
+                    # Context7: Проверка budget gate с детальным логированием (используем уже проверенный budget_check)
                     if self.budget_gate:
-                        budget_check = await self.budget_gate.check_budget(
-                            tenant_id=tenant_id,
-                            estimated_tokens=1792
-                        )
+                        # Используем уже проверенный budget_check из проверки выше (оптимизация)
+                        if budget_check is None:
+                            budget_check = await self.budget_gate.check_budget(
+                                tenant_id=tenant_id,
+                                estimated_tokens=1792
+                            )
                         if not budget_check.allowed:
                             budget_reason = getattr(budget_check, 'reason', 'quota_exhausted')
                             logger.info(
@@ -822,6 +857,7 @@ class VisionAnalysisTask:
                     
                     # Vision анализ через GigaChat
                     media_start_time = time.time()
+                    analysis_start_time = time.time()
                     result = await self._analyze_media(
                         media_file=media_file,
                         tenant_id=tenant_id,
@@ -835,7 +871,9 @@ class VisionAnalysisTask:
                         experiment_variants=experiment_variants
                     )
                     media_duration = time.time() - media_start_time
+                    analysis_duration = time.time() - analysis_start_time
                     vision_media_duration_seconds.observe(media_duration)
+                    vision_analysis_duration_seconds.observe(analysis_duration)
                     
                     if result:
                         result = self._attach_experiment_context(result, experiment_variants)
@@ -843,6 +881,12 @@ class VisionAnalysisTask:
                         # Отметка идемпотентности на уровне медиа
                         await self._mark_media_as_processed(post_id, media_id)
                         vision_media_total.labels(result="ok", reason="success").inc()
+                        # Context7: Учет токенов в метриках
+                        if result.get("analysis") and result["analysis"].get("tokens_used"):
+                            provider = result["analysis"].get("provider", "unknown")
+                            model = result["analysis"].get("model", "unknown")
+                            tokens_used = result["analysis"].get("tokens_used", 0)
+                            vision_analysis_tokens_total.labels(provider=provider, model=model).inc(tokens_used)
                         if is_low_priority:
                             vision_low_priority_processed_total.labels(status="processed").inc()
                     else:
@@ -886,6 +930,7 @@ class VisionAnalysisTask:
                         "details": {"error": str(e)[:200]}
                     })
                     vision_media_total.labels(result="failed", reason="exception").inc()
+                    vision_analysis_errors_total.labels(error_type="exception").inc()
                     continue
             
             # Context7: Всегда эмитить событие (analyzed или skipped)
@@ -895,7 +940,7 @@ class VisionAnalysisTask:
             if analysis_results:
                 # Сохранение результатов в БД (может быть пропущено для невалидных UUID)
                 try:
-                    await self._save_to_db(post_id, analysis_results, trace_id)
+                    await self._save_to_db(post_id, analysis_results, trace_id, event.media_files)
                 except Exception as db_error:
                     # Context7: Если сохранение в БД не удалось (например, невалидный UUID),
                     # логируем но продолжаем обработку - событие все равно должно быть эмитировано
@@ -920,9 +965,13 @@ class VisionAnalysisTask:
                             }
                         )
                 
+                # Context7: Вычисление длительности анализа для события
+                analysis_duration = time.time() - start_time
+                analysis_duration_ms = int(analysis_duration * 1000)
+                
                 # Эмиссия analyzed события (всегда, даже если БД save пропущен)
                 event_emitted = await self._emit_analyzed_event(
-                    post_id, tenant_id, event.media_files, analysis_results, trace_id
+                    post_id, tenant_id, event.media_files, analysis_results, trace_id, analysis_duration_ms
                 )
             
             # Context7: Эмиссия skipped события, если ничего не проанализировано
@@ -953,6 +1002,10 @@ class VisionAnalysisTask:
                 vision_worker_processed_total.labels(status="success", reason="completed").inc()
                 self.processed_count += 1
                 
+                # Context7: Учет альбомов в метриках
+                if is_album:
+                    vision_albums_processed_total.labels(status="success").inc()
+                
                 logger.info(
                     "Vision event processed",
                     extra={
@@ -967,6 +1020,9 @@ class VisionAnalysisTask:
             else:
                 vision_worker_duration_seconds.labels(status="error").observe(duration)
                 vision_worker_processed_total.labels(status="error", reason="emit_failed").inc()
+                vision_analysis_errors_total.labels(error_type="emit_failed").inc()
+                if is_album:
+                    vision_albums_processed_total.labels(status="failed").inc()
                 logger.error(
                     "Failed to emit vision event (analyzed or skipped)",
                     extra={
@@ -981,6 +1037,7 @@ class VisionAnalysisTask:
             duration = time.time() - start_time
             vision_worker_duration_seconds.labels(status="error").observe(duration)
             vision_worker_processed_total.labels(status="error", reason="exception").inc()
+            vision_analysis_errors_total.labels(error_type="exception").inc()
             self.error_count += 1
             logger.error(
                 "Failed to process vision event",
@@ -1848,7 +1905,8 @@ class VisionAnalysisTask:
         self,
         post_id: str,
         analysis_results: List[Dict[str, Any]],
-        trace_id: str
+        trace_id: str,
+        media_files: Optional[List[MediaFile]] = None
     ):
         """
         Context7: Сохранение результатов Vision анализа в БД через EnrichmentRepository.
@@ -2098,17 +2156,27 @@ class VisionAnalysisTask:
             # Context7: Синхронизация Vision результатов в Neo4j
             if self.neo4j_client and analysis_results:
                 try:
+                    # Context7: Создаем mapping sha256 -> media_file для извлечения mime_type
+                    media_file_map = {}
+                    if media_files:
+                        media_file_map = {mf.sha256: mf for mf in media_files if hasattr(mf, 'sha256') and hasattr(mf, 'mime_type')}
+                    
                     for result in analysis_results:
                         analysis = result.get("analysis", {})
                         sha256 = result.get("sha256")
                         s3_key = result.get("s3_key")
+                        
+                        # Context7: Извлекаем mime_type из media_file
+                        mime_type = None
+                        if sha256 and sha256 in media_file_map:
+                            mime_type = media_file_map[sha256].mime_type
                         
                         if sha256:
                             await self.neo4j_client.create_image_content_node(
                                 post_id=post_id,
                                 sha256=sha256,
                                 s3_key=s3_key,
-                                mime_type=None,  # Можно извлечь из media_file
+                                mime_type=mime_type,
                                 vision_classification=analysis.get("classification"),
                                 is_meme=analysis.get("is_meme"),
                                 provider=analysis.get("provider"),
@@ -2166,7 +2234,8 @@ class VisionAnalysisTask:
         tenant_id: str,
         media_files: List[MediaFile],
         analysis_results: List[Dict[str, Any]],
-        trace_id: str
+        trace_id: str,
+        analysis_duration_ms: int = 0
     ) -> bool:
         """
         Эмиссия события stream:posts:vision:analyzed.
@@ -2208,7 +2277,7 @@ class VisionAnalysisTask:
                 post_id=post_id,
                 media=media_files,
                 vision=vision_result.model_dump(),
-                analysis_duration_ms=0,  # TODO: вычислить
+                analysis_duration_ms=analysis_duration_ms,
                 idempotency_key=VisionAnalyzedEventV1.build_dedupe_key(
                     tenant_id, post_id, media_files[0].sha256
                 ),
@@ -3191,6 +3260,7 @@ async def create_vision_analysis_task(
         base_url=vision_config.get("base_url"),
         s3_service=s3_service,
         budget_gate=budget_gate,
+        storage_quota=storage_quota,  # Context7: Передаем для tenant usage tracking
         verify_ssl=vision_config.get("verify_ssl", False),
         timeout=vision_config.get("timeout", 600)
     )
@@ -3222,9 +3292,7 @@ async def create_vision_analysis_task(
                 if policy_ocr_enabled is not None:
                     ocr_fallback_enabled = policy_ocr_enabled
                     logger.info(
-                        "OCR fallback flag from enrichment_policy.yml",
-                        ocr_fallback_enabled=ocr_fallback_enabled,
-                        path=enrichment_policy_path
+                        f"OCR fallback flag from enrichment_policy.yml: ocr_fallback_enabled={ocr_fallback_enabled}, path={enrichment_policy_path}"
                     )
     except Exception as e:
         logger.warning(

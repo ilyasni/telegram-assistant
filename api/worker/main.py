@@ -23,6 +23,7 @@ from tasks.tagging_task import TaggingTask
 from tasks.enrichment_task import EnrichmentTask
 from tasks.indexing_task import IndexingTask
 from tasks.cleanup_task import CleanupTask
+from tasks.graph_writer_task import GraphWriterTask
 
 # Настройка логирования
 structlog.configure(
@@ -56,6 +57,7 @@ class EventWorker:
         self.enrichment_task = None
         self.indexing_task = None
         self.cleanup_task = None
+        self.graph_writer_task = None  # Context7 P2: GraphWriter для Neo4j связей
     
     async def start(self):
         """Запуск worker'а."""
@@ -167,6 +169,23 @@ class EventWorker:
                 neo4j_url=settings.neo4j_url
             )
             
+            # Context7 P2: GraphWriter Task для создания графовых связей в Neo4j
+            # Читает события из stream:posts:parsed и создаёт forwards/replies/author связи
+            # Context7: Проверяем доступность Neo4j через feature flags
+            neo4j_enabled = getattr(feature_flags, 'neo4j_enabled', True) if hasattr(feature_flags, 'neo4j_enabled') else True
+            if neo4j_enabled:
+                self.graph_writer_task = GraphWriterTask(
+                    redis_url=settings.redis_url,
+                    neo4j_url=settings.neo4j_url,
+                    neo4j_user=settings.neo4j_username,
+                    neo4j_password=settings.neo4j_password,
+                    consumer_group=os.getenv("GRAPH_WRITER_CONSUMER_GROUP", "graph_writer"),
+                    batch_size=int(os.getenv("GRAPH_WRITER_BATCH_SIZE", "100"))
+                )
+                logger.info("GraphWriter task initialized")
+            else:
+                logger.warning("Neo4j disabled, skipping GraphWriter task")
+            
             logger.info("Tasks initialized successfully")
             
         except Exception as e:
@@ -201,6 +220,11 @@ class EventWorker:
             tasks.append(asyncio.create_task(self.cleanup_task.start()))
             logger.info("Cleanup task started")
             
+            # Context7 P2: GraphWriter Task
+            if self.graph_writer_task:
+                tasks.append(asyncio.create_task(self.graph_writer_task.start()))
+                logger.info("GraphWriter task started")
+            
             # Ожидание завершения задач
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
@@ -224,6 +248,10 @@ class EventWorker:
             
             if self.cleanup_task:
                 await self.cleanup_task.stop()
+            
+            # Context7 P2: GraphWriter Task
+            if self.graph_writer_task:
+                await self.graph_writer_task.stop()
             
             logger.info("All tasks stopped")
             
@@ -252,6 +280,10 @@ class EventWorker:
             
             if self.cleanup_task:
                 health_status['tasks']['cleanup'] = await self.cleanup_task.health_check()
+            
+            # Context7 P2: GraphWriter Task
+            if self.graph_writer_task:
+                health_status['tasks']['graph_writer'] = await self.graph_writer_task.health_check()
             
             return health_status
             

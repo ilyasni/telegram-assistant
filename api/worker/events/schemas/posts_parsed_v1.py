@@ -6,7 +6,7 @@
 """
 
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from pydantic import Field
 
 from .base import BaseEvent
@@ -50,6 +50,56 @@ class PostParsedEventV1(BaseEvent):
     views_count: int = Field(default=0, description="Количество просмотров")
     forwards_count: int = Field(default=0, description="Количество пересылок")
     reactions_count: int = Field(default=0, description="Количество реакций")
+    
+    # Context7 P2: Данные о forwards для Graph-RAG
+    forward_from_peer_id: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Peer ID источника форварда (JSON: user_id/channel_id/chat_id)"
+    )
+    forward_from_chat_id: Optional[int] = Field(
+        None,
+        description="Chat ID источника форварда (упрощённый доступ)"
+    )
+    forward_from_message_id: Optional[int] = Field(
+        None,
+        description="Message ID исходного сообщения"
+    )
+    forward_date: Optional[datetime] = Field(
+        None,
+        description="Дата оригинального сообщения"
+    )
+    forward_from_name: Optional[str] = Field(
+        None,
+        description="Имя автора оригинального сообщения"
+    )
+    
+    # Context7 P2: Данные о replies для Graph-RAG
+    reply_to_message_id: Optional[int] = Field(
+        None,
+        description="Message ID поста, на который отвечают"
+    )
+    reply_to_chat_id: Optional[int] = Field(
+        None,
+        description="Chat ID канала/чата исходного поста"
+    )
+    thread_id: Optional[int] = Field(
+        None,
+        description="ID треда (для каналов с комментариями)"
+    )
+    
+    # Context7 P2: Данные об авторе для Graph-RAG
+    author_peer_id: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Peer ID автора (JSON: user_id/channel_id/chat_id)"
+    )
+    author_name: Optional[str] = Field(
+        None,
+        description="Имя автора поста"
+    )
+    author_type: Optional[str] = Field(
+        None,
+        description="Тип автора ('user', 'channel', 'chat')"
+    )
     
     class Config:
         # Пример для документации

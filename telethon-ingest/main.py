@@ -674,9 +674,13 @@ async def run_scheduler_loop():
                 telegram_client=temp_client,  # Будет обновлён при обработке
                 s3_service=s3_service,
                 storage_quota=storage_quota,
-                redis_client=redis_for_media
+                redis_client=redis_for_media,
+                tenant_id=None  # Context7: tenant_id будет передаваться при обработке
             )
-            logger.info("MediaProcessor initialized for ChannelParser")
+            logger.info("MediaProcessor initialized for ChannelParser", 
+                       has_s3_service=s3_service is not None,
+                       has_storage_quota=storage_quota is not None,
+                       has_redis=redis_for_media is not None)
         except Exception as e:
             logger.warning(
                 "Failed to initialize MediaProcessor, continuing without media processing",
@@ -723,7 +727,10 @@ async def run_scheduler_loop():
         await scheduler.run_forever()
         
     except Exception as e:
-        logger.error("Scheduler loop error", error=str(e))
+        logger.error("Scheduler loop error", error=str(e), exc_info=True)
+        # Context7: Не прерываем выполнение, но логируем детально
+        import traceback
+        logger.error("Scheduler loop traceback", traceback=traceback.format_exc())
 
 
 async def main():
@@ -776,12 +783,18 @@ async def main():
         app_state["status"] = "ready"
         
         # Context7 best practice: параллельный запуск циклов
-        await asyncio.gather(
-            run_qr_loop(),
-            run_ingest_loop(),
-            run_scheduler_loop(),  # НОВЫЙ: Incremental parsing scheduler
-            return_exceptions=True
-        )
+        # Context7: Логируем запуск каждого цикла для диагностики
+        logger.info("Starting all loops in parallel", loops=["qr", "ingest", "scheduler"])
+        try:
+            await asyncio.gather(
+                run_qr_loop(),
+                run_ingest_loop(),
+                run_scheduler_loop(),  # НОВЫЙ: Incremental parsing scheduler
+                return_exceptions=True
+            )
+        except Exception as gather_error:
+            logger.error("Error in asyncio.gather", error=str(gather_error), exc_info=True)
+            raise
         
     except Exception as e:
         logger.error("Main loop error", error=str(e))

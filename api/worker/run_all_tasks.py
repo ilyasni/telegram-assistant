@@ -114,6 +114,11 @@ async def create_tag_persistence_task():
 
 async def create_crawl_trigger_task():
     """Создание и запуск crawl trigger task."""
+    try:
+        logger.info("create_crawl_trigger_task: Starting initialization")
+    except Exception as e:
+        logger.error(f"create_crawl_trigger_task: Error in initial logging: {e}")
+    
     redis_url = os.getenv("REDIS_URL", "redis://redis:6379")
     database_url = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres")
 
@@ -122,6 +127,11 @@ async def create_crawl_trigger_task():
         'deepdive', 'analysis', 'report', 'study', 'whitepaper'
     ]
     trigger_tags = default_trigger_tags
+
+    try:
+        logger.info("create_crawl_trigger_task: Loading config")
+    except Exception as e:
+        logger.error(f"create_crawl_trigger_task: Error in config loading logging: {e}")
 
     config_env_path = os.getenv("ENRICHMENT_CONFIG_PATH", "/app/config/enrichment_policy.yml")
     candidate_paths = [
@@ -144,35 +154,56 @@ async def create_crawl_trigger_task():
                 if isinstance(loaded_tags, list) and loaded_tags:
                     trigger_tags = [str(tag).strip() for tag in loaded_tags if str(tag).strip()]
                     trigger_tags = list(dict.fromkeys(trigger_tags))
-                    logger.info(
-                        "Crawl trigger tags loaded from config",
-                        path=str(path),
-                        tags_count=len(trigger_tags)
-                    )
+                    try:
+                        logger.info(
+                            f"Crawl trigger tags loaded from config: {str(path)}, tags_count={len(trigger_tags)}"
+                        )
+                    except Exception as log_err:
+                        logger.error(f"Error in logger.info: {log_err}")
                 else:
-                    logger.debug(
-                        "Crawl trigger tags list empty in config, using defaults",
-                        path=str(path)
-                    )
+                    try:
+                        logger.debug(
+                            f"Crawl trigger tags list empty in config, using defaults: {str(path)}"
+                        )
+                    except Exception as log_err:
+                        logger.error(f"Error in logger.debug: {log_err}")
             break
         except Exception as config_error:
-            logger.warning(
-                "Failed to load crawl trigger tags",
-                path=str(path),
-                error=str(config_error)
-            )
+            try:
+                logger.warning(
+                    f"Failed to load crawl trigger tags: {str(path)}, error={str(config_error)}"
+                )
+            except Exception as log_err:
+                logger.error(f"Error in logger.warning: {log_err}, original_error={str(config_error)}")
     else:
-        logger.debug(
-            "Using default crawl trigger tags",
-            tags_count=len(trigger_tags)
-        )
+        try:
+            logger.debug(
+                f"Using default crawl trigger tags: tags_count={len(trigger_tags)}"
+            )
+        except Exception as log_err:
+            logger.error(f"Error in logger.debug (default tags): {log_err}")
     
-    task = CrawlTriggerTask(
-        redis_url=redis_url,
-        trigger_tags=trigger_tags,
-        db_dsn=database_url
-    )
-    await task.start()
+    try:
+        logger.info("create_crawl_trigger_task: Creating CrawlTriggerTask instance")
+    except Exception as e:
+        logger.error(f"create_crawl_trigger_task: Error before creating task: {e}")
+    
+    try:
+        task = CrawlTriggerTask(
+            redis_url=redis_url,
+            trigger_tags=trigger_tags,
+            db_dsn=database_url
+        )
+        logger.info("create_crawl_trigger_task: CrawlTriggerTask created, calling start()")
+    except Exception as e:
+        logger.error(f"create_crawl_trigger_task: Error creating CrawlTriggerTask: {e}", exc_info=True)
+        raise
+    
+    try:
+        await task.start()
+    except Exception as e:
+        logger.error(f"create_crawl_trigger_task: Error in task.start(): {e}", exc_info=True)
+        raise
 
 async def create_post_persistence_task():
     """Создание и запуск PostPersistenceWorker."""
@@ -352,6 +383,17 @@ async def main():
     from ai_providers.embedding_service import embedding_requests_total, embedding_latency_seconds
     from tasks.tagging_task import tagging_processed_total
     from tasks.indexing_task import indexing_processed_total
+    # Context7: Импорт метрик S3 для автоматической регистрации
+    try:
+        from shared.s3_storage.service import (
+            s3_operations_total,
+            s3_upload_duration_seconds,
+            s3_file_size_bytes,
+            s3_compression_ratio
+        )
+        logger.debug("S3 metrics imported successfully")
+    except ImportError:
+        logger.warning("S3 metrics not available (shared.s3_storage may not be loaded)")
     # Context7: Импорт метрик ретеггинга для регистрации
     try:
         from tasks.retagging_task import (

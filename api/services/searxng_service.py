@@ -3,6 +3,7 @@ SearXNG Service для внешнего поиска (external search grounding)
 Context7 best practice: безопасность, rate limiting, кэширование, валидация
 """
 
+import asyncio
 import hashlib
 import json
 import re
@@ -154,9 +155,17 @@ class SearXNGService:
         
         # Context7: Отключаем проверку SSL для внутреннего использования через Caddy
         # В продакшене рекомендуется использовать валидные сертификаты
+        # Context7: Используем httpx.Timeout для детальной настройки таймаутов
+        import httpx
+        timeout = httpx.Timeout(
+            connect=10.0,  # Таймаут подключения
+            read=30.0,     # Таймаут чтения
+            write=10.0,    # Таймаут записи
+            pool=5.0       # Таймаут пула соединений
+        )
         self.http_client = httpx.AsyncClient(
             auth=auth,
-            timeout=30.0,
+            timeout=timeout,
             headers=self.default_headers,
             verify=False  # Context7: Отключаем проверку SSL для внутреннего использования
         )
@@ -371,11 +380,81 @@ class SearXNGService:
                 "Accept": "application/json",  # Переопределяем только Accept для JSON API
             }
             
-            response = await self.http_client.get(
-                search_url,
-                headers=headers
-            )
-            response.raise_for_status()
+            # Context7: Retry логика с exponential backoff для transient ошибок
+            # Best practice: retry для connection errors и server errors (5xx)
+            max_retries = 3
+            retry_delays = [1, 3, 10]  # Exponential backoff: 1s → 3s → 10s
+            
+            response = None
+            for attempt in range(max_retries):
+                try:
+                    response = await self.http_client.get(
+                        search_url,
+                        headers=headers
+                    )
+                    response.raise_for_status()
+                    break  # Успешный запрос
+                except httpx.HTTPStatusError as e:
+                    # Context7: Специфичная обработка HTTP статус ошибок
+                    if e.response.status_code == 429:
+                        # Rate limiting - используем Retry-After заголовок
+                        retry_after = int(e.response.headers.get('Retry-After', 60))
+                        if attempt < max_retries - 1:
+                            logger.warning(
+                                "SearXNG rate limited (429), retrying after backoff",
+                                query=query[:50],
+                                retry_after=retry_after,
+                                attempt=attempt + 1
+                            )
+                            await asyncio.sleep(min(retry_after, 120))  # Максимум 2 минуты
+                            continue
+                        else:
+                            logger.error("SearXNG rate limited after retries", query=query[:50])
+                            return SearXNGSearchResponse(query=query, results=[])
+                    elif e.response.status_code >= 500:
+                        # Server errors - retry с exponential backoff
+                        if attempt < max_retries - 1:
+                            retry_delay = retry_delays[attempt]
+                            logger.warning(
+                                "SearXNG server error, retrying",
+                                query=query[:50],
+                                status_code=e.response.status_code,
+                                attempt=attempt + 1,
+                                retry_delay=retry_delay
+                            )
+                            await asyncio.sleep(retry_delay)
+                            continue
+                        else:
+                            logger.error("SearXNG server error after retries", query=query[:50])
+                            return SearXNGSearchResponse(query=query, results=[])
+                    else:
+                        # Client errors (4xx кроме 429) - не retry
+                        logger.error(
+                            "SearXNG client error",
+                            query=query[:50],
+                            status_code=e.response.status_code
+                        )
+                        return SearXNGSearchResponse(query=query, results=[])
+                except (httpx.ConnectError, httpx.TimeoutException) as e:
+                    # Context7: Connection errors и timeouts - retry с exponential backoff
+                    if attempt < max_retries - 1:
+                        retry_delay = retry_delays[attempt]
+                        logger.warning(
+                            "SearXNG connection error, retrying",
+                            query=query[:50],
+                            error_type=type(e).__name__,
+                            attempt=attempt + 1,
+                            retry_delay=retry_delay
+                        )
+                        await asyncio.sleep(retry_delay)
+                        continue
+                    else:
+                        logger.error("SearXNG connection error after retries", query=query[:50])
+                        return SearXNGSearchResponse(query=query, results=[])
+            
+            if response is None:
+                logger.error("SearXNG request failed after all retries", query=query[:50])
+                return SearXNGSearchResponse(query=query, results=[])
             
             data = response.json()
             

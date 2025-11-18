@@ -10,6 +10,7 @@
     <script src="js/admin-users.js"></script>
     <script src="js/admin-invites.js"></script>
     <script src="js/admin-subscriptions.js"></script>
+    <script src="js/admin-feedback.js"></script>
     <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">
     <meta http-equiv="Pragma" content="no-cache">
     <meta http-equiv="Expires" content="0">
@@ -250,6 +251,7 @@
         .user-card,
         .invite-card,
         .subscription-card,
+        .feedback-card,
         .admin-card {
             border-radius: 16px;
             padding: 16px;
@@ -358,10 +360,65 @@
 
         .admin-users-section,
         .admin-invites-section,
-        .admin-subscriptions-section {
+        .admin-subscriptions-section,
+        .admin-feedback-section {
             display: flex;
             flex-direction: column;
             gap: 16px;
+        }
+        
+        .feedback-list {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+        
+        .feedback-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        
+        .feedback-status-badge {
+            display: inline-flex;
+        }
+        
+        .feedback-meta {
+            display: flex;
+            gap: 12px;
+            font-size: 13px;
+            color: var(--tg-hint-color);
+            flex-wrap: wrap;
+        }
+        
+        .feedback-message {
+            margin: 12px 0;
+            padding: 12px;
+            background: var(--admin-surface-weak-bg);
+            border-radius: 8px;
+            font-size: 14px;
+            line-height: 1.5;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+        
+        .feedback-admin-notes {
+            margin-top: 8px;
+            padding: 12px;
+            background: var(--admin-highlight-bg);
+            border-radius: 8px;
+            font-size: 13px;
+            color: var(--tg-hint-color);
+        }
+        
+        .feedback-actions {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            margin-top: 12px;
         }
 
         .user-name,

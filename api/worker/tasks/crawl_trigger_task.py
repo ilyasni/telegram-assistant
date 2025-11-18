@@ -114,56 +114,98 @@ class CrawlTriggerTask:
     
     async def start(self):
         """Запуск producer."""
-        await self._initialize()
-        logger.info("CrawlTriggerTask started")
+        logger.info("CrawlTriggerTask.start() called")
+        try:
+            await self._initialize()
+            logger.info("CrawlTriggerTask initialized and started")
+        except Exception as e:
+            logger.error("Failed to initialize CrawlTriggerTask", error=str(e), exc_info=True)
+            raise
         
-        while True:
-            try:
-                # Обновляем метрику глубины очереди
-                queue_length = await self.redis.xlen(self.stream_in)
-                crawl_trigger_queue_depth_current.set(queue_length)
-                
-                # Читаем сообщения (сначала с начала, потом только новые)
-                logger.debug("Reading from stream", stream=self.stream_in, group=self.consumer_group)
-                messages = await self.redis.xreadgroup(
-                    self.consumer_group,
-                    self.consumer_name,
-                    {self.stream_in: ">"},  # Читаем только новые сообщения
-                    count=50,
-                    block=1000
-                )
-                
-                logger.debug("xreadgroup result", messages=messages, type=type(messages), len=len(messages) if messages else 0)
-                
-                # Обработка сообщений
-                if messages:
-                    logger.debug("CrawlTriggerTask received messages", count=len(messages))
-                    for stream_name, entries in messages:
-                        logger.debug("Processing stream", stream=stream_name, entries_count=len(entries))
-                        if not entries:
-                            logger.debug("Stream has zero entries", stream=stream_name)
-                            continue
-                        for msg_id, fields in entries:
-                            logger.debug("Processing message", msg_id=msg_id, fields_keys=list(fields.keys()) if isinstance(fields, dict) else "not_dict")
-                            try:
-                                # Измеряем время обработки
-                                start_time = time.time()
-                                await self._process_tagged_event(msg_id, fields)
-                                processing_time = time.time() - start_time
-                                crawl_trigger_processing_latency_seconds.observe(processing_time)
-                                
-                                await self.redis.xack(self.stream_in, self.consumer_group, msg_id)
-                            except Exception as e:
-                                logger.error("Error processing tagged event",
-                                           msg_id=msg_id, error=str(e))
-                else:
-                    await asyncio.sleep(0.1)
+        # Context7: Бесконечный цикл с обработкой всех исключений для предотвращения завершения задачи
+        # Context7: Добавлено логирование для диагностики завершения задачи
+        iteration = 0
+        logger.info("CrawlTriggerTask entering main loop")
+        try:
+            while True:
+                iteration += 1
+                if iteration % 100 == 0:
+                    logger.debug("CrawlTriggerTask iteration", iteration=iteration)
+                try:
+                    # Обновляем метрику глубины очереди
+                    try:
+                        queue_length = await self.redis.xlen(self.stream_in)
+                        crawl_trigger_queue_depth_current.set(queue_length)
+                    except Exception as e:
+                        logger.warning("Failed to get queue length", error=str(e))
+                    
+                    # Читаем сообщения (сначала с начала, потом только новые)
+                    logger.debug("Reading from stream", stream=self.stream_in, group=self.consumer_group)
+                    try:
+                        messages = await self.redis.xreadgroup(
+                            self.consumer_group,
+                            self.consumer_name,
+                            {self.stream_in: ">"},  # Читаем только новые сообщения
+                            count=50,
+                            block=1000
+                        )
+                    except Exception as e:
+                        logger.error("Failed to read from stream", stream=self.stream_in, error=str(e), exc_info=True)
+                        await asyncio.sleep(5)
+                        continue
+                    
+                    logger.debug("xreadgroup result", messages=messages, type=type(messages), len=len(messages) if messages else 0)
+                    
+                    # Обработка сообщений
+                    if messages:
+                        logger.debug("CrawlTriggerTask received messages", count=len(messages))
+                        for stream_name, entries in messages:
+                            logger.debug("Processing stream", stream=stream_name, entries_count=len(entries))
+                            if not entries:
+                                logger.debug("Stream has zero entries", stream=stream_name)
+                                continue
+                            for msg_id, fields in entries:
+                                logger.debug("Processing message", msg_id=msg_id, fields_keys=list(fields.keys()) if isinstance(fields, dict) else "not_dict")
+                                try:
+                                    # Измеряем время обработки
+                                    start_time = time.time()
+                                    await self._process_tagged_event(msg_id, fields)
+                                    processing_time = time.time() - start_time
+                                    crawl_trigger_processing_latency_seconds.observe(processing_time)
+                                    
+                                    await self.redis.xack(self.stream_in, self.consumer_group, msg_id)
+                                except Exception as e:
+                                    logger.error("Error processing tagged event",
+                                               msg_id=msg_id, error=str(e), exc_info=True)
+                                    # Context7: Продолжаем обработку следующих сообщений даже при ошибке
+                    else:
+                        await asyncio.sleep(0.1)
+                        continue
+                    
+                except asyncio.CancelledError:
+                    logger.info("CrawlTriggerTask cancelled")
+                    raise
+                except Exception as e:
+                    logger.error("Error in CrawlTriggerTask loop", error=str(e), exc_info=True)
+                    # Context7: Продолжаем работу после ошибки с задержкой
+                    await asyncio.sleep(5)
                     continue
-                
-                            
-            except Exception as e:
-                logger.error("Error in CrawlTriggerTask loop", error=str(e))
-                await asyncio.sleep(5)
+                except BaseException as e:
+                    # Context7: Обрабатываем все исключения, включая SystemExit и KeyboardInterrupt
+                    logger.critical("Fatal error in CrawlTriggerTask loop", error=str(e), error_type=type(e).__name__, exc_info=True)
+                    # Для критических ошибок делаем паузу перед продолжением
+                    await asyncio.sleep(10)
+                    continue
+        except asyncio.CancelledError:
+            logger.info("CrawlTriggerTask main loop cancelled")
+            raise
+        except Exception as e:
+            logger.critical("CrawlTriggerTask main loop exited with exception", error=str(e), error_type=type(e).__name__, exc_info=True)
+            raise
+        finally:
+            logger.warning("CrawlTriggerTask.start() exiting - this should not happen!")
+            # Context7: Если мы дошли сюда, значит цикл завершился - это ошибка
+            # Не возвращаемся, чтобы supervisor мог перезапустить задачу
     
     async def _process_tagged_event(self, msg_id: str, fields: Dict[str, Any]):
         """Проверка триггеров и публикация в posts.crawl."""

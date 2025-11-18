@@ -93,6 +93,31 @@ trend_cluster_sample_posts = Histogram(
     buckets=(0, 1, 2, 3, 5, 8, 10, 15),
 )
 
+# Context7: Метрики для диагностики порогов детекции трендов
+trend_detection_ratio_histogram = Histogram(
+    "trend_detection_ratio",
+    "Burst ratio (freq_short / expected_baseline) for trend detection",
+    buckets=(0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 10.0, float("inf")),
+)
+
+trend_detection_coherence_histogram = Histogram(
+    "trend_detection_coherence",
+    "Coherence (similarity) for trend detection",
+    buckets=(0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.55, 0.6, 0.7, 0.8, 0.9, 1.0),
+)
+
+trend_detection_source_diversity_histogram = Histogram(
+    "trend_detection_source_diversity",
+    "Source diversity (number of unique channels) for trend detection",
+    buckets=(0, 1, 2, 3, 5, 10, 15, 20, 30, 50, 100),
+)
+
+trend_detection_threshold_reasons = Counter(
+    "trend_detection_threshold_reasons",
+    "Reasons why trends are not emitted (threshold checks)",
+    ["reason"],  # reason: ratio_too_low|source_diversity_too_low|coherence_too_low|cooldown|all_passed
+)
+
 
 # ============================================================================
 # DATA MODELS
@@ -110,6 +135,7 @@ class PostSnapshot:
     topics: List[str]
     engagements: Dict[str, Optional[int]]
     entities: List[str] = field(default_factory=list)
+    grouped_id: Optional[int] = None  # Context7: Для дедупликации альбомов
 
 
 # ============================================================================
@@ -252,10 +278,35 @@ class TrendDetectionWorker:
             return
 
         try:
+            # Context7: Детальное логирование начала обработки
+            logger.debug(
+                "trend_worker_processing_event",
+                post_id=post_id,
+                tenant_id=payload.get("tenant_id"),
+            )
+            
             snapshot = await self._fetch_post_snapshot(post_id)
             if not snapshot:
                 trend_events_processed_total.labels(status="missing_post").inc()
+                logger.debug(
+                    "trend_worker_post_not_found",
+                    post_id=post_id,
+                )
                 return
+
+            # Context7: Дедупликация альбомов - пропускаем посты из альбомов, если уже обработан другой пост из того же альбома
+            # Для альбомов обрабатываем только пост с наивысшим engagement_score
+            if snapshot.grouped_id:
+                should_skip = await self._should_skip_album_post(snapshot)
+                if should_skip:
+                    trend_events_processed_total.labels(status="album_duplicate").inc()
+                    logger.debug(
+                        "trend_worker_album_duplicate_skipped",
+                        post_id=post_id,
+                        grouped_id=snapshot.grouped_id,
+                    )
+                    trend_worker_latency_seconds.labels(outcome="skipped_album").observe(time.time() - process_start)
+                    return
 
             embedding = await self._generate_embedding(snapshot)
             cluster_id, cluster_key, similarity = await self._match_cluster(
@@ -383,6 +434,27 @@ class TrendDetectionWorker:
                 coherence=coherence,
             )
 
+            # Context7: Метрики для диагностики порогов детекции
+            ratio = self._compute_burst(freq_short, expected_short_baseline)
+            trend_detection_ratio_histogram.observe(ratio)
+            trend_detection_coherence_histogram.observe(coherence)
+            trend_detection_source_diversity_histogram.observe(source_diversity)
+            
+            # Context7: Детальное логирование значений для диагностики
+            logger.debug(
+                "trend_worker_detection_values",
+                post_id=post_id,
+                cluster_key=cluster_key,
+                ratio=ratio,
+                coherence=coherence,
+                source_diversity=source_diversity,
+                freq_short=freq_short,
+                expected_baseline=expected_short_baseline,
+                freq_ratio_threshold=self.freq_ratio_threshold,
+                coherence_threshold=self.similarity_threshold,
+                min_source_diversity=self.min_source_diversity,
+            )
+
             await self._maybe_emit_emerging(
                 cluster_id=cluster_id,
                 cluster_key=cluster_key,
@@ -396,8 +468,16 @@ class TrendDetectionWorker:
                 keywords=keywords_for_card,
             )
 
+            # Context7: Метрика успешной обработки
             trend_events_processed_total.labels(status="processed").inc()
             trend_worker_latency_seconds.labels(outcome="success").observe(time.time() - process_start)
+            
+            logger.debug(
+                "trend_worker_event_processed",
+                post_id=post_id,
+                cluster_key=cluster_key,
+                processing_time_ms=int((time.time() - process_start) * 1000),
+            )
 
         except Exception as exc:
             trend_events_processed_total.labels(status="error").inc()
@@ -557,6 +637,7 @@ class TrendDetectionWorker:
                 p.forwards_count,
                 p.replies_count,
                 p.engagement_score,
+                p.grouped_id,
                 c.title AS channel_title,
                 COALESCE(pe.data->'keywords', '[]'::jsonb) AS keywords,
                 COALESCE(pe.data->'topics', '[]'::jsonb)   AS topics,
@@ -608,6 +689,7 @@ class TrendDetectionWorker:
             topics=combined_topics,
             entities=entities,
             engagements=engagements,
+            grouped_id=record.get("grouped_id"),  # Context7: Для дедупликации альбомов
         )
 
     async def _generate_embedding(self, snapshot: PostSnapshot) -> Optional[List[float]]:
@@ -889,16 +971,49 @@ class TrendDetectionWorker:
         keywords: List[str],
     ):
         ratio = self._compute_burst(freq_short, expected_baseline)
+        
+        # Context7: Детальная проверка порогов с логированием причин
+        reasons = []
+        if ratio < self.freq_ratio_threshold:
+            reasons.append("ratio_too_low")
+            trend_detection_threshold_reasons.labels(reason="ratio_too_low").inc()
+        if source_diversity < self.min_source_diversity:
+            reasons.append("source_diversity_too_low")
+            trend_detection_threshold_reasons.labels(reason="source_diversity_too_low").inc()
+        if coherence < self.similarity_threshold:
+            reasons.append("coherence_too_low")
+            trend_detection_threshold_reasons.labels(reason="coherence_too_low").inc()
+        
         should_emit = (
             ratio >= self.freq_ratio_threshold
             and source_diversity >= self.min_source_diversity
             and coherence >= self.similarity_threshold
         )
+        
         if not should_emit:
+            logger.debug(
+                "trend_worker_thresholds_not_met",
+                cluster_key=cluster_key,
+                ratio=ratio,
+                ratio_threshold=self.freq_ratio_threshold,
+                source_diversity=source_diversity,
+                min_source_diversity=self.min_source_diversity,
+                coherence=coherence,
+                coherence_threshold=self.similarity_threshold,
+                reasons=reasons,
+            )
             return
 
         if await self._is_cluster_in_cooldown(cluster_key):
+            trend_detection_threshold_reasons.labels(reason="cooldown").inc()
+            logger.debug(
+                "trend_worker_cooldown_active",
+                cluster_key=cluster_key,
+            )
             return
+        
+        # Context7: Все пороги пройдены
+        trend_detection_threshold_reasons.labels(reason="all_passed").inc()
 
         event_payload = TrendEmergingEventV1(
             idempotency_key=f"trend:{cluster_id}:{snapshot.post_id}",
@@ -933,6 +1048,70 @@ class TrendDetectionWorker:
         value = await redis.incr(key)
         await redis.expire(key, window.seconds)
         return value
+
+    async def _should_skip_album_post(self, snapshot: PostSnapshot) -> bool:
+        """
+        Context7: Проверяет, нужно ли пропустить пост из альбома.
+        Пропускаем, если уже обработан другой пост из того же альбома с более высоким engagement_score.
+        """
+        if not snapshot.grouped_id or not self.db_pool:
+            return False
+        
+        try:
+            # Получаем все посты из альбома с их engagement_score
+            query = """
+                SELECT id, engagement_score
+                FROM posts
+                WHERE grouped_id = $1
+                ORDER BY COALESCE(engagement_score, 0) DESC, posted_at ASC
+                LIMIT 10;
+            """
+            async with self.db_pool.acquire() as conn:
+                records = await conn.fetch(query, snapshot.grouped_id)
+            
+            if not records or len(records) <= 1:
+                return False
+            
+            # Находим пост с наивысшим engagement_score
+            best_post_id = None
+            best_engagement = -1
+            for record in records:
+                engagement = float(record.get("engagement_score") or 0)
+                if engagement > best_engagement:
+                    best_engagement = engagement
+                    best_post_id = str(record.get("id"))
+            
+            # Если текущий пост не лучший, пропускаем его
+            current_engagement = float(snapshot.engagements.get("score") or 0)
+            if best_post_id and best_post_id != snapshot.post_id:
+                # Проверяем, был ли лучший пост уже обработан (есть ли он в trend_cluster_posts)
+                check_query = """
+                    SELECT 1
+                    FROM trend_cluster_posts
+                    WHERE post_id = $1
+                    LIMIT 1;
+                """
+                async with self.db_pool.acquire() as conn:
+                    processed = await conn.fetchrow(check_query, uuid.UUID(best_post_id))
+                
+                if processed:
+                    # Лучший пост уже обработан - пропускаем текущий
+                    return True
+                elif current_engagement < best_engagement:
+                    # Текущий пост хуже лучшего, но лучший еще не обработан
+                    # Пропускаем текущий, чтобы дать шанс лучшему
+                    return True
+            
+            return False
+        except Exception as e:
+            logger.warning(
+                "trend_worker_album_dedup_error",
+                error=str(e),
+                post_id=snapshot.post_id,
+                grouped_id=snapshot.grouped_id,
+            )
+            # При ошибке не пропускаем пост
+            return False
 
     async def _update_source_diversity(self, cluster_key: str, channel_id: str) -> int:
         redis = self.redis_client.client

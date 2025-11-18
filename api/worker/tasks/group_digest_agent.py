@@ -534,7 +534,7 @@ def load_group_digest_config(reload: bool = False) -> GroupDigestConfig:
         raise FileNotFoundError(f"Group digest config not found. Checked: {checked_paths}")
 
     if resolved_path != DEFAULT_CONFIG_PATH:
-        logger.info("group_digest_config.path_resolved", path=str(resolved_path))
+        logger.info(f"group_digest_config.path_resolved: {str(resolved_path)}")
 
     path = resolved_path
     mtime = path.stat().st_mtime
@@ -965,7 +965,11 @@ class LLMRouter:
                 self._breakers[breaker_key] = breaker
             if alias_lower in {"@pro", "pro"}:
                 if not self._quota.check_and_increment(tenant_id):
-                    digest_pro_quota_exceeded_total.labels(tenant=tenant_id or "unknown").inc()
+                    # Context7: Обработка ошибок метрик - не прерываем workflow при ошибках Prometheus
+                    try:
+                        digest_pro_quota_exceeded_total.labels(tenant=_sanitize_prometheus_label(tenant_id or "unknown")).inc()
+                    except Exception as metric_error:
+                        logger.warning("Failed to record digest_pro_quota_exceeded_total metric", tenant_id=tenant_id, error=str(metric_error))
                     logger.info(
                         "digest_pro_invocation_quota_exceeded",
                         tenant_id=tenant_id,
@@ -974,7 +978,11 @@ class LLMRouter:
                     )
                     continue
                 if not self._token_budget.check_and_consume(tenant_id, estimated_tokens):
-                    digest_pro_quota_exceeded_total.labels(tenant=tenant_id or "unknown").inc()
+                    # Context7: Обработка ошибок метрик - не прерываем workflow при ошибках Prometheus
+                    try:
+                        digest_pro_quota_exceeded_total.labels(tenant=_sanitize_prometheus_label(tenant_id or "unknown")).inc()
+                    except Exception as metric_error:
+                        logger.warning("Failed to record digest_pro_quota_exceeded_total metric", tenant_id=tenant_id, error=str(metric_error))
                     logger.info(
                         "digest_pro_token_quota_exceeded",
                         tenant_id=tenant_id,
@@ -1009,9 +1017,16 @@ class LLMRouter:
                     )
             except CircuitOpenError as exc:
                 last_exc = exc
-                digest_circuit_open_total.labels(stage=agent_name).inc()
+                # Context7: Обработка ошибок метрик - не прерываем workflow при ошибках Prometheus
+                try:
+                    digest_circuit_open_total.labels(stage=_sanitize_prometheus_label(agent_name)).inc()
+                except Exception as metric_error:
+                    logger.warning("Failed to record digest_circuit_open_total metric", agent=agent_name, error=str(metric_error))
                 if alias_lower in {"@pro", "pro"} and self.config.fallback_enabled:
-                    digest_synthesis_fallback_total.labels(reason="circuit_open").inc()
+                    try:
+                        digest_synthesis_fallback_total.labels(reason=_sanitize_prometheus_label("circuit_open")).inc()
+                    except Exception as metric_error:
+                        logger.warning("Failed to record digest_synthesis_fallback_total metric", reason="circuit_open", error=str(metric_error))
                     logger.warning(
                         "digest_agent_circuit_open_fallback",
                         agent=agent_name,
@@ -1023,7 +1038,11 @@ class LLMRouter:
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
                 if alias_lower in {"@pro", "pro"} and self.config.fallback_enabled:
-                    digest_synthesis_fallback_total.labels(reason="exception").inc()
+                    # Context7: Обработка ошибок метрик - не прерываем workflow при ошибках Prometheus
+                    try:
+                        digest_synthesis_fallback_total.labels(reason=_sanitize_prometheus_label("exception")).inc()
+                    except Exception as metric_error:
+                        logger.warning("Failed to record digest_synthesis_fallback_total metric", reason="exception", error=str(metric_error))
                     logger.warning(
                         "digest_agent_fallback_triggered",
                         agent=agent_name,
@@ -1033,8 +1052,15 @@ class LLMRouter:
                     continue
                 raise
             else:
-                digest_tokens_total.labels(agent=agent_name, model=model_name).inc(max(1, estimated_tokens))
-                digest_generation_seconds.labels(stage=agent_name).observe(time.perf_counter() - start_ts)
+                # Context7: Обработка ошибок метрик - не прерываем workflow при ошибках Prometheus
+                try:
+                    digest_tokens_total.labels(
+                        agent=_sanitize_prometheus_label(agent_name), 
+                        model=_sanitize_prometheus_label(model_name)
+                    ).inc(max(1, estimated_tokens))
+                    digest_generation_seconds.labels(stage=_sanitize_prometheus_label(agent_name)).observe(time.perf_counter() - start_ts)
+                except Exception as metric_error:
+                    logger.warning("Failed to record digest_tokens_total or digest_generation_seconds metric", agent=agent_name, error=str(metric_error))
                 return LLMResponse(
                     content=result,
                     model=model_name,
@@ -1083,6 +1109,29 @@ def extract_reply_to(raw: Dict[str, Any]) -> Optional[str]:
 
 def clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
     return min(upper, max(lower, value))
+
+
+# Context7: Универсальная функция санитизации значений для Prometheus labels
+def _sanitize_prometheus_label(value: Any) -> str:
+    """Санитизация значения label для Prometheus (универсальная функция)."""
+    import re
+    if value is None:
+        return "unknown"
+    if not isinstance(value, str):
+        value = str(value)
+    if not value:
+        return "unknown"
+    # Заменяем невалидные символы на подчеркивания
+    sanitized = re.sub(r'[^a-zA-Z0-9_]', '_', value)
+    # Убираем множественные подчеркивания
+    sanitized = re.sub(r'_+', '_', sanitized)
+    # Убираем подчеркивания в начале и конце
+    sanitized = sanitized.strip('_')
+    # Если начинается с цифры, добавляем префикс
+    if sanitized and sanitized[0].isdigit():
+        sanitized = f"label_{sanitized}"
+    # Если пусто, возвращаем unknown
+    return sanitized if sanitized else "unknown"
 
 
 class GroupDigestOrchestrator:
@@ -1243,16 +1292,48 @@ class GroupDigestOrchestrator:
                 yield
         except Exception:
             status = "failure"
-            digest_stage_status_total.labels(stage=stage, status=status).inc()
-            digest_stage_latency_seconds.labels(stage=stage, status=status).observe(
-                max(0.0, time.perf_counter() - start_ts)
-            )
+            # Context7: Обработка ошибок метрик - не прерываем workflow при ошибках Prometheus
+            try:
+                digest_stage_status_total.labels(
+                    stage=_sanitize_prometheus_label(stage), 
+                    status=_sanitize_prometheus_label(status)
+                ).inc()
+                digest_stage_latency_seconds.labels(
+                    stage=_sanitize_prometheus_label(stage), 
+                    status=_sanitize_prometheus_label(status)
+                ).observe(
+                    max(0.0, time.perf_counter() - start_ts)
+                )
+            except Exception as metric_error:
+                logger.warning(
+                    "Failed to record stage metrics",
+                    stage=stage,
+                    status=status,
+                    error=str(metric_error),
+                    error_type=type(metric_error).__name__,
+                )
             raise
         else:
-            digest_stage_status_total.labels(stage=stage, status=status).inc()
-            digest_stage_latency_seconds.labels(stage=stage, status=status).observe(
-                max(0.0, time.perf_counter() - start_ts)
-            )
+            # Context7: Обработка ошибок метрик - не прерываем workflow при ошибках Prometheus
+            try:
+                digest_stage_status_total.labels(
+                    stage=_sanitize_prometheus_label(stage), 
+                    status=_sanitize_prometheus_label(status)
+                ).inc()
+                digest_stage_latency_seconds.labels(
+                    stage=_sanitize_prometheus_label(stage), 
+                    status=_sanitize_prometheus_label(status)
+                ).observe(
+                    max(0.0, time.perf_counter() - start_ts)
+                )
+            except Exception as metric_error:
+                logger.warning(
+                    "Failed to record stage metrics",
+                    stage=stage,
+                    status=status,
+                    error=str(metric_error),
+                    error_type=type(metric_error).__name__,
+                )
 
     def _record_dlq_event(
         self,
@@ -1295,7 +1376,20 @@ class GroupDigestOrchestrator:
             next_retry_at=datetime.utcnow() + timedelta(minutes=10),
         )
         state.setdefault("dlq_events", []).append(event_payload)
-        digest_dlq_total.labels(stage=stage, error_code=error_code).inc()
+        # Context7: Обработка ошибок метрик - не прерываем workflow при ошибках Prometheus
+        try:
+            digest_dlq_total.labels(
+                stage=_sanitize_prometheus_label(stage), 
+                error_code=_sanitize_prometheus_label(error_code)
+            ).inc()
+        except Exception as e:
+            logger.warning(
+                "Failed to record digest_dlq_total metric",
+                stage=stage,
+                error_code=error_code,
+                error=str(e),
+                error_type=type(e).__name__,
+            )
 
     def _handle_stage_failure(
         self,
@@ -1583,7 +1677,11 @@ class GroupDigestOrchestrator:
             return None
 
         summary_html = self._normalize_summary_html(response.content)
-        digest_synthesis_fallback_total.labels(reason="quality_retry").inc()
+        # Context7: Обработка ошибок метрик - не прерываем workflow при ошибках Prometheus
+        try:
+            digest_synthesis_fallback_total.labels(reason=_sanitize_prometheus_label("quality_retry")).inc()
+        except Exception as metric_error:
+            logger.warning("Failed to record digest_synthesis_fallback_total metric", reason="quality_retry", error=str(metric_error))
         result = {
             "summary_html": summary_html,
             "summary": summary_html,
@@ -1648,7 +1746,16 @@ class GroupDigestOrchestrator:
             sanitized_messages = context_result.sanitized_messages
             message_total = len(sanitized_messages)
             if message_total == 0:
-                digest_skipped_total.labels(reason="empty_window", tenant_id=tenant_id or "unknown", mode="unknown").inc()
+                # Context7: Санитизация значений метрик для Prometheus labels
+                # Context7: Обработка ошибок метрик - не прерываем workflow при ошибках Prometheus
+                try:
+                    digest_skipped_total.labels(
+                        reason=_sanitize_prometheus_label("empty_window"), 
+                        tenant_id=_sanitize_prometheus_label(tenant_id or "unknown"), 
+                        mode=_sanitize_prometheus_label("unknown")
+                    ).inc()
+                except Exception as metric_error:
+                    logger.warning("Failed to record digest_skipped_total metric", reason="empty_window", error=str(metric_error))
                 result = {
                     "trace_id": trace_id,
                     "tenant_id": tenant_id,
@@ -1670,7 +1777,16 @@ class GroupDigestOrchestrator:
 
             if message_total < self.config.min_messages:
                 # Режим ещё не определён, используем "unknown"
-                digest_skipped_total.labels(reason="too_few_messages", tenant_id=tenant_id or "unknown", mode="unknown").inc()
+                # Context7: Санитизация значений метрик для Prometheus labels
+                # Context7: Обработка ошибок метрик - не прерываем workflow при ошибках Prometheus
+                try:
+                    digest_skipped_total.labels(
+                        reason=_sanitize_prometheus_label("too_few_messages"), 
+                        tenant_id=_sanitize_prometheus_label(tenant_id or "unknown"), 
+                        mode=_sanitize_prometheus_label("unknown")
+                    ).inc()
+                except Exception as metric_error:
+                    logger.warning("Failed to record digest_skipped_total metric", reason="too_few_messages", error=str(metric_error))
                 result = {
                     "trace_id": trace_id,
                     "tenant_id": tenant_id,
@@ -1692,19 +1808,44 @@ class GroupDigestOrchestrator:
                 self._store_stage_payload(state, "ingest_validator", result, model_id="system")
                 return result
 
-            digest_messages_processed_total.labels(tenant=tenant_id or "unknown").inc(message_total)
+            # Context7: Обработка ошибок метрик - не прерываем workflow при ошибках Prometheus
+            try:
+                digest_messages_processed_total.labels(tenant=_sanitize_prometheus_label(tenant_id or "unknown")).inc(message_total)
+            except Exception as metric_error:
+                logger.warning("Failed to record digest_messages_processed_total metric", tenant_id=tenant_id, error=str(metric_error))
 
             duplicates_removed = context_result.stats.get("duplicates_removed", 0)
             trimmed_for_max = context_result.stats.get("trimmed_for_max", 0)
             if duplicates_removed:
                 errors.append(f"context_dedup_removed:{duplicates_removed}")
-                digest_stage_status_total.labels(stage="ingest_validator", status="context_dedup").inc()
+                # Context7: Обработка ошибок метрик - не прерываем workflow при ошибках Prometheus
+                try:
+                    digest_stage_status_total.labels(
+                        stage=_sanitize_prometheus_label("ingest_validator"), 
+                        status=_sanitize_prometheus_label("context_dedup")
+                    ).inc()
+                except Exception as metric_error:
+                    logger.warning("Failed to record digest_stage_status_total metric", stage="ingest_validator", status="context_dedup", error=str(metric_error))
             if trimmed_for_max:
                 errors.append(f"context_trimmed:{trimmed_for_max}")
-                digest_stage_status_total.labels(stage="ingest_validator", status="context_trimmed").inc()
+                # Context7: Обработка ошибок метрик - не прерываем workflow при ошибках Prometheus
+                try:
+                    digest_stage_status_total.labels(
+                        stage=_sanitize_prometheus_label("ingest_validator"), 
+                        status=_sanitize_prometheus_label("context_trimmed")
+                    ).inc()
+                except Exception as metric_error:
+                    logger.warning("Failed to record digest_stage_status_total metric", stage="ingest_validator", status="context_trimmed", error=str(metric_error))
             historical_matches = context_result.stats.get("historical_matches", 0)
             if historical_matches:
-                digest_stage_status_total.labels(stage="ingest_validator", status="context_history").inc(historical_matches)
+                # Context7: Обработка ошибок метрик - не прерываем workflow при ошибках Prometheus
+                try:
+                    digest_stage_status_total.labels(
+                        stage=_sanitize_prometheus_label("ingest_validator"), 
+                        status=_sanitize_prometheus_label("context_history")
+                    ).inc(historical_matches)
+                except Exception as metric_error:
+                    logger.warning("Failed to record digest_stage_status_total metric", stage="ingest_validator", status="context_history", error=str(metric_error))
 
             participant_stats = context_result.participant_stats
             conversation_excerpt = context_result.conversation_excerpt
@@ -1724,11 +1865,15 @@ class GroupDigestOrchestrator:
             
             # Метрика распределения по режимам
             window_size_hours = window_info.get("window_size_hours", 0) or 0
-            digest_mode_total.labels(
-                mode=digest_mode,
-                tenant_id=tenant_id or "unknown",
-                window_size_hours=str(window_size_hours),
-            ).inc()
+            # Context7: Обработка ошибок метрик - не прерываем workflow при ошибках Prometheus
+            try:
+                digest_mode_total.labels(
+                    mode=_sanitize_prometheus_label(digest_mode),
+                    tenant_id=_sanitize_prometheus_label(tenant_id or "unknown"),
+                    window_size_hours=_sanitize_prometheus_label(str(window_size_hours)),
+                ).inc()
+            except Exception as metric_error:
+                logger.warning("Failed to record digest_mode_total metric", mode=digest_mode, tenant_id=tenant_id, error=str(metric_error))
 
             if self._context_storage_client and window_info.get("window_id"):
                 try:
@@ -2312,7 +2457,15 @@ class GroupDigestOrchestrator:
                 )
                 tenant_id = state.get("tenant_id", "unknown")
                 mode = state.get("digest_mode", "normal")
-                digest_topics_empty_total.labels(reason=reason, tenant_id=tenant_id, mode=mode).inc()
+                # Context7: Обработка ошибок метрик - не прерываем workflow при ошибках Prometheus
+                try:
+                    digest_topics_empty_total.labels(
+                        reason=_sanitize_prometheus_label(reason), 
+                        tenant_id=_sanitize_prometheus_label(tenant_id), 
+                        mode=_sanitize_prometheus_label(mode)
+                    ).inc()
+                except Exception as metric_error:
+                    logger.warning("Failed to record digest_topics_empty_total metric", reason=reason, tenant_id=tenant_id, error=str(metric_error))
                 
                 fallback_topics = self._context_service.build_keyword_topics(
                     state.get("sanitized_messages") or [],
@@ -2520,7 +2673,14 @@ class GroupDigestOrchestrator:
                 # Логируем каждую проблему как отдельную метрику
                 for issue in issues:
                     check_name = issue.split(":")[0] if ":" in issue else issue
-                    digest_pre_quality_failed_total.labels(check=check_name, tenant_id=tenant_id).inc()
+                    # Context7: Обработка ошибок метрик - не прерываем workflow при ошибках Prometheus
+                    try:
+                        digest_pre_quality_failed_total.labels(
+                            check=_sanitize_prometheus_label(check_name), 
+                            tenant_id=_sanitize_prometheus_label(tenant_id)
+                        ).inc()
+                    except Exception as metric_error:
+                        logger.warning("Failed to record digest_pre_quality_failed_total metric", check=check_name, tenant_id=tenant_id, error=str(metric_error))
                 
                 # Отправляем на corrective synthesis без LLM-judge
                 baseline_snapshot = self._get_baseline_snapshot(state)
@@ -2594,9 +2754,31 @@ class GroupDigestOrchestrator:
                 "notes": data.get("notes") or "Автоматическая оценка выполнена.",
             }
             quality_score = clamp(float(data.get("quality_score", sum(metrics[k] for k in ("faithfulness", "coherence", "coverage", "focus")) / 4)))
+            # Context7: Санитизация имен метрик для Prometheus labels
             for key in ("faithfulness", "coherence", "coverage", "focus"):
-                digest_quality_score.labels(metric=key).set(metrics[key])
-            digest_quality_score.labels(metric="overall").set(quality_score)
+                try:
+                    safe_key = _sanitize_prometheus_label(key)
+                    digest_quality_score.labels(metric=safe_key).set(metrics[key])
+                except Exception as e:
+                    # Context7: Детальное логирование ошибок Prometheus метрик с traceback
+                    logger.error(
+                        "Failed to record quality metric",
+                        metric=key,
+                        error=str(e),
+                        error_type=type(e).__name__,
+                        traceback=traceback.format_exc(),
+                    )
+            try:
+                digest_quality_score.labels(metric=_sanitize_prometheus_label("overall")).set(quality_score)
+            except Exception as e:
+                # Context7: Детальное логирование ошибок Prometheus метрик с traceback
+                import traceback
+                logger.error(
+                    "Failed to record overall quality score",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    traceback=traceback.format_exc(),
+                )
 
             min_score = min(metrics["faithfulness"], metrics["coherence"], metrics["coverage"], metrics["focus"], quality_score)
             quality_threshold = self.config.quality_checks.quality_threshold
@@ -2622,8 +2804,31 @@ class GroupDigestOrchestrator:
                         )
                         quality_score = clamp(float(data.get("quality_score", sum(metrics[k] for k in ("faithfulness", "coherence", "coverage", "focus")) / 4)))
                         for key in ("faithfulness", "coherence", "coverage", "focus"):
-                            digest_quality_score.labels(metric=key).set(metrics[key])
-                        digest_quality_score.labels(metric="overall").set(quality_score)
+                            try:
+                                safe_key = _sanitize_prometheus_label(key)
+                                digest_quality_score.labels(metric=safe_key).set(metrics[key])
+                            except Exception as e:
+                                # Context7: Детальное логирование ошибок Prometheus метрик с traceback
+                                import traceback
+                                logger.error(
+                                    "Failed to record quality metric",
+                                    metric=key,
+                                    error=str(e),
+                                    error_type=type(e).__name__,
+                                    traceback=traceback.format_exc(),
+                                )
+                        try:
+                            # Context7: Санитизация значения метрики для Prometheus labels
+                            digest_quality_score.labels(metric=_sanitize_prometheus_label("overall")).set(quality_score)
+                        except Exception as e:
+                            # Context7: Детальное логирование ошибок Prometheus метрик с traceback
+                            import traceback
+                            logger.error(
+                                "Failed to record overall quality score",
+                                error=str(e),
+                                error_type=type(e).__name__,
+                                traceback=traceback.format_exc(),
+                            )
                         min_score = min(metrics["faithfulness"], metrics["coherence"], metrics["coverage"], metrics["focus"], quality_score)
                         quality_threshold = self.config.quality_checks.quality_threshold
                         quality_pass = min_score >= quality_threshold
@@ -2632,11 +2837,15 @@ class GroupDigestOrchestrator:
 
             if not quality_pass:
                 mode = state.get("digest_mode", "normal")
-                digest_skipped_total.labels(
-                    reason="quality_below_threshold",
-                    tenant_id=tenant_id or "unknown",
-                    mode=mode,
-                ).inc()
+                # Context7: Обработка ошибок метрик - не прерываем workflow при ошибках Prometheus
+                try:
+                    digest_skipped_total.labels(
+                        reason=_sanitize_prometheus_label("quality_below_threshold"),
+                        tenant_id=_sanitize_prometheus_label(tenant_id or "unknown"),
+                        mode=_sanitize_prometheus_label(mode),
+                    ).inc()
+                except Exception as metric_error:
+                    logger.warning("Failed to record digest_skipped_total metric", reason="quality_below_threshold", tenant_id=tenant_id, error=str(metric_error))
                 errors.append(f"quality_below_threshold:{min_score:.2f}")
                 self._record_dlq_event(
                     state,
@@ -2696,7 +2905,17 @@ class GroupDigestOrchestrator:
                 if required_scope not in scopes:
                     status = "blocked_rbac"
                     reason = f"missing_scope:{required_scope}"
-                    digest_skipped_total.labels(reason="missing_scope").inc()
+                    # Context7: Санитизация значений метрик для Prometheus labels - все три labels обязательны
+                    tenant_id = state.get("tenant_id")  # Context7: Получаем tenant_id из state
+                    # Context7: Обработка ошибок метрик - не прерываем workflow при ошибках Prometheus
+                    try:
+                        digest_skipped_total.labels(
+                            reason=_sanitize_prometheus_label("missing_scope"),
+                            tenant_id=_sanitize_prometheus_label(tenant_id or "unknown"),
+                            mode=_sanitize_prometheus_label(state.get("digest_mode", "normal")),
+                        ).inc()
+                    except Exception as metric_error:
+                        logger.warning("Failed to record digest_skipped_total metric", reason="missing_scope", tenant_id=tenant_id, error=str(metric_error))
                     errors.append(reason)
             delivery = {
                 "format": delivery_format,
@@ -2785,7 +3004,15 @@ class GroupDigestOrchestrator:
             )
             return result
         except Exception as exc:
-            logger.error("group_digest_workflow_failed", error=str(exc))
+            # Context7: Детальное логирование ошибки с traceback для диагностики "Incorrect label names"
+            logger.error(
+                "group_digest_workflow_failed",
+                error=str(exc),
+                error_type=type(exc).__name__,
+                traceback=traceback.format_exc(),
+                tenant_id=tenant_id,
+                trace_id=trace_id,
+            )
             failure_result = self._handle_stage_failure(
                 initial_state,
                 stage="workflow",

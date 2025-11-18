@@ -171,15 +171,97 @@ class TelegramIngestionService:
             return None
     
     def _register_handlers(self):
-        """Регистрация обработчиков событий."""
+        """Context7 P2: Регистрация оптимизированных обработчиков событий.
+        
+        Best practices:
+        - Фильтрация по активным каналам для снижения нагрузки
+        - Обработка MessageEdited для обновления контента
+        - Обработка MessageDeleted для удаления постов
+        """
+        # Context7 P2: Кэш активных каналов для фильтрации
+        self._active_channel_ids: Set[int] = set()
+        self._active_group_ids: Set[int] = set()
+        
+        async def _refresh_active_chats():
+            """Обновление кэша активных чатов."""
+            try:
+                if not self.db_connection:
+                    return
+                
+                with self.db_connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                    # Активные каналы
+                    cursor.execute("""
+                        SELECT tg_channel_id 
+                        FROM channels 
+                        WHERE is_active = true AND tg_channel_id IS NOT NULL
+                    """)
+                    self._active_channel_ids = {int(row['tg_channel_id']) for row in cursor.fetchall() if row['tg_channel_id']}
+                    
+                    # Активные группы
+                    cursor.execute("""
+                        SELECT tg_chat_id 
+                        FROM groups 
+                        WHERE is_active = true AND tg_chat_id IS NOT NULL
+                    """)
+                    self._active_group_ids = {int(row['tg_chat_id']) for row in cursor.fetchall() if row['tg_chat_id']}
+                    
+                    logger.debug("Active chats cache refreshed",
+                               channels_count=len(self._active_channel_ids),
+                               groups_count=len(self._active_group_ids))
+            except Exception as e:
+                logger.warning("Failed to refresh active chats cache", error=str(e))
+        
+        # Context7 P2: Обновляем кэш при старте и периодически
+        asyncio.create_task(_refresh_active_chats())
+        
+        # Context7 P2: Периодическое обновление кэша (каждые 5 минут)
+        async def _periodic_refresh():
+            while self.is_running:
+                await asyncio.sleep(300)  # 5 минут
+                await _refresh_active_chats()
+        
+        asyncio.create_task(_periodic_refresh())
         
         @self.client.on(events.NewMessage)
         async def handle_new_message(event):
-            """Обработка новых сообщений."""
+            """Context7 P2: Обработка новых сообщений с фильтрацией по активным каналам."""
             try:
+                # Context7 P2: Фильтрация по активным каналам/группам
+                chat_id = getattr(event.message.peer_id, 'channel_id', None) or getattr(event.message.peer_id, 'chat_id', None)
+                if chat_id:
+                    chat_id_int = int(chat_id)
+                    if chat_id_int not in self._active_channel_ids and chat_id_int not in self._active_group_ids:
+                        # Не активный канал/группа - пропускаем
+                        return
+                
                 await self._process_message(event)
             except Exception as e:
                 logger.error("Error processing message", error=str(e), message_id=event.message.id)
+        
+        @self.client.on(events.MessageEdited)
+        async def handle_message_edited(event):
+            """Context7 P2: Обработка отредактированных сообщений."""
+            try:
+                # Context7 P2: Фильтрация по активным каналам/группам
+                chat_id = getattr(event.message.peer_id, 'channel_id', None) or getattr(event.message.peer_id, 'chat_id', None)
+                if chat_id:
+                    chat_id_int = int(chat_id)
+                    if chat_id_int not in self._active_channel_ids and chat_id_int not in self._active_group_ids:
+                        return
+                
+                # Context7 P2: Обновление поста в БД
+                await self._process_message_edited(event)
+            except Exception as e:
+                logger.error("Error processing edited message", error=str(e), message_id=event.message.id)
+        
+        @self.client.on(events.MessageDeleted)
+        async def handle_message_deleted(event):
+            """Context7 P2: Обработка удалённых сообщений."""
+            try:
+                # Context7 P2: Помечаем пост как удалённый в БД
+                await self._process_message_deleted(event)
+            except Exception as e:
+                logger.error("Error processing deleted message", error=str(e), deleted_ids=event.deleted_ids)
     
     async def _load_active_channels(self):
         """Загрузка активных каналов из БД."""
@@ -911,15 +993,28 @@ class TelegramIngestionService:
         """Context7 best practice: сохранение всех данных сообщения в БД."""
         try:
             with self.db_connection.cursor() as cursor:
+                # Context7 P1.1: Подготовка новых полей для forwards и replies
+                forward_from_peer_id_json = json.dumps(message_data.get('forward_from_peer_id')) if message_data.get('forward_from_peer_id') else None
+                forward_date_dt = None
+                if message_data.get('forward_date'):
+                    try:
+                        from dateutil.parser import parse as parse_date
+                        forward_date_dt = parse_date(message_data['forward_date'])
+                    except:
+                        forward_date_dt = None
+                
                 cursor.execute("""
                     INSERT INTO posts (
                         channel_id, telegram_message_id, content, media_urls, created_at, is_processed,
                         posted_at, url, has_media, views_count, forwards_count, reactions_count,
                         replies_count, is_pinned, is_edited, edited_at, post_author,
                         reply_to_message_id, reply_to_chat_id, via_bot_id, via_business_bot_id,
-                        is_silent, is_legacy, noforwards, invert_media
+                        is_silent, is_legacy, noforwards, invert_media,
+                        forward_from_peer_id, forward_from_chat_id, forward_from_message_id,
+                        forward_date, forward_from_name, thread_id, forum_topic_id
                     ) VALUES (
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s::jsonb, %s, %s, %s, %s, %s, %s
                     )
                     ON CONFLICT (channel_id, telegram_message_id)
                     DO UPDATE SET
@@ -943,7 +1038,14 @@ class TelegramIngestionService:
                         is_silent = EXCLUDED.is_silent,
                         is_legacy = EXCLUDED.is_legacy,
                         noforwards = EXCLUDED.noforwards,
-                        invert_media = EXCLUDED.invert_media
+                        invert_media = EXCLUDED.invert_media,
+                        forward_from_peer_id = EXCLUDED.forward_from_peer_id,
+                        forward_from_chat_id = EXCLUDED.forward_from_chat_id,
+                        forward_from_message_id = EXCLUDED.forward_from_message_id,
+                        forward_date = EXCLUDED.forward_date,
+                        forward_from_name = EXCLUDED.forward_from_name,
+                        thread_id = EXCLUDED.thread_id,
+                        forum_topic_id = EXCLUDED.forum_topic_id
                     RETURNING id
                 """, (
                     message_data['channel_id'],
@@ -970,7 +1072,14 @@ class TelegramIngestionService:
                     message_data.get('is_silent', False),
                     message_data.get('is_legacy', False),
                     message_data.get('noforwards', False),
-                    message_data.get('invert_media', False)
+                    message_data.get('invert_media', False),
+                    forward_from_peer_id_json,
+                    message_data.get('forward_from_chat_id'),
+                    message_data.get('forward_from_message_id'),
+                    forward_date_dt,
+                    message_data.get('forward_from_name'),
+                    message_data.get('thread_id'),
+                    message_data.get('forum_topic_id')
                 ))
                 
                 post_id = cursor.fetchone()[0]
@@ -1143,6 +1252,128 @@ class TelegramIngestionService:
             await asyncio.sleep(e.seconds)
         except Exception as e:
             logger.error("Error processing message", error=str(e))
+    
+    async def _process_message_edited(self, event):
+        """Context7 P2: Обработка отредактированных сообщений."""
+        try:
+            message = event.message
+            channel = await event.get_chat()
+            
+            # Получение информации о канале из БД
+            channel_info = await self._get_channel_info(channel.id)
+            if not channel_info:
+                logger.debug("Channel not found for edited message", telegram_chat_id=channel.id)
+                return
+            
+            # Context7 P2: Обновление поста в БД
+            with self.db_connection.cursor() as cursor:
+                cursor.execute("""
+                    UPDATE posts
+                    SET content = %s,
+                        is_edited = true,
+                        edited_at = NOW(),
+                        updated_at = NOW()
+                    WHERE channel_id = %s AND telegram_message_id = %s
+                    RETURNING id
+                """, (
+                    message.text or message.message or '',
+                    channel_info['id'],
+                    message.id
+                ))
+                
+                result = cursor.fetchone()
+                if result:
+                    post_id = str(result[0])
+                    self.db_connection.commit()
+                    
+                    # Context7 P2: Публикация события об обновлении
+                    event_data = {
+                        'post_id': post_id,
+                        'channel_id': str(channel_info['id']),
+                        'telegram_message_id': message.id,
+                        'is_edited': True,
+                        'edited_at': datetime.now(timezone.utc).isoformat(),
+                        'content': message.text or message.message or ''
+                    }
+                    
+                    event_data_json = {k: json.dumps(v) if isinstance(v, (list, dict)) else str(v) for k, v in event_data.items()}
+                    await self.redis_client.xadd("stream:posts:edited", event_data_json)
+                    
+                    logger.info("Message edited and updated",
+                               post_id=post_id,
+                               channel_id=channel_info['id'],
+                               message_id=message.id)
+                else:
+                    logger.debug("Post not found for edited message",
+                               channel_id=channel_info['id'],
+                               message_id=message.id)
+                    self.db_connection.rollback()
+                    
+        except Exception as e:
+            logger.error("Error processing edited message", error=str(e), message_id=message.id)
+            try:
+                self.db_connection.rollback()
+            except:
+                pass
+    
+    async def _process_message_deleted(self, event):
+        """Context7 P2: Обработка удалённых сообщений."""
+        try:
+            # Context7 P2: MessageDeleted содержит список deleted_ids
+            deleted_ids = getattr(event, 'deleted_ids', [])
+            if not deleted_ids:
+                return
+            
+            channel = await event.get_chat()
+            channel_info = await self._get_channel_info(channel.id)
+            if not channel_info:
+                logger.debug("Channel not found for deleted message", telegram_chat_id=channel.id)
+                return
+            
+            # Context7 P2: Помечаем посты как удалённые в БД
+            with self.db_connection.cursor() as cursor:
+                for message_id in deleted_ids:
+                    cursor.execute("""
+                        UPDATE posts
+                        SET is_deleted = true,
+                            deleted_at = NOW(),
+                            updated_at = NOW()
+                        WHERE channel_id = %s AND telegram_message_id = %s
+                        RETURNING id
+                    """, (
+                        channel_info['id'],
+                        message_id
+                    ))
+                    
+                    result = cursor.fetchone()
+                    if result:
+                        post_id = str(result[0])
+                        
+                        # Context7 P2: Публикация события об удалении
+                        event_data = {
+                            'post_id': post_id,
+                            'channel_id': str(channel_info['id']),
+                            'telegram_message_id': message_id,
+                            'is_deleted': True,
+                            'deleted_at': datetime.now(timezone.utc).isoformat()
+                        }
+                        
+                        event_data_json = {k: json.dumps(v) if isinstance(v, (list, dict)) else str(v) for k, v in event_data.items()}
+                        await self.redis_client.xadd("stream:posts:deleted", event_data_json)
+                        
+                        logger.info("Message deleted and marked",
+                                   post_id=post_id,
+                                   channel_id=channel_info['id'],
+                                   message_id=message_id)
+                
+                self.db_connection.commit()
+                    
+        except Exception as e:
+            logger.error("Error processing deleted message", error=str(e), deleted_ids=deleted_ids)
+            try:
+                self.db_connection.rollback()
+            except:
+                pass
     
     async def _get_channel_info(self, telegram_id: int) -> Optional[dict]:
         """Получение информации о канале из БД."""
@@ -1346,6 +1577,11 @@ class TelegramIngestionService:
         """Сохранение сообщения группы и связанных записей."""
         try:
             with self.db_connection.cursor() as cursor:
+                # Context7: Устанавливаем tenant_id для RLS перед INSERT
+                tenant_id = message_data.get("tenant_id")
+                if tenant_id:
+                    cursor.execute("SET LOCAL app.tenant_id = %s", (str(tenant_id),))
+                
                 cursor.execute(
                     """
                     INSERT INTO group_messages (
@@ -1479,13 +1715,22 @@ class TelegramIngestionService:
     async def _publish_group_message_event(self, group_message_id: str, message_data: dict, group_info: dict):
         """Публикация события group.message.created в Redis Stream."""
         try:
+            # Context7: Сериализация datetime для JSON
+            posted_at = message_data.get("posted_at")
+            if posted_at and isinstance(posted_at, datetime):
+                posted_at_str = posted_at.isoformat()
+            elif posted_at:
+                posted_at_str = str(posted_at)
+            else:
+                posted_at_str = None
+            
             payload = {
                 "group_message_id": str(group_message_id),
                 "group_id": str(group_info.get("id")),
                 "tenant_id": str(group_info.get("tenant_id")),
                 "tg_message_id": str(message_data.get("tg_message_id")),
                 "content": message_data.get("content", ""),
-                "posted_at": message_data.get("posted_at"),
+                "posted_at": posted_at_str,
                 "trace_id": message_data.get("trace_id"),
                 "sender_tg_id": str(message_data.get("sender_tg_id") or ""),
                 "sender_username": message_data.get("sender_username") or "",
@@ -1582,14 +1827,77 @@ class TelegramIngestionService:
                 elif hasattr(message.from_id, 'channel_id'):
                     message_data['post_author'] = f"channel_{message.from_id.channel_id}"
             
-            # Реплаи
+            # Context7 P1.1: Глубокое извлечение replies с поддержкой thread_id
             if hasattr(message, 'reply_to') and message.reply_to:
-                message_data['reply_to_message_id'] = getattr(message.reply_to, 'reply_to_msg_id', None)
-                if hasattr(message.reply_to, 'reply_to_peer_id'):
-                    if hasattr(message.reply_to.reply_to_peer_id, 'channel_id'):
-                        message_data['reply_to_chat_id'] = message.reply_to.reply_to_peer_id.channel_id
-                    elif hasattr(message.reply_to.reply_to_peer_id, 'chat_id'):
-                        message_data['reply_to_chat_id'] = message.reply_to.reply_to_peer_id.chat_id
+                reply_to = message.reply_to
+                message_data['reply_to_message_id'] = getattr(reply_to, 'reply_to_msg_id', None)
+                
+                # Thread ID (для каналов с комментариями)
+                if hasattr(reply_to, 'reply_to_top_id'):
+                    message_data['thread_id'] = reply_to.reply_to_top_id
+                elif hasattr(reply_to, 'reply_to_forum_top_id'):
+                    message_data['forum_topic_id'] = reply_to.reply_to_forum_top_id
+                
+                # Peer ID для reply
+                if hasattr(reply_to, 'reply_to_peer_id'):
+                    peer_id = reply_to.reply_to_peer_id
+                    if hasattr(peer_id, 'channel_id'):
+                        message_data['reply_to_chat_id'] = peer_id.channel_id
+                    elif hasattr(peer_id, 'chat_id'):
+                        message_data['reply_to_chat_id'] = peer_id.chat_id
+            
+            # Context7 P1.1: Глубокое извлечение forwards из MessageFwdHeader
+            if hasattr(message, 'fwd_from') and message.fwd_from:
+                fwd_from = message.fwd_from
+                
+                # Быстрые поля в Post для прямого доступа
+                if hasattr(fwd_from, 'from_id'):
+                    from_id = fwd_from.from_id
+                    # Сохраняем полный peer ID как JSONB
+                    peer_id_data = {}
+                    if hasattr(from_id, 'user_id'):
+                        peer_id_data['user_id'] = from_id.user_id
+                        message_data['forward_from_peer_id'] = {'user_id': from_id.user_id}
+                    elif hasattr(from_id, 'channel_id'):
+                        peer_id_data['channel_id'] = from_id.channel_id
+                        message_data['forward_from_peer_id'] = {'channel_id': from_id.channel_id}
+                        message_data['forward_from_chat_id'] = from_id.channel_id
+                    elif hasattr(from_id, 'chat_id'):
+                        peer_id_data['chat_id'] = from_id.chat_id
+                        message_data['forward_from_peer_id'] = {'chat_id': from_id.chat_id}
+                        message_data['forward_from_chat_id'] = from_id.chat_id
+                
+                # Message ID и дата
+                if hasattr(fwd_from, 'channel_post'):
+                    message_data['forward_from_message_id'] = fwd_from.channel_post
+                
+                if hasattr(fwd_from, 'date'):
+                    message_data['forward_date'] = fwd_from.date.isoformat() if fwd_from.date else None
+                
+                # Имя автора (если доступно)
+                if hasattr(fwd_from, 'from_name'):
+                    message_data['forward_from_name'] = fwd_from.from_name
+                
+                # Дополнительные поля MessageFwdHeader
+                if hasattr(fwd_from, 'post_author'):
+                    message_data['forward_post_author_signature'] = fwd_from.post_author
+                
+                if hasattr(fwd_from, 'saved_from_peer'):
+                    saved_peer = fwd_from.saved_from_peer
+                    saved_peer_data = {}
+                    if hasattr(saved_peer, 'user_id'):
+                        saved_peer_data['user_id'] = saved_peer.user_id
+                    elif hasattr(saved_peer, 'channel_id'):
+                        saved_peer_data['channel_id'] = saved_peer.channel_id
+                    elif hasattr(saved_peer, 'chat_id'):
+                        saved_peer_data['chat_id'] = saved_peer.chat_id
+                    message_data['forward_saved_from_peer'] = saved_peer_data
+                
+                if hasattr(fwd_from, 'saved_from_msg_id'):
+                    message_data['forward_saved_from_msg_id'] = fwd_from.saved_from_msg_id
+                
+                if hasattr(fwd_from, 'psa_type'):
+                    message_data['forward_psa_type'] = fwd_from.psa_type
             
             # Боты
             if hasattr(message, 'via_bot_id') and message.via_bot_id:

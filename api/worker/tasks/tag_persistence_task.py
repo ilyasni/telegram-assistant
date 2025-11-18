@@ -449,9 +449,10 @@ class TagPersistenceTask:
                 tenant_id_from_db = tenant_id_result["tenant_id"] if tenant_id_result else None
                 tenant_id = metadata.get("tenant_id") or tenant_id_from_db or "default"
                 
-                # Проверяем, изменились ли теги (для метрик)
+                # Context7: Проверяем, изменились ли теги (для метрик)
+                # Убрана ссылка на несуществующую колонку tags, используем data->'tags'
                 existing_tags_result = await conn.fetchrow(
-                    "SELECT tags FROM post_enrichment WHERE post_id = $1 AND kind = 'tags'",
+                    "SELECT data->'tags' as tags FROM post_enrichment WHERE post_id = $1 AND kind = 'tags'",
                     post_id
                 )
                 existing_tags = existing_tags_result["tags"] if existing_tags_result and existing_tags_result.get("tags") else []
@@ -492,18 +493,6 @@ class TagPersistenceTask:
                 # Если теги не изменились — инкрементируем метрику конфликтов
                 if existing_tags == (tags or []):
                     tags_persist_conflicts_total.inc()
-                
-                # Context7: Также сохраняем в legacy поле tags для обратной совместимости
-                # (будет удалено после полной миграции)
-                await conn.execute(
-                    """
-                    UPDATE post_enrichment
-                    SET tags = $1::text[]
-                    WHERE post_id = $2 AND kind = 'tags'
-                    """,
-                    tags or [],
-                    post_id
-                )
                 
                 # КРИТИЧНО: Публикация в posts.enriched (даже если теги пустые!)
                 # Context7: Используем tenant_id из БД, не хардкод 'default'

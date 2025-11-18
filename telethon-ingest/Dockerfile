@@ -20,8 +20,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --no-cache-dir -r requirements.txt
 
 # [C7-ID: CODE-CLEANUP-022] Установка shared пакета (build context теперь корень репозитория)
-COPY shared/ /app/shared/
-RUN pip install -e /app/shared/python
+# Context7: Для telethon-ingest shared устанавливается при сборке образа (обычная установка, не editable)
+# Volume mount для shared отключен из-за конфликта с Docker overlay2 read-only слоем
+# Для изменений shared в telethon-ingest требуется пересборка образа: docker compose build telethon-ingest
+COPY shared/ /tmp/shared/
+RUN pip install /tmp/shared/python && rm -rf /tmp/shared
 
 # [C7-ID: dev-mode-006] Копируем код ПОСЛЕ установки зависимостей
 COPY telethon-ingest/ .

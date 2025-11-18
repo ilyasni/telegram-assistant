@@ -8,7 +8,7 @@
   ],
   "timezone": "browser",
   "schemaVersion": 38,
-  "version": 0,
+  "version": 1,
   "refresh": "30s",
   "panels": [
     {
@@ -27,7 +27,7 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(trend_editor_requests_total[5m])) by (outcome)",
+          "expr": "sum(rate(trend_editor_requests_total[5m])) by (outcome) or vector(0)",
           "legendFormat": "{{outcome}}",
           "datasource": {
             "type": "prometheus",
@@ -257,7 +257,7 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(trend_editor_requests_total[5m])) by (outcome)",
+          "expr": "sum(rate(trend_editor_requests_total[5m])) by (outcome) or vector(0)",
           "legendFormat": "{{outcome}}",
           "datasource": {
             "type": "prometheus",
@@ -275,6 +275,134 @@
           "format": "short"
         }
       ]
+    },
+    {
+      "id": 8,
+      "title": "Trend Events Processed - Total Count",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 16
+      },
+      "targets": [
+        {
+          "expr": "sum(trend_events_processed_total) by (status) or vector(0)",
+          "legendFormat": "{{status}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0
+        }
+      }
+    },
+    {
+      "id": 9,
+      "title": "Trend Emerging Events - Total Count",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 6,
+        "y": 16
+      },
+      "targets": [
+        {
+          "expr": "sum(trend_emerging_events_total) by (status) or vector(0)",
+          "legendFormat": "{{status}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0
+        }
+      }
+    },
+    {
+      "id": 10,
+      "title": "Trend Editor Requests - Total Count",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 16
+      },
+      "targets": [
+        {
+          "expr": "sum(trend_editor_requests_total) by (outcome) or vector(0)",
+          "legendFormat": "{{outcome}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0
+        }
+      }
+    },
+    {
+      "id": 11,
+      "title": "Trend QA Filtered - Total Count",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 16
+      },
+      "targets": [
+        {
+          "expr": "sum(trend_qa_filtered_total) by (reason) or vector(0)",
+          "legendFormat": "{{reason}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0
+        }
+      }
     }
   ],
   "time": {
@@ -292,6 +420,17 @@
       "1h",
       "2h",
       "1d"
+    ],
+    "time_options": [
+      "5m",
+      "15m",
+      "1h",
+      "6h",
+      "12h",
+      "24h",
+      "2d",
+      "7d",
+      "30d"
     ]
   },
   "id": null,

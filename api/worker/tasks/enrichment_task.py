@@ -5,7 +5,6 @@ Enrichment Task - Consumer для posts.tagged → enrichment через crawl4a
 
 import asyncio
 import json
-import logging
 import os
 import time
 import uuid
@@ -13,6 +12,7 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
+import structlog
 import yaml
 from sqlalchemy import text
 
@@ -41,6 +41,9 @@ def normalize_post_id(raw: str) -> uuid.UUID:
         NAMESPACE = uuid.UUID("11111111-1111-1111-1111-111111111111")  # зафиксировано в .env/константах
         return uuid.uuid5(NAMESPACE, raw)
 
+# Context7: Используем structlog для структурированного логирования (как в vision_analysis_task.py)
+logger = structlog.get_logger()
+
 def sanitize_event_post_id(event: Dict[str, Any]) -> Dict[str, Any]:
     """Санитизация post_id в событии для DEV режима."""
     if os.getenv("FEATURE_ALLOW_NON_UUID_IDS", "false").lower() == "true":
@@ -48,10 +51,8 @@ def sanitize_event_post_id(event: Dict[str, Any]) -> Dict[str, Any]:
         if raw_id:
             post_uuid = normalize_post_id(raw_id)
             event["post_id"] = str(post_uuid)
-            logger.debug(f"Sanitized post_id: {raw_id} -> {post_uuid}")
+            logger.debug("Sanitized post_id", raw_id=raw_id, post_uuid=str(post_uuid))
     return event
-
-logger = logging.getLogger(__name__)
 
 # ============================================================================
 # ENRICHMENT WORKER
@@ -198,6 +199,9 @@ class EnrichmentWorker:
             })
 
             # Парсинг события из Redis Streams
+            post_id = None
+            tags = []
+            
             if 'post_id' in event_data:
                 # Прямой формат
                 post_id = event_data['post_id']
@@ -233,17 +237,73 @@ class EnrichmentWorker:
                         "tags_count": len(tags)
                     })
                 except (json.JSONDecodeError, KeyError) as e:
-                    logger.error(f"Failed to parse stream data: {e}")
+                    logger.error("Failed to parse stream data", extra={
+                        "error": str(e),
+                        "error_type": type(e).__name__,
+                        "event_keys": list(event_data.keys())
+                    })
+                    # Context7: Публикуем skipped enrichment для обеспечения цепочки обработки
+                    # Даже при ошибке парсинга пытаемся извлечь post_id из original event_data
+                    fallback_post_id = event_data.get('post_id') or (event_data.get('payload', {}).get('post_id') if isinstance(event_data.get('payload'), dict) else None)
+                    skip_published = False
+                    if fallback_post_id:
+                        try:
+                            await self._publish_skipped_enrichment(event_data, f"parse_error: {str(e)[:50]}")
+                            skip_published = True
+                        except Exception as skip_error:
+                            logger.error("Failed to publish skipped enrichment after parse error", 
+                                       post_id=fallback_post_id, error=str(skip_error))
+                    # Context7: Если skipped enrichment опубликован успешно, это skip, а не error
+                    posts_processed_total.labels(stage='enrichment', success='skip' if skip_published else 'error').inc()
                     return
             else:
                 # Формат из Redis Streams - нужно найти payload
-                logger.error(f"enrichment_event_missing_post_id: keys={list(event_data.keys())}")
+                logger.error("enrichment_event_missing_post_id", extra={
+                    "keys": list(event_data.keys()),
+                    "event_sample": str(event_data)[:200]
+                })
+                # Context7: Пытаемся опубликовать skipped enrichment даже без post_id
+                # Это позволит зафиксировать проблему в цепочке обработки
+                skip_published = False
+                try:
+                    # Создаем минимальное событие для skipped enrichment
+                    minimal_event = {
+                        "post_id": None,
+                        "tenant_id": event_data.get('tenant_id', 'default'),
+                        "tags": [],
+                        "idempotency_key": event_data.get('idempotency_key', f"unknown:{uuid.uuid4()}")
+                    }
+                    await self._publish_skipped_enrichment(minimal_event, "missing_post_id")
+                    skip_published = True
+                except Exception as skip_error:
+                    logger.error("Failed to publish skipped enrichment for missing post_id", 
+                               error=str(skip_error))
+                # Context7: Если skipped enrichment опубликован успешно, это skip, а не error
+                posts_processed_total.labels(stage='enrichment', success='skip' if skip_published else 'error').inc()
                 return
             
-            logger.debug(f"Processing post {post_id} for enrichment")
+            # Context7: Валидация post_id после парсинга
+            if not post_id:
+                logger.error("Post ID is None after parsing", extra={
+                    "event_keys": list(event_data.keys()),
+                    "event_sample": str(event_data)[:200]
+                })
+                # Context7: Публикуем skipped enrichment для обеспечения цепочки обработки
+                skip_published = False
+                try:
+                    await self._publish_skipped_enrichment(event_data, "post_id_is_none")
+                    skip_published = True
+                except Exception as skip_error:
+                    logger.error("Failed to publish skipped enrichment for None post_id", 
+                               error=str(skip_error))
+                # Context7: Если skipped enrichment опубликован успешно, это skip, а не error
+                posts_processed_total.labels(stage='enrichment', success='skip' if skip_published else 'error').inc()
+                return
             
-            # МЕТРИКА: попытка обработки
-            posts_processed_total.labels(stage='enrichment', success='attempt').inc()
+            logger.debug("Processing post for enrichment", extra={"post_id": post_id})
+            
+            # Context7: Метрика будет инкрементирована один раз с финальным статусом
+            # Убрали 'attempt' чтобы избежать двойного подсчета в Grafana rate()
             
             # [C7-ID: ENRICH-DEV-FIX-002] Санитизация post_id перед запросом к БД
             sanitized_post_id = str(normalize_post_id(post_id)) if os.getenv("FEATURE_ALLOW_NON_UUID_IDS", "false").lower() == "true" else post_id
@@ -258,7 +318,9 @@ class EnrichmentWorker:
             # Context7: Проверка существования поста перед обогащением
             if not post_context:
                 logger.warning("Post not found in DB, skipping enrichment", extra={"post_id": post_id, "trace_id": event_data.get('trace_id')})
-                posts_processed_total.labels(stage='enrichment', success='skip').inc()
+                # Context7: Публикуем skipped enrichment для обеспечения цепочки обработки
+                await self._publish_skipped_enrichment(event_data, "post_not_found")
+                # Context7: Метрика инкрементируется один раз с финальным статусом (в _publish_skipped_enrichment)
                 return
             
             # [C7-ID: ENRICH-URLS-001] Источники URLs: event.urls → regex из text → []
@@ -356,8 +418,7 @@ class EnrichmentWorker:
                 await self._publish_skipped_enrichment(event_data, skip_reason)
                 self.stats['posts_skipped'] += 1
                 enrichment_skipped_total.labels(reason=skip_reason).inc()
-                # МЕТРИКА: пропуск обогащения
-                posts_processed_total.labels(stage='enrichment', success='skip').inc()
+                # Context7: Метрика инкрементируется один раз с финальным статусом (в _publish_skipped_enrichment)
                 return
             
             # Context7: Обогащение через crawl4ai (если есть URLs)
@@ -451,8 +512,16 @@ class EnrichmentWorker:
                 })
                 # DLQ, чтобы не стопорить CG:
                 await self.publisher.to_dlq("posts.tagged", event_data, reason="serialize_error", details=str(e))
-                # МЕТРИКА: ошибка сериализации
-                posts_processed_total.labels(stage='enrichment', success='error').inc()
+                # Context7: Публикуем skipped enrichment для обеспечения цепочки обработки даже при ошибке сериализации
+                skip_published = False
+                try:
+                    await self._publish_skipped_enrichment(event_data, f"serialize_error: {str(e)[:50]}")
+                    skip_published = True
+                except Exception as skip_error:
+                    logger.error("Failed to publish skipped enrichment after serialize error", 
+                               post_id=post_id, error=str(skip_error))
+                # Context7: Если skipped enrichment опубликован успешно, это skip, а не error
+                posts_processed_total.labels(stage='enrichment', success='skip' if skip_published else 'error').inc()
                 return
             
             # Context7: Проверка trigger для observability
@@ -495,8 +564,17 @@ class EnrichmentWorker:
                 })  # exception → стектрейс
                 # DLQ вместо break-падения:
                 await self.publisher.to_dlq("posts.tagged", {"data": body if 'body' in locals() else b""}, reason="publish_fail", details=str(e))
-                # МЕТРИКА: ошибка публикации
-                posts_processed_total.labels(stage='enrichment', success='error').inc()
+                # Context7: Пытаемся опубликовать skipped enrichment как fallback
+                # Это позволит цепочке обработки продолжиться даже при ошибке публикации
+                skip_published = False
+                try:
+                    await self._publish_skipped_enrichment(event_data, f"publish_fail: {str(e)[:50]}")
+                    skip_published = True
+                except Exception as skip_error:
+                    logger.error("Failed to publish skipped enrichment after publish error", 
+                               post_id=post_id, error=str(skip_error))
+                # Context7: Если skipped enrichment опубликован успешно, это skip, а не error
+                posts_processed_total.labels(stage='enrichment', success='skip' if skip_published else 'error').inc()
                 return
             
             self.stats['posts_processed'] += 1
@@ -524,9 +602,22 @@ class EnrichmentWorker:
                 operation='enrich',
                 success=False
             ).inc()
-            # МЕТРИКА: ошибка обработки
-            posts_processed_total.labels(stage='enrichment', success='error').inc()
             self.stats['errors'] += 1
+            # DLQ для дальнейшего анализа
+            try:
+                await self.publisher.to_dlq("posts.tagged", event_data, reason="processing_error", details=str(e))
+            except Exception as dlq_error:
+                logger.error("Failed to send to DLQ after processing error", error=str(dlq_error))
+            # Context7: Публикуем skipped enrichment для обеспечения цепочки обработки даже при ошибке
+            skip_published = False
+            try:
+                await self._publish_skipped_enrichment(event_data, f"processing_error: {str(e)[:50]}")
+                skip_published = True
+            except Exception as skip_error:
+                logger.error("Failed to publish skipped enrichment after processing error", 
+                           post_id=event_data.get('post_id'), error=str(skip_error))
+            # Context7: Если skipped enrichment опубликован успешно, это skip, а не error
+            posts_processed_total.labels(stage='enrichment', success='skip' if skip_published else 'error').inc()
     
     async def _check_enrichment_triggers(self, post_id: str, tags: List[Dict[str, Any]], post_content: Optional[str] = None) -> tuple[bool, str, List[str]]:
         """
@@ -556,22 +647,51 @@ class EnrichmentWorker:
         # Приоритет 2: trigger_tags
         trigger_tags_config = self.config.get('crawl4ai', {}).get('trigger_tags', [])
         if trigger_tags_config:
-            post_tags = [tag.get('name', '').lower() for tag in tags]
+            # Context7: Поддержка двух форматов tags: список строк или список словарей
+            if tags and isinstance(tags[0], dict):
+                # Формат: [{"name": "tag1"}, {"name": "tag2"}]
+                post_tags = [tag.get('name', '').lower() for tag in tags if isinstance(tag, dict)]
+            else:
+                # Формат: ["tag1", "tag2"] (стандартный формат из posts.tagged)
+                post_tags = [str(tag).lower() for tag in tags] if tags else []
             if any(tag.lower() in post_tags for tag in trigger_tags_config):
                 triggers.append("trigger:tag")
                 enrichment_triggers_total.labels(type="tag", decision="hit").inc()
             else:
                 enrichment_triggers_total.labels(type="tag", decision="miss").inc()
         
-        # Приоритет 3: word_count
+        # Приоритет 3: word_count (снижен порог с 100 до 50)
         if post_content:
-            min_word_count = self.config.get('crawl4ai', {}).get('min_word_count', 100)
+            min_word_count = self.config.get('crawl4ai', {}).get('min_word_count', 50)  # Context7: Снижен с 100 до 50
             word_count = len(post_content.split())
             if word_count >= min_word_count:
                 triggers.append("trigger:wordcount")
                 enrichment_triggers_total.labels(type="wordcount", decision="hit").inc()
             else:
                 enrichment_triggers_total.labels(type="wordcount", decision="miss").inc()
+        
+        # Приоритет 4: text_length (новый триггер - если текст >= 200 символов)
+        if post_content:
+            min_text_length = self.config.get('crawl4ai', {}).get('min_text_length', 200)  # Context7: Новый триггер
+            text_length = len(post_content)
+            if text_length >= min_text_length:
+                triggers.append("trigger:textlength")
+                enrichment_triggers_total.labels(type="textlength", decision="hit").inc()
+            else:
+                enrichment_triggers_total.labels(type="textlength", decision="miss").inc()
+        
+        # Приоритет 5: has_media (новый триггер - если пост содержит медиа)
+        # Context7: Получаем информацию о медиа из post_id
+        try:
+            post_context = await self._get_post_content(post_id)
+            if post_context and post_context.get('has_media'):
+                triggers.append("trigger:media")
+                enrichment_triggers_total.labels(type="media", decision="hit").inc()
+            else:
+                enrichment_triggers_total.labels(type="media", decision="miss").inc()
+        except Exception as e:
+            logger.debug("Failed to check media for enrichment trigger", post_id=post_id, error=str(e))
+            enrichment_triggers_total.labels(type="media", decision="miss").inc()
         
         if not triggers:
             return False, 'no_triggers', []
@@ -581,8 +701,12 @@ class EnrichmentWorker:
             reason = "trigger:url"
         elif "trigger:tag" in triggers:
             reason = "trigger:tag"
-        else:
+        elif "trigger:wordcount" in triggers:
             reason = "trigger:wordcount"
+        elif "trigger:textlength" in triggers:
+            reason = "trigger:textlength"
+        else:
+            reason = "trigger:media"
         
         return True, reason, triggers
     
@@ -606,16 +730,6 @@ class EnrichmentWorker:
         skip_limits = skip_limits_env.lower() == "true"
         logger.info("enrich_limits_check", extra={"env": skip_limits_env, "skip": skip_limits, "post_id": post_id})
         
-        if skip_limits:
-            logger.warning("enrich_limits_skipped: feature_flag enabled", extra={"post_id": post_id})
-            # Пропускаем проверку лимитов, возвращаем True для продолжения обогащения
-            return True, 'skip_limits_feature_flag', 'skip_limits_feature_flag', []
-        else:
-            # Проверка лимитов пользователя
-            if not await self._check_user_limits(post_id):
-                logger.warning("enrich_limits_exceeded", extra={"post_id": post_id})
-                return False, 'user_limits_exceeded', None, None
-        
         # Получаем контент поста для проверки триггеров (если не передан)
         if post_content is None:
             post = await self._get_post_content(post_id)
@@ -630,6 +744,21 @@ class EnrichmentWorker:
         
         if not should_enrich:
             return False, trigger_reason, None, None
+        
+        # Context7: Проверка лимитов только после подтверждения триггеров
+        if skip_limits:
+            logger.info("enrich_limits_skipped: feature_flag enabled, proceeding with enrichment", extra={
+                "post_id": post_id,
+                "trigger_reason": trigger_reason,
+                "triggers": triggers
+            })
+            # Пропускаем проверку лимитов, возвращаем True для продолжения обогащения
+            return True, 'skip_limits_feature_flag', trigger_reason, triggers
+        else:
+            # Проверка лимитов пользователя
+            if not await self._check_user_limits(post_id):
+                logger.warning("enrich_limits_exceeded", extra={"post_id": post_id})
+                return False, 'user_limits_exceeded', None, None
         
         # Логируем сработавшие триггеры
         logger.info(
@@ -836,8 +965,9 @@ class EnrichmentWorker:
                 JOIN posts p ON p.id = pe.post_id
                 JOIN channels c ON p.channel_id = c.id
                 WHERE c.tenant_id = :tenant_id
-                AND DATE(pe.enriched_at) = :today
-                AND pe.crawl_md IS NOT NULL
+                AND DATE(pe.updated_at) = :today
+                AND pe.kind = 'crawl'
+                AND pe.data->>'crawl_md' IS NOT NULL
                 """),
                 {"tenant_id": tenant_id, "today": today}
             )
@@ -903,8 +1033,9 @@ class EnrichmentWorker:
         return None
     
     async def _get_post_content(self, post_id: str) -> Optional[Dict[str, Any]]:
-        """Получение контента поста."""
-        sql = "SELECT content FROM posts WHERE id = :post_id LIMIT 1"
+        """Получение контента поста и информации о медиа."""
+        # Context7: Получаем content и has_media для проверки триггеров
+        sql = "SELECT content, has_media FROM posts WHERE id = :post_id LIMIT 1"
         t0 = time.perf_counter()
         try:
             result = await self.db_session.execute(
@@ -912,14 +1043,13 @@ class EnrichmentWorker:
                 {"post_id": post_id}
             )
             elapsed = (time.perf_counter() - t0) * 1000
-            logger.info("enrich_sql_ok", extra={"ms": elapsed, "row_found": bool(result.fetchone())})
+            row = result.fetchone()
+            logger.info("enrich_sql_ok", extra={"ms": elapsed, "row_found": bool(row)})
+            return dict(row._mapping) if row else None
         except Exception as e:
             elapsed = (time.perf_counter() - t0) * 1000
             logger.error("enrich_sql_error", extra={"err": str(e), "ms": elapsed, "sql_preview": sql.strip()[:120]})
             return None
-        
-        row = result.fetchone()
-        return dict(row._mapping) if row else None
     
     async def _enrich_post_urls(self, post: Dict[str, Any], tenant_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
@@ -982,7 +1112,7 @@ class EnrichmentWorker:
         try:
             crawl_result = await self.db_session.execute(
                 text("""
-                    SELECT data, crawl_md, updated_at
+                    SELECT data, updated_at
                     FROM post_enrichment
                     WHERE post_id = :post_id AND kind = 'crawl'
                     ORDER BY updated_at DESC
@@ -994,7 +1124,8 @@ class EnrichmentWorker:
             
             if row and row[0]:  # data JSONB не пустой
                 crawl_data = row[0] if isinstance(row[0], dict) else json.loads(row[0]) if isinstance(row[0], str) else {}
-                crawl_md = row[1] if row[1] else crawl_data.get('crawl_md') or crawl_data.get('markdown')
+                # Context7: crawl_md теперь в data JSONB (legacy поле удалено в миграции)
+                crawl_md = crawl_data.get('crawl_md') or crawl_data.get('markdown') or crawl_data.get('enrichment_data', {}).get('crawl_md')
                 
                 if crawl_md or crawl_data.get('urls'):
                     # Формируем результат в формате, ожидаемом enrichment_data
@@ -1002,7 +1133,7 @@ class EnrichmentWorker:
                         'source_urls': urls,
                         'crawl_results': [],
                         'total_word_count': crawl_data.get('word_count', 0) or 0,
-                        'crawled_at': crawl_data.get('crawled_at') or (row[2].isoformat() if row[2] else datetime.now(timezone.utc).isoformat())
+                        'crawled_at': crawl_data.get('crawled_at') or (row[1].isoformat() if len(row) > 1 and row[1] else datetime.now(timezone.utc).isoformat())
                     }
                     
                     # Извлекаем crawl_results из data
@@ -1450,26 +1581,95 @@ class EnrichmentWorker:
             raise
     
     async def _publish_skipped_enrichment(self, original_event: Dict[str, Any], skip_reason: str):
-        """Публикация события posts.enriched для пропущенного поста."""
+        """
+        Context7: Публикация события posts.enriched для пропущенного поста.
+        Использует тот же формат, что и успешное обогащение, для совместимости с IndexingTask.
+        """
         try:
-            # Создание события
-            enriched_event = PostEnrichedEvent(
-                idempotency_key=original_event['idempotency_key'],
-                post_id=original_event['post_id'],
-                enrichment_data={},
-                source_urls=[],
-                word_count=0,
-                skipped=True,
-                skip_reason=skip_reason
-            )
+            post_id = original_event.get('post_id')
+            if not post_id:
+                logger.warning("Cannot publish skipped enrichment: post_id missing", extra={
+                    "event_keys": list(original_event.keys()),
+                    "skip_reason": skip_reason
+                })
+                # Context7: Метрика для отслеживания пропущенных событий без post_id
+                posts_processed_total.labels(stage='enrichment', success='error').inc()
+                return
+            
+            # Context7: Санитизация post_id для использования в запросах к БД
+            sanitized_post_id_for_skip = str(normalize_post_id(post_id)) if os.getenv("FEATURE_ALLOW_NON_UUID_IDS", "false").lower() == "true" else post_id
+            
+            # Context7: Получаем tenant_id из original_event или БД
+            tenant_id = original_event.get('tenant_id')
+            if not tenant_id or tenant_id == "default":
+                try:
+                    tenant_id_result = await self.db_session.execute(
+                        text("""
+                            SELECT COALESCE(
+                                (SELECT u.tenant_id::text FROM users u 
+                                 JOIN user_channel uc ON uc.user_id = u.id 
+                                 WHERE uc.channel_id = c.id 
+                                 LIMIT 1),
+                                CAST(pe_tags.data->>'tenant_id' AS text),
+                                CAST(c.settings->>'tenant_id' AS text),
+                                'default'
+                            ) as tenant_id
+                            FROM posts p
+                            JOIN channels c ON c.id = p.channel_id
+                            LEFT JOIN post_enrichment pe_tags 
+                                ON pe_tags.post_id = p.id AND pe_tags.kind = 'tags'
+                            WHERE p.id = :post_id
+                            LIMIT 1
+                        """),
+                        {"post_id": sanitized_post_id_for_skip}
+                    )
+                    row = tenant_id_result.fetchone()
+                    if row and row[0] and row[0] != "default":
+                        tenant_id = str(row[0])
+                except Exception as e:
+                    logger.debug("Failed to get tenant_id from DB for skipped enrichment", post_id=post_id, error=str(e))
+                    tenant_id = tenant_id or "default"
+            
+            # Context7: Получаем post_context для channel_id и других полей
+            # Context7: Используем санитизированный post_id для запроса к БД
+            post_context = await self._get_post_with_urls(sanitized_post_id_for_skip)
+            
+            # Context7: Используем тот же формат, что и успешное обогащение
+            enriched_event = {
+                "idempotency_key": original_event.get('idempotency_key', f"{post_id}:enriched:v1"),
+                "post_id": post_id,
+                "tenant_id": tenant_id,
+                "channel_id": post_context.get("channel_id", "") if post_context else original_event.get('channel_id', ''),
+                "text": post_context.get("content", "") if post_context else original_event.get('text', ''),
+                "telegram_post_url": post_context.get("telegram_post_url", "") if post_context else "",
+                "posted_at": post_context.get("posted_at", datetime.now(timezone.utc)) if post_context else datetime.now(timezone.utc),
+                "enrichment_data": {
+                    "kind": "enrichment",
+                    "source": "enrichment_task",
+                    "version": "v1",
+                    "tags": original_event.get('tags', []),
+                    "entities": [],
+                    "urls": [],
+                    "reason": skip_reason,
+                    "metadata": {
+                        "triggers": [],
+                        "crawl_priority": "normal"
+                    }
+                },
+            }
             
             # Публикация через event publisher
-            from event_bus import EventPublisher
-            publisher = EventPublisher(self.consumer.client)
-            await publisher.publish_event('posts.enriched', enriched_event)
+            await self.publisher.publish_event('posts.enriched', enriched_event)
+            # Context7: Метрика инкрементируется один раз с финальным статусом для skipped enrichment
+            posts_processed_total.labels(stage='enrichment', success='skip').inc()
+            logger.info("enrich_skipped_published", extra={"post_id": post_id, "skip_reason": skip_reason})
             
         except Exception as e:
-            logger.error(f"Failed to publish skipped enrichment event: {e}")
+            logger.error("Failed to publish skipped enrichment event", extra={
+                "post_id": original_event.get('post_id'),
+                "skip_reason": skip_reason,
+                "error": str(e)
+            }, exc_info=True)
     
     async def get_stats(self) -> Dict[str, Any]:
         """Получение статистики worker."""
@@ -1619,5 +1819,5 @@ class EnrichmentTask:
 
 if __name__ == "__main__":
     import hashlib
-    logging.basicConfig(level=logging.INFO)
+    # Context7: structlog уже настроен глобально, не нужно basicConfig
     asyncio.run(main())

@@ -148,6 +148,7 @@ async def set_bot_commands() -> None:
         commands = [
             BotCommand(command="start", description="Начать работу с ботом"),
             BotCommand(command="help", description="Показать справку по командам"),
+            BotCommand(command="menu", description="Главное меню"),
             BotCommand(command="login", description="Войти в систему"),
             BotCommand(command="add_channel", description="Добавить канал"),
             BotCommand(command="my_channels", description="Мои каналы"),
@@ -159,6 +160,7 @@ async def set_bot_commands() -> None:
             BotCommand(command="recommend", description="Получить рекомендации"),
             BotCommand(command="trends", description="Тренды в каналах"),
             BotCommand(command="subscription", description="Информация о подписке"),
+            BotCommand(command="feedback", description="Отправить feedback"),
             BotCommand(command="admin", description="Админ-панель"),
         ]
         

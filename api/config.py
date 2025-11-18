@@ -109,6 +109,19 @@ class Settings(BaseSettings):
     digest_agent_canary_tenants: list[str] = []  # Allow-list арендаторов для canary
     digest_agent_version: str = "v1"
     
+    @field_validator("digest_agent_enabled", mode="before")
+    @classmethod
+    def parse_digest_agent_enabled(cls, v):
+        """Context7: Парсинг DIGEST_AGENT_ENABLED из строки (1/0) в bool."""
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            v_lower = v.strip().lower()
+            return v_lower in ("1", "true", "yes", "on")
+        if isinstance(v, int):
+            return bool(v)
+        return False
+    
     # WebApp auth TTL (Context7)
     webapp_auth_ttl_seconds: int = 900  # 15 минут по умолчанию
     
@@ -134,6 +147,11 @@ class Settings(BaseSettings):
     searxng_enrichment_min_results_threshold: int = 3  # Минимальное количество результатов для обогащения
     searxng_enrichment_score_threshold: float = 0.6  # Порог среднего score для обогащения (0.0-1.0)
     searxng_enrichment_max_external_results: int = 2  # Максимум внешних результатов для обогащения
+    
+    # Context7: OCR Enhancement Configuration - улучшение качества OCR текста
+    ocr_enhancement_enabled: bool = True  # Включение/выключение пайплайна улучшения OCR
+    ocr_spell_llm_fallback_enabled: bool = True  # Включение LLM fallback для spell correction
+    ocr_entity_extraction_enabled: bool = True  # Включение извлечения сущностей из OCR
     
     # SaluteSpeech Configuration - Context7: для транскрибации голосовых сообщений
     salutespeech_client_id: str = ""

@@ -7,6 +7,7 @@ Context7 best practice: индексация в Qdrant и Neo4j с обновл�
 
 import asyncio
 import os
+import re
 import time
 import structlog
 import psycopg2
@@ -794,10 +795,12 @@ class IndexingTask:
                     text_parts.append(vision_desc_normalized[:500])  # Лимит 500 символов
                 
                 # Vision OCR text
+                # Context7: Используем text_enhanced если доступен (приоритет), иначе text
                 vision_ocr = vision_data.get('ocr')
                 if vision_ocr:
                     if isinstance(vision_ocr, dict):
-                        ocr_text = vision_ocr.get('text', '')
+                        # Приоритет: text_enhanced > text (fallback на оригинал если enhanced отсутствует)
+                        ocr_text = vision_ocr.get('text_enhanced') or vision_ocr.get('text', '')
                     else:
                         ocr_text = str(vision_ocr)
                     
@@ -805,8 +808,24 @@ class IndexingTask:
                         # Context7: [C7-ID: ocr-text-normalization-001] Нормализация OCR текста перед использованием
                         # OCR текст часто содержит множественные переносы строк и плохое форматирование
                         # Нормализация удаляет избыточные пробелы и переносы строк для улучшения качества эмбеддингов
+                        # text_enhanced уже нормализован, но дополнительная нормализация для консистентности
                         ocr_text_normalized = normalize_text(ocr_text)
                         text_parts.append(ocr_text_normalized[:300])  # Лимит 300 символов
+                        
+                        # Context7: Логирование метрик качества (coverage, если есть corrections)
+                        if isinstance(vision_ocr, dict) and vision_ocr.get('corrections'):
+                            corrections_count = len(vision_ocr.get('corrections', []))
+                            original_length = len(vision_ocr.get('text', ''))
+                            enhanced_length = len(ocr_text)
+                            coverage = corrections_count / max(1, len(re.findall(r'\b\w+\b', vision_ocr.get('text', ''))))
+                            logger.debug(
+                                "Using enhanced OCR text for embedding",
+                                post_id=post_data.get('id'),
+                                original_length=original_length,
+                                enhanced_length=enhanced_length,
+                                corrections_count=corrections_count,
+                                coverage=round(coverage, 3)
+                            )
             
             # Crawl enrichment данные (приоритет 3)
             crawl_data = post_data.get('crawl_data')
@@ -1380,6 +1399,8 @@ class IndexingTask:
                 # Продолжаем с оригинальными данными
             
             # Context7: Вызов метода create_post_node с enrichment данными
+            # Context7 P2: Добавляем telegram_message_id и tg_channel_id для reply связей
+            # Context7: Добавляем posted_at для обогащения графа временными данными
             success = await self.neo4j_client.create_post_node(
                 post_id=node_data['post_id'],
                 user_id=post_data.get('user_id', 'system'),  # Fallback для совместимости
@@ -1388,7 +1409,10 @@ class IndexingTask:
                 expires_at=node_data['expires_at'],
                 enrichment_data=node_data.get('enrichment_data'),
                 indexed_at=node_data['indexed_at'],
-                content=node_data.get('content')
+                content=node_data.get('content'),
+                telegram_message_id=post_data.get('telegram_message_id'),
+                tg_channel_id=post_data.get('tg_channel_id'),
+                posted_at=node_data.get('posted_at')
             )
             
             # Context7: Создаём узел альбома и связи если пост из альбома
@@ -1470,11 +1494,50 @@ class IndexingTask:
                             has_s3_keys_list=bool(s3_keys_list)
                         )
                     
+                    # Context7: Извлечение mime_type из БД (media_objects) по sha256
+                    mime_type = None
+                    if sha256:
+                        try:
+                            # Получаем mime_type из media_objects по sha256
+                            # Используем async execute для запроса к БД
+                            db_url = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@supabase-db:5432/postgres")
+                            if db_url.startswith("postgresql://"):
+                                db_url = db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+                            
+                            engine = create_async_engine(db_url)
+                            try:
+                                async_session = async_sessionmaker(engine, expire_on_commit=False)
+                                
+                                async with async_session() as session:
+                                    result = await session.execute(
+                                        text("""
+                                            SELECT mime_type 
+                                            FROM media_objects 
+                                            WHERE file_sha256 = :sha256 
+                                            LIMIT 1
+                                        """),
+                                        {"sha256": sha256}
+                                    )
+                                    row = result.fetchone()
+                                    if row and row[0]:
+                                        mime_type = row[0]
+                            finally:
+                                # Context7: Закрываем engine после использования
+                                await engine.dispose()
+                        except Exception as e:
+                            logger.debug(
+                                "Failed to get mime_type from DB for ImageContent node",
+                                post_id=post_id,
+                                sha256=sha256[:16] + "..." if sha256 and len(sha256) > 16 else sha256,
+                                error=str(e)
+                            )
+                            # Не критично - продолжаем без mime_type
+                    
                     await self.neo4j_client.create_image_content_node(
                         post_id=post_id,
                         sha256=sha256 or 'unknown',  # Fallback если нет sha256
                         s3_key=image_key,
-                        mime_type=None,  # TODO: извлечь из media metadata
+                        mime_type=mime_type,
                         vision_classification=vision_data.get('classification'),
                         is_meme=vision_data.get('is_meme', False),
                         labels=labels if isinstance(labels, list) else [],
@@ -1510,6 +1573,25 @@ class IndexingTask:
                                 url_hash=url_hash,
                                 content_sha256=content_sha256
                             )
+            
+            # Context7: Создание Entity nodes из OCR сущностей
+            if vision_data and isinstance(vision_data, dict):
+                vision_ocr = vision_data.get('ocr')
+                if vision_ocr and isinstance(vision_ocr, dict):
+                    ocr_entities = vision_ocr.get('entities', [])
+                    if ocr_entities and isinstance(ocr_entities, list):
+                        # Используем text_enhanced для контекста если доступен
+                        ocr_text = vision_ocr.get('text_enhanced') or vision_ocr.get('text', '')
+                        await self.neo4j_client.create_ocr_entities(
+                            post_id=post_id,
+                            entities=ocr_entities,
+                            ocr_context=ocr_text
+                        )
+                        logger.debug(
+                            "OCR entities indexed to Neo4j",
+                            post_id=post_id,
+                            entities_count=len(ocr_entities)
+                        )
             
             logger.debug("Indexed to Neo4j with enrichment",
                         post_id=post_id,

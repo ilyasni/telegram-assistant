@@ -30,3 +30,7 @@ class DigestStates(StatesGroup):
     waiting_topics = State()  # Ожидание ввода тем
     waiting_schedule_time = State()  # Ожидание времени отправки
     waiting_frequency = State()  # Ожидание частоты
+
+class FeedbackStates(StatesGroup):
+    """Состояния для отправки feedback."""
+    waiting_message = State()  # Ожидание ввода текста feedback

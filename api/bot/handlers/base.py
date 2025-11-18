@@ -6,7 +6,7 @@ from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, C
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from bot.states import DigestStates, AddChannelStates, ChannelManagementStates, SearchStates
+from bot.states import DigestStates, AddChannelStates, ChannelManagementStates, SearchStates, FeedbackStates
 import html
 import httpx
 import structlog
@@ -308,6 +308,10 @@ async def cmd_help(msg: Message):
 <b>💎 Подписка</b>
 /subscription — Информация о вашей подписке и лимитах
 
+<b>💬 Feedback</b>
+/feedback — Отправить комментарий, предложение или пожелание
+Пример: <code>/feedback</code> — затем введите ваш текст
+
 <b>💡 Советы</b>
 • Задавайте вопросы естественным языком
 • Используйте голосовые сообщения для быстрого ввода
@@ -321,6 +325,17 @@ async def cmd_help(msg: Message):
         help_text,
         parse_mode="HTML",
         reply_markup=_kb_login(_resolve_qr_webapp_url(None, msg.from_user.id))
+    )
+
+
+@router.message(Command("menu"))
+async def cmd_menu(msg: Message):
+    """Обработчик команды /menu — показывает главное меню."""
+    await msg.answer(
+        "🤖 <b>Главное меню</b>\n\n"
+        "Выберите действие:",
+        parse_mode="HTML",
+        reply_markup=_kb_main_menu()
     )
 
 
@@ -394,6 +409,98 @@ async def cmd_recommend(msg: Message):
 async def cmd_subscription(msg: Message):
     """Обработчик команды /subscription."""
     await _show_subscription(msg)
+
+
+@router.message(Command("feedback"))
+async def cmd_feedback(msg: Message, state: FSMContext):
+    """Обработчик команды /feedback для отправки комментариев и пожеланий."""
+    await state.set_state(FeedbackStates.waiting_message)
+    await msg.answer(
+        "💬 <b>Отправка feedback</b>\n\n"
+        "Пожалуйста, опишите ваше предложение, комментарий или пожелание.\n\n"
+        "Мы ценим ваше мнение и обязательно рассмотрим ваше сообщение.\n\n"
+        "Используйте /cancel для отмены.",
+        parse_mode="HTML"
+    )
+
+
+@router.message(FeedbackStates.waiting_message)
+async def process_feedback_message(msg: Message, state: FSMContext):
+    """Обработка ввода текста feedback."""
+    # Проверка на команду отмены
+    if msg.text and msg.text.startswith("/cancel"):
+        await state.clear()
+        await msg.answer("❌ Отправка feedback отменена.")
+        return
+    
+    # Валидация длины сообщения
+    if len(msg.text.strip()) < 3:
+        await msg.answer(
+            "❌ <b>Слишком короткое сообщение</b>\n\n"
+            "Пожалуйста, опишите ваше предложение более подробно (минимум 3 символа)."
+        )
+        return
+    
+    if len(msg.text.strip()) > 5000:
+        await msg.answer(
+            f"❌ <b>Слишком длинное сообщение</b>\n\n"
+            f"Максимальная длина feedback: 5000 символов.\n"
+            f"Ваше сообщение: {len(msg.text)} символов."
+        )
+        return
+    
+    try:
+        # Получаем пользователя
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(f"{API_BASE}/api/users/{msg.from_user.id}")
+            if r.status_code == 404:
+                await msg.answer("❌ Пользователь не найден. Используйте /start для регистрации.")
+                await state.clear()
+                return
+            r.raise_for_status()
+            user = r.json()
+        
+        # Создаем feedback через API
+        feedback_data = {
+            "message": msg.text.strip(),
+            "user_id": str(user['id'])
+        }
+        
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(f"{API_BASE}/api/feedback/", json=feedback_data)
+            r.raise_for_status()
+            feedback = r.json()
+        
+        await msg.answer(
+            "✅ <b>Feedback отправлен!</b>\n\n"
+            "Спасибо за ваше сообщение. Мы рассмотрим его в ближайшее время.\n\n"
+            f"ID: <code>{feedback['id']}</code>\n"
+            f"Статус: {feedback['status']}",
+            parse_mode="HTML"
+        )
+        
+        logger.info(
+            "Feedback created via bot",
+            feedback_id=str(feedback['id']),
+            user_id=str(user['id']),
+            telegram_id=msg.from_user.id,
+            message_length=len(msg.text.strip())
+        )
+        
+        await state.clear()
+        
+    except httpx.HTTPStatusError as e:
+        logger.error(
+            "HTTP error creating feedback",
+            status_code=e.response.status_code,
+            response_text=e.response.text[:200] if hasattr(e.response, 'text') else None
+        )
+        await msg.answer("❌ <b>Ошибка отправки feedback</b>\n\nПопробуйте позже.")
+        await state.clear()
+    except Exception as e:
+        logger.error("Error creating feedback", error=str(e))
+        await msg.answer("❌ <b>Произошла ошибка</b>\n\nПопробуйте позже.")
+        await state.clear()
 
 
 @router.message(Command("admin"))
@@ -1138,7 +1245,8 @@ async def cmd_my_channels(msg: Message):
     ~StateFilter(AddChannelStates.await_username),
     ~StateFilter(ChannelManagementStates.viewing_channel),
     ~StateFilter(ChannelManagementStates.confirming_delete),
-    ~StateFilter(SearchStates.awaiting_query)
+    ~StateFilter(SearchStates.awaiting_query),
+    ~StateFilter(FeedbackStates.waiting_message)
 )
 async def handle_text_message(msg: Message):
     """

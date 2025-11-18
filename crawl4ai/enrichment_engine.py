@@ -407,14 +407,46 @@ class EnrichmentEngine:
             
             try:
                 response = await self.circuit_breaker.call_async(_fetch_url)
+            except aiohttp.ClientConnectionError as conn_error:
+                # Context7: Специфичная обработка connection errors
+                # Best practice: различать типы ошибок для лучшей диагностики
+                logger.warning(
+                    "Connection error during enrichment",
+                    url=url,
+                    error=str(conn_error),
+                    error_type="ClientConnectionError",
+                    url_hash=url_hash
+                )
+                return None
+            except aiohttp.ClientTimeout as timeout_error:
+                # Context7: Специфичная обработка timeout errors
+                logger.warning(
+                    "Timeout error during enrichment",
+                    url=url,
+                    error=str(timeout_error),
+                    error_type="ClientTimeout",
+                    url_hash=url_hash
+                )
+                return None
+            except aiohttp.ClientError as client_error:
+                # Context7: Общая обработка других aiohttp client errors
+                logger.warning(
+                    "Client error during enrichment",
+                    url=url,
+                    error=str(client_error),
+                    error_type="ClientError",
+                    url_hash=url_hash
+                )
+                return None
             except Exception as cb_error:
-                # Context7: Circuit breaker открыт или произошла ошибка
+                # Context7: Circuit breaker открыт или произошла другая ошибка
                 # Логируем и возвращаем None для graceful degradation
                 logger.warning(
                     "HTTP request blocked by circuit breaker or failed",
                     url=url,
                     error=str(cb_error),
-                    circuit_breaker_state=self.circuit_breaker.get_state(),
+                    error_type=type(cb_error).__name__,
+                    circuit_breaker_state=self.circuit_breaker.get_state() if hasattr(self.circuit_breaker, 'get_state') else 'unknown',
                     url_hash=url_hash
                 )
                 return None
@@ -426,6 +458,35 @@ class EnrichmentEngine:
                 cache_hits_total.labels(type='http').inc()
                 logger.debug("URL not modified, using cache", url=url)
                 return await self._get_from_cache(cache_key)
+            
+            # Context7: Обработка HTTP 429 (Too Many Requests) с exponential backoff
+            # Best practice: обрабатывать rate limiting с увеличенным backoff
+            if response.status == 429:
+                retry_after = int(response.headers.get('Retry-After', 60))
+                logger.warning(
+                    "HTTP 429 Too Many Requests, applying exponential backoff",
+                    url=url,
+                    retry_after=retry_after,
+                    url_hash=url_hash
+                )
+                # Используем Retry-After заголовок или exponential backoff
+                await asyncio.sleep(min(retry_after, 120))  # Максимум 2 минуты
+                # Retry запрос один раз после backoff
+                try:
+                    async with self.http_session.get(url, headers=headers) as retry_response:
+                        if retry_response.status == 200:
+                            response = retry_response
+                            processing_time = time.time() - start_time
+                        else:
+                            logger.warning("HTTP error after 429 retry",
+                                        url=url,
+                                        status=retry_response.status)
+                            return None
+                except Exception as retry_error:
+                    logger.error("Error during 429 retry",
+                               url=url,
+                               error=str(retry_error))
+                    return None
             
             if response.status != 200:
                 logger.warning("HTTP error during enrichment",

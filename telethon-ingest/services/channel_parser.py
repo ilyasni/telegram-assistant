@@ -25,13 +25,54 @@ import structlog
 from .telethon_retry import fetch_messages_with_retry, is_channel_in_cooldown
 from .atomic_db_saver import AtomicDBSaver
 from .rate_limiter import RateLimiter, check_parsing_rate_limit
+from .discussion_extractor import (
+    get_discussion_message,
+    extract_reply_chain,
+    check_channel_has_comments
+)
 from utils.time_utils import ensure_dt_utc
+from prometheus_client import Counter
 
 # WORKER IMPORT DISABLED - will be restored when worker module is available
 # from worker.event_bus import EventPublisher, PostParsedEvent
 # from worker.events.schemas.posts_parsed_v1 import PostParsedEventV1
 
 logger = structlog.get_logger()
+
+# Context7: Метрики для отслеживания проблем с парсингом
+# Context7: Используем проверку на существование метрики для предотвращения дублирования
+from prometheus_client import REGISTRY
+
+def _get_or_create_counter(name, description, labels):
+    """Получить существующую метрику или создать новую."""
+    try:
+        # Пытаемся получить существующую метрику
+        existing = REGISTRY._names_to_collectors.get(name)
+        if existing:
+            return existing
+    except (AttributeError, KeyError):
+        pass
+    
+    # Создаём новую метрику
+    return Counter(name, description, labels)
+
+channel_not_found_total = _get_or_create_counter(
+    'channel_not_found_total',
+    'Total channel not found errors',
+    ['exists_in_db']  # exists_in_db: 'true' или 'false'
+)
+
+album_save_failures_total = _get_or_create_counter(
+    'album_save_failures_total',
+    'Total album save failures',
+    ['error_type']
+)
+
+session_rollback_failures_total = _get_or_create_counter(
+    'session_rollback_failures_total',
+    'Total session rollback failures',
+    ['operation']  # operation: 'before_parsing', 'before_entity', 'before_albums'
+)
 
 # ============================================================================
 # КОНФИГУРАЦИЯ
@@ -155,7 +196,9 @@ class ChannelParser:
                            channel_id=channel_id)
         except Exception as e:
             logger.warning("Failed to rollback transaction before parsing",
-                         channel_id=channel_id, error=str(e))
+                         channel_id=channel_id, error=str(e), error_type=type(e).__name__)
+            # Context7: Метрика для отслеживания проблем с rollback
+            session_rollback_failures_total.labels(operation='before_parsing').inc()
         
         # Context7: Сброс статистики для каждого канала
         self.stats = {
@@ -221,30 +264,52 @@ class ChannelParser:
             
             # Context7: Получение tg_channel_id для проверки cooldown
             logger.info("Fetching tg_channel_id from DB", channel_id=channel_id)
-            # Context7: Используем autocommit=True для SELECT запросов, чтобы избежать проблем с транзакциями
-            try:
-                result = await self.db_session.execute(
-                    text("SELECT tg_channel_id FROM channels WHERE id = :channel_id"),
-                    {"channel_id": channel_id}
-                )
-                row = result.fetchone()
-            except Exception as e:
-                # Context7: Если ошибка "invalid transaction", делаем rollback и повторяем запрос
-                if "invalid transaction" in str(e).lower() or "rollback" in str(e).lower():
-                    logger.warning("Invalid transaction detected, rolling back and retrying", 
-                                 channel_id=channel_id, error=str(e))
+            # Context7: Используем retry логику для SELECT запросов, чтобы избежать проблем с транзакциями
+            async def _execute_tg_channel_id_query(max_retries: int = 3) -> Optional[Any]:
+                """Выполнение запроса tg_channel_id с retry логикой."""
+                for attempt in range(max_retries):
                     try:
-                        await self.db_session.rollback()
-                    except Exception:
-                        pass
-                    # Повторяем запрос после rollback
-                    result = await self.db_session.execute(
-                        text("SELECT tg_channel_id FROM channels WHERE id = :channel_id"),
-                        {"channel_id": channel_id}
-                    )
-                    row = result.fetchone()
-                else:
-                    raise
+                        # Context7: Перед каждым запросом проверяем состояние сессии
+                        if self.db_session.in_transaction():
+                            await self.db_session.rollback()
+                            logger.debug("Rolled back transaction before tg_channel_id query",
+                                       channel_id=channel_id, attempt=attempt + 1)
+                        
+                        result = await self.db_session.execute(
+                            text("SELECT tg_channel_id FROM channels WHERE id = :channel_id"),
+                            {"channel_id": channel_id}
+                        )
+                        return result.fetchone()
+                    except Exception as e:
+                        error_str = str(e).lower()
+                        is_transaction_error = (
+                            "invalid transaction" in error_str or
+                            "rollback" in error_str or
+                            "transaction" in error_str
+                        )
+                        
+                        if is_transaction_error and attempt < max_retries - 1:
+                            logger.warning("Transaction error in tg_channel_id query, retrying",
+                                         channel_id=channel_id,
+                                         attempt=attempt + 1,
+                                         max_retries=max_retries,
+                                         error=str(e))
+                            try:
+                                await self.db_session.rollback()
+                            except Exception:
+                                pass
+                            await asyncio.sleep(0.1 * (attempt + 1))
+                            continue
+                        else:
+                            raise
+                return None
+            
+            try:
+                row = await _execute_tg_channel_id_query()
+            except Exception as e:
+                logger.error("Failed to fetch tg_channel_id after retries",
+                           channel_id=channel_id, error=str(e))
+                raise
             logger.info("tg_channel_id query result", 
                        channel_id=channel_id,
                        has_row=row is not None,
@@ -310,14 +375,23 @@ class ChannelParser:
             
             # Context7: Проверяем и откатываем активную транзакцию перед получением entity
             # Это предотвращает ошибки "A transaction is already begun on this Session"
+            # Context7 best practice: Явная проверка и очистка состояния сессии
             try:
                 if self.db_session.in_transaction():
                     await self.db_session.rollback()
                     logger.debug("Rolled back active transaction before getting channel entity",
                                channel_id=channel_id)
+                    # Context7: Проверяем, что rollback прошел успешно
+                    if self.db_session.in_transaction():
+                        logger.error("Transaction still active after rollback - session may be in bad state",
+                                   channel_id=channel_id)
+                        # Context7: Метрика для отслеживания проблем с состоянием сессии
+                        session_rollback_failures_total.labels(operation='before_entity').inc()
             except Exception as e:
                 logger.warning("Failed to rollback transaction before getting channel entity",
-                             channel_id=channel_id, error=str(e))
+                             channel_id=channel_id, error=str(e), error_type=type(e).__name__)
+                # Context7: Метрика для отслеживания проблем с rollback
+                session_rollback_failures_total.labels(operation='before_entity').inc()
             
             # Получение entity канала и tg_channel_id
             channel_result = await self._get_channel_entity(telegram_client, channel_id)
@@ -327,29 +401,52 @@ class ChannelParser:
             channel_entity, tg_channel_id = channel_result
             
             # Context7 best practice: Получение данных канала для определения since_date
-            try:
-                result = await self.db_session.execute(
-                    text("SELECT id, last_parsed_at FROM channels WHERE id = :channel_id"),
-                    {"channel_id": channel_id}
-                )
-                channel_row = result.fetchone()
-            except Exception as e:
-                # Context7: Если ошибка "invalid transaction", делаем rollback и повторяем запрос
-                if "invalid transaction" in str(e).lower() or "rollback" in str(e).lower():
-                    logger.warning("Invalid transaction detected, rolling back and retrying", 
-                                 channel_id=channel_id, error=str(e))
+            # Context7: Используем retry логику для обработки проблем с транзакциями
+            async def _execute_channel_data_query(max_retries: int = 3) -> Optional[Any]:
+                """Выполнение запроса данных канала с retry логикой."""
+                for attempt in range(max_retries):
                     try:
-                        await self.db_session.rollback()
-                    except Exception:
-                        pass
-                    # Повторяем запрос после rollback
-                    result = await self.db_session.execute(
-                        text("SELECT id, last_parsed_at FROM channels WHERE id = :channel_id"),
-                        {"channel_id": channel_id}
-                    )
-                    channel_row = result.fetchone()
-                else:
-                    raise
+                        # Context7: Перед каждым запросом проверяем состояние сессии
+                        if self.db_session.in_transaction():
+                            await self.db_session.rollback()
+                            logger.debug("Rolled back transaction before channel data query",
+                                       channel_id=channel_id, attempt=attempt + 1)
+                        
+                        result = await self.db_session.execute(
+                            text("SELECT id, last_parsed_at FROM channels WHERE id = :channel_id"),
+                            {"channel_id": channel_id}
+                        )
+                        return result.fetchone()
+                    except Exception as e:
+                        error_str = str(e).lower()
+                        is_transaction_error = (
+                            "invalid transaction" in error_str or
+                            "rollback" in error_str or
+                            "transaction" in error_str
+                        )
+                        
+                        if is_transaction_error and attempt < max_retries - 1:
+                            logger.warning("Transaction error in channel data query, retrying",
+                                         channel_id=channel_id,
+                                         attempt=attempt + 1,
+                                         max_retries=max_retries,
+                                         error=str(e))
+                            try:
+                                await self.db_session.rollback()
+                            except Exception:
+                                pass
+                            await asyncio.sleep(0.1 * (attempt + 1))
+                            continue
+                        else:
+                            raise
+                return None
+            
+            try:
+                channel_row = await _execute_channel_data_query()
+            except Exception as e:
+                logger.error("Failed to fetch channel data after retries",
+                           channel_id=channel_id, error=str(e))
+                raise
             channel_data = {
                 'id': str(channel_row.id) if channel_row else channel_id,
                 'last_parsed_at': channel_row.last_parsed_at if channel_row and channel_row.last_parsed_at else None
@@ -371,20 +468,26 @@ class ChannelParser:
             # Парсинг сообщений батчами
             messages_processed = 0
             batch_count = 0
+            has_successful_save = False  # Context7: Отслеживаем успешное сохранение хотя бы одного батча
             
             async for message_batch in self._get_message_batches(
                 telegram_client, channel_entity, since_date, mode
             ):
                 batch_count += 1
                 
-                # Обработка батча с передачей mode и channel_entity
+                # Обработка батча с передачей mode, channel_entity и telegram_client
                 batch_result = await self._process_message_batch(
-                    message_batch, channel_id, user_id, tenant_id, tg_channel_id, channel_entity, mode
+                    message_batch, channel_id, user_id, tenant_id, tg_channel_id, channel_entity, mode, telegram_client
                 )
                 
                 messages_processed += batch_result['processed']
                 self.stats['messages_parsed'] += batch_result['processed']
                 self.stats['messages_skipped'] += batch_result['skipped']
+                
+                # Context7: Отслеживаем успешное сохранение - если processed > 0, значит сохранение прошло успешно
+                # (в _process_message_batch processed увеличивается только после успешного save_batch_atomic)
+                if batch_result['processed'] > 0:
+                    has_successful_save = True
                 
                 # Track max_message_date across all batches
                 if batch_result.get('max_date') and (max_message_date is None or batch_result['max_date'] > max_message_date):
@@ -397,9 +500,23 @@ class ChannelParser:
             # Обновление статистики канала
             await self._update_channel_stats(channel_id, messages_processed)
             
-            # Context7 best practice: Обновление last_parsed_at после успешного парсинга
-            # ВСЕГДА обновляем для отслеживания последней попытки парсинга
-            await self._update_last_parsed_at(channel_id, messages_processed)
+            # Context7 best practice: Обновление last_parsed_at ТОЛЬКО после успешного сохранения постов
+            # КРИТИЧНО: Не обновляем last_parsed_at если все батчи завершились с ошибкой сохранения
+            # Это предотвращает пропуск постов при следующем парсинге
+            if has_successful_save or messages_processed == 0:
+                # Обновляем если:
+                # 1. Был хотя бы один успешный save (has_successful_save = True), ИЛИ
+                # 2. Не было постов для сохранения (messages_processed = 0) - это нормальная ситуация
+                await self._update_last_parsed_at(channel_id, messages_processed)
+            else:
+                # Context7: Все батчи завершились с ошибкой - НЕ обновляем last_parsed_at
+                # Это гарантирует, что при следующем парсинге мы попытаемся сохранить те же посты
+                logger.warning(
+                    "Skipping last_parsed_at update - all batches failed to save",
+                    channel_id=channel_id,
+                    messages_processed=messages_processed,
+                    batch_count=batch_count
+                )
             
             # Context7: [C7-ID: monitoring-missing-posts-002] Мониторинг пропусков постов
             # Сравниваем last_parsed_at с реальным временем последнего поста
@@ -454,39 +571,111 @@ class ChannelParser:
         """
         try:
             # Context7: Проверка и очистка транзакции перед запросом
+            # Context7 best practice: Явно проверяем и очищаем состояние сессии
             try:
                 if self.db_session.in_transaction():
                     await self.db_session.rollback()
-            except Exception:
-                pass
+                    logger.debug("Rolled back active transaction before _get_channel_entity",
+                               channel_id=channel_id)
+            except Exception as rollback_error:
+                logger.warning("Failed to rollback transaction before _get_channel_entity",
+                             channel_id=channel_id, error=str(rollback_error))
+            
+            # Context7: Функция для выполнения запроса с retry логикой
+            async def _execute_channel_query(max_retries: int = 3) -> Optional[Any]:
+                """Выполнение запроса с retry логикой для обработки проблем с транзакциями."""
+                for attempt in range(max_retries):
+                    try:
+                        # Context7: Перед каждым запросом проверяем состояние сессии
+                        if self.db_session.in_transaction():
+                            await self.db_session.rollback()
+                            logger.debug("Rolled back transaction before query attempt",
+                                       channel_id=channel_id, attempt=attempt + 1)
+                        
+                        result = await self.db_session.execute(
+                            text("SELECT tg_channel_id, username, title FROM channels WHERE id = :channel_id"),
+                            {"channel_id": channel_id}
+                        )
+                        channel_info = result.fetchone()
+                        return channel_info
+                    except Exception as e:
+                        error_str = str(e).lower()
+                        is_transaction_error = (
+                            "invalid transaction" in error_str or
+                            "rollback" in error_str or
+                            "transaction" in error_str
+                        )
+                        
+                        if is_transaction_error and attempt < max_retries - 1:
+                            logger.warning("Transaction error in channel query, retrying",
+                                         channel_id=channel_id,
+                                         attempt=attempt + 1,
+                                         max_retries=max_retries,
+                                         error=str(e),
+                                         error_type=type(e).__name__)
+                            try:
+                                await self.db_session.rollback()
+                            except Exception:
+                                pass
+                            # Небольшая задержка перед retry
+                            await asyncio.sleep(0.1 * (attempt + 1))
+                            continue
+                        else:
+                            logger.error("Failed to execute channel query",
+                                       channel_id=channel_id,
+                                       attempt=attempt + 1,
+                                       error=str(e),
+                                       error_type=type(e).__name__)
+                            raise
+                return None
             
             # Получение информации о канале из БД
-            try:
-                result = await self.db_session.execute(
-                    text("SELECT tg_channel_id, username, title FROM channels WHERE id = :channel_id"),
-                    {"channel_id": channel_id}
-                )
-                channel_info = result.fetchone()
-            except Exception as e:
-                # Context7: Если ошибка "invalid transaction", делаем rollback и повторяем запрос
-                if "invalid transaction" in str(e).lower() or "rollback" in str(e).lower():
-                    logger.warning("Invalid transaction detected in _get_channel_entity, rolling back and retrying", 
-                                 channel_id=channel_id, error=str(e))
-                    try:
-                        await self.db_session.rollback()
-                    except Exception:
-                        pass
-                    # Повторяем запрос после rollback
-                    result = await self.db_session.execute(
-                        text("SELECT tg_channel_id, username, title FROM channels WHERE id = :channel_id"),
-                        {"channel_id": channel_id}
-                    )
-                    channel_info = result.fetchone()
-                else:
-                    raise
+            # Context7: Добавляем детальное логирование для диагностики
+            logger.debug("Fetching channel info from DB", channel_id=channel_id)
+            channel_info = await _execute_channel_query()
+            
+            if channel_info:
+                logger.debug("Channel info query result", 
+                           channel_id=channel_id,
+                           has_result=True,
+                           tg_channel_id=channel_info.tg_channel_id,
+                           username=channel_info.username)
+            else:
+                logger.warning("Channel info query returned None", channel_id=channel_id)
             
             if not channel_info:
-                logger.error("Channel not found in database", channel_id=channel_id)
+                # Context7: Дополнительная диагностика - проверяем, существует ли канал в БД
+                logger.error("Channel not found in database", 
+                           channel_id=channel_id,
+                           query_executed=True)
+                # Context7: Пытаемся проверить, существует ли канал через прямой запрос с retry
+                try:
+                    # Context7: Проверяем состояние сессии перед диагностическим запросом
+                    if self.db_session.in_transaction():
+                        await self.db_session.rollback()
+                    
+                    diagnostic_result = await self.db_session.execute(
+                        text("SELECT COUNT(*) as count FROM channels WHERE id = :channel_id"),
+                        {"channel_id": channel_id}
+                    )
+                    diagnostic_row = diagnostic_result.fetchone()
+                    count = diagnostic_row.count if diagnostic_row else 0
+                    logger.error("Channel diagnostic query", 
+                               channel_id=channel_id,
+                               exists_in_db=count > 0,
+                               count=count)
+                    
+                    # Context7: Если канал существует, но не был найден - это проблема с сессией
+                    if count > 0:
+                        logger.error("Channel exists in DB but query returned None - possible session state issue",
+                                   channel_id=channel_id)
+                        # Context7: Метрика для отслеживания проблем с сессией
+                        channel_not_found_total.labels(exists_in_db='true').inc()
+                    else:
+                        channel_not_found_total.labels(exists_in_db='false').inc()
+                except Exception as diag_error:
+                    logger.error("Failed to run diagnostic query", 
+                               channel_id=channel_id, error=str(diag_error))
                 return None
             
             tg_channel_id_db = channel_info.tg_channel_id
@@ -1011,15 +1200,19 @@ class ChannelParser:
                              channel_id=channel_id)
                 return now - timedelta(minutes=self.config.incremental_minutes)
             
-            # Safeguard: если базовая дата слишком старая, форсим historical
+            # Context7: [C7-ID: incremental-old-date-fix-001] КРИТИЧНО - если базовая дата слишком старая,
+            # НЕ переключаемся на historical режим, а используем last_post_date как нижнюю границу
+            # Это гарантирует, что мы не пропустим посты, опубликованные между last_post_date и now
             age_hours = (now - base_utc).total_seconds() / 3600
             if age_hours > self.config.lpa_max_age_hours:
                 logger.warning(
-                    "Base date too old, forcing historical mode",
+                    "Base date too old, but using it as lower bound to avoid missing posts",
                     channel_id=channel_id,
-                    age_hours=age_hours
+                    age_hours=age_hours,
+                    base_date=base_utc.isoformat()
                 )
-                return now - timedelta(hours=self.config.historical_hours)
+                # НЕ переключаемся на historical - используем last_post_date как есть
+                # Это гарантирует, что мы найдем все посты после last_post_date
             
             # Проверка на будущее время
             if base_utc > now:
@@ -1053,10 +1246,10 @@ class ChannelParser:
             
             since_date = base_utc - timedelta(seconds=int(overlap_minutes * 60))
             
-            # Не даём since_date уйти в слишком далёкое прошлое
-            min_since_date = now - timedelta(hours=self.config.historical_hours)
-            if since_date < min_since_date:
-                since_date = min_since_date
+            # Context7: [C7-ID: incremental-old-date-fix-002] КРИТИЧНО - НЕ ограничиваем since_date для старых дат
+            # Если last_post_date старый, мы должны парсить все посты после него, даже если это больше 24 часов
+            # Ограничение min_since_date приводит к пропуску постов между last_post_date и now - 24h
+            # Убираем это ограничение для incremental режима, чтобы гарантировать полноту парсинга
             
             logger.debug("Calculated since_date with overlap",
                        channel_id=channel_id,
@@ -1130,7 +1323,8 @@ class ChannelParser:
                 channel_entity,
                 limit=limit,
                 redis_client=self.redis_client,
-                offset_date=offset_date_param  # Всегда None для обоих режимов (получаем последние сообщения)
+                offset_date=offset_date_param,  # Всегда None для обоих режимов (получаем последние сообщения)
+                reverse=False  # Context7 P1.3: По умолчанию без reverse (для incremental/historical)
             )
             
             # Диагностика: логируем первое и последнее сообщение для понимания диапазона
@@ -1171,16 +1365,20 @@ class ChannelParser:
             # Обрабатываем полученные сообщения
             messages_filtered = 0
             found_newer_messages = False  # Context7: Флаг для отслеживания наличия новых сообщений
+            messages_checked = 0  # Context7: Счетчик проверенных сообщений для диагностики
+            max_check_before_stop = 20  # Context7: Максимальное количество сообщений для проверки перед остановкой в incremental режиме
             
             for message in messages:
                 # Context7: КРИТИЧНО - нормализуем message.date к UTC для корректного сравнения
                 # Telethon может возвращать datetime с разными timezone или без timezone
                 message_date_utc = ensure_dt_utc(message.date) if message.date else None
+                messages_checked += 1
                 
                 if not message_date_utc:
                     logger.warning(f"Message {message.id} has no date, skipping",
                                  channel_id=channel_entity.id,
-                                 message_id=message.id)
+                                 message_id=message.id,
+                                 message_index=messages_checked)
                     continue
                 
                 # [C7-ID: dev-mode-017] Context7: Унифицированная логика фильтрации с нормализацией timezone
@@ -1194,8 +1392,8 @@ class ChannelParser:
                         break
                 else:  # incremental
                     # Context7: КРИТИЧНО - для incremental режима проверяем, есть ли сообщения новее since_date
-                    # Если первое сообщение уже старше since_date, это означает, что новых сообщений нет
-                    # НО: если мы уже нашли хотя бы одно новое сообщение, продолжаем до тех пор, пока не встретим старое
+                    # Улучшенная логика: проверяем несколько сообщений перед остановкой, чтобы не пропустить новые
+                    # если они не в начале списка (например, из-за задержек в Telegram API)
                     if message_date_utc > since_date:
                         found_newer_messages = True
                         # Включаем сообщение в batch
@@ -1204,11 +1402,19 @@ class ChannelParser:
                         messages_filtered += 1
                     elif found_newer_messages:
                         # Мы уже нашли новые сообщения, но теперь встретили старое - останавливаемся
-                        logger.info(f"Reached since_date in incremental mode after processing newer messages, stopping. message_date_utc={message_date_utc}, since_date={since_date}, messages_yielded={messages_yielded}, messages_filtered={messages_filtered}")
+                        logger.info(f"Reached since_date in incremental mode after processing newer messages, stopping. message_date_utc={message_date_utc}, since_date={since_date}, messages_yielded={messages_yielded}, messages_filtered={messages_filtered}, messages_checked={messages_checked}")
                         break
                     else:
-                        # Первое сообщение уже старше since_date - новых сообщений нет
-                        logger.info(f"No newer messages found in incremental mode. First message date: {message_date_utc}, since_date: {since_date}, messages_yielded={messages_yielded}, messages_filtered={messages_filtered}")
+                        # Первое сообщение уже старше since_date
+                        # Context7: Проверяем несколько сообщений перед остановкой, чтобы не пропустить новые
+                        # которые могут быть не в начале списка из-за задержек или нехронологического порядка
+                        if messages_checked < max_check_before_stop:
+                            # Продолжаем проверку - возможно, новые сообщения дальше в списке
+                            logger.debug(f"Message {messages_checked} is older than since_date, but checking more messages. message_date_utc={message_date_utc}, since_date={since_date}, messages_checked={messages_checked}/{max_check_before_stop}")
+                            continue
+                        else:
+                            # Проверили достаточно сообщений - новых нет
+                            logger.info(f"No newer messages found in incremental mode after checking {messages_checked} messages. Last checked message_date: {message_date_utc}, since_date: {since_date}, messages_yielded={messages_yielded}, messages_filtered={messages_filtered}")
                         break
                 
                 # Для historical режима добавляем сообщение в batch
@@ -1257,9 +1463,10 @@ class ChannelParser:
                     # Incremental: сообщения приходят от новых к старым, останавливаемся при встрече <= since_date
                     # Это исключает сообщения на границе since_date (равные last_parsed_at), предотвращая дубликаты
                     if message_date_utc <= since_date:
-                        logger.debug(f"Reached since_date in incremental mode, stopping. message_date_utc={message_date_utc}, since_date={since_date}")
+                        logger.debug(f"Reached since_date in incremental mode (fallback), stopping. message_date_utc={message_date_utc}, since_date={since_date}, messages_yielded={messages_yielded}")
                         break
                 
+                # Добавляем сообщение в batch (для historical или incremental с message_date_utc > since_date)
                 batch.append(message)
                 messages_yielded += 1
                 
@@ -1282,7 +1489,8 @@ class ChannelParser:
         tenant_id: str,
         tg_channel_id: int,
         channel_entity: Any = None,  # [C7-ID: dev-mode-012] Для получения title/username канала
-        mode: str = "historical"
+        mode: str = "historical",
+        telegram_client: Any = None  # Context7 P1: TelegramClient для DiscussionExtractor
     ) -> Dict[str, int]:
         """Обработка батча сообщений с обновлением HWM."""
         processed = 0
@@ -1372,26 +1580,29 @@ class ChannelParser:
                                     channel_id=channel_id
                                 )
                                 
-                                logger.debug(
+                                logger.info(
                                     "Media processed",
                                     post_id=post_id,
                                     media_count=len(media_files),
                                     is_album=bool(grouped_id and len(media_files) > 1),
                                     grouped_id=grouped_id,
-                                    channel_id=channel_id
+                                    channel_id=channel_id,
+                                    has_media=bool(message.media)
                                 )
                             else:
-                                logger.debug(
+                                logger.warning(
                                     "TelegramClient not available for media processing",
                                     post_id=post_id,
                                     user_id=user_id,
-                                    channel_id=channel_id
+                                    channel_id=channel_id,
+                                    has_media=bool(message.media)
                                 )
                         else:
-                            logger.debug(
+                            logger.warning(
                                 "TelegramClientManager not available for media processing",
                                 post_id=post_id,
-                                channel_id=channel_id
+                                channel_id=channel_id,
+                                has_media=bool(message.media)
                             )
                     except Exception as e:
                         logger.warning(
@@ -1402,6 +1613,15 @@ class ChannelParser:
                             exc_info=True
                         )
                         # Продолжаем обработку даже при ошибке медиа
+                elif message.media:
+                    # Context7: Логируем, почему медиа не обрабатывается
+                    logger.debug(
+                        "Media not processed - MediaProcessor or message.media check failed",
+                        post_id=post_id,
+                        has_media_processor=bool(self.media_processor),
+                        has_message_media=bool(message.media),
+                        channel_id=channel_id
+                    )
                 
                 # Сохраняем информацию о медиа в post_data для последующего использования
                 if media_files:
@@ -1421,7 +1641,8 @@ class ChannelParser:
                 )
                 events_data.append(event_data)
                 
-                processed += 1
+                # Context7: НЕ увеличиваем processed здесь - это будет сделано только после успешного сохранения в БД
+                # processed будет обновлен после успешного save_batch_atomic
                 
             except Exception as e:
                 logger.error(f"Failed to process message {message.id}: {e}", 
@@ -1435,7 +1656,7 @@ class ChannelParser:
         logger.info(f"Batch processing completed", 
                    channel_id=channel_id,
                    total_messages=len(messages),
-                   processed=processed,
+                   posts_prepared=len(posts_data),
                    skipped=skipped,
                    posts_data_count=len(posts_data),
                    max_date=max_date)
@@ -1453,12 +1674,40 @@ class ChannelParser:
                                 channel_id=channel_id)
                 
                 # Создаём user_channel через atomic_saver
+                # Context7 P2: Получение first_name из Telegram API (если доступен telegram_client)
+                user_first_name = ''
+                user_last_name = ''
+                user_username = ''
+                
+                # Context7 P2: Получаем first_name из Telegram API через telegram_client (передается как параметр)
+                if telegram_client and user_id:
+                    try:
+                        user_entity = await telegram_client.get_entity(int(user_id))
+                        if user_entity:
+                            user_first_name = getattr(user_entity, 'first_name', '') or ''
+                            user_last_name = getattr(user_entity, 'last_name', '') or ''
+                            user_username = getattr(user_entity, 'username', '') or ''
+                            
+                            logger.debug(
+                                "User info retrieved from Telegram API (no new posts)",
+                                user_id=user_id,
+                                first_name=user_first_name[:50] if user_first_name else None,
+                                username=user_username
+                            )
+                    except Exception as e:
+                        logger.debug(
+                            "Failed to get user entity from Telegram API (no new posts)",
+                            user_id=user_id,
+                            error=str(e)
+                        )
+                        # Продолжаем с пустыми значениями - не критично
+                
                 user_data = {
                     'telegram_id': user_id,
                     'tenant_id': tenant_id,
-                    'first_name': '',
-                    'last_name': '',
-                    'username': ''
+                    'first_name': user_first_name,
+                    'last_name': user_last_name,
+                    'username': user_username
                 }
                 
                 channel_title = channel_entity.title if channel_entity and hasattr(channel_entity, 'title') else ''
@@ -1505,12 +1754,40 @@ class ChannelParser:
         if posts_data:
             # Подготовка данных пользователя и канала
             # [C7-ID: dev-mode-012] tenant_id из параметра функции (передается в parse_channel_messages)
+            # Context7 P2: Получение first_name, last_name, username из Telegram API
+            user_first_name = ''
+            user_last_name = ''
+            user_username = ''
+            
+            if telegram_client and user_id:
+                try:
+                    # Получаем entity пользователя через Telegram API
+                    user_entity = await telegram_client.get_entity(int(user_id))
+                    if user_entity:
+                        user_first_name = getattr(user_entity, 'first_name', '') or ''
+                        user_last_name = getattr(user_entity, 'last_name', '') or ''
+                        user_username = getattr(user_entity, 'username', '') or ''
+                        
+                        logger.debug(
+                            "User info retrieved from Telegram API",
+                            user_id=user_id,
+                            first_name=user_first_name[:50] if user_first_name else None,
+                            username=user_username
+                        )
+                except Exception as e:
+                    logger.debug(
+                        "Failed to get user entity from Telegram API",
+                        user_id=user_id,
+                        error=str(e)
+                    )
+                    # Продолжаем с пустыми значениями - не критично
+            
             user_data = {
                 'telegram_id': user_id,
                 'tenant_id': tenant_id,  # Используем переданный tenant_id
-                'first_name': '',  # TODO: Получить из Telegram API
-                'last_name': '',
-                'username': ''
+                'first_name': user_first_name,
+                'last_name': user_last_name,
+                'username': user_username
             }
             
             # [C7-ID: dev-mode-012] channel_data использует tg_channel_id (bigint) для UPSERT, а не channel_id (UUID)
@@ -1549,9 +1826,14 @@ class ChannelParser:
             )
             
             if success:
+                # Context7: КРИТИЧНО - увеличиваем processed ТОЛЬКО после успешного сохранения в БД
+                # inserted_count - это количество реально сохраненных/обновленных постов
+                processed = inserted_count
+                
                 logger.info("Atomic batch save successful", 
                           channel_id=channel_id,
-                          inserted_count=inserted_count)
+                          inserted_count=inserted_count,
+                          processed=processed)
                 
                 # Context7: Сохранение альбомов в media_groups/media_group_items
                 # Context7 best practice: Собираем альбомы из БД, а не только из текущего batch
@@ -1627,14 +1909,30 @@ class ChannelParser:
                     if not grouped_ids_in_batch:
                         # Нет альбомов в текущем batch - пропускаем обработку альбомов
                         logger.debug("No media groups in batch, skipping album processing",
-                                   channel_id=channel_id)
+                                   channel_id=channel_id,
+                                   processed=processed,
+                                   posts_count=len(posts_data))
                     else:
                         # Context7: Используем отдельную транзакцию для сохранения альбомов
                         # Context7: Проверяем состояние транзакции перед началом новой
-                        if self.db_session.in_transaction():
-                            await self.db_session.rollback()
-                            logger.debug("Rolled back active transaction before saving albums",
-                                       channel_id=channel_id)
+                        # Context7 best practice: Явная проверка и очистка состояния сессии
+                        try:
+                            if self.db_session.in_transaction():
+                                await self.db_session.rollback()
+                                logger.debug("Rolled back active transaction before saving albums",
+                                           channel_id=channel_id)
+                                # Context7: Проверяем, что rollback прошел успешно
+                                if self.db_session.in_transaction():
+                                    logger.error("Transaction still active after rollback before saving albums - session may be in bad state",
+                                               channel_id=channel_id)
+                                    # Context7: Метрика для отслеживания проблем с состоянием сессии
+                                    session_rollback_failures_total.labels(operation='before_albums').inc()
+                        except Exception as rollback_error:
+                            logger.warning("Failed to rollback transaction before saving albums",
+                                         channel_id=channel_id, error=str(rollback_error), error_type=type(rollback_error).__name__)
+                            # Context7: Метрика для отслеживания проблем с rollback
+                            session_rollback_failures_total.labels(operation='before_albums').inc()
+                        
                         async with self.db_session.begin():
                             # Context7: Получаем UUID пользователя один раз (для всех альбомов канала)
                             user_uuid = None
@@ -1653,7 +1951,13 @@ class ChannelParser:
                                 row = result.fetchone()
                                 if row:
                                     user_uuid = str(row[0])
+                                    logger.debug("Found user_uuid via user_channel",
+                                               channel_id=channel_id,
+                                               user_uuid=user_uuid)
                                 else:
+                                    logger.debug("No user_channel found, trying direct telegram_id lookup",
+                                               channel_id=channel_id,
+                                               telegram_id=user_id)
                                     # Fallback: пытаемся получить по telegram_id (приоритет 2)
                                     result2 = await self.db_session.execute(
                                         text("SELECT id::text FROM users WHERE telegram_id = :telegram_id LIMIT 1"),
@@ -1662,12 +1966,18 @@ class ChannelParser:
                                     row2 = result2.fetchone()
                                     if row2:
                                         user_uuid = str(row2[0])
+                                        logger.debug("Found user_uuid via direct telegram_id lookup",
+                                                   channel_id=channel_id,
+                                                   user_uuid=user_uuid,
+                                                   telegram_id=user_id)
                             except Exception as e:
                                 logger.warning(
                                     "Failed to get user UUID for albums",
                                     channel_id=channel_id,
                                     telegram_id=user_id,
-                                    error=str(e)
+                                    error=str(e),
+                                    error_type=type(e).__name__,
+                                    exc_info=True
                                 )
                             
                             if not user_uuid:
@@ -1702,12 +2012,40 @@ class ChannelParser:
                                 
                                 # Context7: Создаём user_channel через atomic_saver
                                 try:
+                                    # Context7 P2: Получение first_name из Telegram API (если доступен telegram_client)
+                                    user_first_name = ''
+                                    user_last_name = ''
+                                    user_username = ''
+                                    
+                                    # Context7 P2: Получаем first_name из Telegram API через telegram_client (передается как параметр)
+                                    if telegram_client and user_id:
+                                        try:
+                                            user_entity = await telegram_client.get_entity(int(user_id))
+                                            if user_entity:
+                                                user_first_name = getattr(user_entity, 'first_name', '') or ''
+                                                user_last_name = getattr(user_entity, 'last_name', '') or ''
+                                                user_username = getattr(user_entity, 'username', '') or ''
+                                                
+                                                logger.debug(
+                                                    "User info retrieved from Telegram API (for albums)",
+                                                    user_id=user_id,
+                                                    first_name=user_first_name[:50] if user_first_name else None,
+                                                    username=user_username
+                                                )
+                                        except Exception as e:
+                                            logger.debug(
+                                                "Failed to get user entity from Telegram API (for albums)",
+                                                user_id=user_id,
+                                                error=str(e)
+                                            )
+                                            # Продолжаем с пустыми значениями - не критично
+                                    
                                     user_data = {
                                         'telegram_id': user_id,
                                         'tenant_id': tenant_id,
-                                        'first_name': '',
-                                        'last_name': '',
-                                        'username': ''
+                                        'first_name': user_first_name,
+                                        'last_name': user_last_name,
+                                        'username': user_username
                                     }
                                     
                                     channel_title = channel_entity.title if channel_entity and hasattr(channel_entity, 'title') else ''
@@ -1858,46 +2196,103 @@ class ChannelParser:
                                                 'size_bytes': row.size_bytes
                                             })
                                         
-                                        # Собираем media_types, media_sha256s, media_bytes в порядке постов
+                                        # Context7: Собираем media_types, media_sha256s, media_bytes в порядке постов
+                                        # КРИТИЧНО: Каждый пост должен иметь ОДИН элемент в каждом массиве
+                                        # Если у поста несколько медиа, берем первое (основное)
                                         media_types = []
                                         media_sha256s = []
                                         media_bytes = []
+                                        media_kinds = []
                                         
                                         for post_row in album_posts:
                                             post_id_str = str(post_row.id)
-                                            if post_id_str in media_by_post:
-                                                for media in media_by_post[post_id_str]:
-                                                    mime = media['mime_type'] or ''
-                                                    media_type = (
-                                                        'photo' if 'image' in mime else
-                                                        'video' if 'video' in mime else
-                                                        'document'
-                                                    )
-                                                    media_types.append(media_type)
-                                                    media_sha256s.append(media['sha256'])
-                                                    media_bytes.append(media['size_bytes'])
+                                            if post_id_str in media_by_post and media_by_post[post_id_str]:
+                                                # Берем первое медиа из поста (основное)
+                                                media = media_by_post[post_id_str][0]
+                                                mime = media['mime_type'] or ''
+                                                media_type = (
+                                                    'photo' if 'image' in mime else
+                                                    'video' if 'video' in mime else
+                                                    'document'
+                                                )
+                                                media_types.append(media_type)
+                                                media_sha256s.append(media['sha256'])
+                                                media_bytes.append(media['size_bytes'])
+                                                # Определяем media_kind (photo/video/document/audio)
+                                                media_kind = media_type if media_type in ['photo', 'video', 'document', 'audio'] else None
+                                                media_kinds.append(media_kind)
                                             else:
-                                                # Пост без медиа - пропускаем
-                                                pass
+                                                # Пост без медиа в post_media_map - проверяем текущий batch
+                                                # Context7: Медиа может быть в текущем batch, но еще не сохранено в post_media_map
+                                                found_in_batch = False
+                                                for pd in posts_data:
+                                                    if str(pd.get('id')) == post_id_str and pd.get('media_files'):
+                                                        # Нашли медиа в текущем batch - используем его
+                                                        mf = pd['media_files'][0]  # Берем первое медиа
+                                                        mime = mf.mime_type or ''
+                                                        media_type = (
+                                                            'photo' if 'image' in mime else
+                                                            'video' if 'video' in mime else
+                                                            'document'
+                                                        )
+                                                        media_types.append(media_type)
+                                                        media_sha256s.append(mf.sha256)
+                                                        media_bytes.append(mf.size_bytes)
+                                                        media_kinds.append(media_type if media_type in ['photo', 'video', 'document', 'audio'] else None)
+                                                        found_in_batch = True
+                                                        logger.info(
+                                                            "Found media in batch for album post",
+                                                            post_id=post_id_str,
+                                                            grouped_id=grouped_id,
+                                                            sha256=mf.sha256[:16] if mf.sha256 else None,
+                                                            mime_type=mime
+                                                        )
+                                                        break
+                                                
+                                                if not found_in_batch:
+                                                    # Медиа не найдено ни в БД, ни в batch - используем значения по умолчанию
+                                                    logger.warning(
+                                                        "Post in album has no media anywhere, using defaults",
+                                                        post_id=post_id_str,
+                                                        grouped_id=grouped_id,
+                                                        channel_id=channel_id,
+                                                        telegram_message_id=post_row.telegram_message_id
+                                                    )
+                                                    media_types.append('photo')  # Fallback
+                                                    media_sha256s.append(None)
+                                                    media_bytes.append(None)
+                                                    media_kinds.append('photo')
+                                        
+                                        # Context7: Проверяем соответствие длин массивов
+                                        if len(media_types) != len(actual_post_ids):
+                                            logger.error(
+                                                "Mismatch between post_ids and media_types lengths",
+                                                grouped_id=grouped_id,
+                                                post_ids_count=len(actual_post_ids),
+                                                media_types_count=len(media_types),
+                                                channel_id=channel_id
+                                            )
+                                            # Пропускаем этот альбом - не можем сохранить с несоответствием
+                                            continue
                                         
                                         # Получаем caption_text и posted_at из первого поста
                                         first_post = album_posts[0]
                                         caption_text = first_post.content if first_post.content else None
                                         posted_at = first_post.posted_at
                                         
-                                        # Сохраняем альбом
+                                        # Context7: Сохраняем альбом с проверенными массивами
                                         group_id = await save_media_group(
                                             db_session=self.db_session,
                                             user_id=user_uuid,
                                             channel_id=channel_id,
                                             grouped_id=grouped_id,
                                             post_ids=actual_post_ids,
-                                            media_types=media_types[:len(actual_post_ids)] if media_types else ['photo'] * len(actual_post_ids),
-                                            media_sha256s=media_sha256s[:len(actual_post_ids)] if media_sha256s else None,
-                                            media_bytes=media_bytes[:len(actual_post_ids)] if media_bytes else None,
+                                            media_types=media_types,  # Уже правильной длины
+                                            media_sha256s=media_sha256s if media_sha256s and any(m for m in media_sha256s if m) else None,
+                                            media_bytes=media_bytes if media_bytes and any(m for m in media_bytes if m) else None,
                                             caption_text=caption_text,
                                             posted_at=posted_at,
-                                            media_kinds=media_types[:len(actual_post_ids)] if media_types else ['photo'] * len(actual_post_ids),
+                                            media_kinds=media_kinds,  # Уже правильной длины
                                             trace_id=f"{tenant_id}:{channel_id}:{grouped_id}",
                                             tenant_id=tenant_id,
                                             event_publisher=self.event_publisher,
@@ -1905,28 +2300,116 @@ class ChannelParser:
                                         )
                                         
                                         if group_id:
+                                            # Context7: Детальное логирование для мониторинга альбомов
+                                            posts_from_current_batch = len([p for p in posts_data if p.get('grouped_id') == grouped_id])
+                                            media_with_sha256 = len([s for s in media_sha256s if s]) if media_sha256s else 0
+                                            # Определяем album_kind из media_types
+                                            unique_types = set(media_types) if media_types else set()
+                                            album_kind_value = media_types[0] if len(unique_types) == 1 and media_types else "mixed" if len(unique_types) > 1 else None
                                             logger.info(
                                                 "Media group saved to DB",
                                                 group_id=group_id,
                                                 grouped_id=grouped_id,
                                                 items_count=len(actual_post_ids),
-                                                posts_from_current_batch=len([p for p in posts_data if p.get('grouped_id') == grouped_id])
+                                                posts_from_current_batch=posts_from_current_batch,
+                                                media_with_sha256=media_with_sha256,
+                                                media_without_sha256=len(actual_post_ids) - media_with_sha256,
+                                                album_kind=album_kind_value,
+                                                channel_id=channel_id
                                             )
+                                            
+                                            # Context7: Эмиссия Vision события для альбома целиком
+                                            if self.media_processor and media_sha256s and any(m for m in media_sha256s if m):
+                                                try:
+                                                    # Собираем все MediaFile из альбома из posts_data
+                                                    album_media_files = []
+                                                    for post_id_str in actual_post_ids:
+                                                        for pd in posts_data:
+                                                            if str(pd.get('id')) == post_id_str and pd.get('media_files'):
+                                                                # Добавляем все медиа файлы из поста
+                                                                for mf in pd['media_files']:
+                                                                    if mf.sha256 in media_sha256s:
+                                                                        album_media_files.append(mf)
+                                                                    elif not media_sha256s:  # Если media_sha256s None, добавляем все
+                                                                        album_media_files.append(mf)
+                                                    
+                                                    # Если не нашли в posts_data, пытаемся получить из БД через media_objects
+                                                    if not album_media_files and media_sha256s:
+                                                        try:
+                                                            from worker.events.schemas.posts_vision_v1 import MediaFile
+                                                            media_objects_result = await self.db_session.execute(
+                                                                text("""
+                                                                    SELECT mo.file_sha256, mo.s3_key, mo.mime, mo.size_bytes
+                                                                    FROM media_objects mo
+                                                                    WHERE mo.file_sha256 = ANY(CAST(:sha256_list AS text[]))
+                                                                    ORDER BY array_position(CAST(:sha256_list AS text[]), mo.file_sha256)
+                                                                """),
+                                                                {"sha256_list": [s for s in media_sha256s if s]}
+                                                            )
+                                                            media_rows = media_objects_result.fetchall()
+                                                            for row in media_rows:
+                                                                album_media_files.append(MediaFile(
+                                                                    sha256=row.file_sha256,
+                                                                    s3_key=row.s3_key,
+                                                                    mime_type=row.mime,
+                                                                    size_bytes=row.size_bytes
+                                                                ))
+                                                        except Exception as db_error:
+                                                            logger.warning(
+                                                                "Failed to fetch media files from DB for album Vision event",
+                                                                grouped_id=grouped_id,
+                                                                error=str(db_error)
+                                                            )
+                                                    
+                                                    # Эмитим Vision событие для альбома, если есть подходящие медиа
+                                                    if album_media_files:
+                                                        await self.media_processor.emit_vision_uploaded_event(
+                                                            post_id=f"album:{grouped_id}",  # Используем grouped_id для идентификации альбома
+                                                            tenant_id=tenant_id,
+                                                            media_files=album_media_files,
+                                                            trace_id=f"{tenant_id}:{channel_id}:{grouped_id}:album_vision"
+                                                        )
+                                                        logger.info(
+                                                            "Vision uploaded event emitted for album",
+                                                            grouped_id=grouped_id,
+                                                            group_id=group_id,
+                                                            media_count=len(album_media_files),
+                                                            channel_id=channel_id
+                                                        )
+                                                except Exception as vision_error:
+                                                    logger.warning(
+                                                        "Failed to emit Vision event for album",
+                                                        grouped_id=grouped_id,
+                                                        error=str(vision_error),
+                                                        exc_info=True
+                                                    )
                                         else:
                                             logger.warning(
                                                 "Failed to save media group (save_media_group returned None)",
                                                 grouped_id=grouped_id,
-                                                channel_id=channel_id
+                                                channel_id=channel_id,
+                                                post_ids_count=len(actual_post_ids),
+                                                media_types_count=len(media_types) if 'media_types' in locals() else 0
                                             )
                                     except Exception as e:
-                                        logger.warning(
+                                        # Context7: Детальное логирование ошибок сохранения альбомов
+                                        logger.error(
                                             "Failed to save media group to DB",
                                             grouped_id=grouped_id,
+                                            channel_id=channel_id,
+                                            user_uuid=user_uuid if 'user_uuid' in locals() else None,
+                                            post_ids_count=len(actual_post_ids) if 'actual_post_ids' in locals() else 0,
+                                            media_types_count=len(media_types) if 'media_types' in locals() else 0,
                                             error=str(e),
+                                            error_type=type(e).__name__,
                                             exc_info=True
                                         )
-                                        # Не прерываем транзакцию - альбом можно сохранить позже
+                                        # Context7: Метрика для отслеживания ошибок сохранения альбомов
+                                        album_save_failures_total.labels(error_type=type(e).__name__).inc()
+                                        # Context7: Не прерываем транзакцию для других альбомов
+                                        # Каждый альбом обрабатывается независимо
                                         # Транзакция будет откачена автоматически при ошибке через context manager
+                                        continue
                             # Транзакция для альбомов автоматически коммитится через context manager
                 except ImportError as e:
                     logger.debug("media_group_saver not available", error=str(e))
@@ -1986,6 +2469,52 @@ class ChannelParser:
                             reactions = extract_reactions_details(message)
                             replies = extract_replies_details(message, post_id)
                             
+                            # Context7 P1: Извлечение reply-цепочек для каналов с комментариями
+                            # Проверяем, есть ли у канала включённые комментарии (с кэшированием в Redis)
+                            try:
+                                if telegram_client and channel_entity:
+                                    has_comments = await check_channel_has_comments(
+                                        telegram_client,
+                                        channel_entity,
+                                        redis_client=self.redis_client  # Context7 P1: Передаём Redis для кэширования
+                                    )
+                                    if has_comments:
+                                        # Извлекаем reply-цепочку через GetDiscussionMessage
+                                        discussion_replies = await extract_reply_chain(
+                                            telegram_client,
+                                            channel_entity,
+                                            message.id,
+                                            max_depth=10,
+                                            max_replies=100
+                                        )
+                                        
+                                        # Объединяем replies из message.reply_to и discussion replies
+                                        if discussion_replies:
+                                            # Преобразуем discussion replies в формат для сохранения
+                                            for disc_reply in discussion_replies:
+                                                reply_data = {
+                                                    'post_id': post_id,
+                                                    'reply_to_post_id': None,
+                                                    'reply_message_id': disc_reply.get('reply_message_id'),
+                                                    'reply_chat_id': disc_reply.get('reply_chat_id'),
+                                                    'reply_author_tg_id': disc_reply.get('reply_author_tg_id'),
+                                                    'reply_author_username': disc_reply.get('reply_author_username'),
+                                                    'reply_content': disc_reply.get('reply_content'),
+                                                    'reply_posted_at': disc_reply.get('reply_posted_at'),
+                                                    'thread_id': disc_reply.get('thread_id')
+                                                }
+                                                replies.append(reply_data)
+                                            
+                                            logger.debug("Extracted discussion replies",
+                                                         post_id=post_id,
+                                                         discussion_replies_count=len(discussion_replies))
+                            except Exception as e:
+                                logger.warning("Failed to extract discussion replies",
+                                             post_id=post_id,
+                                             error=str(e),
+                                             exc_info=True)
+                                # Не прерываем обработку - продолжаем с базовыми replies
+                            
                             # Сохраняем forwards/reactions/replies в БД, если есть данные
                             if forwards or reactions or replies:
                                 await self.atomic_saver.save_forwards_reactions_replies(
@@ -2014,7 +2543,7 @@ class ChannelParser:
                                         s3_bucket=s3_bucket,
                                         trace_id=trace_id
                                     )
-                                    logger.debug("Saved media to CAS",
+                                    logger.info("Saved media to CAS",
                                                post_id=post_id,
                                                media_count=len(media_files),
                                                trace_id=trace_id)
@@ -2023,9 +2552,21 @@ class ChannelParser:
                                         "Failed to save media to CAS",
                                         post_id=post_id,
                                         error=str(e),
-                                        trace_id=trace_id
+                                        trace_id=trace_id,
+                                        exc_info=True
                                     )
                                     # Не прерываем транзакцию
+                            elif post_data.get('media_urls'):
+                                # Context7: Логируем, почему медиа не сохраняется в CAS
+                                logger.warning(
+                                    "Media not saved to CAS - missing media_files or media_processor",
+                                    post_id=post_id,
+                                    has_media_files=bool(media_files),
+                                    media_files_count=len(media_files) if media_files else 0,
+                                    has_media_processor=bool(self.media_processor),
+                                    has_media_urls=bool(post_data.get('media_urls')),
+                                    trace_id=trace_id
+                                )
                             
                             # Commit после сохранения всех данных для поста
                             await self.db_session.commit()
@@ -2073,11 +2614,15 @@ class ChannelParser:
                                     trace_id=trace_id
                                 )
                                 
-                                logger.debug(
+                                # Context7: Логируем на уровне INFO для мониторинга Vision пайплайна
+                                vision_suitable_count = len([mf for mf in media_files if self.media_processor._is_vision_suitable(mf.mime_type)])
+                                logger.info(
                                     "Vision uploaded event emitted",
                                     post_id=post_id,
                                     media_count=len(media_files),
-                                    channel_id=channel_id
+                                    vision_suitable_count=vision_suitable_count,
+                                    channel_id=channel_id,
+                                    trace_id=trace_id
                                 )
                             except Exception as e:
                                 logger.warning(
@@ -2089,11 +2634,15 @@ class ChannelParser:
                                 )
                                 # Продолжаем обработку даже при ошибке события
             else:
+                # Context7: При ошибке сохранения processed остается 0
+                processed = 0
                 logger.error("Atomic batch save failed", 
                            channel_id=channel_id,
-                           error=error)
+                           error=error,
+                           posts_data_count=len(posts_data))
                 self.stats['errors'] += 1
         
+        # Context7: Возвращаем processed только после успешного сохранения
         return {
             'processed': processed,
             'skipped': skipped,
@@ -2174,6 +2723,95 @@ class ChannelParser:
         # Context7: Извлечение grouped_id для поддержки альбомов
         grouped_id = getattr(message, 'grouped_id', None)
         
+        # Context7 P1.1: Быстрые поля для forwards и replies в Post
+        forward_from_peer_id = None
+        forward_from_chat_id = None
+        forward_from_message_id = None
+        forward_date = None
+        forward_from_name = None
+        thread_id = None
+        forum_topic_id = None
+        
+        # Context7 P2: Извлечение author_peer_id и author_type из message.from_id
+        author_peer_id = None
+        author_type = None
+        post_author = None
+        
+        if hasattr(message, 'from_id') and message.from_id:
+            from_id = message.from_id
+            if hasattr(from_id, 'user_id'):
+                author_peer_id = {'user_id': from_id.user_id}
+                author_type = 'user'
+                post_author = str(from_id.user_id)
+            elif hasattr(from_id, 'channel_id'):
+                author_peer_id = {'channel_id': from_id.channel_id}
+                author_type = 'channel'
+                post_author = f"channel_{from_id.channel_id}"
+            elif hasattr(from_id, 'chat_id'):
+                author_peer_id = {'chat_id': from_id.chat_id}
+                author_type = 'chat'
+                post_author = f"chat_{from_id.chat_id}"
+        
+        # Context7 P2: Попытка получить имя автора из message.sender (если доступно)
+        # Используем message.sender как fallback для получения username/first_name
+        if hasattr(message, 'sender') and message.sender:
+            sender = message.sender
+            # Определяем тип на основе sender
+            if hasattr(sender, 'bot') and sender.bot:
+                author_type = 'bot'
+            elif author_type is None:
+                # Если author_type ещё не определён, пытаемся определить по типу sender
+                from telethon.tl.types import User, Channel, Chat
+                if isinstance(sender, User):
+                    author_type = 'bot' if getattr(sender, 'bot', False) else 'user'
+                elif isinstance(sender, Channel):
+                    author_type = 'channel'
+                elif isinstance(sender, Chat):
+                    author_type = 'chat'
+            
+            # Получаем имя автора
+            if hasattr(sender, 'first_name'):
+                if not post_author or post_author.startswith(('channel_', 'chat_', 'bot_')):
+                    # Используем first_name только если post_author - это ID
+                    post_author = sender.first_name
+            elif hasattr(sender, 'username') and sender.username:
+                if not post_author or post_author.startswith(('channel_', 'chat_', 'bot_')):
+                    post_author = sender.username
+            elif hasattr(sender, 'title'):
+                # Для каналов/чатов используем title
+                post_author = sender.title
+        
+        # Извлечение forwards (быстрые поля в Post)
+        if hasattr(message, 'fwd_from') and message.fwd_from:
+            fwd_from = message.fwd_from
+            if hasattr(fwd_from, 'from_id') and fwd_from.from_id:
+                from_id = fwd_from.from_id
+                if hasattr(from_id, 'user_id'):
+                    forward_from_peer_id = {'user_id': from_id.user_id}
+                elif hasattr(from_id, 'channel_id'):
+                    forward_from_peer_id = {'channel_id': from_id.channel_id}
+                    forward_from_chat_id = from_id.channel_id
+                elif hasattr(from_id, 'chat_id'):
+                    forward_from_peer_id = {'chat_id': from_id.chat_id}
+                    forward_from_chat_id = from_id.chat_id
+            
+            if hasattr(fwd_from, 'channel_post'):
+                forward_from_message_id = fwd_from.channel_post
+            
+            if hasattr(fwd_from, 'date') and fwd_from.date:
+                forward_date = fwd_from.date
+            
+            if hasattr(fwd_from, 'from_name'):
+                forward_from_name = fwd_from.from_name
+        
+        # Извлечение thread_id для replies
+        if hasattr(message, 'reply_to') and message.reply_to:
+            reply_to = message.reply_to
+            if hasattr(reply_to, 'reply_to_top_id'):
+                thread_id = reply_to.reply_to_top_id
+            elif hasattr(reply_to, 'reply_to_forum_top_id'):
+                forum_topic_id = reply_to.reply_to_forum_top_id
+        
         return {
             'id': post_id,
             'channel_id': channel_id,  # Context7: глобальные каналы без tenant_id
@@ -2192,7 +2830,19 @@ class ChannelParser:
             'reactions_count': reactions_count,
             'replies_count': replies_count,
             'telegram_post_url': telegram_post_url,
-            'grouped_id': grouped_id  # Context7: ID альбома для дедупликации
+            'grouped_id': grouped_id,  # Context7: ID альбома для дедупликации
+            # Context7 P1.1: Быстрые поля для forwards и replies
+            'forward_from_peer_id': forward_from_peer_id,
+            'forward_from_chat_id': forward_from_chat_id,
+            'forward_from_message_id': forward_from_message_id,
+            'forward_date': forward_date,
+            'forward_from_name': forward_from_name,
+            'thread_id': thread_id,
+            'forum_topic_id': forum_topic_id,
+            # Context7 P2: Данные об авторе для Graph-RAG
+            'author_peer_id': author_peer_id,
+            'author_type': author_type,
+            'post_author': post_author
         }
     
     def _extract_urls(self, text: str) -> List[str]:
@@ -2276,6 +2926,7 @@ class ChannelParser:
                          telegram_message_id=telegram_message_id)
 
         # PostParsedEventV1 temporarily disabled - returning dict instead
+        # Context7 P2: Расширяем событие данными о forwards/replies/author для Graph-RAG
         return dict(
             idempotency_key=idempotency_key,
             user_id=user_id,
@@ -2297,7 +2948,21 @@ class ChannelParser:
             is_edited=post_data.get('is_edited', False),
             views_count=post_data.get('views_count', 0),
             forwards_count=post_data.get('forwards_count', 0),
-            reactions_count=post_data.get('reactions_count', 0)
+            reactions_count=post_data.get('reactions_count', 0),
+            # Context7 P2: Данные о forwards для Graph-RAG
+            forward_from_peer_id=post_data.get('forward_from_peer_id'),
+            forward_from_chat_id=post_data.get('forward_from_chat_id'),
+            forward_from_message_id=post_data.get('forward_from_message_id'),
+            forward_date=post_data.get('forward_date').isoformat() if post_data.get('forward_date') and hasattr(post_data.get('forward_date'), 'isoformat') else post_data.get('forward_date'),
+            forward_from_name=post_data.get('forward_from_name'),
+            # Context7 P2: Данные о replies для Graph-RAG
+            reply_to_message_id=post_data.get('reply_to_message_id'),
+            reply_to_chat_id=post_data.get('reply_to_chat_id'),
+            thread_id=post_data.get('thread_id'),
+            # Context7 P2: Данные об авторе для Graph-RAG (если доступны)
+            author_peer_id=post_data.get('author_peer_id'),  # TODO: извлечь из message если доступно
+            author_name=post_data.get('post_author'),  # Используем post_author как author_name
+            author_type=post_data.get('author_type')  # TODO: определить тип автора
         )
     
     # Context7: Методы _bulk_insert_posts и _legacy_bulk_insert_posts удалены

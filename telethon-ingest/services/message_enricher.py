@@ -13,9 +13,17 @@ logger = structlog.get_logger()
 
 def extract_forwards_details(message) -> List[Dict[str, Any]]:
     """
-    Извлечение деталей forwards из Telegram сообщения.
+    Извлечение деталей forwards из Telegram сообщения (Context7 P1.1).
     
-    Context7: Обработка message.fwd_from для извлечения информации о репостах.
+    Context7: Обработка message.fwd_from (MessageFwdHeader) для извлечения всех данных о репостах.
+    Поддерживает все поля из MessageFwdHeader:
+    - from_id (peer ID источника)
+    - from_name (имя автора)
+    - date (дата оригинального сообщения)
+    - channel_post (ID сообщения в канале)
+    - post_author (подпись автора)
+    - saved_from_peer, saved_from_msg_id (сохранённые форварды)
+    - psa_type (публичное объявление)
     
     Args:
         message: Telegram Message объект
@@ -34,28 +42,59 @@ def extract_forwards_details(message) -> List[Dict[str, Any]]:
                 'from_message_id': getattr(fwd_from, 'channel_post', None),
                 'from_chat_title': None,
                 'from_chat_username': None,
-                'forwarded_at': fwd_from.date if hasattr(fwd_from, 'date') else datetime.now(timezone.utc)
+                'forwarded_at': fwd_from.date if hasattr(fwd_from, 'date') and fwd_from.date else datetime.now(timezone.utc)
             }
             
-            # Извлечение информации о чате
-            if hasattr(fwd_from, 'from_id'):
+            # Context7 P1.1: Извлечение полного peer ID как JSONB
+            if hasattr(fwd_from, 'from_id') and fwd_from.from_id:
                 from_id = fwd_from.from_id
-                if hasattr(from_id, 'channel_id'):
+                peer_id_data = {}
+                
+                if hasattr(from_id, 'user_id'):
+                    peer_id_data['user_id'] = from_id.user_id
+                elif hasattr(from_id, 'channel_id'):
+                    peer_id_data['channel_id'] = from_id.channel_id
                     forward_data['from_chat_id'] = from_id.channel_id
                 elif hasattr(from_id, 'chat_id'):
+                    peer_id_data['chat_id'] = from_id.chat_id
                     forward_data['from_chat_id'] = from_id.chat_id
+                
+                forward_data['from_id'] = peer_id_data
             
-            # Извлечение названия и username (если доступны)
-            if hasattr(fwd_from, 'from_name'):
+            # Извлечение названия автора
+            if hasattr(fwd_from, 'from_name') and fwd_from.from_name:
                 forward_data['from_chat_title'] = fwd_from.from_name
+                forward_data['from_name'] = fwd_from.from_name
             
-            # Обычно username доступен только через дополнительный запрос к API
-            # Здесь оставляем None - может быть заполнено позже
+            # Подпись автора (для каналов)
+            if hasattr(fwd_from, 'post_author') and fwd_from.post_author:
+                forward_data['post_author_signature'] = fwd_from.post_author
+            
+            # Сохранённые форварды (saved_from_peer, saved_from_msg_id)
+            if hasattr(fwd_from, 'saved_from_peer') and fwd_from.saved_from_peer:
+                saved_peer = fwd_from.saved_from_peer
+                saved_peer_data = {}
+                
+                if hasattr(saved_peer, 'user_id'):
+                    saved_peer_data['user_id'] = saved_peer.user_id
+                elif hasattr(saved_peer, 'channel_id'):
+                    saved_peer_data['channel_id'] = saved_peer.channel_id
+                elif hasattr(saved_peer, 'chat_id'):
+                    saved_peer_data['chat_id'] = saved_peer.chat_id
+                
+                forward_data['saved_from_peer'] = saved_peer_data
+            
+            if hasattr(fwd_from, 'saved_from_msg_id') and fwd_from.saved_from_msg_id:
+                forward_data['saved_from_msg_id'] = fwd_from.saved_from_msg_id
+            
+            # Тип публичного объявления
+            if hasattr(fwd_from, 'psa_type') and fwd_from.psa_type:
+                forward_data['psa_type'] = fwd_from.psa_type
             
             forwards.append(forward_data)
     
     except Exception as e:
-        logger.warning("Failed to extract forwards details", error=str(e))
+        logger.warning("Failed to extract forwards details", error=str(e), exc_info=True)
     
     return forwards
 
@@ -132,9 +171,10 @@ def extract_reactions_details(message) -> List[Dict[str, Any]]:
 
 def extract_replies_details(message, post_id: str) -> List[Dict[str, Any]]:
     """
-    Извлечение деталей replies из Telegram сообщения.
+    Извлечение деталей replies из Telegram сообщения (Context7 P1.1).
     
     Context7: Обработка message.reply_to для извлечения информации об ответах.
+    Поддерживает thread_id для каналов с комментариями.
     
     Args:
         message: Telegram Message объект
@@ -158,11 +198,16 @@ def extract_replies_details(message, post_id: str) -> List[Dict[str, Any]]:
                 'reply_author_tg_id': None,
                 'reply_author_username': None,
                 'reply_content': None,  # Содержимое ответа - нужно получать отдельно
-                'reply_posted_at': datetime.now(timezone.utc)  # Примерное время
+                'reply_posted_at': datetime.now(timezone.utc),  # Примерное время
+                'thread_id': None  # Context7 P1.1: ID треда для каналов с комментариями
             }
             
+            # Context7 P1.1: Извлечение thread_id (для каналов с комментариями)
+            if hasattr(reply_to, 'reply_to_top_id') and reply_to.reply_to_top_id:
+                reply_data['thread_id'] = reply_to.reply_to_top_id
+            
             # Извлечение информации о чате
-            if hasattr(reply_to, 'reply_to_peer_id'):
+            if hasattr(reply_to, 'reply_to_peer_id') and reply_to.reply_to_peer_id:
                 peer_id = reply_to.reply_to_peer_id
                 if hasattr(peer_id, 'channel_id'):
                     reply_data['reply_chat_id'] = peer_id.channel_id
@@ -178,7 +223,7 @@ def extract_replies_details(message, post_id: str) -> List[Dict[str, Any]]:
         # Здесь оставляем базовую структуру
     
     except Exception as e:
-        logger.warning("Failed to extract replies details", error=str(e))
+        logger.warning("Failed to extract replies details", error=str(e), exc_info=True)
     
     return replies
 

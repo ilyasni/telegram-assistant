@@ -255,35 +255,9 @@ class PostEnrichment(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
-    # Legacy поля (deprecated, будут удалены после миграции)
-    tags = Column(JSONB, default=[])  # DEPRECATED: использовать data->'tags'
-    vision_labels = Column(JSONB, default=[])  # DEPRECATED: использовать data->'labels'
-    ocr_text = Column(Text)  # DEPRECATED: использовать data->'ocr'->>'text'
-    crawl_md = Column(Text)  # DEPRECATED: использовать data->>'crawl_md'
-    enrichment_provider = Column(String(50))  # DEPRECATED: использовать provider
-    enriched_at = Column(DateTime, default=datetime.utcnow)  # DEPRECATED: использовать created_at
-    enrichment_latency_ms = Column(Integer)  # DEPRECATED: использовать data->>'latency_ms'
-    enrichment_metadata = Column(JSONB, default={})  # DEPRECATED: использовать data
-    summary = Column(Text)  # DEPRECATED: использовать data->>'caption' или data->>'summary'
-    
-    # Legacy Vision поля (deprecated)
-    vision_classification = Column(JSONB)  # DEPRECATED: использовать data->'labels'
-    vision_description = Column(Text)  # DEPRECATED: использовать data->>'caption'
-    vision_ocr_text = Column(Text)  # DEPRECATED: использовать data->'ocr'->>'text'
-    vision_is_meme = Column(Boolean, default=False)  # DEPRECATED: использовать data->>'is_meme'
-    vision_context = Column(JSONB)  # DEPRECATED: использовать data->'context'
-    vision_provider = Column(String(50))  # DEPRECATED: использовать provider
-    vision_model = Column(String(100))  # DEPRECATED: использовать data->>'model'
-    vision_analyzed_at = Column(DateTime)  # DEPRECATED: использовать created_at
-    vision_file_id = Column(String(255))  # DEPRECATED: использовать data->>'file_id'
-    vision_tokens_used = Column(Integer, default=0)  # DEPRECATED: использовать data->>'tokens_used'
-    vision_cost_microunits = Column(Integer, default=0)  # DEPRECATED: использовать data->>'cost_microunits'
-    vision_analysis_reason = Column(String(50))  # DEPRECATED: использовать data->>'analysis_reason'
-    
-    # Legacy S3 references (deprecated)
-    s3_media_keys = Column(JSONB, default=[])  # DEPRECATED: использовать post_media_map + media_objects
-    s3_vision_keys = Column(JSONB, default=[])  # DEPRECATED: использовать data->'s3_keys'
-    s3_crawl_keys = Column(JSONB, default=[])  # DEPRECATED: использовать data->'s3_keys'
+    # Context7: Legacy поля удалены из БД миграцией 20251117_remove_legacy
+    # Все данные хранятся только в data JSONB
+    # Используйте data->'tags', data->'labels', data->'ocr'->>'text' и т.д.
     
     # Relationships
     post = relationship("Post", back_populates="enrichment")

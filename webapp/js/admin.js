@@ -1,7 +1,7 @@
 // [C7-ID: miniapp-admin-002] Основной модуль админки
 
 let isAdmin = false;
-let currentSection = 'users'; // 'users', 'invites', 'subscriptions'
+let currentSection = 'users'; // 'users', 'invites', 'subscriptions', 'feedback'
 let accessToken = null;
 
 /**
@@ -235,6 +235,10 @@ function showAdminPanel() {
                         onclick="switchAdminSection('subscriptions')">
                     📋 Подписки
                 </button>
+                <button class="tab-btn ${currentSection === 'feedback' ? 'active' : ''}" 
+                        onclick="switchAdminSection('feedback')">
+                    💬 Feedback
+                </button>
             </div>
             
             <div id="admin-content" class="admin-content">
@@ -253,7 +257,13 @@ function switchAdminSection(section) {
     // Обновляем активные табы
     document.querySelectorAll('.tab-btn').forEach(btn => {
         btn.classList.remove('active');
-        if (btn.textContent.includes(section === 'users' ? 'Пользователи' : section === 'invites' ? 'Инвайт-коды' : 'Подписки')) {
+        const sectionLabels = {
+            'users': 'Пользователи',
+            'invites': 'Инвайт-коды',
+            'subscriptions': 'Подписки',
+            'feedback': 'Feedback'
+        };
+        if (btn.textContent.includes(sectionLabels[section] || '')) {
             btn.classList.add('active');
         }
     });
@@ -294,6 +304,13 @@ function loadCurrentSection() {
                 loadSubscriptionsSection();
             } else {
                 content.innerHTML = '<p>Модуль управления подписками не загружен</p>';
+            }
+            break;
+        case 'feedback':
+            if (typeof loadFeedbackSection === 'function') {
+                loadFeedbackSection();
+            } else {
+                content.innerHTML = '<p>Модуль управления feedback не загружен</p>';
             }
             break;
         default:

@@ -428,6 +428,8 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       ENVIRONMENT: ${ENVIRONMENT:-production}
       PYTHONPATH: /app:/opt/project
+      # Context7: Feature flags для группового дайджеста
+      DIGEST_AGENT_ENABLED: ${DIGEST_AGENT_ENABLED:-0}
       # Neo4j Configuration - Context7: для GraphRAG и графа знаний
       NEO4J_URI: ${NEO4J_URI:-neo4j://neo4j:7687}
       NEO4J_USER: ${NEO4J_USER:-neo4j}
@@ -597,7 +599,7 @@ services:
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
       # Context7: Volume mount для api модуля (cross-service import для VisionAnalysisTask)
-      # TODO: [C7-ID: ARCH-SHARED-001] Переместить S3StorageService в shared-пакет
+      # [C7-ID: ARCH-SHARED-001] S3StorageService перемещен в shared-пакет, но api оставлен для обратной совместимости
       - ./api:/opt/telegram-assistant/api:ro
       # Context7: Volume mount для shared пакета (hot reload изменений)
       - ./shared:/app/shared:ro
@@ -676,8 +678,13 @@ services:
     volumes:
       - ./telethon-ingest/sessions:/app/sessions  # персистентность сессий
       - ./telethon-ingest:/app:ro  # Context7: монтируем код для разработки (read-only для безопасности)
-      - ./api:/opt/telegram-assistant/api:ro  # Context7: монтируем api для импорта S3StorageService
+      - ./api:/opt/telegram-assistant/api:ro  # Context7: монтируем api для импорта S3StorageService (deprecated - используем shared)
       - ./worker:/opt/telegram-assistant/worker:ro  # Context7: монтируем worker для импорта StorageQuotaService
+      # Context7: Volume mount для shared пакета (hot reload изменений)
+      # Note: Для telethon-ingest shared устанавливается при сборке образа (pip install -e)
+      # Из-за ограничений Docker overlay2 не монтируем shared как volume (конфликт с read-only слоем)
+      # Для изменения shared в telethon-ingest требуется пересборка образа
+      # - ./shared:/app/shared:ro  # Отключено из-за конфликта с Dockerfile COPY shared/
       # Context7 best practice: монтируем timezone данные хоста
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro

@@ -800,7 +800,18 @@ class MediaProcessor:
             ]
             
             if not vision_files:
-                logger.debug("No vision-suitable media files", post_id=post_id)
+                # Context7: Логируем причину пропуска для диагностики
+                filtered_count = len(media_files) - len(vision_files)
+                filtered_mime_types = [mf.mime_type for mf in media_files if not self._is_vision_suitable(mf.mime_type)]
+                logger.info(
+                    "No vision-suitable media files",
+                    post_id=post_id,
+                    total_media_count=len(media_files),
+                    vision_suitable_count=len(vision_files),
+                    filtered_count=filtered_count,
+                    filtered_mime_types=filtered_mime_types[:5],  # Первые 5 для диагностики
+                    trace_id=trace_id
+                )
                 return
             
             # Создание события

@@ -495,15 +495,15 @@ class TrendEditorAgent:
                     ELSE topics
                 END,
                 label = CASE
-                    WHEN $5 IS NOT NULL AND $5 != '' THEN $5
+                    WHEN $5::text IS NOT NULL AND $5::text != '' THEN $5::text
                     ELSE label
                 END,
                 summary = CASE
-                    WHEN $6 IS NOT NULL AND $6 != '' THEN $6
+                    WHEN $6::text IS NOT NULL AND $6::text != '' THEN $6::text
                     ELSE summary
                 END,
                 why_important = CASE
-                    WHEN $7 IS NOT NULL AND $7 != '' THEN $7
+                    WHEN $7::text IS NOT NULL AND $7::text != '' THEN $7::text
                     ELSE why_important
                 END,
                 card_payload = jsonb_set(
@@ -512,13 +512,13 @@ class TrendEditorAgent:
                             jsonb_set(
                                 COALESCE(card_payload, '{}'::jsonb),
                                 '{title}',
-                                to_jsonb(COALESCE($5, card_payload->>'title', label, 'Тренд'))
+                                to_jsonb(COALESCE(NULLIF($5::text, ''), card_payload->>'title', label, 'Тренд'))
                             ),
                             '{summary}',
-                            to_jsonb(COALESCE($6, card_payload->>'summary', summary, ''))
+                            to_jsonb(COALESCE(NULLIF($6::text, ''), card_payload->>'summary', summary, ''))
                         ),
                         '{why_important}',
-                        to_jsonb(COALESCE($7, card_payload->>'why_important', why_important, ''))
+                        to_jsonb(COALESCE(NULLIF($7::text, ''), card_payload->>'why_important', why_important, ''))
                     ),
                     '{topics}',
                     to_jsonb(COALESCE($9::jsonb, card_payload->'topics', '[]'::jsonb))

@@ -14,6 +14,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from typing import Dict, Optional, Any, List
+from uuid import UUID
 import structlog
 import redis.asyncio as redis
 from telethon import TelegramClient, errors
@@ -68,9 +69,10 @@ class TelegramClientManager:
     - watchdog для мониторинга подключения
     - keep-alive пинги
     - обработка длительных отвалов (on_hold)
+    - интеграция с SessionManager для централизованного управления сессиями (P0.1)
     """
     
-    def __init__(self, redis_client: redis.Redis, db_connection):
+    def __init__(self, redis_client: redis.Redis, db_connection, session_manager=None):
         self._clients: Dict[int, TelegramClient] = {}
         self._reconnect_attempts: Dict[int, int] = {}  # счетчик попыток
         self._reconnect_backoffs: Dict[int, float] = {}
@@ -78,6 +80,7 @@ class TelegramClientManager:
         self._last_disconnect: Dict[int, float] = {}
         self._redis = redis_client
         self._db = db_connection
+        self._session_manager = session_manager  # Context7 P0.1: SessionManager для новой схемы
         self._watchdog_task: Optional[asyncio.Task] = None
         self._shutdown = False
         
@@ -348,24 +351,50 @@ class TelegramClientManager:
             logger.warning("QR session fallback failed", telegram_id=telegram_id, error=str(e))
 
         # 2) Fallback B: читать из БД авторизованную сессию и расшифровать
+        # Context7 P0.1: Сначала пробуем новую схему через SessionManager
+        if self._session_manager:
+            try:
+                # Получение identity_id по telegram_id
+                identity_id = await self._get_identity_id(telegram_id)
+                if identity_id:
+                    session = await self._session_manager.load_session(
+                        identity_id=identity_id,
+                        telegram_id=telegram_id
+                    )
+                    if session:
+                        session_string = session.save()
+                        # Запишем в Redis для последующих обращений
+                        try:
+                            await self._redis.set(f"telegram:session:{telegram_id}", session_string, ex=86400)
+                        except Exception:
+                            pass
+                        return session_string
+            except Exception as e:
+                logger.debug("Failed to load session via SessionManager, trying legacy", 
+                           telegram_id=telegram_id, error=str(e))
+        
+        # Fallback: старая схема (legacy)
         try:
             import psycopg2
             from psycopg2.extras import RealDictCursor
             from crypto_utils import decrypt_session
             with self._db.cursor(cursor_factory=RealDictCursor) as cur:
+                # Пробуем новую таблицу telegram_sessions (если миграция применена)
                 cur.execute(
                     """
                     SELECT ts.session_string_enc
                     FROM telegram_sessions ts
-                    JOIN users u ON u.id::uuid = ts.user_id::uuid
-                    WHERE ts.status IN ('authorized','active')
-                      AND u.telegram_id = %s
+                    JOIN identities i ON i.id = ts.identity_id
+                    WHERE ts.is_active = true
+                      AND i.telegram_id = %s
                     ORDER BY ts.updated_at DESC
                     LIMIT 1
                     """,
                     (telegram_id,)
                 )
                 row = cur.fetchone()
+                
+                # Fallback на старую схему (telegram_sessions_legacy или users.telegram_session_enc)
                 if not row:
                     cur.execute(
                         """
@@ -379,6 +408,7 @@ class TelegramClientManager:
                         (telegram_id,)
                     )
                     row = cur.fetchone()
+                
                 if not row:
                     return None
                 session_dec = decrypt_session(row['session_string_enc'])
@@ -390,6 +420,29 @@ class TelegramClientManager:
                 return session_dec
         except Exception as e:
             logger.error("Failed to load session from DB", telegram_id=telegram_id, error=str(e))
+            return None
+    
+    async def _get_identity_id(self, telegram_id: int) -> Optional[UUID]:
+        """Получение identity_id по telegram_id из БД."""
+        try:
+            import psycopg2
+            from psycopg2.extras import RealDictCursor
+            from uuid import UUID
+            loop = asyncio.get_event_loop()
+            
+            def _get_identity_sync():
+                with self._db.cursor(cursor_factory=RealDictCursor) as cursor:
+                    cursor.execute("""
+                        SELECT id FROM identities WHERE telegram_id = %s LIMIT 1
+                    """, (telegram_id,))
+                    row = cursor.fetchone()
+                    if row:
+                        return UUID(row['id'])
+                    return None
+            
+            return await loop.run_in_executor(None, _get_identity_sync)
+        except Exception as e:
+            logger.debug("Failed to get identity_id", telegram_id=telegram_id, error=str(e))
             return None
     
     async def _reconnect_with_backoff(self, telegram_id: int) -> bool:

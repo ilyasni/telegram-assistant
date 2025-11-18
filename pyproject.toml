@@ -137,7 +137,7 @@ name = "Worker does not import api (except shared)"
 type = "forbidden"
 source_modules = ["worker"]
 forbidden_modules = ["api"]
-ignore_imports = ["worker.* -> api.services.s3_storage"]  # TODO: [C7-ID: ARCH-SHARED-001] Переместить S3StorageService в shared-пакет для соблюдения архитектурных границ
+# [C7-ID: ARCH-SHARED-001] S3StorageService перемещен в shared/s3_storage - игнорирование больше не требуется
 
 [[tool.importlinter.contracts]]
 name = "Cross-service imports must use shared"

@@ -8,12 +8,15 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from uuid import UUID
 
+import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy.orm import Session
 
 from models.database import get_db, Group, GroupDiscoveryRequest
 from api.tasks.scheduler_tasks import enqueue_group_digest
+
+logger = structlog.get_logger()
 
 router = APIRouter(prefix="/groups", tags=["groups"])
 
@@ -53,13 +56,94 @@ class GroupUpdateRequest(BaseModel):
     settings: Optional[Dict[str, Any]] = None
 
 
+def _validate_uuid_string(value: Any, field_name: str = "field") -> UUID:
+    """Context7: Конвертация строки в UUID для использования в BeforeValidator."""
+    logger.info(
+        f"GroupDigestRequest BeforeValidator - {field_name}",
+        field_value=value,
+        field_type=type(value).__name__,
+        field_value_repr=repr(value),
+    )
+    
+    if value is None:
+        logger.error(f"GroupDigestRequest BeforeValidator - {field_name} is None")
+        raise ValueError(f"{field_name} не может быть None")
+    
+    if isinstance(value, UUID):
+        logger.debug(f"GroupDigestRequest BeforeValidator - {field_name} already UUID", uuid=str(value))
+        return value
+    
+    value_str = str(value).strip()
+    if not value_str or value_str.lower() in ('none', 'null', ''):
+        logger.error(f"GroupDigestRequest BeforeValidator - {field_name} is empty or None-like", original_value=value, value_str=value_str)
+        raise ValueError(f"{field_name} не может быть пустой строкой или None")
+    
+    try:
+        uuid_obj = UUID(value_str)
+        logger.info(f"GroupDigestRequest BeforeValidator - {field_name} converted to UUID", original=value_str, uuid=str(uuid_obj))
+        return uuid_obj
+    except ValueError as e:
+        logger.error(f"GroupDigestRequest BeforeValidator - {field_name} conversion failed", value=value, value_str=value_str, error=str(e), error_type=type(e).__name__)
+        raise ValueError(f"Невалидный формат UUID для {field_name}: {value}") from e
+
+
+def _validate_tenant_id(value: Any) -> UUID:
+    """Context7: Валидатор для tenant_id."""
+    return _validate_uuid_string(value, "tenant_id")
+
+
+def _validate_user_id(value: Any) -> UUID:
+    """Context7: Валидатор для user_id."""
+    return _validate_uuid_string(value, "user_id")
+
+
 class GroupDigestRequest(BaseModel):
+    # Context7: Поля объявлены как UUID, но model_validator конвертирует строки ПЕРЕД валидацией
     tenant_id: UUID
     user_id: UUID
     window_size_hours: int = Field(..., description="Размер окна в часах", example=24)
     delivery_channel: str = Field(default="telegram", pattern="^(telegram)$")
     delivery_format: str = Field(default="telegram_html", pattern="^(telegram_html|json|cards)$")
     trigger: str = Field(default="manual")
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_and_convert_uuids(cls, data: Any) -> Any:
+        """Context7: Конвертация строк в UUID для tenant_id и user_id ПЕРЕД валидацией полей."""
+        if not isinstance(data, dict):
+            return data
+        
+        logger.info(
+            "GroupDigestRequest model_validator - before",
+            tenant_id_raw=data.get("tenant_id"),
+            user_id_raw=data.get("user_id"),
+            tenant_id_type=type(data.get("tenant_id")).__name__ if data.get("tenant_id") is not None else "None",
+            user_id_type=type(data.get("user_id")).__name__ if data.get("user_id") is not None else "None",
+        )
+        
+        # Конвертируем tenant_id
+        if "tenant_id" in data:
+            tenant_id_raw = data["tenant_id"]
+            try:
+                tenant_id_converted = _validate_tenant_id(tenant_id_raw)
+                data["tenant_id"] = tenant_id_converted
+                logger.info("GroupDigestRequest model_validator - tenant_id converted", original=tenant_id_raw, converted=str(tenant_id_converted))
+            except Exception as e:
+                logger.error("GroupDigestRequest model_validator - tenant_id conversion failed", value=tenant_id_raw, error=str(e))
+                raise ValueError(f"Невалидный формат UUID для tenant_id: {tenant_id_raw}") from e
+        
+        # Конвертируем user_id
+        if "user_id" in data:
+            user_id_raw = data["user_id"]
+            try:
+                user_id_converted = _validate_user_id(user_id_raw)
+                data["user_id"] = user_id_converted
+                logger.info("GroupDigestRequest model_validator - user_id converted", original=user_id_raw, converted=str(user_id_converted))
+            except Exception as e:
+                logger.error("GroupDigestRequest model_validator - user_id conversion failed", value=user_id_raw, error=str(e))
+                raise ValueError(f"Невалидный формат UUID для user_id: {user_id_raw}") from e
+        
+        return data
 
     @field_validator("window_size_hours")
     @classmethod
@@ -268,9 +352,46 @@ async def update_group(group_id: UUID, request: GroupUpdateRequest, db: Session 
 
 @router.post("/{group_id}/digest", response_model=GroupDigestResponse, status_code=202)
 async def trigger_group_digest(group_id: UUID, request: GroupDigestRequest, db: Session = Depends(get_db)):
-    group = db.query(Group).filter(Group.id == group_id, Group.tenant_id == request.tenant_id).first()
+    # Context7: Детальное логирование входящего запроса (после успешной валидации)
+    logger.info(
+        "Group digest trigger request received (validation passed)",
+        group_id=str(group_id),
+        tenant_id=str(request.tenant_id),
+        user_id=str(request.user_id),
+        window_size_hours=request.window_size_hours,
+        tenant_id_type=type(request.tenant_id).__name__,
+        user_id_type=type(request.user_id).__name__,
+        tenant_id_is_uuid=isinstance(request.tenant_id, UUID),
+        user_id_is_uuid=isinstance(request.user_id, UUID),
+    )
+    
+    # Context7: Проверка существования группы и принадлежности к tenant
+    group = db.query(Group).filter(Group.id == group_id).first()
     if not group:
-        raise HTTPException(status_code=404, detail="Group not found")
+        logger.warning(
+            "Group not found for digest request",
+            group_id=str(group_id),
+            tenant_id=str(request.tenant_id),
+            user_id=str(request.user_id),
+        )
+        raise HTTPException(
+            status_code=404,
+            detail=f"Group {group_id} not found"
+        )
+    
+    # Context7: Проверка принадлежности группы к указанному tenant_id
+    if group.tenant_id != request.tenant_id:
+        logger.warning(
+            "Group tenant mismatch for digest request",
+            group_id=str(group_id),
+            group_tenant_id=str(group.tenant_id),
+            request_tenant_id=str(request.tenant_id),
+            user_id=str(request.user_id),
+        )
+        raise HTTPException(
+            status_code=403,
+            detail=f"Group {group_id} does not belong to tenant {request.tenant_id}"
+        )
 
     try:
         result = await enqueue_group_digest(

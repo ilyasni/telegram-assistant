@@ -61,38 +61,70 @@ class TaskSupervisor:
                     task_coroutine = config.task_func()
                     task_handle = asyncio.create_task(task_coroutine, name=f"{name}_worker")
                     
+                    logger.debug(f"Task {name} created, waiting for completion or timeout")
+                    
                     # Отслеживание выполнения задачи
                     while not task_handle.done() and self.running:
                         try:
                             # Проверяем каждые 5 секунд
                             await asyncio.wait_for(asyncio.shield(task_handle), timeout=5.0)
                             # Если задача завершилась, выходим из цикла
+                            logger.debug(f"Task {name} completed (no timeout)")
                             break
                         except asyncio.TimeoutError:
                             # Задача все еще работает - обновляем last_success
                             self.last_success[name] = time.time()
                             self.retry_counts[name] = 0
+                            logger.debug(f"Task {name} still running (timeout check)")
                             continue
+                    
+                    # Context7: Проверяем, почему задача завершилась
+                    if task_handle.done():
+                        try:
+                            # Получаем результат или исключение
+                            result = task_handle.result()
+                            logger.info(
+                                f"Task {name} completed successfully in {time.time() - start_time:.2f}s, result={result}"
+                            )
+                        except Exception as task_error:
+                            # Задача завершилась с исключением
+                            import traceback
+                            error_traceback = traceback.format_exc()
+                            logger.error(
+                                f"Task {name} completed with error in {time.time() - start_time:.2f}s, error={str(task_error)}, error_type={type(task_error).__name__}, traceback={error_traceback}"
+                            )
+                            # Не увеличиваем retry_count здесь - это сделает внешний except
+                            raise
+                        except BaseException as task_error:
+                            # Задача завершилась с критическим исключением (SystemExit, KeyboardInterrupt)
+                            import traceback
+                            error_traceback = traceback.format_exc()
+                            logger.critical(
+                                f"Task {name} completed with critical error in {time.time() - start_time:.2f}s, error={str(task_error)}, error_type={type(task_error).__name__}, traceback={error_traceback}"
+                            )
+                            raise
                     
                     # Успешное выполнение
                     self.last_success[name] = time.time()
                     self.retry_counts[name] = 0
                     backoff = config.initial_backoff
                     
-                    logger.info(f"Task {name} completed successfully in {time.time() - start_time:.2f}s")
-                    
                 except asyncio.CancelledError:
                     logger.info(f"Task cancelled: {name}")
                     break
                 except Exception as e:
                     self.retry_counts[name] += 1
+                    import traceback
+                    error_traceback = traceback.format_exc()
                     error_msg = f"Task {name} failed (retry {self.retry_counts[name]}): {e}"
                     
                     if self.retry_counts[name] >= config.max_retries:
-                        logger.critical(f"Task {name} exceeded max retries ({config.max_retries}), stopping")
+                        logger.critical(
+                            f"Task {name} exceeded max retries ({config.max_retries}), stopping. Traceback: {error_traceback}"
+                        )
                         break
                     
-                    logger.error(error_msg)
+                    logger.error(f"{error_msg}. Traceback: {error_traceback}")
                     
                     # Exponential backoff
                     logger.info(f"Retrying {name} in {backoff:.1f}s...")
@@ -138,7 +170,24 @@ class TaskSupervisor:
                         
                         # Проверка на зависшие tasks
                         if task.done():
-                            logger.warning(f"Task {name} completed unexpectedly, will be restarted")
+                            # Context7: Детальное логирование причины завершения задачи
+                            try:
+                                result = task.result()
+                                logger.warning(
+                                    f"Task {name} completed unexpectedly (success), result={result}, will be restarted"
+                                )
+                            except Exception as task_error:
+                                import traceback
+                                error_traceback = traceback.format_exc()
+                                logger.error(
+                                    f"Task {name} completed unexpectedly (error), error={str(task_error)}, error_type={type(task_error).__name__}, traceback={error_traceback}, will be restarted"
+                                )
+                            except BaseException as task_error:
+                                import traceback
+                                error_traceback = traceback.format_exc()
+                                logger.critical(
+                                    f"Task {name} completed unexpectedly (critical), error={str(task_error)}, error_type={type(task_error).__name__}, traceback={error_traceback}, will be restarted"
+                                )
                             # Task будет автоматически перезапущен в start_task
                         elif time.time() - self.last_success.get(name, 0) > config.health_check_interval * 2:
                             logger.warning(f"Task {name} appears stuck, last success: {self.last_success.get(name, 0)}")

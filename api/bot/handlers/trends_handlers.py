@@ -8,6 +8,7 @@ from aiogram.filters import Command
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 import httpx
+import json
 import structlog
 from typing import Optional, List, Tuple, Dict, Any
 from uuid import UUID
@@ -35,8 +36,41 @@ async def _get_user_id(telegram_id: int) -> Optional[UUID]:
         async with httpx.AsyncClient(timeout=5) as client:
             r = await client.get(f"{API_BASE}/api/users/{telegram_id}")
             if r.status_code == 200:
-                user_data = r.json()
-                return UUID(user_data.get("id"))
+                # Context7: Безопасное чтение response body перед парсингом JSON
+                try:
+                    response_text = r.text
+                    if response_text and response_text.strip():
+                        try:
+                            user_data = json.loads(response_text)
+                            return UUID(user_data.get("id"))
+                        except (json.JSONDecodeError, ValueError) as e:
+                            logger.warning(
+                                "Error parsing JSON from user response",
+                                telegram_id=telegram_id,
+                                error=str(e),
+                                error_type=type(e).__name__
+                            )
+                            return None
+                    else:
+                        logger.warning("Empty response body for user", telegram_id=telegram_id)
+                        return None
+                except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout,
+                        httpx.RemoteProtocolError, httpx.LocalProtocolError, httpx.NetworkError) as e:
+                    logger.warning(
+                        "Error reading response body for user",
+                        telegram_id=telegram_id,
+                        error=str(e),
+                        error_type=type(e).__name__
+                    )
+                    return None
+                except Exception as e:
+                    logger.warning(
+                        "Unexpected error reading response body for user",
+                        telegram_id=telegram_id,
+                        error=str(e),
+                        error_type=type(e).__name__
+                    )
+                    return None
             else:
                 logger.warning("User not found", telegram_id=telegram_id, status_code=r.status_code)
                 return None
@@ -73,7 +107,25 @@ async def _update_trend_subscription(chat_id: int, frequency: str, topics: List[
                     f"{API_BASE}/api/trends/subscriptions/{chat_id}/{frequency}"
                 )
         if response.status_code not in (200, 201):
-            detail = response.json().get("detail", "Неизвестная ошибка")
+            # Context7: Безопасное чтение response body для получения деталей ошибки
+            try:
+                response_text = response.text
+                if response_text and response_text.strip():
+                    try:
+                        error_data = json.loads(response_text)
+                        detail = error_data.get("detail", "Неизвестная ошибка")
+                    except (json.JSONDecodeError, ValueError):
+                        detail = f"HTTP {response.status_code}: {response_text[:200]}"
+                else:
+                    detail = f"HTTP {response.status_code}"
+            except Exception as e:
+                logger.warning(
+                    "Error reading error response body",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    status_code=response.status_code
+                )
+                detail = f"HTTP {response.status_code}: Неизвестная ошибка"
             return False, detail
         return True, ""
     except Exception as exc:
@@ -82,43 +134,286 @@ async def _update_trend_subscription(chat_id: int, frequency: str, topics: List[
 
 
 async def _load_emerging_digest(client: httpx.AsyncClient, window: str = "3h", limit: int = 5, user_id: Optional[UUID] = None) -> Tuple[str, List[Dict[str, Any]]]:
-    response = await client.get(
-        f"{API_BASE}/api/trends/emerging",
-        params={
-            "min_sources": 1,
-            "min_burst": 0.8,
-            "page": 1,
-            "page_size": max(limit, 1),
-            "window": window,
-            **({"user_id": str(user_id)} if user_id else {}),
-        },
-    )
-    if response.status_code != 200:
+    """Загрузить emerging тренды с обработкой ошибок."""
+    try:
+        response = await client.get(
+            f"{API_BASE}/api/trends/emerging",
+            params={
+                "min_sources": 1,
+                "min_burst": 0.8,
+                "page": 1,
+                "page_size": max(limit, 1),
+                "window": window,
+                **({"user_id": str(user_id)} if user_id else {}),
+            },
+        )
+        if response.status_code != 200:
+            logger.warning(
+                "Failed to load emerging trends",
+                status_code=response.status_code,
+                user_id=str(user_id) if user_id else None
+            )
+            return window, []
+        
+        # Context7: Безопасное чтение response body перед парсингом JSON
+        # Используем response.text для чтения тела ответа, чтобы избежать ошибок при закрытом соединении
+        try:
+            response_text = response.text
+            if not response_text or not response_text.strip():
+                logger.warning(
+                    "Empty response body for emerging trends",
+                    status_code=response.status_code,
+                    user_id=str(user_id) if user_id else None
+                )
+                return window, []
+        except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout,
+                httpx.RemoteProtocolError, httpx.LocalProtocolError, httpx.NetworkError) as e:
+            logger.error(
+                "Error reading response body for emerging trends",
+                error=str(e),
+                error_type=type(e).__name__,
+                status_code=response.status_code,
+                user_id=str(user_id) if user_id else None
+            )
+            return window, []
+        except Exception as e:
+            logger.error(
+                "Unexpected error reading response body for emerging trends",
+                error=str(e),
+                error_type=type(e).__name__,
+                status_code=response.status_code,
+                user_id=str(user_id) if user_id else None
+            )
+            return window, []
+        
+        # Парсинг JSON из уже прочитанного текста
+        try:
+            payload = json.loads(response_text)
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.error(
+                "Error parsing JSON from emerging trends response",
+                error=str(e),
+                error_type=type(e).__name__,
+                status_code=response.status_code,
+                response_preview=response_text[:200] if response_text else None,
+                user_id=str(user_id) if user_id else None
+            )
+            return window, []
+        except Exception as e:
+            logger.error(
+                "Unexpected error parsing JSON from emerging trends response",
+                error=str(e),
+                error_type=type(e).__name__,
+                status_code=response.status_code,
+                user_id=str(user_id) if user_id else None
+            )
+            return window, []
+        
+        return payload.get("window") or window, payload.get("clusters", [])
+    except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout, 
+            httpx.RemoteProtocolError, httpx.LocalProtocolError) as e:
+        logger.error(
+            "Network error loading emerging trends",
+            error=str(e),
+            error_type=type(e).__name__,
+            user_id=str(user_id) if user_id else None
+        )
         return window, []
-    payload = response.json()
-    return payload.get("window") or window, payload.get("clusters", [])
+    except httpx.HTTPStatusError as e:
+        logger.error(
+            "HTTP error loading emerging trends",
+            status_code=e.response.status_code,
+            error=str(e),
+            user_id=str(user_id) if user_id else None
+        )
+        return window, []
+    except Exception as e:
+        logger.error(
+            "Unexpected error loading emerging trends",
+            error=str(e),
+            error_type=type(e).__name__,
+            user_id=str(user_id) if user_id else None
+        )
+        return window, []
 
 
 async def _load_stable_digest(client: httpx.AsyncClient, min_frequency: int = 10, limit: int = 5, user_id: Optional[UUID] = None) -> List[Dict[str, Any]]:
-    params = {
-        "min_frequency": min_frequency,
-        "status": "stable",
-        "page": 1,
-        "page_size": max(limit, 1),
-        **({"user_id": str(user_id)} if user_id else {}),
-    }
-    response = await client.get(f"{API_BASE}/api/trends/clusters", params=params)
-    if response.status_code != 200:
+    """Загрузить stable тренды с обработкой ошибок."""
+    try:
+        params = {
+            "min_frequency": min_frequency,
+            "status": "stable",
+            "page": 1,
+            "page_size": max(limit, 1),
+            **({"user_id": str(user_id)} if user_id else {}),
+        }
+        response = await client.get(f"{API_BASE}/api/trends/clusters", params=params)
+        if response.status_code != 200:
+            logger.warning(
+                "Failed to load stable trends",
+                status_code=response.status_code,
+                user_id=str(user_id) if user_id else None
+            )
+            return []
+        
+        # Context7: Безопасное чтение response body перед парсингом JSON
+        # Используем response.text для чтения тела ответа, чтобы избежать ошибок при закрытом соединении
+        try:
+            response_text = response.text
+            if not response_text or not response_text.strip():
+                logger.warning(
+                    "Empty response body for stable trends",
+                    status_code=response.status_code,
+                    user_id=str(user_id) if user_id else None
+                )
+                return []
+        except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout,
+                httpx.RemoteProtocolError, httpx.LocalProtocolError, httpx.NetworkError) as e:
+            logger.error(
+                "Error reading response body for stable trends",
+                error=str(e),
+                error_type=type(e).__name__,
+                status_code=response.status_code,
+                user_id=str(user_id) if user_id else None
+            )
+            return []
+        except Exception as e:
+            logger.error(
+                "Unexpected error reading response body for stable trends",
+                error=str(e),
+                error_type=type(e).__name__,
+                status_code=response.status_code,
+                user_id=str(user_id) if user_id else None
+            )
+            return []
+        
+        # Парсинг JSON из уже прочитанного текста
+        try:
+            payload = json.loads(response_text)
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.error(
+                "Error parsing JSON from stable trends response",
+                error=str(e),
+                error_type=type(e).__name__,
+                status_code=response.status_code,
+                response_preview=response_text[:200] if response_text else None,
+                user_id=str(user_id) if user_id else None
+            )
+            return []
+        except Exception as e:
+            logger.error(
+                "Unexpected error parsing JSON from stable trends response",
+                error=str(e),
+                error_type=type(e).__name__,
+                status_code=response.status_code,
+                user_id=str(user_id) if user_id else None
+            )
+            return []
+        
+        clusters = payload.get("clusters", [])
+        if clusters:
+            return clusters
+        
+        # Fallback to emerging if no stable trends
+        params["status"] = "emerging"
+        try:
+            fallback = await client.get(f"{API_BASE}/api/trends/clusters", params=params)
+            if fallback.status_code != 200:
+                logger.warning(
+                    "Failed to load emerging trends as fallback",
+                    status_code=fallback.status_code,
+                    user_id=str(user_id) if user_id else None
+                )
+                return []
+            
+            # Context7: Безопасное чтение response body для fallback запроса
+            try:
+                fallback_text = fallback.text
+                if not fallback_text or not fallback_text.strip():
+                    logger.warning(
+                        "Empty response body for fallback trends",
+                        status_code=fallback.status_code,
+                        user_id=str(user_id) if user_id else None
+                    )
+                    return []
+            except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout,
+                    httpx.RemoteProtocolError, httpx.LocalProtocolError, httpx.NetworkError) as e:
+                logger.error(
+                    "Error reading response body for fallback trends",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    status_code=fallback.status_code,
+                    user_id=str(user_id) if user_id else None
+                )
+                return []
+            except Exception as e:
+                logger.error(
+                    "Unexpected error reading response body for fallback trends",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    status_code=fallback.status_code,
+                    user_id=str(user_id) if user_id else None
+                )
+                return []
+            
+            # Парсинг JSON из уже прочитанного текста
+            try:
+                fallback_payload = json.loads(fallback_text)
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.error(
+                    "Error parsing JSON from fallback trends response",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    status_code=fallback.status_code,
+                    response_preview=fallback_text[:200] if fallback_text else None,
+                    user_id=str(user_id) if user_id else None
+                )
+                return []
+            except Exception as e:
+                logger.error(
+                    "Unexpected error parsing JSON from fallback trends response",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    status_code=fallback.status_code,
+                    user_id=str(user_id) if user_id else None
+                )
+                return []
+            
+            return fallback_payload.get("clusters", [])
+        except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout,
+                httpx.RemoteProtocolError, httpx.LocalProtocolError) as e:
+            logger.error(
+                "Network error in fallback trends request",
+                error=str(e),
+                error_type=type(e).__name__,
+                user_id=str(user_id) if user_id else None
+            )
+            return []
+    except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout,
+            httpx.RemoteProtocolError, httpx.LocalProtocolError) as e:
+        logger.error(
+            "Network error loading stable trends",
+            error=str(e),
+            error_type=type(e).__name__,
+            user_id=str(user_id) if user_id else None
+        )
         return []
-    payload = response.json()
-    clusters = payload.get("clusters", [])
-    if clusters:
-        return clusters
-    params["status"] = "emerging"
-    fallback = await client.get(f"{API_BASE}/api/trends/clusters", params=params)
-    if fallback.status_code != 200:
+    except httpx.HTTPStatusError as e:
+        logger.error(
+            "HTTP error loading stable trends",
+            status_code=e.response.status_code,
+            error=str(e),
+            user_id=str(user_id) if user_id else None
+        )
         return []
-    return fallback.json().get("clusters", [])
+    except Exception as e:
+        logger.error(
+            "Unexpected error loading stable trends",
+            error=str(e),
+            error_type=type(e).__name__,
+            user_id=str(user_id) if user_id else None
+        )
+        return []
 
 
 def _format_emerging_digest(window_label: str, clusters: List[Dict[str, Any]]) -> str:
@@ -276,16 +571,90 @@ async def callback_trends_list(callback: CallbackQuery):
             if r.status_code != 200:
                 await callback.answer("❌ Ошибка получения трендов", show_alert=True)
                 return
-            payload = r.json()
+            
+            # Context7: Безопасное чтение response body перед парсингом JSON
+            try:
+                response_text = r.text
+                if not response_text or not response_text.strip():
+                    await callback.message.edit_text(
+                        "📉 <b>Свежих трендов сейчас нет</b>\n\n"
+                        "Запусти обнаружение или попробуй позже.",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="🔍 Обнаружить", callback_data="trends:detect")],
+                            [InlineKeyboardButton(text="🔙 Назад", callback_data="trends:menu")]
+                        ]),
+                        parse_mode="HTML"
+                    )
+                    await callback.answer()
+                    return
+            except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout,
+                    httpx.RemoteProtocolError, httpx.LocalProtocolError, httpx.NetworkError) as e:
+                logger.error(
+                    "Error reading response body for trends list",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    status_code=r.status_code
+                )
+                await callback.answer("❌ Ошибка чтения ответа", show_alert=True)
+                return
+            except Exception as e:
+                logger.error(
+                    "Unexpected error reading response body for trends list",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    status_code=r.status_code
+                )
+                await callback.answer("❌ Неожиданная ошибка", show_alert=True)
+                return
+            
+            try:
+                payload = json.loads(response_text)
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.error(
+                    "Error parsing JSON from trends list response",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    status_code=r.status_code,
+                    response_preview=response_text[:200] if response_text else None
+                )
+                await callback.answer("❌ Ошибка обработки ответа", show_alert=True)
+                return
+            except Exception as e:
+                logger.error(
+                    "Unexpected error parsing JSON from trends list response",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    status_code=r.status_code
+                )
+                await callback.answer("❌ Неожиданная ошибка", show_alert=True)
+                return
+            
             clusters = payload.get("clusters", [])
             if not clusters:
                 params["status"] = "emerging"
                 r = await client.get(f"{API_BASE}/api/trends/clusters", params=params)
                 if r.status_code == 200:
-                    payload = r.json()
-                    clusters = payload.get("clusters", [])
-                    if clusters:
-                        status_used = "emerging"
+                    # Context7: Безопасное чтение response body для fallback
+                    try:
+                        fallback_text = r.text
+                        if fallback_text and fallback_text.strip():
+                            try:
+                                payload = json.loads(fallback_text)
+                                clusters = payload.get("clusters", [])
+                                if clusters:
+                                    status_used = "emerging"
+                            except (json.JSONDecodeError, ValueError) as e:
+                                logger.warning(
+                                    "Error parsing JSON from fallback trends list",
+                                    error=str(e),
+                                    error_type=type(e).__name__
+                                )
+                    except Exception as e:
+                        logger.warning(
+                            "Error reading fallback trends list response",
+                            error=str(e),
+                            error_type=type(e).__name__
+                        )
 
         if not clusters:
                 await callback.message.edit_text(
@@ -368,7 +737,63 @@ async def callback_trends_emerging(callback: CallbackQuery):
             await callback.answer("❌ Ошибка получения горящих трендов", show_alert=True)
             return
 
-        payload = r.json()
+        # Context7: Безопасное чтение response body перед парсингом JSON
+        try:
+            response_text = r.text
+            if not response_text or not response_text.strip():
+                await callback.message.edit_text(
+                    "🔥 <b>Горящих трендов сейчас нет</b>\n\n"
+                    "Запусти обнаружение или попробуй позже.",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="🔍 Обнаружить", callback_data="trends:detect")],
+                        [InlineKeyboardButton(text="🔙 Назад", callback_data="trends:menu")]
+                    ]),
+                    parse_mode="HTML"
+                )
+                await callback.answer()
+                return
+        except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout,
+                httpx.RemoteProtocolError, httpx.LocalProtocolError, httpx.NetworkError) as e:
+            logger.error(
+                "Error reading response body for emerging trends",
+                error=str(e),
+                error_type=type(e).__name__,
+                status_code=r.status_code
+            )
+            await callback.answer("❌ Ошибка чтения ответа", show_alert=True)
+            return
+        except Exception as e:
+            logger.error(
+                "Unexpected error reading response body for emerging trends",
+                error=str(e),
+                error_type=type(e).__name__,
+                status_code=r.status_code
+            )
+            await callback.answer("❌ Неожиданная ошибка", show_alert=True)
+            return
+        
+        try:
+            payload = json.loads(response_text)
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.error(
+                "Error parsing JSON from emerging trends response",
+                error=str(e),
+                error_type=type(e).__name__,
+                status_code=r.status_code,
+                response_preview=response_text[:200] if response_text else None
+            )
+            await callback.answer("❌ Ошибка обработки ответа", show_alert=True)
+            return
+        except Exception as e:
+            logger.error(
+                "Unexpected error parsing JSON from emerging trends response",
+                error=str(e),
+                error_type=type(e).__name__,
+                status_code=r.status_code
+            )
+            await callback.answer("❌ Неожиданная ошибка", show_alert=True)
+            return
+        
         clusters = payload.get("clusters", [])
         window_label = payload.get("window") or "3h"
         if not clusters:
@@ -443,7 +868,58 @@ async def callback_trend_view(callback: CallbackQuery):
                 await callback.answer("❌ Ошибка получения тренда", show_alert=True)
                 return
             
-            trend = r.json()
+            # Context7: Безопасное чтение response body перед парсингом JSON
+            try:
+                response_text = r.text
+                if not response_text or not response_text.strip():
+                    await callback.answer("❌ Пустой ответ от сервера", show_alert=True)
+                    return
+            except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout,
+                    httpx.RemoteProtocolError, httpx.LocalProtocolError, httpx.NetworkError) as e:
+                logger.error(
+                    "Error reading response body for trend view",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    status_code=r.status_code,
+                    trend_id=trend_id
+                )
+                await callback.answer("❌ Ошибка чтения ответа", show_alert=True)
+                return
+            except Exception as e:
+                logger.error(
+                    "Unexpected error reading response body for trend view",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    status_code=r.status_code,
+                    trend_id=trend_id
+                )
+                await callback.answer("❌ Неожиданная ошибка", show_alert=True)
+                return
+            
+            # Парсинг JSON из уже прочитанного текста
+            try:
+                trend = json.loads(response_text)
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.error(
+                    "Error parsing JSON from trend view response",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    status_code=r.status_code,
+                    trend_id=trend_id,
+                    response_preview=response_text[:200] if response_text else None
+                )
+                await callback.answer("❌ Ошибка обработки ответа", show_alert=True)
+                return
+            except Exception as e:
+                logger.error(
+                    "Unexpected error parsing JSON from trend view response",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    status_code=r.status_code,
+                    trend_id=trend_id
+                )
+                await callback.answer("❌ Неожиданная ошибка", show_alert=True)
+                return
             
             keyword = trend.get("trend_keyword", "N/A")
             frequency = trend.get("frequency_count", 0)
@@ -501,7 +977,7 @@ async def callback_trend_view(callback: CallbackQuery):
 
 @router.callback_query(F.data == "trends:detect")
 async def callback_trends_detect(callback: CallbackQuery):
-    """Запустить обнаружение трендов."""
+    """Запустить обнаружение трендов с улучшенной обработкой ошибок."""
     await callback.answer("⏳ Обнаружение запущено...")
     try:
         await callback.message.edit_text(
@@ -512,21 +988,173 @@ async def callback_trends_detect(callback: CallbackQuery):
         pass
     
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
+        # Context7: Используем детальные таймауты для разных операций
+        timeout = httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
             user_uuid = await _get_user_id(callback.from_user.id)
-            r = await client.post(
-                f"{API_BASE}/api/trends/detect",
-                params={
-                    "days": 7,
-                    "min_frequency": 10,
-                    "min_growth": 0.2,
-                    "min_engagement": 5.0
-                }
-            )
             
-            if r.status_code == 200:
-                result = r.json()
+            # Запрос на обнаружение трендов
+            try:
+                r = await client.post(
+                    f"{API_BASE}/api/trends/detect",
+                    params={
+                        "days": 7,
+                        "min_frequency": 10,
+                        "min_growth": 0.2,
+                        "min_engagement": 5.0
+                    }
+                )
+                r.raise_for_status()  # Вызовет HTTPStatusError для 4xx/5xx
+            except httpx.HTTPStatusError as e:
+                error_detail = "Неизвестная ошибка"
+                try:
+                    error_detail = e.response.json().get("detail", f"HTTP {e.response.status_code}")
+                except Exception:
+                    error_detail = f"HTTP {e.response.status_code}: {e.response.text[:200]}"
+                
+                logger.error(
+                    "HTTP error detecting trends",
+                    status_code=e.response.status_code,
+                    error=error_detail,
+                    user_id=str(user_uuid) if user_uuid else None
+                )
+                await callback.message.edit_text(
+                    f"❌ <b>Ошибка обнаружения трендов</b>\n\n{error_detail}",
+                    parse_mode="HTML"
+                )
+                return
+            except (httpx.ConnectError, httpx.ConnectTimeout, 
+                    httpx.RemoteProtocolError, httpx.LocalProtocolError) as e:
+                logger.error(
+                    "Connection error detecting trends",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    user_id=str(user_uuid) if user_uuid else None
+                )
+                await callback.message.edit_text(
+                    "❌ <b>Ошибка подключения к серверу</b>\n\n"
+                    "Не удалось установить соединение. Попробуйте позже.",
+                    parse_mode="HTML"
+                )
+                return
+            except (httpx.ReadTimeout, httpx.WriteTimeout) as e:
+                logger.error(
+                    "Timeout detecting trends",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    user_id=str(user_uuid) if user_uuid else None
+                )
+                await callback.message.edit_text(
+                    "⏳ <b>Обнаружение трендов занимает больше времени</b>\n\n"
+                    "Результаты будут доступны позже. Попробуйте проверить тренды через несколько минут.",
+                    parse_mode="HTML"
+                )
+                return
+            
+            # Успешное обнаружение - загружаем результаты
+            try:
+                # Context7: Безопасное чтение response body перед парсингом JSON
+                # Используем response.text для чтения тела ответа, чтобы избежать ошибок при закрытом соединении
+                try:
+                    response_text = r.text
+                    if not response_text or not response_text.strip():
+                        logger.warning(
+                            "Empty response body for detect trends",
+                            status_code=r.status_code,
+                            user_id=str(user_uuid) if user_uuid else None
+                        )
+                        await callback.message.edit_text(
+                            "⚠️ <b>Обнаружение завершено, но ответ пуст</b>\n\n"
+                            "Попробуйте просмотреть тренды через меню.",
+                            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                [InlineKeyboardButton(text="📈 Список трендов", callback_data="trends:list")],
+                                [InlineKeyboardButton(text="🔙 Меню", callback_data="trends:menu")]
+                            ]),
+                            parse_mode="HTML"
+                        )
+                        return
+                except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout,
+                        httpx.RemoteProtocolError, httpx.LocalProtocolError, httpx.NetworkError) as e:
+                    logger.error(
+                        "Error reading response body for detect trends",
+                        error=str(e),
+                        error_type=type(e).__name__,
+                        status_code=r.status_code,
+                        user_id=str(user_uuid) if user_uuid else None
+                    )
+                    await callback.message.edit_text(
+                        "⚠️ <b>Обнаружение завершено, но не удалось прочитать ответ</b>\n\n"
+                        "Проблема с сетью. Попробуйте просмотреть тренды через меню.",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="📈 Список трендов", callback_data="trends:list")],
+                            [InlineKeyboardButton(text="🔙 Меню", callback_data="trends:menu")]
+                        ]),
+                        parse_mode="HTML"
+                    )
+                    return
+                except Exception as e:
+                    logger.error(
+                        "Unexpected error reading response body for detect trends",
+                        error=str(e),
+                        error_type=type(e).__name__,
+                        status_code=r.status_code,
+                        user_id=str(user_uuid) if user_uuid else None
+                    )
+                    await callback.message.edit_text(
+                        "⚠️ <b>Обнаружение завершено, но произошла ошибка</b>\n\n"
+                        "Попробуйте просмотреть тренды через меню.",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="📈 Список трендов", callback_data="trends:list")],
+                            [InlineKeyboardButton(text="🔙 Меню", callback_data="trends:menu")]
+                        ]),
+                        parse_mode="HTML"
+                    )
+                    return
+                
+                # Context7: Безопасный парсинг JSON из уже прочитанного текста
+                try:
+                    result = json.loads(response_text)
+                except (json.JSONDecodeError, ValueError) as json_error:
+                    logger.error(
+                        "Error parsing JSON from detect trends response",
+                        error=str(json_error),
+                        error_type=type(json_error).__name__,
+                        status_code=r.status_code,
+                        response_preview=response_text[:200] if response_text else None,
+                        user_id=str(user_uuid) if user_uuid else None
+                    )
+                    await callback.message.edit_text(
+                        "⚠️ <b>Обнаружение завершено, но не удалось обработать ответ</b>\n\n"
+                        "Попробуйте просмотреть тренды через меню.",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="📈 Список трендов", callback_data="trends:list")],
+                            [InlineKeyboardButton(text="🔙 Меню", callback_data="trends:menu")]
+                        ]),
+                        parse_mode="HTML"
+                    )
+                    return
+                except Exception as json_error:
+                    logger.error(
+                        "Unexpected error parsing JSON from detect trends response",
+                        error=str(json_error),
+                        error_type=type(json_error).__name__,
+                        status_code=r.status_code,
+                        user_id=str(user_uuid) if user_uuid else None
+                    )
+                    await callback.message.edit_text(
+                        "⚠️ <b>Обнаружение завершено, но не удалось обработать ответ</b>\n\n"
+                        "Попробуйте просмотреть тренды через меню.",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="📈 Список трендов", callback_data="trends:list")],
+                            [InlineKeyboardButton(text="🔙 Меню", callback_data="trends:menu")]
+                        ]),
+                        parse_mode="HTML"
+                    )
+                    return
+                
                 trends_count = result.get("trends_count", 0)
+                
+                # Загружаем emerging и stable тренды (с обработкой ошибок внутри функций)
                 window_label, emerging_clusters = await _load_emerging_digest(client, user_id=user_uuid)
                 stable_trends = await _load_stable_digest(client, user_id=user_uuid)
 
@@ -551,26 +1179,102 @@ async def callback_trends_detect(callback: CallbackQuery):
                     reply_markup=builder.as_markup(),
                     parse_mode="HTML",
                 )
-            else:
-                error_detail = r.json().get("detail", "Неизвестная ошибка")
+            except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout,
+                    httpx.RemoteProtocolError, httpx.LocalProtocolError) as e:
+                # Ошибка сети при загрузке результатов
+                logger.error(
+                    "Network error loading trend results",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    user_id=str(user_uuid) if user_uuid else None
+                )
                 await callback.message.edit_text(
-                    f"❌ <b>Ошибка обнаружения трендов</b>\n\n{error_detail}",
+                    "⚠️ <b>Обнаружение завершено, но не удалось загрузить результаты</b>\n\n"
+                    "Проблема с сетью. Попробуйте просмотреть тренды через меню.",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="📈 Список трендов", callback_data="trends:list")],
+                        [InlineKeyboardButton(text="🔙 Меню", callback_data="trends:menu")]
+                    ]),
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                # Ошибка при загрузке или форматировании результатов
+                logger.error(
+                    "Error loading trend results",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    user_id=str(user_uuid) if user_uuid else None,
+                    exc_info=True
+                )
+                await callback.message.edit_text(
+                    "⚠️ <b>Обнаружение завершено, но не удалось загрузить результаты</b>\n\n"
+                    "Попробуйте просмотреть тренды через меню.",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="📈 Список трендов", callback_data="trends:list")],
+                        [InlineKeyboardButton(text="🔙 Меню", callback_data="trends:menu")]
+                    ]),
                     parse_mode="HTML"
                 )
     
-    except httpx.TimeoutException:
+    except httpx.TimeoutException as e:
+        logger.error(
+            "Timeout exception detecting trends",
+            error=str(e),
+            error_type=type(e).__name__
+        )
         await callback.message.edit_text(
-            "⏳ <b>Обнаружение трендов занимает больше времени</b>\n\n"
+            "⏳ <b>Превышено время ожидания</b>\n\n"
+            "Обнаружение трендов занимает больше времени, чем ожидалось. "
             "Результаты будут доступны позже.",
             parse_mode="HTML"
         )
-    except Exception as e:
-        logger.error("Error detecting trends", error=str(e))
+    except (httpx.NetworkError, httpx.ProtocolError, httpx.TransportError, 
+            httpx.ReadError, httpx.WriteError, httpx.DecodingError) as e:
+        logger.error(
+            "Network/Protocol error detecting trends",
+            error=str(e),
+            error_type=type(e).__name__,
+            exc_info=True
+        )
         await callback.message.edit_text(
-            "❌ <b>Ошибка обнаружения трендов</b>\n\n"
-            "Попробуйте позже.",
+            "❌ <b>Ошибка сети</b>\n\n"
+            "Не удалось выполнить запрос. Проверьте подключение и попробуйте позже.",
             parse_mode="HTML"
         )
+    except Exception as e:
+        # Логируем все детали для диагностики
+        error_msg = str(e)
+        error_type = type(e).__name__
+        
+        # Проверяем, не является ли это ошибкой "Server disconnected"
+        if "Server disconnected" in error_msg or "disconnected" in error_msg.lower():
+            logger.error(
+                "Server disconnected error detecting trends",
+                error=error_msg,
+                error_type=error_type,
+                exc_info=True
+            )
+            await callback.message.edit_text(
+                "⚠️ <b>Сервер отключился во время обработки</b>\n\n"
+                "Обнаружение трендов может быть завершено. Попробуйте просмотреть тренды через меню.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="📈 Список трендов", callback_data="trends:list")],
+                    [InlineKeyboardButton(text="🔙 Меню", callback_data="trends:menu")]
+                ]),
+                parse_mode="HTML"
+            )
+        else:
+            logger.error(
+                "Unexpected error detecting trends",
+                error=error_msg,
+                error_type=error_type,
+                exc_info=True
+            )
+            await callback.message.edit_text(
+                "❌ <b>Ошибка обнаружения трендов</b>\n\n"
+                "Произошла непредвиденная ошибка. Попробуйте позже или обратитесь к администратору.",
+                parse_mode="HTML"
+            )
 
 
 @router.callback_query(F.data.startswith("trend:archive:"))

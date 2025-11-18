@@ -3,6 +3,7 @@
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
+from fastapi.exceptions import RequestValidationError
 from contextlib import asynccontextmanager
 import structlog
 import os
@@ -84,10 +85,10 @@ async def lifespan(app: FastAPI):
     # Инициализация scheduler для периодических задач
     try:
         from tasks.scheduler_tasks import start_scheduler
-        start_scheduler()
+        await start_scheduler()  # Context7: AsyncIOScheduler требует async контекст
         logger.info("Scheduler started for digest and trend tasks")
     except Exception as e:
-        logger.error("Failed to start scheduler", error=str(e))
+        logger.error("Failed to start scheduler", error=str(e), exc_info=True)
         # Продолжаем без scheduler
     
     # Инициализация Redis для rate limiter
@@ -249,6 +250,44 @@ def mask_sensitive_data(data: dict) -> dict:
 
 
 @app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    """Context7: Логирование входящих запросов для диагностики проблем с tenant_id."""
+    # Логируем запросы к группам/digest для диагностики
+    if "/api/groups/" in str(request.url.path) and "/digest" in str(request.url.path) and request.method == "POST":
+        # Context7: Читаем body для логирования, но не блокируем дальнейшую обработку
+        body_bytes = b""
+        async for chunk in request.stream():
+            body_bytes += chunk
+        
+        body_str = body_bytes.decode("utf-8", errors="ignore")[:1000] if body_bytes else None
+        body_json = None
+        if body_str:
+            try:
+                import json
+                body_json = json.loads(body_str)
+                logger.error(
+                    "Incoming group digest request - BEFORE validation",
+                    method=request.method,
+                    path=request.url.path,
+                    body_str=body_str,
+                    body_json=body_json,
+                    tenant_id_in_body=body_json.get("tenant_id") if isinstance(body_json, dict) else None,
+                    user_id_in_body=body_json.get("user_id") if isinstance(body_json, dict) else None,
+                    tenant_id_type=type(body_json.get("tenant_id")).__name__ if isinstance(body_json, dict) and body_json.get("tenant_id") is not None else "None",
+                    user_id_type=type(body_json.get("user_id")).__name__ if isinstance(body_json, dict) and body_json.get("user_id") is not None else "None",
+                )
+            except Exception as e:
+                logger.error("Failed to parse body JSON", error=str(e), body_str=body_str[:200])
+        
+        # Восстанавливаем body для дальнейшей обработки
+        async def receive():
+            return {"type": "http.request", "body": body_bytes}
+        request._receive = receive
+    
+    return await call_next(request)
+
+
+@app.middleware("http")
 async def logging_middleware(request: Request, call_next):
     """Middleware для логирования запросов с маскированием секретов."""
     start_time = time.time()
@@ -317,11 +356,53 @@ async def logging_middleware(request: Request, call_next):
     return response
 
 
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Context7: Обработчик ошибок валидации с детальным логированием."""
+    errors = exc.errors()
+    body = await request.body()
+    
+    # Context7: Детальное логирование для диагностики проблем с tenant_id
+    body_str = body.decode("utf-8", errors="ignore")[:1000] if body else None
+    try:
+        import json
+        body_json = json.loads(body_str) if body_str else None
+    except:
+        body_json = None
+    
+    logger.error(
+        "Request validation error",
+        method=request.method,
+        url=str(request.url),
+        path=request.url.path,
+        errors=errors,
+        body=body_str,
+        body_json=body_json,
+        error_count=len(errors),
+    )
+    
+    # Формируем детальное сообщение об ошибке
+    error_details = []
+    for error in errors:
+        loc = " → ".join(str(l) for l in error.get("loc", []))
+        msg = error.get("msg", "")
+        error_details.append(f"{loc}: {msg}")
+    
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": errors,
+            "message": "; ".join(error_details) if error_details else "Validation error",
+        }
+    )
+
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     """Глобальный обработчик исключений."""
     logger.error("Unhandled exception", 
                 error=str(exc),
+                error_type=type(exc).__name__,
                 method=request.method,
                 url=str(request.url))
     
@@ -340,6 +421,7 @@ from routers import admin_invites  # Admin invites management
 from routers import rag  # RAG API endpoints
 from routers import digest  # Digest API endpoints
 from routers import trends  # Trends API endpoints
+from routers import feedback  # Feedback API endpoints
 app.include_router(health.router, prefix="/api")
 app.include_router(channels.router, prefix="/api")
 app.include_router(tg_auth.router)  # QR auth endpoints
@@ -355,6 +437,7 @@ app.include_router(rag.router, prefix="/api")  # RAG API endpoints
 app.include_router(digest.router, prefix="/api")  # Digest API endpoints
 app.include_router(groups.router, prefix="/api")  # Groups & group digests
 app.include_router(trends.router, prefix="/api")  # Trends API endpoints
+app.include_router(feedback.router)  # Feedback API endpoints (prefix уже в роутере)
 app.include_router(bot_router, prefix="/tg")
 
 # Диагностический код временно убран

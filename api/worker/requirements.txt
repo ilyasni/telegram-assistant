@@ -71,3 +71,8 @@ loguru==0.7.2
 mistune>=3.0.0
 
 aiogram>=3.13.0
+
+# OCR Enhancement (опциональные зависимости)
+# Context7: pyspellchecker и langdetect опциональны - код работает без них
+pyspellchecker>=0.8.0; python_version >= "3.11"
+langdetect>=1.0.9; python_version >= "3.11"

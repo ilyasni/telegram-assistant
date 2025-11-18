@@ -106,22 +106,31 @@ async def test_tagging():
                     )
                     
                     # Сохранить результат в БД
+                    # Context7: Используем унифицированную схему с kind/provider/data
+                    import json
+                    tags_json = json.dumps({'tags': tags or []})
                     cursor.execute("""
                                INSERT INTO post_enrichment (
                                    post_id, 
-                                   enrichment_provider, 
-                                   tags,
-                                   kind
-                               ) VALUES (%s, %s, %s, %s)
+                                   provider,
+                                   kind,
+                                   data
+                               ) VALUES (%s, %s, %s, %s::jsonb)
                                ON CONFLICT (post_id, kind) 
                                DO UPDATE SET 
-                                   tags = EXCLUDED.tags,
-                                   enrichment_provider = EXCLUDED.enrichment_provider
+                                   data = jsonb_set(
+                                       COALESCE(post_enrichment.data, '{}'::jsonb),
+                                       '{tags}',
+                                       %s::jsonb
+                                   ),
+                                   provider = EXCLUDED.provider,
+                                   updated_at = NOW()
                            """, (
                                post_id,
                                'gigachat',
-                               tags,
-                               'tags'
+                               'tags',
+                               tags_json,
+                               tags_json
                            ))
                     
                     db_conn.commit()

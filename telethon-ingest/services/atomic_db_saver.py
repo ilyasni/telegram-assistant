@@ -19,6 +19,7 @@ from sqlalchemy import text, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from prometheus_client import Counter, Histogram
+from dateutil import parser as date_parser
 
 logger = structlog.get_logger()
 
@@ -45,6 +46,47 @@ db_transaction_rollbacks_total = Counter(
     'Transaction rollbacks',
     ['reason']
 )
+
+# Context7: Метрики для отслеживания проблем с парсингом
+# Context7: Импортируем метрики из channel_parser для предотвращения дублирования
+# Метрики уже определены в channel_parser.py с правильными labels
+try:
+    from services.channel_parser import (
+        channel_not_found_total,
+        album_save_failures_total,
+        session_rollback_failures_total
+    )
+except ImportError:
+    # Fallback: если channel_parser не импортирован, создаём метрики с проверкой на дублирование
+    from prometheus_client import REGISTRY
+    
+    def _get_or_create_counter(name, description, labels):
+        """Получить существующую метрику или создать новую."""
+        try:
+            existing = REGISTRY._names_to_collectors.get(name)
+            if existing:
+                return existing
+        except (AttributeError, KeyError):
+            pass
+        return Counter(name, description, labels)
+    
+    channel_not_found_total = _get_or_create_counter(
+        'channel_not_found_total',
+        'Total channel not found errors',
+        ['exists_in_db']  # Context7: Унифицированные labels (без channel_id для контроля кардинальности)
+    )
+    
+    album_save_failures_total = _get_or_create_counter(
+        'album_save_failures_total',
+        'Total album save failures',
+        ['error_type']  # Context7: Унифицированные labels (без channel_id для контроля кардинальности)
+    )
+    
+    session_rollback_failures_total = _get_or_create_counter(
+        'session_rollback_failures_total',
+        'Total session rollback failures',
+        ['operation']  # operation: 'before_parsing', 'before_entity', 'before_albums'
+    )
 
 db_users_upserted_total = Counter(
     'db_users_upserted_total',
@@ -230,15 +272,19 @@ class AtomicDBSaver:
         from sqlalchemy import text
         
         try:
-            # Сохранение forwards
+            # Context7 P1.1: Сохранение forwards с расширенными полями MessageFwdHeader
             if forwards_data:
                 forwards_sql = text("""
                     INSERT INTO post_forwards (
                         post_id, from_chat_id, from_message_id,
-                        from_chat_title, from_chat_username, forwarded_at
+                        from_chat_title, from_chat_username, forwarded_at,
+                        from_id, from_name, post_author_signature,
+                        saved_from_peer, saved_from_msg_id, psa_type
                     ) VALUES (
                         :post_id, :from_chat_id, :from_message_id,
-                        :from_chat_title, :from_chat_username, :forwarded_at
+                        :from_chat_title, :from_chat_username, :forwarded_at,
+                        :from_id::jsonb, :from_name, :post_author_signature,
+                        :saved_from_peer::jsonb, :saved_from_msg_id, :psa_type
                     )
                     ON CONFLICT DO NOTHING
                 """)
@@ -250,7 +296,13 @@ class AtomicDBSaver:
                         'from_message_id': fwd.get('from_message_id'),
                         'from_chat_title': fwd.get('from_chat_title'),
                         'from_chat_username': fwd.get('from_chat_username'),
-                        'forwarded_at': fwd.get('forwarded_at')
+                        'forwarded_at': fwd.get('forwarded_at'),
+                        'from_id': json.dumps(fwd.get('from_id')) if fwd.get('from_id') else None,
+                        'from_name': fwd.get('from_name'),
+                        'post_author_signature': fwd.get('post_author_signature'),
+                        'saved_from_peer': json.dumps(fwd.get('saved_from_peer')) if fwd.get('saved_from_peer') else None,
+                        'saved_from_msg_id': fwd.get('saved_from_msg_id'),
+                        'psa_type': fwd.get('psa_type')
                     }
                     for fwd in forwards_data
                 ]
@@ -286,21 +338,45 @@ class AtomicDBSaver:
                     await db_session.execute(reactions_sql, reactions_params)
                     logger.debug("Saved reactions", post_id=post_id, count=len(reactions_data))
             
-            # Сохранение replies
+            # Context7 P1.1: Сохранение replies с поддержкой thread_id
             if replies_data:
                 replies_sql = text("""
                     INSERT INTO post_replies (
                         post_id, reply_to_post_id, reply_message_id, reply_chat_id,
-                        reply_author_tg_id, reply_author_username, reply_content, reply_posted_at
+                        reply_author_tg_id, reply_author_username, reply_content, reply_posted_at,
+                        thread_id
                     ) VALUES (
                         :post_id, :reply_to_post_id, :reply_message_id, :reply_chat_id,
-                        :reply_author_tg_id, :reply_author_username, :reply_content, :reply_posted_at
+                        :reply_author_tg_id, :reply_author_username, :reply_content, :reply_posted_at,
+                        :thread_id
                     )
                     ON CONFLICT DO NOTHING
                 """)
                 
-                replies_params = [
-                    {
+                # Context7: Конвертация reply_posted_at из ISO строки в datetime для asyncpg
+                replies_params = []
+                for reply in replies_data:
+                    reply_posted_at = reply.get('reply_posted_at')
+                    # Context7: Конвертируем ISO строку в datetime, если это строка
+                    if reply_posted_at and isinstance(reply_posted_at, str):
+                        try:
+                            # Пробуем fromisoformat для стандартного формата ISO 8601
+                            if 'T' in reply_posted_at or '+' in reply_posted_at or reply_posted_at.endswith('Z'):
+                                reply_posted_at = datetime.fromisoformat(reply_posted_at.replace('Z', '+00:00'))
+                            else:
+                                # Fallback на dateutil.parser для других форматов
+                                reply_posted_at = date_parser.parse(reply_posted_at)
+                        except (ValueError, TypeError) as e:
+                            logger.warning(
+                                "Failed to parse reply_posted_at",
+                                reply_posted_at=reply_posted_at,
+                                error=str(e),
+                                post_id=post_id
+                            )
+                            reply_posted_at = None
+                    # Если уже datetime объект, оставляем как есть
+                    
+                    replies_params.append({
                         'post_id': post_id,
                         'reply_to_post_id': reply.get('reply_to_post_id'),
                         'reply_message_id': reply.get('reply_message_id'),
@@ -308,10 +384,9 @@ class AtomicDBSaver:
                         'reply_author_tg_id': reply.get('reply_author_tg_id'),
                         'reply_author_username': reply.get('reply_author_username'),
                         'reply_content': reply.get('reply_content'),
-                        'reply_posted_at': reply.get('reply_posted_at')
-                    }
-                    for reply in replies_data
-                ]
+                        'reply_posted_at': reply_posted_at,
+                        'thread_id': reply.get('thread_id')
+                    })
                 
                 if replies_params:
                     await db_session.execute(replies_sql, replies_params)
@@ -763,7 +838,17 @@ class AtomicDBSaver:
                     'noforwards': post.get('noforwards', False),
                     'invert_media': post.get('invert_media', False),
                     'telegram_post_url': post.get('telegram_post_url', ''),
-                    'grouped_id': post.get('grouped_id')  # Context7: ID альбома для дедупликации
+                    'grouped_id': post.get('grouped_id'),  # Context7: ID альбома для дедупликации
+                    # Context7 P1.1: Быстрые поля для forwards и replies
+                    # Context7: asyncpg требует явный NULL для jsonb, иначе будет ошибка типа
+                    # Используем пустую строку '' вместо None для корректной работы NULLIF
+                    'forward_from_peer_id': json.dumps(post.get('forward_from_peer_id')) if post.get('forward_from_peer_id') else '',
+                    'forward_from_chat_id': post.get('forward_from_chat_id'),
+                    'forward_from_message_id': post.get('forward_from_message_id'),
+                    'forward_date': post.get('forward_date'),
+                    'forward_from_name': post.get('forward_from_name'),
+                    'thread_id': post.get('thread_id'),
+                    'forum_topic_id': post.get('forum_topic_id')
                 }
                 prepared_posts.append(prepared_post)
             
@@ -779,7 +864,9 @@ class AtomicDBSaver:
                     views_count, forwards_count, reactions_count, replies_count,
                     is_pinned, is_edited, edited_at, post_author,
                     reply_to_message_id, reply_to_chat_id, via_bot_id, via_business_bot_id,
-                    is_silent, is_legacy, noforwards, invert_media, telegram_post_url, grouped_id
+                    is_silent, is_legacy, noforwards, invert_media, telegram_post_url, grouped_id,
+                    forward_from_peer_id, forward_from_chat_id, forward_from_message_id,
+                    forward_date, forward_from_name, thread_id, forum_topic_id
                 )
                 VALUES (
                     :id, :channel_id, :telegram_message_id, :content, :media_urls,
@@ -787,10 +874,50 @@ class AtomicDBSaver:
                     :views_count, :forwards_count, :reactions_count, :replies_count,
                     :is_pinned, :is_edited, :edited_at, :post_author,
                     :reply_to_message_id, :reply_to_chat_id, :via_bot_id, :via_business_bot_id,
-                    :is_silent, :is_legacy, :noforwards, :invert_media, :telegram_post_url, :grouped_id
+                    :is_silent, :is_legacy, :noforwards, :invert_media, :telegram_post_url, :grouped_id,
+                    NULLIF(:forward_from_peer_id, '')::jsonb, :forward_from_chat_id, :forward_from_message_id,
+                    :forward_date, :forward_from_name, :thread_id, :forum_topic_id
                 )
                 ON CONFLICT (channel_id, telegram_message_id)
-                DO NOTHING
+                DO UPDATE SET
+                    -- Context7: Обновление контента и медиа
+                    content = COALESCE(NULLIF(EXCLUDED.content, ''), posts.content),
+                    media_urls = COALESCE(EXCLUDED.media_urls, posts.media_urls),
+                    has_media = COALESCE(EXCLUDED.has_media, posts.has_media),
+                    telegram_post_url = COALESCE(EXCLUDED.telegram_post_url, posts.telegram_post_url),
+                    -- Context7: Обновление метрик - используем GREATEST для сохранения максимальных значений
+                    views_count = GREATEST(COALESCE(posts.views_count, 0), COALESCE(EXCLUDED.views_count, 0)),
+                    forwards_count = GREATEST(COALESCE(posts.forwards_count, 0), COALESCE(EXCLUDED.forwards_count, 0)),
+                    reactions_count = GREATEST(COALESCE(posts.reactions_count, 0), COALESCE(EXCLUDED.reactions_count, 0)),
+                    replies_count = GREATEST(COALESCE(posts.replies_count, 0), COALESCE(EXCLUDED.replies_count, 0)),
+                    -- Context7: Обновление информации об редактировании
+                    is_edited = COALESCE(EXCLUDED.is_edited, posts.is_edited),
+                    edited_at = COALESCE(EXCLUDED.edited_at, posts.edited_at),
+                    -- Context7: Обновление времени публикации - используем большее значение
+                    posted_at = GREATEST(COALESCE(posts.posted_at, '1970-01-01'::timestamp), COALESCE(EXCLUDED.posted_at, '1970-01-01'::timestamp)),
+                    -- Context7: Обновление информации об авторе
+                    post_author = COALESCE(NULLIF(EXCLUDED.post_author, ''), posts.post_author),
+                    -- Context7: Обновление флагов
+                    is_pinned = COALESCE(EXCLUDED.is_pinned, posts.is_pinned),
+                    is_silent = COALESCE(EXCLUDED.is_silent, posts.is_silent),
+                    is_legacy = COALESCE(EXCLUDED.is_legacy, posts.is_legacy),
+                    noforwards = COALESCE(EXCLUDED.noforwards, posts.noforwards),
+                    invert_media = COALESCE(EXCLUDED.invert_media, posts.invert_media),
+                    -- Context7: Обновление grouped_id для альбомов
+                    grouped_id = COALESCE(EXCLUDED.grouped_id, posts.grouped_id),
+                    -- Context7: Обновление полей forward/reply
+                    forward_from_peer_id = COALESCE(EXCLUDED.forward_from_peer_id, posts.forward_from_peer_id),
+                    forward_from_chat_id = COALESCE(EXCLUDED.forward_from_chat_id, posts.forward_from_chat_id),
+                    forward_from_message_id = COALESCE(EXCLUDED.forward_from_message_id, posts.forward_from_message_id),
+                    forward_date = COALESCE(EXCLUDED.forward_date, posts.forward_date),
+                    forward_from_name = COALESCE(NULLIF(EXCLUDED.forward_from_name, ''), posts.forward_from_name),
+                    thread_id = COALESCE(EXCLUDED.thread_id, posts.thread_id),
+                    forum_topic_id = COALESCE(EXCLUDED.forum_topic_id, posts.forum_topic_id),
+                    -- Context7: Обновление reply полей
+                    reply_to_message_id = COALESCE(EXCLUDED.reply_to_message_id, posts.reply_to_message_id),
+                    reply_to_chat_id = COALESCE(EXCLUDED.reply_to_chat_id, posts.reply_to_chat_id),
+                    via_bot_id = COALESCE(EXCLUDED.via_bot_id, posts.via_bot_id),
+                    via_business_bot_id = COALESCE(EXCLUDED.via_business_bot_id, posts.via_business_bot_id)
             """)
             
             # Context7 best practice: SQLAlchemy автоматически использует executemany
@@ -798,41 +925,44 @@ class AtomicDBSaver:
             # Это правильно обработает bulk insert и даст корректный rowcount
             result = await db_session.execute(sql, prepared_posts)
             
-            # Context7: Правильный подсчет вставленных строк
-            # result.rowcount возвращает количество действительно вставленных/обновленных строк
-            # При ON CONFLICT DO NOTHING это количество новых строк (не конфликтных)
+            # Context7: Правильный подсчет вставленных/обновленных строк
+            # result.rowcount возвращает количество обработанных строк (вставленных + обновленных)
+            # При ON CONFLICT DO UPDATE это количество всех обработанных строк (новые + обновленные)
             # Следим: при executemany с PostgreSQL rowcount может быть -1 (не поддерживается)
-            inserted_count = result.rowcount if result.rowcount is not None else 0
+            processed_count = result.rowcount if result.rowcount is not None else 0
             
             # Context7: Проверяем на некорректные значения rowcount
-            if inserted_count < 0:
+            if processed_count < 0:
                 # PostgreSQL/asyncpg может вернуть -1 для bulk операций
-                # В этом случае считаем, что все посты были вставлены (оптимистичный подход)
+                # В этом случае считаем, что все посты были обработаны (оптимистичный подход)
                 # Лучше пересчитать через SELECT, но это дорого - используем логику идемпотентности
-                self.logger.warning("Invalid rowcount from bulk insert, assuming all inserted",
+                self.logger.warning("Invalid rowcount from bulk insert, assuming all processed",
                                   total_count=len(prepared_posts),
                                   rowcount=result.rowcount)
-                inserted_count = len(prepared_posts)
+                processed_count = len(prepared_posts)
             
-            # Если rowcount недоступен (старые версии SQLAlchemy), используем приблизительную оценку
-            # Но для bulk insert с executemany это может быть неправильно
-            # Поэтому добавляем предупреждение если rowcount не совпадает с ожидаемым
-            if inserted_count == 0 and len(prepared_posts) > 0:
-                self.logger.warning("No posts inserted despite having data", 
+            # Context7: При ON CONFLICT DO UPDATE все посты должны быть обработаны (вставлены или обновлены)
+            # Если rowcount меньше количества постов, это может означать ошибку
+            if processed_count == 0 and len(prepared_posts) > 0:
+                self.logger.warning("No posts processed despite having data", 
                                   posts_count=len(prepared_posts),
                                   rowcount=result.rowcount)
-            elif inserted_count < len(prepared_posts):
-                self.logger.debug("Some posts were duplicates and not inserted",
+            elif processed_count < len(prepared_posts):
+                # Это необычная ситуация - все посты должны быть обработаны (вставлены или обновлены)
+                self.logger.warning("Some posts were not processed",
                                 total=len(prepared_posts),
-                                inserted=inserted_count,
-                                duplicates=len(prepared_posts) - inserted_count)
+                                processed=processed_count,
+                                unprocessed=len(prepared_posts) - processed_count)
             
-            self.logger.info("Posts bulk insert completed", 
+            # Context7: При ON CONFLICT DO UPDATE мы не можем точно определить, сколько было вставлено, а сколько обновлено
+            # Поэтому возвращаем общее количество обработанных постов
+            # Для точного подсчета нужно было бы делать отдельные запросы, что дорого
+            self.logger.info("Posts bulk insert/update completed", 
                             total_count=len(prepared_posts),
-                            inserted_count=inserted_count,
+                            processed_count=processed_count,
                             rowcount=result.rowcount)
             
-            return inserted_count
+            return processed_count
             
         except Exception as e:
             self.logger.error("Failed to bulk insert posts", 

@@ -207,11 +207,9 @@ class TrendDetectionService:
                             or enrichment_data.get("tags")
                             or []
                         )
-                    if not keywords:
-                        keywords = enrichment.tags or []
-                if enrichment and not topics:
-                    # legacy fallback
-                    topics = enrichment.tags or []
+                    # Context7: Убрана ссылка на несуществующую колонку enrichment.tags
+                    # Все данные извлекаются из enrichment.data
+                # Context7: Убрана legacy fallback для enrichment.tags
                 keywords = list(keywords) if isinstance(keywords, list) else [keywords]
                 topics = list(topics) if isinstance(topics, list) else [topics]
                 

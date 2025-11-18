@@ -19,20 +19,29 @@ import sys
 import os
 
 # 1. Импорт ensure_dt_utc - пробуем разные источники
+# Context7: Импортируем time_utils напрямую, минуя __init__.py, чтобы избежать зависимости от phash
 try:
     # Сначала пробуем shared-пакет (правильный способ)
-    from shared.utils.time_utils import ensure_dt_utc
-except ImportError:
+    # Context7: Импортируем напрямую из time_utils, минуя __init__.py с phash
+    import importlib.util
+    shared_utils_path = os.path.abspath(os.path.join(
+        os.path.dirname(__file__), '..', '..', 'shared', 'python'
+    ))
+    time_utils_path = os.path.join(shared_utils_path, 'shared', 'utils', 'time_utils.py')
+    if os.path.exists(time_utils_path):
+        spec = importlib.util.spec_from_file_location("time_utils", time_utils_path)
+        time_utils = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(time_utils)
+        ensure_dt_utc = time_utils.ensure_dt_utc
+    else:
+        # Fallback: обычный импорт
+        from shared.utils.time_utils import ensure_dt_utc
+except (ImportError, RuntimeError, FileNotFoundError):
     try:
         # Fallback: локальный utils в worker (dev окружение)
         from utils.time_utils import ensure_dt_utc
     except ImportError:
-        # Последний fallback: импорт из shared/python
-        shared_utils_path = os.path.abspath(os.path.join(
-            os.path.dirname(__file__), '..', '..', 'shared', 'python'
-        ))
-        if shared_utils_path not in sys.path and os.path.exists(shared_utils_path):
-            sys.path.insert(0, shared_utils_path)
+        # Последний fallback: обычный импорт
         from shared.utils.time_utils import ensure_dt_utc
 
 # 2. Импорт S3StorageService из api (временное исключение для архитектурной границы)
@@ -104,6 +113,14 @@ storage_cleanup_freed_gb = Histogram(
 storage_quota_check_duration_seconds = Histogram(
     'storage_quota_check_duration_seconds',
     'Duration of quota checks',
+    namespace='worker'
+)
+
+# Context7: Метрики для tenant storage usage tracking
+tenant_storage_usage_gb = Gauge(
+    'tenant_storage_usage_gb',
+    'Storage usage per tenant by content type',
+    ['tenant_id', 'content_type'],  # tenant_id: UUID, content_type: media|vision|crawl
     namespace='worker'
 )
 
@@ -335,8 +352,44 @@ class StorageQuotaService:
                     current_usage_gb=total_gb
                 )
         
-        # Проверка 2: Tenant квота (упрощённая, нужна БД для точного tracking)
-        # TODO: Реализовать через БД при наличии tenant usage tracking
+        # Context7: Проверка 2: Tenant квота через БД
+        if self.db_pool:
+            try:
+                tenant_usage_result = await self.get_tenant_usage(tenant_id, content_type)
+                tenant_usage_gb = tenant_usage_result.get("total_gb", 0.0) if isinstance(tenant_usage_result, dict) else 0.0
+                
+                per_tenant_limit = self.limits.get("per_tenant_max_gb", 2.0)
+                
+                if tenant_usage_gb + size_gb > per_tenant_limit:
+                    storage_quota_violations_total.labels(
+                        tenant_id=tenant_id,
+                        reason="tenant_limit"
+                    ).inc()
+                    logger.warning(
+                        "Quota check blocked upload - tenant limit exceeded",
+                        tenant_id=tenant_id,
+                        content_type=content_type,
+                        size_bytes=size_bytes,
+                        size_gb=size_gb,
+                        tenant_usage_gb=tenant_usage_gb,
+                        tenant_limit_gb=per_tenant_limit,
+                        remaining_gb=per_tenant_limit - tenant_usage_gb
+                    )
+                    return QuotaCheckResult(
+                        allowed=False,
+                        reason="tenant_limit",
+                        current_usage_gb=total_gb,
+                        tenant_usage_gb=tenant_usage_gb,
+                        type_usage_gb=type_usage
+                    )
+            except Exception as e:
+                # Не критично - логируем но продолжаем проверку
+                logger.warning(
+                    "Failed to check tenant quota, continuing with other checks",
+                    tenant_id=tenant_id,
+                    content_type=content_type,
+                    error=str(e)
+                )
         
         # Context7: Проверка 3: Type квота с детальным логированием
         type_limit = self.limits["quotas_by_type"][content_type]["max_gb"]
@@ -530,5 +583,325 @@ class StorageQuotaService:
                 "error": str(e),
                 "deleted_count": 0,
                 "freed_gb": 0.0
+            }
+    
+    async def update_tenant_usage(
+        self,
+        tenant_id: str,
+        content_type: str,
+        size_bytes: int,
+        objects_count: int = 1
+    ) -> None:
+        """
+        Обновление использования storage для tenant.
+        
+        Context7: Использует таблицу tenant_storage_usage для отслеживания использования.
+        Идемпотентная операция через ON CONFLICT (UPSERT).
+        
+        Args:
+            tenant_id: ID tenant (UUID строка)
+            content_type: Тип контента (media|vision|crawl)
+            size_bytes: Размер в байтах
+            objects_count: Количество объектов (по умолчанию 1)
+        """
+        if not self.db_pool:
+            logger.debug(
+                "DB pool not available, skipping tenant usage update",
+                tenant_id=tenant_id,
+                content_type=content_type
+            )
+            return
+        
+        try:
+            size_gb = size_bytes / (1024 ** 3)
+            
+            async with self.db_pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO tenant_storage_usage 
+                        (tenant_id, content_type, total_bytes, total_gb, objects_count, last_updated)
+                    VALUES 
+                        ($1::uuid, $2, $3, $4, $5, now())
+                    ON CONFLICT (tenant_id, content_type)
+                    DO UPDATE SET
+                        total_bytes = tenant_storage_usage.total_bytes + $3,
+                        total_gb = (tenant_storage_usage.total_bytes + $3) / (1024.0 ^ 3),
+                        objects_count = tenant_storage_usage.objects_count + $5,
+                        last_updated = now()
+                    """,
+                    tenant_id, content_type, size_bytes, size_gb, objects_count
+                )
+            
+            # Обновляем Prometheus метрики
+            tenant_storage_usage_gb.labels(
+                tenant_id=tenant_id,
+                content_type=content_type
+            ).inc(size_gb)
+            
+            logger.debug(
+                "Tenant storage usage updated",
+                tenant_id=tenant_id,
+                content_type=content_type,
+                size_bytes=size_bytes,
+                size_gb=size_gb,
+                objects_count=objects_count
+            )
+            
+        except Exception as e:
+            logger.error(
+                "Failed to update tenant storage usage",
+                tenant_id=tenant_id,
+                content_type=content_type,
+                error=str(e),
+                error_type=type(e).__name__,
+                exc_info=True
+            )
+            # Не критично - продолжаем без обновления
+    
+    async def get_tenant_usage(
+        self,
+        tenant_id: str,
+        content_type: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Получение использования storage для tenant.
+        
+        Context7: Использует таблицу tenant_storage_usage для получения актуальных данных.
+        
+        Args:
+            tenant_id: ID tenant (UUID строка)
+            content_type: Тип контента (media|vision|crawl), опционально
+            
+        Returns:
+            Dict с использованием по типам контента:
+            {
+                "tenant_id": str,
+                "total_bytes": int,
+                "total_gb": float,
+                "objects_count": int,
+                "by_type": {
+                    "media": {"total_bytes": int, "total_gb": float, "objects_count": int},
+                    "vision": {...},
+                    "crawl": {...}
+                },
+                "last_updated": datetime
+            }
+        """
+        if not self.db_pool:
+            logger.debug(
+                "DB pool not available, returning empty tenant usage",
+                tenant_id=tenant_id
+            )
+            return {
+                "tenant_id": tenant_id,
+                "total_bytes": 0,
+                "total_gb": 0.0,
+                "objects_count": 0,
+                "by_type": {},
+                "last_updated": None
+            }
+        
+        try:
+            async with self.db_pool.acquire() as conn:
+                if content_type:
+                    # Получение использования для конкретного типа
+                    row = await conn.fetchrow(
+                        """
+                        SELECT 
+                            tenant_id,
+                            content_type,
+                            total_bytes,
+                            total_gb,
+                            objects_count,
+                            last_updated
+                        FROM tenant_storage_usage
+                        WHERE tenant_id = $1::uuid AND content_type = $2
+                        """,
+                        tenant_id, content_type
+                    )
+                    
+                    if row:
+                        return {
+                            "tenant_id": str(row['tenant_id']),
+                            "content_type": row['content_type'],
+                            "total_bytes": row['total_bytes'],
+                            "total_gb": float(row['total_gb']),
+                            "objects_count": row['objects_count'],
+                            "last_updated": row['last_updated']
+                        }
+                    else:
+                        return {
+                            "tenant_id": tenant_id,
+                            "content_type": content_type,
+                            "total_bytes": 0,
+                            "total_gb": 0.0,
+                            "objects_count": 0,
+                            "last_updated": None
+                        }
+                else:
+                    # Получение использования для всех типов
+                    rows = await conn.fetch(
+                        """
+                        SELECT 
+                            tenant_id,
+                            content_type,
+                            total_bytes,
+                            total_gb,
+                            objects_count,
+                            last_updated
+                        FROM tenant_storage_usage
+                        WHERE tenant_id = $1::uuid
+                        ORDER BY content_type
+                        """,
+                        tenant_id
+                    )
+                    
+                    total_bytes = 0
+                    total_objects = 0
+                    by_type = {}
+                    last_updated = None
+                    
+                    for row in rows:
+                        ct = row['content_type']
+                        by_type[ct] = {
+                            "total_bytes": row['total_bytes'],
+                            "total_gb": float(row['total_gb']),
+                            "objects_count": row['objects_count'],
+                            "last_updated": row['last_updated']
+                        }
+                        total_bytes += row['total_bytes']
+                        total_objects += row['objects_count']
+                        if not last_updated or row['last_updated'] > last_updated:
+                            last_updated = row['last_updated']
+                    
+                    return {
+                        "tenant_id": tenant_id,
+                        "total_bytes": total_bytes,
+                        "total_gb": total_bytes / (1024 ** 3),
+                        "objects_count": total_objects,
+                        "by_type": by_type,
+                        "last_updated": last_updated
+                    }
+                    
+        except Exception as e:
+            logger.error(
+                "Failed to get tenant storage usage",
+                tenant_id=tenant_id,
+                content_type=content_type,
+                error=str(e),
+                error_type=type(e).__name__,
+                exc_info=True
+            )
+            return {
+                "tenant_id": tenant_id,
+                "total_bytes": 0,
+                "total_gb": 0.0,
+                "objects_count": 0,
+                "by_type": {},
+                "last_updated": None
+            }
+    
+    async def calculate_and_update_tenant_usage(
+        self,
+        tenant_id: str,
+        content_type: str
+    ) -> Dict[str, Any]:
+        """
+        Расчет использования storage для tenant из S3 и обновление БД.
+        
+        Context7: Сканирует S3 bucket для расчета использования по tenant_id.
+        Используется для периодической синхронизации использования.
+        
+        Args:
+            tenant_id: ID tenant (UUID строка)
+            content_type: Тип контента (media|vision|crawl)
+            
+        Returns:
+            Dict с результатами расчета:
+            {
+                "tenant_id": str,
+                "content_type": str,
+                "total_bytes": int,
+                "total_gb": float,
+                "objects_count": int,
+                "calculated_at": datetime
+            }
+        """
+        try:
+            # Получаем префикс для tenant (например, "media/t{tenant_id}/")
+            prefix = f"{content_type}/t{tenant_id}/"
+            
+            # Список объектов S3 для tenant
+            objects = await self.s3_service.list_objects(prefix)
+            
+            total_bytes = 0
+            objects_count = 0
+            
+            for obj in objects:
+                total_bytes += obj.get('size', 0)
+                objects_count += 1
+            
+            size_gb = total_bytes / (1024 ** 3)
+            
+            # Обновляем в БД
+            if self.db_pool:
+                async with self.db_pool.acquire() as conn:
+                    await conn.execute(
+                        """
+                        INSERT INTO tenant_storage_usage 
+                            (tenant_id, content_type, total_bytes, total_gb, objects_count, last_updated)
+                        VALUES 
+                            ($1::uuid, $2, $3, $4, $5, now())
+                        ON CONFLICT (tenant_id, content_type)
+                        DO UPDATE SET
+                            total_bytes = $3,
+                            total_gb = $4,
+                            objects_count = $5,
+                            last_updated = now()
+                        """,
+                        tenant_id, content_type, total_bytes, size_gb, objects_count
+                    )
+                
+                # Обновляем Prometheus метрики
+                tenant_storage_usage_gb.labels(
+                    tenant_id=tenant_id,
+                    content_type=content_type
+                ).set(size_gb)
+            
+            logger.info(
+                "Tenant storage usage calculated and updated",
+                tenant_id=tenant_id,
+                content_type=content_type,
+                total_bytes=total_bytes,
+                total_gb=size_gb,
+                objects_count=objects_count
+            )
+            
+            return {
+                "tenant_id": tenant_id,
+                "content_type": content_type,
+                "total_bytes": total_bytes,
+                "total_gb": size_gb,
+                "objects_count": objects_count,
+                "calculated_at": datetime.now(timezone.utc)
+            }
+            
+        except Exception as e:
+            logger.error(
+                "Failed to calculate tenant storage usage",
+                tenant_id=tenant_id,
+                content_type=content_type,
+                error=str(e),
+                error_type=type(e).__name__,
+                exc_info=True
+            )
+            return {
+                "tenant_id": tenant_id,
+                "content_type": content_type,
+                "total_bytes": 0,
+                "total_gb": 0.0,
+                "objects_count": 0,
+                "calculated_at": None,
+                "error": str(e)
             }
 

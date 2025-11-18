@@ -60,6 +60,7 @@ class EvictionCandidate:
     last_seen_at: Optional[datetime]
     refs_count: int = 0
     tenant_id: Optional[str] = None
+    file_sha256: Optional[str] = None  # Context7: SHA256 для синхронизации с БД
 
 
 class LRUEvictionService:
@@ -196,7 +197,8 @@ class LRUEvictionService:
                         content_type=content_type,
                         size_bytes=row['size_bytes'],
                         last_seen_at=row['last_seen_at'],
-                        refs_count=row['refs_count']
+                        refs_count=row['refs_count'],
+                        file_sha256=row['file_sha256']  # Context7: Сохраняем для синхронизации с БД
                     ))
                 
                 return candidates
@@ -288,14 +290,20 @@ class LRUEvictionService:
         dry_run: bool = True
     ) -> Dict[str, Any]:
         """
-        Удаление кандидатов из S3.
+        Удаление кандидатов из S3 с синхронизацией БД.
+        
+        Context7 best practice:
+        - Проверяет refs_count перед удалением (защита от удаления используемых медиа)
+        - Удаляет/обновляет записи в media_objects после успешного удаления из S3
+        - Синхронизирует состояние между S3 и БД
         
         Returns:
             {
                 "deleted_count": int,
                 "freed_bytes": int,
                 "freed_gb": float,
-                "by_content_type": {...}
+                "by_content_type": {...},
+                "db_updated": int
             }
         """
         if not candidates:
@@ -303,11 +311,13 @@ class LRUEvictionService:
                 "deleted_count": 0,
                 "freed_bytes": 0,
                 "freed_gb": 0.0,
-                "by_content_type": {}
+                "by_content_type": {},
+                "db_updated": 0
             }
         
         deleted_count = 0
         freed_bytes = 0
+        db_updated = 0
         by_content_type = {}
         
         if dry_run:
@@ -317,9 +327,32 @@ class LRUEvictionService:
                 freed_bytes += candidate.size_bytes
                 deleted_count += 1
         else:
+            # Context7: Проверяем refs_count в БД перед удалением (защита)
+            validated_candidates = []
+            if self.db_pool:
+                validated_candidates = await self._validate_candidates_with_db(candidates)
+            else:
+                # Без БД используем все кандидаты (рискованно, но лучше чем ничего)
+                validated_candidates = candidates
+                logger.warning(
+                    "DB pool not available, skipping refs_count validation",
+                    candidates_count=len(candidates)
+                )
+            
+            if not validated_candidates:
+                logger.warning("No validated candidates after DB check", original_count=len(candidates))
+                return {
+                    "deleted_count": 0,
+                    "freed_bytes": 0,
+                    "freed_gb": 0.0,
+                    "by_content_type": {},
+                    "db_updated": 0,
+                    "status": "no_validated_candidates"
+                }
+            
             # Удаляем батчами по 1000 (boto3 лимит)
-            for i in range(0, len(candidates), 1000):
-                batch = candidates[i:i+1000]
+            for i in range(0, len(validated_candidates), 1000):
+                batch = validated_candidates[i:i+1000]
                 delete_keys = [{'Key': c.s3_key} for c in batch]
                 
                 try:
@@ -333,10 +366,18 @@ class LRUEvictionService:
                     
                     # Подсчитываем успешно удалённые
                     deleted = result.get('Deleted', [])
+                    deleted_keys = {obj['Key'] for obj in deleted}
                     deleted_count += len(deleted)
                     
+                    # Context7: Синхронизируем БД после успешного удаления из S3
+                    if self.db_pool:
+                        batch_db_updated = await self._sync_db_after_deletion(
+                            [c for c in batch if c.s3_key in deleted_keys]
+                        )
+                        db_updated += batch_db_updated
+                    
                     for candidate in batch:
-                        if any(obj['Key'] == candidate.s3_key for obj in deleted):
+                        if candidate.s3_key in deleted_keys:
                             freed_bytes += candidate.size_bytes
                             by_content_type[candidate.content_type] = by_content_type.get(candidate.content_type, 0) + candidate.size_bytes
                             
@@ -346,8 +387,24 @@ class LRUEvictionService:
                                 reason='lru'
                             ).inc()
                     
+                    # Логируем ошибки удаления (если есть)
+                    errors = result.get('Errors', [])
+                    if errors:
+                        logger.warning(
+                            "Some objects failed to delete",
+                            errors_count=len(errors),
+                            batch_size=len(batch),
+                            errors_sample=[e.get('Key') for e in errors[:5]]
+                        )
+                    
                 except Exception as e:
-                    logger.error("Failed to delete batch", batch_size=len(batch), error=str(e))
+                    logger.error(
+                        "Failed to delete batch",
+                        batch_size=len(batch),
+                        error=str(e),
+                        error_type=type(e).__name__,
+                        exc_info=True
+                    )
         
         freed_gb = freed_bytes / (1024 ** 3)
         
@@ -363,17 +420,168 @@ class LRUEvictionService:
             "freed_gb": freed_gb,
             "by_content_type": {
                 k: v / (1024 ** 3) for k, v in by_content_type.items()
-            }
+            },
+            "db_updated": db_updated
         }
         
         logger.info(
             "LRU eviction completed",
             deleted_count=deleted_count,
             freed_gb=freed_gb,
+            db_updated=db_updated,
             dry_run=dry_run
         )
         
         return result
+    
+    async def _validate_candidates_with_db(
+        self,
+        candidates: List[EvictionCandidate]
+    ) -> List[EvictionCandidate]:
+        """
+        Валидация кандидатов на удаление через БД.
+        
+        Context7: Проверяет refs_count перед удалением для защиты от удаления используемых медиа.
+        
+        Returns:
+            Список валидированных кандидатов (только с refs_count=0)
+        """
+        if not self.db_pool or not candidates:
+            return candidates
+        
+        try:
+            # Получаем s3_key для кандидатов (нужно для поиска по БД)
+            # Для медиа из БД уже есть s3_key, для медиа из S3 может не быть
+            validated = []
+            
+            async with self.db_pool.acquire() as conn:
+                # Группируем кандидатов по типу для оптимизации запросов
+                media_candidates = [
+                    c for c in candidates 
+                    if c.content_type == 'media' and hasattr(c, 's3_key') and c.s3_key
+                ]
+                
+                if media_candidates:
+                    # Context7: Проверяем refs_count для медиа из БД
+                    # Получаем file_sha256 из s3_key (нужно для поиска в БД)
+                    s3_keys = [c.s3_key for c in media_candidates]
+                    
+                    # Получаем refs_count для каждого s3_key
+                    rows = await conn.fetch("""
+                        SELECT s3_key, refs_count, file_sha256
+                        FROM media_objects
+                        WHERE s3_key = ANY($1::text[])
+                    """, s3_keys)
+                    
+                    # Создаём mapping s3_key -> refs_count
+                    refs_map = {row['s3_key']: row['refs_count'] for row in rows}
+                    sha256_map = {row['s3_key']: row['file_sha256'] for row in rows}
+                    
+                    # Фильтруем только кандидатов с refs_count=0
+                    for candidate in media_candidates:
+                        refs_count = refs_map.get(candidate.s3_key, -1)
+                        
+                        if refs_count == 0:
+                            # Обновляем refs_count в candidate
+                            candidate.refs_count = 0
+                            # Сохраняем file_sha256 для последующего удаления из БД
+                            if candidate.s3_key in sha256_map:
+                                candidate.file_sha256 = sha256_map[candidate.s3_key]
+                            validated.append(candidate)
+                        elif refs_count > 0:
+                            logger.debug(
+                                "Skipping candidate with refs_count > 0",
+                                s3_key=candidate.s3_key,
+                                refs_count=refs_count
+                            )
+                        else:
+                            # Медиа нет в БД - считаем безопасным для удаления
+                            validated.append(candidate)
+                
+                # Для vision и crawl добавляем все (не имеют refs_count в media_objects)
+                other_candidates = [
+                    c for c in candidates 
+                    if c.content_type in ('vision', 'crawl')
+                ]
+                validated.extend(other_candidates)
+                
+                logger.info(
+                    "Validated LRU eviction candidates",
+                    original_count=len(candidates),
+                    validated_count=len(validated),
+                    skipped_count=len(candidates) - len(validated)
+                )
+                
+                return validated
+                
+        except Exception as e:
+            logger.error(
+                "Failed to validate candidates with DB",
+                error=str(e),
+                error_type=type(e).__name__,
+                exc_info=True
+            )
+            # При ошибке валидации возвращаем пустой список (безопаснее)
+            return []
+    
+    async def _sync_db_after_deletion(
+        self,
+        deleted_candidates: List[EvictionCandidate]
+    ) -> int:
+        """
+        Синхронизация БД после удаления медиа из S3.
+        
+        Context7: Удаляет записи из media_objects после успешного удаления из S3.
+        
+        Returns:
+            Количество обновлённых записей в БД
+        """
+        if not self.db_pool or not deleted_candidates:
+            return 0
+        
+        try:
+            async with self.db_pool.acquire() as conn:
+                updated_count = 0
+                
+                # Группируем по типу контента
+                media_candidates = [
+                    c for c in deleted_candidates 
+                    if c.content_type == 'media' and hasattr(c, 'file_sha256') and c.file_sha256
+                ]
+                
+                if media_candidates:
+                    # Context7: Удаляем записи из media_objects для удалённых медиа
+                    # Используем file_sha256 для точного поиска
+                    file_sha256_list = [c.file_sha256 for c in media_candidates if hasattr(c, 'file_sha256')]
+                    
+                    if file_sha256_list:
+                        # Удаляем записи из media_objects (CASCADE удалит связанные записи в post_media_map)
+                        result = await conn.execute("""
+                            DELETE FROM media_objects
+                            WHERE file_sha256 = ANY($1::text[])
+                        """, file_sha256_list)
+                        
+                        updated_count = int(result.split()[-1])  # "DELETE N" -> N
+                        
+                        logger.info(
+                            "Synced DB after media deletion",
+                            deleted_media_count=len(file_sha256_list),
+                            db_records_updated=updated_count
+                        )
+                
+                # Для vision и crawl медиа нет в media_objects, пропускаем
+                
+                return updated_count
+                
+        except Exception as e:
+            logger.error(
+                "Failed to sync DB after deletion",
+                error=str(e),
+                error_type=type(e).__name__,
+                exc_info=True
+            )
+            # Не критично - продолжаем без обновления БД
+            return 0
     
     async def evict_to_target(
         self,

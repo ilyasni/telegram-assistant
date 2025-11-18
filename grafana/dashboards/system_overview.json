@@ -226,7 +226,10 @@
           "editorMode": "code",
           "expr": "sum(increase(posts_processed_total[24h]))",
           "legendFormat": "Posts Processed (24h)",
-          "refId": "A"
+          "refId": "A",
+          "maxDataPoints": 100,
+          "interval": "",
+          "intervalMs": 30000
         }
       ],
       "description": "Total number of posts processed in the last 24 hours",
@@ -861,7 +864,10 @@
           "editorMode": "code",
           "expr": "sum(increase(posts_processed_total{stage=\"enrichment\", success=\"true\"}[24h]))",
           "legendFormat": "Total Enriched Processed (24h)",
-          "refId": "B"
+          "refId": "B",
+          "maxDataPoints": 100,
+          "interval": "",
+          "intervalMs": 30000
         },
         {
           "datasource": {
@@ -1094,7 +1100,7 @@
           "query": "label_values(posts_processed_total, stage)",
           "refId": "StandardVariableQuery"
         },
-        "refresh": 1,
+        "refresh": 2,
         "regex": "",
         "skipUrlSync": false,
         "sort": 1,

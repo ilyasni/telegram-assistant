@@ -26,6 +26,7 @@ from models.database import (
     GroupDigestMetric,
     GroupDigestParticipant,
     GroupDigestTopic,
+    GroupMediaMap,
     GroupMessage,
     User,
 )
@@ -216,7 +217,7 @@ class GroupDigestService:
             db.query(GroupMessage)
             .options(
                 selectinload(GroupMessage.analytics),
-                selectinload(GroupMessage.media_map).selectinload("media_object"),
+                selectinload(GroupMessage.media_map).selectinload(GroupMediaMap.media_object),
             )
             .filter(
                 GroupMessage.group_id == window.group_id,

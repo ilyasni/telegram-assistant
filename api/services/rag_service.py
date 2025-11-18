@@ -1337,7 +1337,7 @@ class RAGService:
                         processing_time_ms=int((time.time() - start_time) * 1000)
                     )
                 
-                # Сохранение в историю даже при отсутствии результатов
+                # Context7: Сохранение в историю даже при отсутствии результатов (критично для аналитики)
                 try:
                     from models.database import RAGQueryHistory
                     rag_history = RAGQueryHistory(
@@ -1355,9 +1355,24 @@ class RAGService:
                     )
                     db.add(rag_history)
                     db.commit()
-                    logger.debug("RAG query saved to history (no results)", user_id=str(user_id), query_id=str(rag_history.id))
+                    logger.info(
+                        "RAG query saved to history (no results)",
+                        user_id=str(user_id),
+                        query_id=str(rag_history.id),
+                        intent=intent
+                    )
                 except Exception as e:
-                    logger.warning("Failed to save RAG query to history", error=str(e))
+                    logger.error(
+                        "Failed to save RAG query to history (no results)",
+                        user_id=str(user_id),
+                        error=str(e),
+                        error_type=type(e).__name__,
+                        exc_info=True
+                    )
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
                 
                 return result
             
@@ -1446,7 +1461,7 @@ class RAGService:
             
             answer = await self.intent_router.ainvoke(router_input)
             
-            # 6. Сохранение в историю запросов
+            # 6. Сохранение в историю запросов (Context7: критично для аналитики)
             try:
                 from models.database import RAGQueryHistory
                 from datetime import timezone
@@ -1469,14 +1484,27 @@ class RAGService:
                 db.add(rag_history)
                 db.commit()
                 
-                logger.debug(
+                logger.info(
                     "RAG query saved to history",
                     user_id=str(user_id),
                     query_id=str(rag_history.id),
-                    intent=intent
+                    intent=intent,
+                    sources_count=len(sources),
+                    confidence=confidence
                 )
             except Exception as e:
-                logger.warning("Failed to save RAG query to history", error=str(e))
+                logger.error(
+                    "Failed to save RAG query to history",
+                    user_id=str(user_id),
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    exc_info=True
+                )
+                # Context7: Пытаемся откатить транзакцию и продолжить
+                try:
+                    db.rollback()
+                except Exception as rollback_error:
+                    logger.warning("Failed to rollback after RAG history save error", error=str(rollback_error))
                 # Не прерываем выполнение, если сохранение не удалось
             
             # 7. Context7: Отслеживание интересов пользователя
@@ -1497,10 +1525,9 @@ class RAGService:
                         ).first()
                         
                         if enrichment and enrichment.data:
-                            # Извлекаем теги из data->'tags' или из legacy поля tags
+                            # Context7: Извлекаем теги только из enrichment.data
+                            # Убрана ссылка на несуществующую колонку enrichment.tags
                             tags = enrichment.data.get('tags', [])
-                            if not tags and enrichment.tags:
-                                tags = enrichment.tags
                             
                             if isinstance(tags, list):
                                 post_topics = [str(tag) for tag in tags if tag]
@@ -1557,7 +1584,7 @@ class RAGService:
                 processing_time_ms=int((time.time() - start_time) * 1000)
             )
             
-            # Сохранение в историю даже при ошибке
+            # Context7: Сохранение в историю даже при ошибке (критично для аналитики и отладки)
             try:
                 from models.database import RAGQueryHistory
                 rag_history = RAGQueryHistory(
@@ -1575,9 +1602,24 @@ class RAGService:
                 )
                 db.add(rag_history)
                 db.commit()
-                logger.debug("RAG query saved to history (error case)", user_id=str(user_id), query_id=str(rag_history.id))
+                logger.info(
+                    "RAG query saved to history (error case)",
+                    user_id=str(user_id),
+                    query_id=str(rag_history.id),
+                    error=str(e)
+                )
             except Exception as save_error:
-                logger.warning("Failed to save RAG query to history (error case)", error=str(save_error))
+                logger.error(
+                    "Failed to save RAG query to history (error case)",
+                    user_id=str(user_id),
+                    error=str(save_error),
+                    error_type=type(save_error).__name__,
+                    exc_info=True
+                )
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
             
             return error_result
 

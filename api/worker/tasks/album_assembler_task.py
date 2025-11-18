@@ -591,13 +591,7 @@ class AlbumAssemblerTask:
                 text("""
                     SELECT 
                         pe.data,
-                        pe.updated_at,
-                        -- Legacy поля для обратной совместимости (fallback)
-                        pe.vision_description,
-                        pe.vision_classification,
-                        pe.vision_is_meme,
-                        pe.vision_ocr_text,
-                        pe.vision_analyzed_at
+                        pe.updated_at
                     FROM post_enrichment pe
                     WHERE pe.post_id = :post_id
                     AND pe.kind = 'vision'

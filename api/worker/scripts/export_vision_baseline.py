@@ -123,7 +123,7 @@ def write_output(report: Dict[str, Any], target: Path | None) -> None:
     if target:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(payload + "\n", encoding="utf-8")
-        logger.info("Baseline metrics written", path=str(target))
+        logger.info(f"Baseline metrics written: path={str(target)}")
     else:
         sys.stdout.write(payload + "\n")
 

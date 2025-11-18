@@ -41,9 +41,7 @@ class VisionExperimentManager:
     def _load_config(self) -> None:
         if not self.config_path or not os.path.exists(self.config_path):
             logger.info(
-                "Vision experiments config not found",
-                path=self.config_path,
-                experiments_enabled=False,
+                f"Vision experiments config not found: path={self.config_path}, experiments_enabled=False"
             )
             return
 
@@ -52,9 +50,7 @@ class VisionExperimentManager:
                 raw_config = yaml.safe_load(f) or {}
         except Exception as exc:  # pragma: no cover
             logger.error(
-                "Failed to read vision experiments config",
-                path=self.config_path,
-                error=str(exc),
+                f"Failed to read vision experiments config: path={self.config_path}, error={str(exc)}"
             )
             return
 
@@ -64,9 +60,7 @@ class VisionExperimentManager:
             self.experiments[name] = definition
 
         logger.info(
-            "Vision experiments loaded",
-            path=self.config_path,
-            experiments=list(self.experiments.keys()),
+            f"Vision experiments loaded: path={self.config_path}, experiments={list(self.experiments.keys())}"
         )
 
     def _normalize_definition(self, name: str, cfg: Dict[str, object]) -> ExperimentDefinition:

@@ -35,6 +35,7 @@ if parent_dir not in sys.path and os.path.exists(os.path.join(parent_dir, 'api')
 
 from api.services.s3_storage import S3StorageService
 from services.budget_gate import BudgetGateService
+from services.storage_quota import StorageQuotaService
 from services.retry_policy import create_retry_decorator, DEFAULT_RETRY_CONFIG
 
 logger = structlog.get_logger()
@@ -88,6 +89,13 @@ vision_parsed_total = Counter(
     ['status', 'method']  # status: success|fallback|error, method: direct|bracket_extractor|partial_fallback|keyword
 )
 
+# Context7: Метрики для отслеживания типов ошибок парсинга
+vision_parse_errors_total = Counter(
+    'vision_parse_errors_total',
+    'Total vision parsing errors by type',
+    ['error_type']  # error_type: json_decode|validation|missing_field|empty_response|other
+)
+
 
 class GigaChatVisionAdapter:
     """
@@ -109,6 +117,7 @@ class GigaChatVisionAdapter:
         base_url: Optional[str] = None,
         s3_service: Optional[S3StorageService] = None,
         budget_gate: Optional[BudgetGateService] = None,
+        storage_quota: Optional[StorageQuotaService] = None,
         verify_ssl: bool = False,
         timeout: int = 600,
         circuit_breaker: Optional[Any] = None
@@ -143,6 +152,7 @@ class GigaChatVisionAdapter:
         self.base_url = base_url
         self.s3_service = s3_service
         self.budget_gate = budget_gate
+        self.storage_quota = storage_quota
         self.verify_ssl = verify_ssl
         self.timeout = timeout
         self.max_output_tokens = int(os.getenv("VISION_MAX_OUTPUT_TOKENS", "512"))
@@ -213,6 +223,7 @@ class GigaChatVisionAdapter:
             base_url=base_url or "default",
             s3_enabled=s3_service is not None,
             budget_gate_enabled=budget_gate is not None,
+            storage_quota_enabled=storage_quota is not None,
             credentials_set=bool(credentials)
         )
     
@@ -593,24 +604,92 @@ class GigaChatVisionAdapter:
                 # Context7: Сохранение в S3 кэш (включая OCR данные)
                 if self.s3_service and cache_key:
                     try:
-                        size_bytes = await self.s3_service.put_json(
-                            data={
-                                **analysis_result,
-                                "usage": usage_payload,
-                            },
-                            s3_key=cache_key,
-                            compress=True,
-                        )
-                        logger.debug(
-                            "Vision result saved to S3 cache",
-                            sha256=sha256,
-                            cache_key=cache_key,
-                            size_bytes=size_bytes,
-                            has_ocr=bool(analysis_result.get("ocr") and analysis_result["ocr"].get("text")),
-                            ocr_text_length=len(analysis_result.get("ocr", {}).get("text", "")) if analysis_result.get("ocr") else 0,
-                            usage=usage_payload,
-                            trace_id=trace_id
-                        )
+                        # Context7: Оценка размера JSON перед проверкой квоты
+                        import json
+                        estimated_json_size = len(json.dumps({
+                            **analysis_result,
+                            "usage": usage_payload,
+                        }, default=str).encode('utf-8'))
+                        
+                        # Context7: Проверка квоты перед сохранением в S3
+                        quota_blocked = False
+                        if self.storage_quota and hasattr(self.storage_quota, 'check_quota_before_upload'):
+                            try:
+                                quota_check = await self.storage_quota.check_quota_before_upload(
+                                    tenant_id=tenant_id,
+                                    size_bytes=estimated_json_size,
+                                    content_type="vision"
+                                )
+                                
+                                if not quota_check.allowed:
+                                    quota_blocked = True
+                                    logger.warning(
+                                        "Quota check blocked vision result save to S3",
+                                        sha256=sha256,
+                                        tenant_id=tenant_id,
+                                        reason=quota_check.reason,
+                                        tenant_usage_gb=quota_check.tenant_usage_gb,
+                                        size_bytes=estimated_json_size,
+                                        trace_id=trace_id
+                                    )
+                                    # Продолжаем без сохранения в S3 (но результат все равно возвращается)
+                                    # Это не критично - результат уже проанализирован
+                            except Exception as quota_error:
+                                # Fail-open: если проверка квоты не удалась, продолжаем с сохранением
+                                logger.warning(
+                                    "Quota check failed, continuing with S3 save",
+                                    sha256=sha256,
+                                    tenant_id=tenant_id,
+                                    error=str(quota_error),
+                                    trace_id=trace_id
+                                )
+                        
+                        if not quota_blocked:
+                            # Сохранение в S3
+                            size_bytes = await self.s3_service.put_json(
+                                data={
+                                    **analysis_result,
+                                    "usage": usage_payload,
+                                },
+                                s3_key=cache_key,
+                                compress=True,
+                            )
+                            
+                            # Context7: Обновление tenant usage после успешного сохранения
+                            if self.storage_quota and hasattr(self.storage_quota, 'update_tenant_usage'):
+                                try:
+                                    await self.storage_quota.update_tenant_usage(
+                                        tenant_id=tenant_id,
+                                        content_type="vision",
+                                        size_bytes=size_bytes,
+                                        objects_count=1
+                                    )
+                                    logger.debug(
+                                        "Tenant usage updated for vision result",
+                                        sha256=sha256,
+                                        tenant_id=tenant_id,
+                                        size_bytes=size_bytes,
+                                        trace_id=trace_id
+                                    )
+                                except Exception as usage_error:
+                                    logger.warning(
+                                        "Failed to update tenant usage for vision result",
+                                        sha256=sha256,
+                                        tenant_id=tenant_id,
+                                        error=str(usage_error),
+                                        trace_id=trace_id
+                                    )
+                            
+                            logger.debug(
+                                "Vision result saved to S3 cache",
+                                sha256=sha256,
+                                cache_key=cache_key,
+                                size_bytes=size_bytes,
+                                has_ocr=bool(analysis_result.get("ocr") and analysis_result["ocr"].get("text")),
+                                ocr_text_length=len(analysis_result.get("ocr", {}).get("text", "")) if analysis_result.get("ocr") else 0,
+                                usage=usage_payload,
+                                trace_id=trace_id
+                            )
                     except Exception as e:
                         # Не критичная ошибка - логируем но продолжаем
                         logger.warning(
@@ -827,12 +906,20 @@ class GigaChatVisionAdapter:
         import json
         import re
         
+        # Context7: Валидация входных данных
+        if not content or not content.strip():
+            vision_parse_errors_total.labels(error_type='empty_response').inc()
+            logger.warning("Empty vision response content", file_id=file_id)
+            # Возвращаем минимальный fallback
+            return self._create_minimal_fallback(content or "", file_id)
+        
         # Context7: Импорт VisionEnrichment для валидации
         try:
             from events.schemas.posts_vision_v1 import VisionEnrichment
         except ImportError:
             # Fallback для случая если схема не доступна
             VisionEnrichment = None
+            logger.warning("VisionEnrichment schema not available, using fallback parsing", file_id=file_id)
         
         # Приоритет 1: Попытка прямого парсинга JSON
         if VisionEnrichment:
@@ -865,12 +952,21 @@ class GigaChatVisionAdapter:
                 try:
                     enrichment = VisionEnrichment(**parsed)
                     vision_parsed_total.labels(status="success", method="direct").inc()
+                    logger.debug("Vision response parsed successfully via direct JSON", file_id=file_id)
                     return self._enrichment_to_dict(enrichment, file_id)
                 except Exception as e:
-                    logger.debug("Direct JSON parsing failed validation, trying repair", error=str(e))
+                    error_type = 'validation'
+                    if 'required' in str(e).lower() or 'missing' in str(e).lower():
+                        error_type = 'missing_field'
+                    vision_parse_errors_total.labels(error_type=error_type).inc()
+                    logger.debug("Direct JSON parsing failed validation, trying repair", 
+                               file_id=file_id, error=str(e), error_type=type(e).__name__)
                     # Пробуем repair-prompt (если возможно)
-            except json.JSONDecodeError:
-                pass
+            except json.JSONDecodeError as e:
+                vision_parse_errors_total.labels(error_type='json_decode').inc()
+                logger.debug("Direct JSON parsing failed with JSONDecodeError", 
+                           file_id=file_id, error=str(e), content_preview=content[:200])
+                # Продолжаем к следующему методу парсинга
         
         # Приоритет 2: Tolerant-parser - скобочный экстрактор для неполных ответов
         if VisionEnrichment:
@@ -888,11 +984,23 @@ class GigaChatVisionAdapter:
                     try:
                         enrichment = VisionEnrichment(**parsed)
                         vision_parsed_total.labels(status="success", method="bracket_extractor").inc()
+                        logger.debug("Vision response parsed successfully via bracket extractor", file_id=file_id)
                         return self._enrichment_to_dict(enrichment, file_id)
                     except Exception as e:
-                        logger.debug("Bracket extractor result failed validation", error=str(e))
-            except (json.JSONDecodeError, Exception) as e:
-                logger.debug("Bracket extractor failed", error=str(e))
+                        error_type = 'validation'
+                        if 'required' in str(e).lower() or 'missing' in str(e).lower():
+                            error_type = 'missing_field'
+                        vision_parse_errors_total.labels(error_type=error_type).inc()
+                        logger.debug("Bracket extractor result failed validation", 
+                                   file_id=file_id, error=str(e), error_type=type(e).__name__)
+            except json.JSONDecodeError as e:
+                vision_parse_errors_total.labels(error_type='json_decode').inc()
+                logger.debug("Bracket extractor failed with JSONDecodeError", 
+                           file_id=file_id, error=str(e))
+            except Exception as e:
+                vision_parse_errors_total.labels(error_type='other').inc()
+                logger.debug("Bracket extractor failed with exception", 
+                           file_id=file_id, error=str(e), error_type=type(e).__name__)
         
         # Приоритет 3: Попытка извлечь частичный JSON и дополнить дефолтами
         if VisionEnrichment:
@@ -916,16 +1024,32 @@ class GigaChatVisionAdapter:
                     try:
                         enrichment = VisionEnrichment(**partial_data)
                         vision_parsed_total.labels(status="success", method="partial_fallback").inc()
+                        logger.debug("Vision response parsed successfully via partial fallback", file_id=file_id)
                         return self._enrichment_to_dict(enrichment, file_id)
                     except Exception as e:
-                        logger.debug("Partial JSON with defaults failed validation", error=str(e))
+                        error_type = 'validation'
+                        if 'required' in str(e).lower() or 'missing' in str(e).lower():
+                            error_type = 'missing_field'
+                        vision_parse_errors_total.labels(error_type=error_type).inc()
+                        logger.debug("Partial JSON with defaults failed validation", 
+                                   file_id=file_id, error=str(e), error_type=type(e).__name__)
             except Exception as e:
-                logger.debug("Partial extraction failed", error=str(e))
+                vision_parse_errors_total.labels(error_type='other').inc()
+                logger.debug("Partial extraction failed", 
+                           file_id=file_id, error=str(e), error_type=type(e).__name__)
         
         # Приоритет 4: Fallback - классификация по ключевым словам
         vision_parsed_total.labels(status="fallback", method="keyword").inc()
-        logger.warning("Vision parsing fallback to keyword classification", content_preview=content[:100])
+        logger.warning("Vision parsing fallback to keyword classification", 
+                     file_id=file_id, content_preview=content[:100], content_length=len(content))
         
+        return self._create_minimal_fallback(content, file_id, VisionEnrichment)
+    
+    def _create_minimal_fallback(self, content: str, file_id: str, VisionEnrichment=None) -> Dict[str, Any]:
+        """
+        Context7: Создание минимального валидного результата парсинга Vision ответа.
+        Используется как последний резерв при всех неудачных попытках парсинга.
+        """
         classification_type = self._classify_by_keywords(content)
         is_meme = self._detect_meme_by_keywords(content)
         
@@ -956,7 +1080,9 @@ class GigaChatVisionAdapter:
                 )
                 return self._enrichment_to_dict(enrichment, file_id)
             except Exception as e:
-                logger.error("Failed to create fallback VisionEnrichment", error=str(e))
+                vision_parse_errors_total.labels(error_type='validation').inc()
+                logger.error("Failed to create fallback VisionEnrichment", 
+                           file_id=file_id, error=str(e), error_type=type(e).__name__)
         
         # Последний резерв - возвращаем минимальный dict
         return {

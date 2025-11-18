@@ -11,6 +11,8 @@
 - Prioritize architecture & pipelines; no production code unless explicitly asked
 - Use ARCHITECTURE_PRINCIPLES.md as single source of truth
 - Follow security → observability → multi-tenancy priorities
+- Use Context7 MCP for best practices and library documentation
+- Keep documentation up-to-date with actual implementation status
 
 ## Modular Rules
 Load modular rules from `.cursor/rules/` and apply them in numeric order:

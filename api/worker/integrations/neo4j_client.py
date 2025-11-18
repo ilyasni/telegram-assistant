@@ -101,7 +101,10 @@ class Neo4jClient:
         expires_at: str,
         enrichment_data: Optional[Dict[str, Any]] = None,
         indexed_at: str = None,
-        content: Optional[str] = None
+        content: Optional[str] = None,
+        telegram_message_id: Optional[int] = None,
+        tg_channel_id: Optional[int] = None,
+        posted_at: Optional[str] = None
     ) -> bool:
         """
         Создание узла поста с expires_at property.
@@ -135,7 +138,10 @@ class Neo4jClient:
                     p.expires_at = $expires_at,
                     p.indexed_at = $indexed_at,
                     p.enrichment_data = $enrichment_data,
-                    p.content = coalesce($content, p.content)
+                    p.content = coalesce($content, p.content),
+                    p.telegram_message_id = coalesce($telegram_message_id, p.telegram_message_id),
+                    p.tg_channel_id = coalesce($tg_channel_id, p.tg_channel_id),
+                    p.posted_at = coalesce($posted_at, p.posted_at)
                 MERGE (u:User {user_id: $effective_user_id})
                 SET u.tenant_id = $tenant_id
                 MERGE (c:Channel {channel_id: $channel_id})
@@ -158,7 +164,10 @@ class Neo4jClient:
                     expires_at=expires_at,
                     indexed_at=indexed_at or datetime.now(timezone.utc).isoformat(),
                     enrichment_data=enrichment_json,
-                    content=trimmed_content
+                    content=trimmed_content,
+                    telegram_message_id=telegram_message_id,
+                    tg_channel_id=tg_channel_id,
+                    posted_at=posted_at
                 )
                 
                 record = await result.single()
@@ -645,6 +654,347 @@ class Neo4jClient:
             )
             return False
     
+    async def create_forward_relationship(
+        self,
+        post_id: str,
+        forward_from_peer_id: Optional[Dict[str, Any]] = None,
+        forward_from_chat_id: Optional[int] = None,
+        forward_from_message_id: Optional[int] = None,
+        forward_date: Optional[str] = None,
+        forward_from_name: Optional[str] = None
+    ) -> bool:
+        """
+        Создание связи FORWARDED_FROM между постами (Context7 P2: Graph-RAG).
+        
+        Создаёт:
+        - Узел (:ForwardSource) для источника форварда
+        - Связь (:Post)-[:FORWARDED_FROM]->(:ForwardSource)
+        - Если известно, связь (:Post)-[:FORWARDED_FROM]->(:Post) для исходного поста
+        
+        Args:
+            post_id: ID поста, который содержит форвард
+            forward_from_peer_id: Peer ID источника (JSON: user_id/channel_id/chat_id)
+            forward_from_chat_id: Chat ID источника (упрощённый доступ)
+            forward_from_message_id: Message ID исходного сообщения
+            forward_date: Дата оригинального сообщения
+            forward_from_name: Имя автора оригинального сообщения
+        """
+        try:
+            if not self._driver:
+                return False
+            
+            await self._ping()
+            
+            async with self._driver.session() as session:
+                # Context7 P2: Создание узла ForwardSource для источника форварда
+                # Используем комбинацию peer_id + message_id как уникальный идентификатор
+                source_id = None
+                source_type = None
+                
+                if forward_from_peer_id:
+                    if 'user_id' in forward_from_peer_id:
+                        source_id = str(forward_from_peer_id['user_id'])
+                        source_type = 'user'
+                    elif 'channel_id' in forward_from_peer_id:
+                        source_id = str(forward_from_peer_id['channel_id'])
+                        source_type = 'channel'
+                    elif 'chat_id' in forward_from_peer_id:
+                        source_id = str(forward_from_peer_id['chat_id'])
+                        source_type = 'chat'
+                
+                if not source_id:
+                    # Нет информации о источнике - пропускаем
+                    logger.debug("No forward source information", post_id=post_id)
+                    return False
+                
+                # Создаём узел ForwardSource
+                source_query = """
+                MERGE (fs:ForwardSource {source_id: $source_id, source_type: $source_type})
+                SET fs.name = $forward_from_name,
+                    fs.forward_date = $forward_date,
+                    fs.updated_at = datetime()
+                RETURN fs.source_id as source_id
+                """
+                
+                await session.run(
+                    source_query,
+                    source_id=source_id,
+                    source_type=source_type,
+                    forward_from_name=forward_from_name,
+                    forward_date=forward_date
+                )
+                
+                # Создаём связь FORWARDED_FROM к ForwardSource
+                forward_query = """
+                MATCH (p:Post {post_id: $post_id})
+                MATCH (fs:ForwardSource {source_id: $source_id, source_type: $source_type})
+                MERGE (p)-[r:FORWARDED_FROM]->(fs)
+                SET r.forward_from_message_id = $forward_from_message_id,
+                    r.forward_date = $forward_date,
+                    r.updated_at = datetime()
+                RETURN p.post_id as post_id, fs.source_id as source_id
+                """
+                
+                result = await session.run(
+                    forward_query,
+                    post_id=post_id,
+                    source_id=source_id,
+                    source_type=source_type,
+                    forward_from_message_id=forward_from_message_id,
+                    forward_date=forward_date
+                )
+                
+                record = await result.single()
+                if record:
+                    logger.debug("Forward relationship created",
+                               post_id=post_id,
+                               source_id=source_id,
+                               source_type=source_type)
+                    
+                    # Context7 P2: Если известен channel_id и message_id, пытаемся найти исходный пост
+                    if forward_from_chat_id and forward_from_message_id:
+                        # Пытаемся найти исходный пост в Neo4j (если он уже проиндексирован)
+                        original_post_query = """
+                        MATCH (orig_p:Post)
+                        WHERE orig_p.channel_id = $channel_id 
+                          AND orig_p.telegram_message_id = $message_id
+                        MATCH (p:Post {post_id: $post_id})
+                        MERGE (p)-[r2:FORWARDED_FROM_POST]->(orig_p)
+                        SET r2.forward_date = $forward_date,
+                            r2.updated_at = datetime()
+                        RETURN orig_p.post_id as original_post_id
+                        """
+                        
+                        await session.run(
+                            original_post_query,
+                            post_id=post_id,
+                            channel_id=str(forward_from_chat_id),
+                            message_id=forward_from_message_id,
+                            forward_date=forward_date
+                        )
+                    
+                    return True
+                else:
+                    logger.warning("Failed to create forward relationship",
+                                 post_id=post_id,
+                                 source_id=source_id)
+                    return False
+                    
+        except Exception as e:
+            logger.error("Error creating forward relationship",
+                        post_id=post_id,
+                        error=str(e))
+            return False
+    
+    async def create_reply_relationship(
+        self,
+        post_id: str,
+        reply_to_message_id: Optional[int] = None,
+        reply_to_chat_id: Optional[int] = None,
+        thread_id: Optional[int] = None
+    ) -> bool:
+        """
+        Создание связи REPLIES_TO между постами (Context7 P2: Graph-RAG).
+        
+        Создаёт:
+        - Связь (:Post)-[:REPLIES_TO {thread_id}]->(:Post) для исходного поста
+        - Если thread_id указан, создаёт связь к треду
+        
+        Args:
+            post_id: ID поста-ответа
+            reply_to_message_id: Message ID поста, на который отвечают
+            reply_to_chat_id: Chat ID канала/чата исходного поста (может быть числом или UUID строкой)
+            thread_id: ID треда (для каналов с комментариями)
+        """
+        try:
+            if not self._driver or not reply_to_message_id:
+                return False
+            
+            await self._ping()
+            
+            async with self._driver.session() as session:
+                # Context7 P2: Улучшенный поиск исходного поста
+                # Поддерживаем поиск по разным форматам channel_id:
+                # 1. По channel_id (UUID строка)
+                # 2. По tg_channel_id (число, если есть)
+                # 3. По комбинации обоих
+                
+                # Нормализуем reply_to_chat_id для поиска
+                channel_id_str = str(reply_to_chat_id) if reply_to_chat_id else None
+                
+                # Context7 P2: Расширенный поиск исходного поста
+                # Ищем по channel_id (UUID) или tg_channel_id (число) + telegram_message_id
+                reply_query = """
+                MATCH (p:Post {post_id: $post_id})
+                MATCH (orig_p:Post)
+                WHERE orig_p.telegram_message_id = $message_id
+                  AND (
+                    orig_p.channel_id = $channel_id_str
+                    OR orig_p.tg_channel_id = $chat_id_num
+                  )
+                MERGE (p)-[r:REPLIES_TO]->(orig_p)
+                SET r.thread_id = $thread_id,
+                    r.updated_at = datetime()
+                RETURN orig_p.post_id as original_post_id
+                """
+                
+                result = await session.run(
+                    reply_query,
+                    post_id=post_id,
+                    channel_id_str=channel_id_str,
+                    chat_id_num=reply_to_chat_id,
+                    message_id=reply_to_message_id,
+                    thread_id=thread_id
+                )
+                
+                record = await result.single()
+                if record:
+                    logger.debug("Reply relationship created",
+                               post_id=post_id,
+                               original_post_id=record['original_post_id'],
+                               thread_id=thread_id)
+                    return True
+                else:
+                    # Исходный пост ещё не проиндексирован
+                    # Context7 P2: Попытка найти по channel_id из текущего поста
+                    # (если reply_to_chat_id совпадает с channel_id текущего поста)
+                    fallback_query = """
+                    MATCH (p:Post {post_id: $post_id})
+                    MATCH (orig_p:Post)
+                    WHERE orig_p.telegram_message_id = $message_id
+                      AND orig_p.channel_id = p.channel_id
+                    MERGE (p)-[r:REPLIES_TO]->(orig_p)
+                    SET r.thread_id = $thread_id,
+                        r.updated_at = datetime()
+                    RETURN orig_p.post_id as original_post_id
+                    """
+                    
+                    fallback_result = await session.run(
+                        fallback_query,
+                        post_id=post_id,
+                        message_id=reply_to_message_id,
+                        thread_id=thread_id
+                    )
+                    
+                    fallback_record = await fallback_result.single()
+                    if fallback_record:
+                        logger.debug("Reply relationship created (fallback by same channel)",
+                                   post_id=post_id,
+                                   original_post_id=fallback_record['original_post_id'],
+                                   thread_id=thread_id)
+                        return True
+                    
+                    # Исходный пост не найден - логируем для последующего backfilling
+                    logger.debug("Original post not found in graph",
+                               post_id=post_id,
+                               reply_to_message_id=reply_to_message_id,
+                               reply_to_chat_id=reply_to_chat_id)
+                    # Связь будет создана позже при индексации исходного поста
+                    # Для этого можно использовать отдельный процесс backfilling
+                    return True
+                    
+        except Exception as e:
+            logger.error("Error creating reply relationship",
+                        post_id=post_id,
+                        error=str(e))
+            return False
+    
+    async def create_author_relationship(
+        self,
+        post_id: str,
+        author_peer_id: Optional[Dict[str, Any]] = None,
+        author_name: Optional[str] = None,
+        author_type: Optional[str] = None  # 'user', 'channel', 'chat'
+    ) -> bool:
+        """
+        Создание связи AUTHOR_OF между автором и постом (Context7 P2: Graph-RAG).
+        
+        Создаёт:
+        - Узел (:Author) для автора (если не существует)
+        - Связь (:Author)-[:AUTHOR_OF]->(:Post)
+        
+        Args:
+            post_id: ID поста
+            author_peer_id: Peer ID автора (JSON: user_id/channel_id/chat_id)
+            author_name: Имя автора
+            author_type: Тип автора ('user', 'channel', 'chat')
+        """
+        try:
+            if not self._driver:
+                return False
+            
+            await self._ping()
+            
+            async with self._driver.session() as session:
+                # Определяем author_id и author_type
+                author_id = None
+                if author_peer_id:
+                    if 'user_id' in author_peer_id:
+                        author_id = str(author_peer_id['user_id'])
+                        author_type = author_type or 'user'
+                    elif 'channel_id' in author_peer_id:
+                        author_id = str(author_peer_id['channel_id'])
+                        author_type = author_type or 'channel'
+                    elif 'chat_id' in author_peer_id:
+                        author_id = str(author_peer_id['chat_id'])
+                        author_type = author_type or 'chat'
+                
+                if not author_id:
+                    # Нет информации об авторе - пропускаем
+                    logger.debug("No author information", post_id=post_id)
+                    return False
+                
+                # Context7 P2: Создаём узел Author (или используем существующий User/Channel)
+                # Используем единый тип Author для унификации
+                author_query = """
+                MERGE (a:Author {author_id: $author_id, author_type: $author_type})
+                SET a.name = coalesce($author_name, a.name),
+                    a.updated_at = datetime()
+                RETURN a.author_id as author_id
+                """
+                
+                await session.run(
+                    author_query,
+                    author_id=author_id,
+                    author_type=author_type,
+                    author_name=author_name
+                )
+                
+                # Создаём связь AUTHOR_OF
+                author_rel_query = """
+                MATCH (p:Post {post_id: $post_id})
+                MATCH (a:Author {author_id: $author_id, author_type: $author_type})
+                MERGE (a)-[r:AUTHOR_OF]->(p)
+                SET r.updated_at = datetime()
+                RETURN p.post_id as post_id, a.author_id as author_id
+                """
+                
+                result = await session.run(
+                    author_rel_query,
+                    post_id=post_id,
+                    author_id=author_id,
+                    author_type=author_type
+                )
+                
+                record = await result.single()
+                if record:
+                    logger.debug("Author relationship created",
+                               post_id=post_id,
+                               author_id=author_id,
+                               author_type=author_type)
+                    return True
+                else:
+                    logger.warning("Failed to create author relationship",
+                                 post_id=post_id,
+                                 author_id=author_id)
+                    return False
+                    
+        except Exception as e:
+            logger.error("Error creating author relationship",
+                        post_id=post_id,
+                        error=str(e))
+            return False
+    
     async def create_webpage_node(
         self,
         post_id: str,
@@ -977,6 +1327,339 @@ class Neo4jClient:
                 'connected': False,
                 'error': str(e)
             }
+    
+    # ============================================================================
+    # P3: PERSONA AND DIALOGUE NODES (Context7 P3: Sideloading)
+    # ============================================================================
+    
+    async def create_persona_node(
+        self,
+        user_id: str,
+        tenant_id: str,
+        telegram_id: int,
+        persona_name: Optional[str] = None,
+        persona_metadata: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """
+        Создание узла :Persona для пользователя (Context7 P3).
+        
+        Создаёт:
+        - Узел (:Persona {user_id, tenant_id, telegram_id, ...})
+        - Связь (:User)-[:HAS_PERSONA]->(:Persona)
+        
+        Args:
+            user_id: UUID пользователя
+            tenant_id: UUID tenant
+            telegram_id: Telegram ID пользователя
+            persona_name: Имя persona (опционально)
+            persona_metadata: Дополнительные метаданные (опционально)
+        """
+        try:
+            if not self._driver:
+                return False
+            
+            await self._ping()
+            
+            async with self._driver.session() as session:
+                import json
+                metadata_json = json.dumps(persona_metadata, ensure_ascii=False, default=str) if persona_metadata else None
+                
+                query = """
+                MERGE (u:User {user_id: $user_id})
+                SET u.tenant_id = $tenant_id
+                MERGE (p:Persona {user_id: $user_id, tenant_id: $tenant_id})
+                SET p.telegram_id = $telegram_id,
+                    p.name = coalesce($persona_name, p.name),
+                    p.metadata = $persona_metadata,
+                    p.updated_at = datetime()
+                MERGE (u)-[:HAS_PERSONA]->(p)
+                RETURN p.user_id as user_id
+                """
+                
+                result = await session.run(
+                    query,
+                    user_id=user_id,
+                    tenant_id=tenant_id,
+                    telegram_id=telegram_id,
+                    persona_name=persona_name,
+                    persona_metadata=metadata_json
+                )
+                
+                record = await result.single()
+                if record:
+                    logger.debug("Persona node created/updated",
+                               user_id=user_id,
+                               tenant_id=tenant_id)
+                    return True
+                else:
+                    logger.warning("Failed to create persona node",
+                                 user_id=user_id)
+                    return False
+                    
+        except Exception as e:
+            logger.error("Error creating persona node",
+                        user_id=user_id,
+                        error=str(e))
+            return False
+    
+    async def create_dialogue_node(
+        self,
+        user_id: str,
+        tenant_id: str,
+        dialogue_id: str,
+        dialogue_type: str,  # 'dm' or 'group'
+        peer_id: int,
+        peer_name: Optional[str] = None,
+        dialogue_metadata: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """
+        Создание узла :Dialogue для диалога (Context7 P3).
+        
+        Создаёт:
+        - Узел (:Dialogue {dialogue_id, user_id, tenant_id, dialogue_type, ...})
+        - Связь (:Persona)-[:HAS_DIALOGUE]->(:Dialogue)
+        
+        Args:
+            user_id: UUID пользователя
+            tenant_id: UUID tenant
+            dialogue_id: Уникальный ID диалога (например, peer_id или UUID)
+            dialogue_type: Тип диалога ('dm' или 'group')
+            peer_id: Telegram ID собеседника/группы
+            peer_name: Имя собеседника/группы (опционально)
+            dialogue_metadata: Дополнительные метаданные (опционально)
+        """
+        try:
+            if not self._driver:
+                return False
+            
+            await self._ping()
+            
+            async with self._driver.session() as session:
+                import json
+                metadata_json = json.dumps(dialogue_metadata, ensure_ascii=False, default=str) if dialogue_metadata else None
+                
+                query = """
+                MATCH (pers:Persona {user_id: $user_id, tenant_id: $tenant_id})
+                MERGE (d:Dialogue {dialogue_id: $dialogue_id, user_id: $user_id, tenant_id: $tenant_id})
+                SET d.dialogue_type = $dialogue_type,
+                    d.peer_id = $peer_id,
+                    d.peer_name = coalesce($peer_name, d.peer_name),
+                    d.metadata = $dialogue_metadata,
+                    d.updated_at = datetime()
+                MERGE (pers)-[:HAS_DIALOGUE]->(d)
+                RETURN d.dialogue_id as dialogue_id
+                """
+                
+                result = await session.run(
+                    query,
+                    user_id=user_id,
+                    tenant_id=tenant_id,
+                    dialogue_id=dialogue_id,
+                    dialogue_type=dialogue_type,
+                    peer_id=peer_id,
+                    peer_name=peer_name,
+                    dialogue_metadata=metadata_json
+                )
+                
+                record = await result.single()
+                if record:
+                    logger.debug("Dialogue node created/updated",
+                               dialogue_id=dialogue_id,
+                               dialogue_type=dialogue_type)
+                    return True
+                else:
+                    logger.warning("Failed to create dialogue node",
+                                 dialogue_id=dialogue_id)
+                    return False
+                    
+        except Exception as e:
+            logger.error("Error creating dialogue node",
+                        dialogue_id=dialogue_id,
+                        error=str(e))
+            return False
+    
+    async def create_persona_message_relationship(
+        self,
+        post_id: str,
+        user_id: str,
+        tenant_id: str,
+        dialogue_id: str,
+        dialogue_type: str,
+        peer_id: int
+    ) -> bool:
+        """
+        Создание связей между persona message и dialogue (Context7 P3).
+        
+        Создаёт:
+        - Связь (:Post)-[:IN_DIALOGUE]->(:Dialogue)
+        - Связь (:Persona)-[:SENT_MESSAGE]->(:Post) (если отправитель - пользователь)
+        
+        Args:
+            post_id: ID поста (сообщения) в PostgreSQL
+            user_id: UUID пользователя
+            tenant_id: UUID tenant
+            dialogue_id: ID диалога
+            dialogue_type: Тип диалога ('dm' или 'group')
+            peer_id: Telegram ID собеседника/группы
+        """
+        try:
+            if not self._driver:
+                return False
+            
+            await self._ping()
+            
+            async with self._driver.session() as session:
+                # Создаём связь между Post и Dialogue
+                query = """
+                MATCH (p:Post {post_id: $post_id})
+                MATCH (d:Dialogue {dialogue_id: $dialogue_id, user_id: $user_id, tenant_id: $tenant_id})
+                MERGE (p)-[r:IN_DIALOGUE]->(d)
+                SET r.updated_at = datetime()
+                RETURN p.post_id as post_id, d.dialogue_id as dialogue_id
+                """
+                
+                result = await session.run(
+                    query,
+                    post_id=post_id,
+                    user_id=user_id,
+                    tenant_id=tenant_id,
+                    dialogue_id=dialogue_id
+                )
+                
+                record = await result.single()
+                if record:
+                    # Создаём связь между Persona и Post (если нужно)
+                    # Можно определить, является ли пользователь отправителем, по автору поста
+                    persona_query = """
+                    MATCH (pers:Persona {user_id: $user_id, tenant_id: $tenant_id})
+                    MATCH (p:Post {post_id: $post_id})
+                    MERGE (pers)-[r:SENT_MESSAGE]->(p)
+                    SET r.updated_at = datetime()
+                    RETURN pers.user_id as user_id
+                    """
+                    
+                    await session.run(
+                        persona_query,
+                        user_id=user_id,
+                        tenant_id=tenant_id,
+                        post_id=post_id
+                    )
+                    
+                    logger.debug("Persona message relationship created",
+                               post_id=post_id,
+                               dialogue_id=dialogue_id)
+                    return True
+                else:
+                    logger.warning("Failed to create persona message relationship",
+                                 post_id=post_id,
+                                 dialogue_id=dialogue_id)
+                    return False
+                    
+        except Exception as e:
+            logger.error("Error creating persona message relationship",
+                        post_id=post_id,
+                        dialogue_id=dialogue_id,
+                        error=str(e))
+            return False
+    
+    async def create_ocr_entities(
+        self,
+        post_id: str,
+        entities: List[Dict[str, Any]],
+        ocr_context: Optional[str] = None
+    ) -> bool:
+        """
+        Создание Entity узлов из извлеченных сущностей OCR.
+        
+        Context7: Создает Entity nodes с типами ORG, PRODUCT, PERSON, LOC
+        и связи (:Post)-[:MENTIONS {source: "ocr"}]->(:Entity)
+        
+        Args:
+            post_id: ID поста
+            entities: Список сущностей [{"text": "...", "type": "ORG|PRODUCT|PERSON|LOC", "confidence": 0.0-1.0}]
+            ocr_context: Контекст из OCR текста (опционально)
+        
+        Returns:
+            True если успешно, False в случае ошибки
+        """
+        try:
+            if not self._driver or not entities:
+                return True
+            
+            await self._ping()
+            
+            async with self._driver.session() as session:
+                # Context7: Батч-операция через UNWIND для производительности
+                query = """
+                MATCH (p:Post {post_id: $post_id})
+                UNWIND $entities as entity
+                MERGE (e:Entity {name: entity.text, type: entity.type})
+                SET e.confidence = entity.confidence,
+                    e.source = "ocr",
+                    e.updated_at = datetime()
+                MERGE (p)-[r:MENTIONS {
+                    source: "ocr",
+                    confidence: entity.confidence,
+                    context: $ocr_context
+                }]->(e)
+                ON CREATE SET r.created_at = datetime()
+                ON MATCH SET r.updated_at = datetime()
+                RETURN count(e) as entities_created
+                """
+                
+                result = await session.run(
+                    query,
+                    post_id=post_id,
+                    entities=entities,
+                    ocr_context=ocr_context[:500] if ocr_context else None  # Ограничиваем длину контекста
+                )
+                
+                record = await result.single()
+                if record:
+                    entities_count = record.get("entities_created", 0)
+                    logger.debug(
+                        "OCR entities created",
+                        post_id=post_id,
+                        entities_count=entities_count,
+                        total_entities=len(entities)
+                    )
+                    return True
+                else:
+                    logger.warning("Failed to create OCR entities", post_id=post_id)
+                    return False
+                    
+        except Exception as e:
+            logger.error(
+                "Error creating OCR entities",
+                post_id=post_id,
+                error=str(e)
+            )
+            return False
+    
+    async def link_post_to_ocr_entities(
+        self,
+        post_id: str,
+        entities: List[Dict[str, Any]],
+        ocr_text: Optional[str] = None
+    ) -> bool:
+        """
+        Создание связей между Post и Entity узлами из OCR.
+        
+        Context7: Алиас для create_ocr_entities для обратной совместимости.
+        
+        Args:
+            post_id: ID поста
+            entities: Список сущностей
+            ocr_text: OCR текст для контекста (опционально)
+        
+        Returns:
+            True если успешно, False в случае ошибки
+        """
+        return await self.create_ocr_entities(
+            post_id=post_id,
+            entities=entities,
+            ocr_context=ocr_text[:500] if ocr_text else None  # Ограничиваем длину контекста
+        )
     
     async def close(self):
         """Закрытие подключения к Neo4j."""

@@ -94,19 +94,46 @@ async def populate_channel_ids():
         redis_client = redis.from_url(settings.redis_url)
         
         # Ищем авторизованную сессию
-        keys = await redis_client.keys("tg:qr:session:*")
+        # Context7: Проверяем разные ключи для сессий
         session_string = None
         
+        # Вариант 1: tg:qr:session:*
+        keys = await redis_client.keys("tg:qr:session:*")
         for key in keys:
             session_data = await redis_client.hgetall(key)
             if session_data.get(b'status') == b'authorized':
                 session_string = session_data.get(b'session_string', b'').decode('utf-8')
                 if session_string:
-                    logger.info("Found authorized session", key=key.decode())
+                    logger.info("Found authorized session in tg:qr:session", key=key.decode())
                     break
         
+        # Вариант 2: ingest:session:*
         if not session_string:
-            logger.error("No authorized Telegram session found")
+            keys = await redis_client.keys("ingest:session:*")
+            for key in keys:
+                session_data = await redis_client.hgetall(key)
+                if session_data.get(b'status') == b'authorized':
+                    session_string = session_data.get(b'session_string', b'').decode('utf-8')
+                    if session_string:
+                        logger.info("Found authorized session in ingest:session", key=key.decode())
+                        break
+        
+        # Вариант 3: Получаем из Redis по ключу telegram:session:*
+        if not session_string:
+            keys = await redis_client.keys("telegram:session:*")
+            for key in keys:
+                # Пробуем получить session_string напрямую
+                session_string_raw = await redis_client.get(key)
+                if session_string_raw:
+                    try:
+                        session_string = session_string_raw.decode('utf-8')
+                        logger.info("Found session string in telegram:session", key=key.decode())
+                        break
+                    except:
+                        pass
+        
+        if not session_string:
+            logger.error("No authorized Telegram session found in Redis or DB")
             return
         
         from telethon.sessions import StringSession

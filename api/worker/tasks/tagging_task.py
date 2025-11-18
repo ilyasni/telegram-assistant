@@ -253,6 +253,27 @@ class TaggingTask:
             elif media_sha256_list is None:
                 event_data['media_sha256_list'] = []
             
+            # Context7: Нормализация forward_from_peer_id (может прийти как JSON строка)
+            forward_from_peer_id = event_data.get('forward_from_peer_id')
+            if isinstance(forward_from_peer_id, str):
+                # Обработка пустой строки или строки 'null'
+                if not forward_from_peer_id.strip() or forward_from_peer_id.strip() in ('null', 'None', '{}'):
+                    event_data['forward_from_peer_id'] = None
+                else:
+                    try:
+                        loaded = json.loads(forward_from_peer_id)
+                        if isinstance(loaded, dict):
+                            event_data['forward_from_peer_id'] = loaded
+                        else:
+                            event_data['forward_from_peer_id'] = None
+                    except json.JSONDecodeError:
+                        # Если не JSON, устанавливаем None
+                        logger.warning("Failed to parse forward_from_peer_id as JSON", 
+                                     forward_from_peer_id=forward_from_peer_id[:100])
+                        event_data['forward_from_peer_id'] = None
+            elif forward_from_peer_id is None:
+                event_data['forward_from_peer_id'] = None
+            
             # Валидация входного события (после нормализации)
             parsed_event = PostParsedEventV1(**event_data)
             

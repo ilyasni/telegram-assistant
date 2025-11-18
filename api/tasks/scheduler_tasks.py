@@ -28,6 +28,7 @@ from models.database import (
     GroupMessage,
     ChatTrendSubscription,
     UserTrendProfile,
+    Tenant,
 )
 from sqlalchemy import and_
 from services.trend_detection_service import get_trend_detection_service
@@ -1131,8 +1132,38 @@ async def sync_user_interests_to_neo4j_task():
                 logger.debug("User interests synced to Neo4j", user_id=str(user_id), count=len(interests))
                 
             except Exception as e:
-                logger.error("Error syncing user interests to Neo4j", user_id=str(user_id), error=str(e))
+                logger.error("Error syncing user interests to Neo4j", user_id=str(user_id), error=str(e), exc_info=True)
                 error_count += 1
+                
+                # Context7: DLQ для failed синхронизации интересов - отправка в Redis Stream при ошибках
+                try:
+                    import redis.asyncio as redis
+                    redis_client = redis.from_url(settings.redis_url, decode_responses=True)
+                    
+                    # Отправляем failed синхронизацию в DLQ stream с детальной информацией
+                    await redis_client.xadd(
+                        "stream:user_interests.sync.failed",
+                        {
+                            "user_id": str(user_id),
+                            "error": str(e),
+                            "error_type": type(e).__name__,
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "interests_count": str(len(interests) if 'interests' in locals() else 0)
+                        },
+                        maxlen=10000  # Ограничение размера stream
+                    )
+                    
+                    logger.debug(
+                        "Failed sync sent to DLQ",
+                        user_id=str(user_id),
+                        dlq_stream="stream:user_interests.sync.failed"
+                    )
+                except Exception as dlq_error:
+                    logger.warning(
+                        "Failed to send to DLQ",
+                        user_id=str(user_id),
+                        error=str(dlq_error)
+                    )
         
         logger.info(
             "Interests sync completed",
@@ -1178,6 +1209,191 @@ async def sync_user_interests_to_neo4j_task():
             )
         except Exception:
             pass  # Не критично, если DLQ недоступен
+
+
+async def calculate_tenant_storage_usage_task():
+    """
+    Периодическая задача для расчета использования storage по tenant из S3.
+    
+    Context7: Сканирует S3 bucket для расчета использования по tenant_id и обновляет БД.
+    Выполняется каждые 6 часов для синхронизации использования.
+    """
+    try:
+        import os
+        import asyncpg
+        
+        # Context7: Импорт worker версии StorageQuotaService для async методов
+        # Добавляем путь к worker для импорта
+        worker_services_path = os.path.abspath(os.path.join(
+            os.path.dirname(__file__), '..', 'worker', 'services'
+        ))
+        if worker_services_path not in sys.path:
+            sys.path.insert(0, worker_services_path)
+        
+        try:
+            from worker.services.storage_quota import StorageQuotaService as WorkerStorageQuotaService
+            from api.services.s3_storage import S3StorageService
+        except ImportError:
+            # Fallback: пробуем через разные пути
+            try:
+                from services.s3_storage import S3StorageService
+            except ImportError:
+                logger.error("Failed to import S3StorageService")
+                return
+            
+            try:
+                # Добавляем путь к worker
+                worker_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'worker'))
+                if worker_dir not in sys.path:
+                    sys.path.insert(0, worker_dir)
+                from worker.services.storage_quota import StorageQuotaService as WorkerStorageQuotaService
+            except ImportError as e:
+                logger.warning(
+                    "Worker StorageQuotaService not available, skipping tenant storage usage calculation",
+                    error=str(e)
+                )
+                return
+        
+        logger.info("Starting tenant storage usage calculation task")
+        
+        # Context7: Инициализация S3 Storage Service
+        secret_key_value = getattr(settings, 's3_secret_access_key', None)
+        if secret_key_value and hasattr(secret_key_value, 'get_secret_value'):
+            secret_key_value = secret_key_value.get_secret_value()
+        elif not secret_key_value:
+            secret_key_value = os.getenv('S3_SECRET_ACCESS_KEY', '')
+        
+        s3_service = S3StorageService(
+            endpoint_url=getattr(settings, 's3_endpoint_url', os.getenv('S3_ENDPOINT_URL', 'https://s3.cloud.ru')),
+            access_key_id=getattr(settings, 's3_access_key_id', os.getenv('S3_ACCESS_KEY_ID', '')),
+            secret_access_key=secret_key_value,
+            bucket_name=getattr(settings, 's3_bucket_name', os.getenv('S3_BUCKET_NAME', 'test-467940')),
+            region=getattr(settings, 's3_region', os.getenv('S3_REGION', 'ru-central-1')),
+            use_compression=getattr(settings, 's3_use_compression', os.getenv('S3_USE_COMPRESSION', 'true').lower() == 'true')
+        )
+        
+        # Context7: Создание asyncpg pool для StorageQuotaService
+        db_pool = None
+        try:
+            database_url = getattr(settings, 'database_url', os.getenv('DATABASE_URL', ''))
+            if not database_url:
+                logger.warning("DATABASE_URL not configured, skipping tenant storage usage calculation")
+                return
+            
+            # Конвертируем SQLAlchemy URL в asyncpg DSN
+            dsn = database_url.replace("postgresql+asyncpg://", "postgresql://").replace("postgresql://", "postgresql://")
+            db_pool = await asyncpg.create_pool(
+                dsn,
+                min_size=2,
+                max_size=5,
+                command_timeout=30
+            )
+            logger.debug("AsyncPG pool created for tenant storage usage calculation")
+        except Exception as e:
+            logger.warning(
+                "Failed to create asyncpg pool for tenant storage usage calculation",
+                error=str(e)
+            )
+            return  # Без db_pool нельзя обновить БД
+        
+        # Context7: Инициализация StorageQuotaService (worker версия)
+        quota_service = WorkerStorageQuotaService(
+            s3_service=s3_service,
+            db_pool=db_pool,
+            limits={
+                "total_gb": 15.0,
+                "emergency_threshold_gb": 14.0,
+                "per_tenant_max_gb": 2.0
+            }
+        )
+        
+        # Получаем список всех tenant_id из БД
+        db = next(get_db())
+        try:
+            tenants = db.query(Tenant).all()
+            tenant_ids = [str(tenant.id) for tenant in tenants]
+            
+            if not tenant_ids:
+                logger.info("No tenants found, skipping storage usage calculation")
+                return
+            
+            logger.info(
+                "Calculating storage usage for tenants",
+                tenant_count=len(tenant_ids)
+            )
+            
+            # Расчет использования для каждого tenant и типа контента
+            content_types = ["media", "vision", "crawl"]
+            total_processed = 0
+            total_errors = 0
+            
+            for tenant_id in tenant_ids:
+                for content_type in content_types:
+                    try:
+                        # Context7: Используем метод calculate_and_update_tenant_usage для расчета из S3
+                        if hasattr(quota_service, 'calculate_and_update_tenant_usage'):
+                            result = await quota_service.calculate_and_update_tenant_usage(
+                                tenant_id=tenant_id,
+                                content_type=content_type
+                            )
+                        else:
+                            # Fallback для sync версии (не поддерживает calculate_and_update_tenant_usage)
+                            logger.debug(
+                                "StorageQuotaService does not support calculate_and_update_tenant_usage, skipping",
+                                tenant_id=tenant_id,
+                                content_type=content_type
+                            )
+                            continue
+                        
+                        if result and not result.get("error"):
+                            total_processed += 1
+                            logger.debug(
+                                "Tenant storage usage calculated",
+                                tenant_id=tenant_id,
+                                content_type=content_type,
+                                total_gb=result.get("total_gb", 0.0),
+                                objects_count=result.get("objects_count", 0)
+                            )
+                        else:
+                            total_errors += 1
+                            logger.warning(
+                                "Failed to calculate tenant storage usage",
+                                tenant_id=tenant_id,
+                                content_type=content_type,
+                                error=result.get("error") if result else "Unknown error"
+                            )
+                    
+                    except Exception as e:
+                        total_errors += 1
+                        logger.error(
+                            "Error calculating tenant storage usage",
+                            tenant_id=tenant_id,
+                            content_type=content_type,
+                            error=str(e),
+                            error_type=type(e).__name__,
+                            exc_info=True
+                        )
+                        continue
+            
+            logger.info(
+                "Tenant storage usage calculation completed",
+                total_processed=total_processed,
+                total_errors=total_errors,
+                tenant_count=len(tenant_ids)
+            )
+            
+        finally:
+            db.close()
+            if db_pool:
+                await db_pool.close()
+    
+    except Exception as e:
+        logger.error(
+            "Failed to run tenant storage usage calculation task",
+            error=str(e),
+            error_type=type(e).__name__,
+            exc_info=True
+        )
 
 
 def setup_scheduled_tasks():
@@ -1256,6 +1472,15 @@ def setup_scheduled_tasks():
         replace_existing=True,
     )
     
+    # Context7: Расчет использования storage по tenant каждые 6 часов
+    scheduler.add_job(
+        calculate_tenant_storage_usage_task,
+        trigger=CronTrigger(hour="*/6"),  # Каждые 6 часов
+        id="calculate_tenant_storage_usage",
+        name="Calculate tenant storage usage from S3",
+        replace_existing=True
+    )
+    
     logger.info(
         "Scheduled tasks configured",
         tasks=[
@@ -1264,18 +1489,21 @@ def setup_scheduled_tasks():
             "sync_user_interests",
             "trends_stable",
             "trend_digest_subscriptions",
+            "calculate_tenant_storage_usage",
         ],
     )
 
 
-def start_scheduler():
-    """Запуск scheduler."""
+async def start_scheduler():
+    """Запуск scheduler (async для работы с AsyncIOScheduler)."""
     global scheduler
     
     if scheduler is None:
         scheduler = init_scheduler()
     
     if not scheduler.running:
+        # Context7: AsyncIOScheduler требует запущенного event loop
+        # Запускаем scheduler в фоне через asyncio.create_task
         scheduler.start()
         setup_scheduled_tasks()
         logger.info("Scheduler started")

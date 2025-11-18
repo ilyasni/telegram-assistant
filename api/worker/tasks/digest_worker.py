@@ -151,6 +151,31 @@ from api.services.group_digest_service import (  # type: ignore # noqa: E402
 from api.utils.telegram_formatter import markdown_to_telegram_chunks  # type: ignore # noqa: E402
 import bot.webhook as webhook_module  # type: ignore # noqa: E402
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError  # type: ignore # noqa: E402
+# Context7: Импорт универсальной функции санитизации для Prometheus labels
+try:
+    from worker.tasks.group_digest_agent import _sanitize_prometheus_label  # type: ignore # noqa: E402
+except ImportError:
+    # Context7: Fallback - создаем аналогичную функцию для консистентности
+    import re
+    def _sanitize_prometheus_label(value: Any) -> str:
+        """Санитизация значения label для Prometheus (универсальная функция)."""
+        if value is None:
+            return "unknown"
+        if not isinstance(value, str):
+            value = str(value)
+        if not value:
+            return "unknown"
+        # Заменяем невалидные символы на подчеркивания
+        sanitized = re.sub(r'[^a-zA-Z0-9_]', '_', value)
+        # Убираем множественные подчеркивания
+        sanitized = re.sub(r'_+', '_', sanitized)
+        # Убираем подчеркивания в начале и конце
+        sanitized = sanitized.strip('_')
+        # Если начинается с цифры, добавляем префикс
+        if sanitized and sanitized[0].isdigit():
+            sanitized = f"label_{sanitized}"
+        # Если пусто, возвращаем unknown
+        return sanitized if sanitized else "unknown"
 
 FEATURE_RLS_ENABLED = os.getenv("FEATURE_RLS_ENABLED", "false").lower() == "true"
 
@@ -296,8 +321,19 @@ class DigestWorker:
             session.commit()
 
             user = session.query(User).filter(User.id == history.user_id).first()
-            if not user or not user.telegram_id:
-                raise NonRetryableDigestError("User missing telegram_id for digest delivery")
+            if not user:
+                raise NonRetryableDigestError(f"User not found: {digest_event.user_id}")
+            
+            if not user.telegram_id:
+                logger.warning(
+                    "User missing telegram_id for digest delivery",
+                    user_id=digest_event.user_id,
+                    history_id=str(history.id)
+                )
+                history.status = "failed"
+                history.sent_at = None
+                session.commit()
+                raise NonRetryableDigestError(f"User {digest_event.user_id} missing telegram_id for digest delivery")
 
             digest_result = await self._generate_digest(digest_event, session)
             history.content = digest_result.content
@@ -315,9 +351,24 @@ class DigestWorker:
 
             evaluation_scores = getattr(digest_result, "evaluation", {})
             if isinstance(evaluation_scores, dict):
+                # Context7: Валидация и санитизация имен метрик для Prometheus
+                # Используем универсальную функцию _sanitize_prometheus_label для консистентности
                 for metric_name, metric_value in evaluation_scores.items():
                     if isinstance(metric_value, (int, float)):
-                        group_digest_quality_scores.labels(metric=metric_name).observe(float(metric_value))
+                        try:
+                            # Context7: Санитизация имени метрики для Prometheus labels
+                            safe_name = _sanitize_prometheus_label(metric_name)
+                            group_digest_quality_scores.labels(metric=safe_name).observe(float(metric_value))
+                        except Exception as e:
+                            # Context7: Детальное логирование ошибок Prometheus метрик с traceback
+                            logger.error(
+                                "Failed to record evaluation metric",
+                                metric_name=metric_name,
+                                error=str(e),
+                                error_type=type(e).__name__,
+                                traceback=traceback.format_exc(),
+                                history_id=str(history.id),
+                            )
                 logger.info(
                     "Group digest auto-evaluation",
                     history_id=str(history.id),
@@ -335,7 +386,11 @@ class DigestWorker:
                 delivery_channel=digest_event.delivery_channel or "telegram",
             )
 
-            digest_jobs_processed_total.labels(stage="complete", status="success").inc()
+            # Context7: Санитизация значений метрик для Prometheus labels
+            digest_jobs_processed_total.labels(
+                stage=_sanitize_prometheus_label("complete"), 
+                status=_sanitize_prometheus_label("success")
+            ).inc()
             logger.info(
                 "Digest processed successfully",
                 history_id=str(history.id),
@@ -348,7 +403,11 @@ class DigestWorker:
                 history.status = "failed"
                 history.sent_at = None
                 session.commit()
-            digest_jobs_processed_total.labels(stage="complete", status="non_retryable").inc()
+            # Context7: Санитизация значений метрик для Prometheus labels
+            digest_jobs_processed_total.labels(
+                stage=_sanitize_prometheus_label("complete"), 
+                status=_sanitize_prometheus_label("non_retryable")
+            ).inc()
             logger.warning(
                 "Digest processing failed (non-retryable)",
                 user_id=digest_event.user_id,
@@ -359,7 +418,11 @@ class DigestWorker:
             if history:
                 history.status = "failed"
                 session.commit()
-            digest_jobs_processed_total.labels(stage="complete", status="circuit_open").inc()
+            # Context7: Санитизация значений метрик для Prometheus labels
+            digest_jobs_processed_total.labels(
+                stage=_sanitize_prometheus_label("complete"), 
+                status=_sanitize_prometheus_label("circuit_open")
+            ).inc()
             if self.publisher:
                 await self.publisher.to_dlq(
                     base_event_name="digests.generate",
@@ -374,7 +437,11 @@ class DigestWorker:
                 tenant_id=digest_event.tenant_id,
             )
         except Exception as e:
-            digest_jobs_processed_total.labels(stage="complete", status="error").inc()
+            # Context7: Санитизация значений метрик для Prometheus labels
+            digest_jobs_processed_total.labels(
+                stage=_sanitize_prometheus_label("complete"), 
+                status=_sanitize_prometheus_label("error")
+            ).inc()
             logger.error(
                 "Digest processing failed",
                 user_id=digest_event.user_id,
@@ -425,14 +492,22 @@ class DigestWorker:
         start = time.perf_counter()
         try:
             result = await _run_generation()
-            digest_worker_generation_seconds.labels(status="success").observe(time.perf_counter() - start)
-            digest_jobs_processed_total.labels(stage="generate", status="success").inc()
+            # Context7: Санитизация значений метрик для Prometheus labels
+            digest_worker_generation_seconds.labels(status=_sanitize_prometheus_label("success")).observe(time.perf_counter() - start)
+            digest_jobs_processed_total.labels(
+                stage=_sanitize_prometheus_label("generate"), 
+                status=_sanitize_prometheus_label("success")
+            ).inc()
             if is_group_context:
                 await self._publish_context_prepared_event(digest_event, result)
             return result
         except Exception as e:
-            digest_worker_generation_seconds.labels(status="failed").observe(time.perf_counter() - start)
-            digest_jobs_processed_total.labels(stage="generate", status="failed").inc()
+            # Context7: Санитизация значений метрик для Prometheus labels
+            digest_worker_generation_seconds.labels(status=_sanitize_prometheus_label("failed")).observe(time.perf_counter() - start)
+            digest_jobs_processed_total.labels(
+                stage=_sanitize_prometheus_label("generate"), 
+                status=_sanitize_prometheus_label("failed")
+            ).inc()
             if isinstance(e, ValueError):
                 raise NonRetryableDigestError(str(e)) from e
             raise
@@ -528,8 +603,12 @@ class DigestWorker:
         start = time.perf_counter()
         try:
             await _send_with_cb()
-            digest_worker_send_seconds.labels(status="success").observe(time.perf_counter() - start)
-            digest_jobs_processed_total.labels(stage="send", status="success").inc()
+            # Context7: Санитизация значений метрик для Prometheus labels
+            digest_worker_send_seconds.labels(status=_sanitize_prometheus_label("success")).observe(time.perf_counter() - start)
+            digest_jobs_processed_total.labels(
+                stage=_sanitize_prometheus_label("send"), 
+                status=_sanitize_prometheus_label("success")
+            ).inc()
 
             history.status = "sent"
             history.sent_at = datetime.now(timezone.utc)
@@ -538,8 +617,12 @@ class DigestWorker:
             if group_digest_id:
                 self._mark_group_digest_sent(session, group_digest_id, delivery_channel, status="sent")
         except (TelegramForbiddenError, TelegramBadRequest) as e:
-            digest_worker_send_seconds.labels(status="telegram_error").observe(time.perf_counter() - start)
-            digest_jobs_processed_total.labels(stage="send", status="telegram_error").inc()
+            # Context7: Санитизация значений метрик для Prometheus labels
+            digest_worker_send_seconds.labels(status=_sanitize_prometheus_label("telegram_error")).observe(time.perf_counter() - start)
+            digest_jobs_processed_total.labels(
+                stage=_sanitize_prometheus_label("send"), 
+                status=_sanitize_prometheus_label("telegram_error")
+            ).inc()
 
             history.status = "failed"
             history.sent_at = None
@@ -548,8 +631,12 @@ class DigestWorker:
                 self._mark_group_digest_sent(session, group_digest_id, delivery_channel, status="failed", error=str(e))
             raise NonRetryableDigestError(str(e)) from e
         except Exception as e:
-            digest_worker_send_seconds.labels(status="failed").observe(time.perf_counter() - start)
-            digest_jobs_processed_total.labels(stage="send", status="failed").inc()
+            # Context7: Санитизация значений метрик для Prometheus labels
+            digest_worker_send_seconds.labels(status=_sanitize_prometheus_label("failed")).observe(time.perf_counter() - start)
+            digest_jobs_processed_total.labels(
+                stage=_sanitize_prometheus_label("send"), 
+                status=_sanitize_prometheus_label("failed")
+            ).inc()
             if group_digest_id:
                 self._mark_group_digest_sent(session, group_digest_id, delivery_channel, status="failed", error=str(e))
             raise

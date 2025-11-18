@@ -334,9 +334,9 @@ class SLOThresholds:
                 data = json.load(f)
                 mode_data = data.get(self.mode, {})
                 self.thresholds.update(mode_data)
-                logger.info("Thresholds loaded from JSON", path=path, mode=self.mode)
+                logger.info(f"Thresholds loaded from JSON: path={path}, mode={self.mode}")
         except Exception as e:
-            logger.warning("Failed to load thresholds from JSON", path=path, error=str(e))
+                logger.warning(f"Failed to load thresholds from JSON: path={path}, error={str(e)}")
     
     def env_override(self):
         """Переопределение порогов из ENV переменных."""
@@ -687,16 +687,17 @@ class PipelineChecker:
                     WHERE kind = 'tags'
                 """)
                 
+                # Context7: Используем data JSONB вместо legacy полей
                 recent_tags = await conn.fetch(f"""
                     SELECT 
                         pe.post_id,
-                        pe.tags,
-                        pe.enriched_at,
+                        pe.data->'tags' as tags,
+                        pe.updated_at as enriched_at,
                         p.content
                     FROM post_enrichment pe
                     LEFT JOIN posts p ON pe.post_id = p.id
                     WHERE pe.kind = 'tags'
-                    ORDER BY pe.enriched_at DESC
+                    ORDER BY pe.updated_at DESC
                     LIMIT {min(self.limit, 5)}
                 """)
                 
@@ -741,12 +742,12 @@ class PipelineChecker:
                 recent_enrichments = await conn.fetch(f"""
                     SELECT 
                         pe.post_id,
-                        pe.metadata->>'urls_count' as urls_count,
-                        pe.enrichment_latency_ms,
-                        pe.enriched_at
+                        pe.data->>'urls_count' as urls_count,
+                        pe.data->>'latency_ms' as enrichment_latency_ms,
+                        pe.updated_at as enriched_at
                     FROM post_enrichment pe
                     WHERE pe.kind = 'crawl'
-                    ORDER BY pe.enriched_at DESC
+                    ORDER BY pe.updated_at DESC
                     LIMIT {min(self.limit, 5)}
                 """)
                 
@@ -1085,8 +1086,8 @@ class PipelineChecker:
                         p.content,
                         p.posted_at,
                         p.is_processed,
-                        pe_tags.tags,
-                        pe_crawl.metadata as crawl_metadata,
+                        pe_tags.data->'tags' as tags,
+                        pe_crawl.data as crawl_metadata,
                         isi.embedding_status,
                         isi.graph_status,
                         isi.error_message
@@ -1410,7 +1411,7 @@ async def main():
                 os.makedirs(output_dir, exist_ok=True)
             with open(args.output, 'w', encoding='utf-8') as f:
                 json.dump(results, f, indent=2, default=str)
-            logger.info("Results saved to JSON", path=args.output)
+            logger.info(f"Results saved to JSON: path={args.output}")
         
         # Сохранение JUnit XML (создаём директорию если нужно)
         if args.junit:
@@ -1419,7 +1420,7 @@ async def main():
                 os.makedirs(junit_dir, exist_ok=True)
             checks = results.get('checks', [])
             write_junit(args.junit, f"e2e-{args.mode}", checks)
-            logger.info("JUnit XML saved", path=args.junit)
+            logger.info(f"JUnit XML saved: path={args.junit}")
         
         # Вывод результатов
         if not args.json:

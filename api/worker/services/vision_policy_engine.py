@@ -68,7 +68,7 @@ class VisionPolicyEngine:
             with open(config_path, 'r', encoding='utf-8') as f:
                 return yaml.safe_load(f)
         except Exception as e:
-            logger.error("Failed to load vision policy config", path=config_path, error=str(e))
+            logger.error(f"Failed to load vision policy config: {config_path}, error={str(e)}")
             return self._get_default_config()
     
     def _get_default_config(self) -> Dict[str, Any]:

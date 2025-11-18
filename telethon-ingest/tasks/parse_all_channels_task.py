@@ -238,11 +238,21 @@ class ParseAllChannelsTask:
         """Release scheduler lock"""
         try:
             # Context7: async Redis - используем await для delete()
-            await self.redis.delete("parse_all_channels:lock")
+            # Context7: Проверяем, что lock существует перед удалением
+            lock_key = "parse_all_channels:lock"
+            deleted = await self.redis.delete(lock_key)
+            if deleted > 0:
+                logger.debug("Lock released successfully", lock_key=lock_key)
+            else:
+                logger.warning("Lock was not found when trying to release", lock_key=lock_key)
+            
             if self.app_state:
                 self.app_state["scheduler"]["lock_owner"] = None
         except Exception as e:
-            logger.error(f"Failed to release lock: {str(e)}")
+            logger.error("Failed to release lock", 
+                        error=str(e), 
+                        error_type=type(e).__name__,
+                        exc_info=True)
     
     async def _update_hwm(self, channel_id: str, max_message_date: datetime):
         """Update Redis HWM watermark"""
@@ -416,6 +426,22 @@ class ParseAllChannelsTask:
                     
             except Exception as e:
                 error_type = type(e).__name__
+                # Context7: Проверяем состояние db_session после ошибки
+                # Если сессия в неправильном состоянии, пересоздаем parser с новой сессией
+                if self.parser and hasattr(self.parser, 'db_session'):
+                    try:
+                        if self.parser.db_session.in_transaction():
+                            logger.warning("Session in transaction after error, rolling back",
+                                         channel_id=channel.get('id'),
+                                         error_type=error_type)
+                            await self.parser.db_session.rollback()
+                    except Exception as session_error:
+                        logger.warning("Failed to check/rollback session after error, may need to recreate parser",
+                                     channel_id=channel.get('id'),
+                                     error_type=error_type,
+                                     session_error=str(session_error))
+                        # Context7: Если не можем восстановить сессию, сбрасываем parser для пересоздания
+                        self.parser = None
                 
                 # FloodWait handling
                 if "FloodWait" in error_type or "FLOOD_WAIT" in str(e):
@@ -598,7 +624,17 @@ class ParseAllChannelsTask:
             )
             
         finally:
-            await self._release_lock()
+            # Context7: Всегда освобождаем lock в finally блоке
+            # Context7: Логируем освобождение lock для диагностики
+            try:
+                await self._release_lock()
+                logger.debug("Lock released after tick", 
+                           tick_duration_seconds=(datetime.now(timezone.utc) - tick_start_time).total_seconds() if 'tick_start_time' in locals() else None)
+            except Exception as release_error:
+                logger.error("Failed to release lock in finally block", 
+                           error=str(release_error), 
+                           error_type=type(release_error).__name__,
+                           exc_info=True)
     
     async def _check_and_trigger_backfill(self, channel: Dict[str, Any]):
         """
