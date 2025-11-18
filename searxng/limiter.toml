@@ -1,0 +1,43 @@
+# Context7: Конфигурация limiter для SearXNG
+# Основано на best practices из n8n-installer: https://github.com/kossakovsky/n8n-installer
+# Согласно документации SearXNG: https://docs.searxng.org/admin/limiter.html
+# 
+# ВАЖНО: botdetection инициализируется ВСЕГДА, даже при limiter: false
+# Поэтому нужно настроить trusted_proxies и pass_ip для Docker сети
+
+# Context7: Настройки botdetection
+[botdetection]
+# IPv4 prefix для подсети (32 = точный IP, 16 = подсеть)
+ipv4_prefix = 32
+# IPv6 prefix для подсети
+ipv6_prefix = 48
+
+# Context7: trusted_proxies - IP адреса прокси-серверов (Caddy)
+# Если используется Caddy, добавьте его IP сюда
+# Для прямого доступа через Docker network можно оставить пустым
+trusted_proxies = []
+
+# Context7: Настройки IP лимитов
+[botdetection.ip_limit]
+# Отключаем link-local фильтрацию
+filter_link_local = false
+# Отключаем link token проверку
+link_token = false
+
+# Context7: IP списки - КРИТИЧНО для Docker сети
+[botdetection.ip_lists]
+# block_ip - список заблокированных IP (пустой = нет блокировок)
+block_ip = []
+
+# pass_ip - список разрешенных IP/подсетей
+# ВАЖНО: Добавьте сюда подсеть Docker сети и IP контейнера API
+# Docker сеть telegram-network: 172.18.0.0/16
+pass_ip = [
+  "172.18.0.0/16",  # Docker подсеть telegram-network
+  "127.0.0.1/32",   # localhost
+  "10.0.0.0/8",     # Частные сети
+  "192.168.0.0/16", # Частные сети
+]
+
+# Context7: Разрешаем запросы от searxng.org (для проверки работоспособности)
+pass_searxng_org = true

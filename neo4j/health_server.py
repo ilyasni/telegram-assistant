@@ -21,61 +21,104 @@ from typing import Dict, Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
-from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST, REGISTRY
+from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST, CollectorRegistry
 from starlette.responses import Response
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Context7: Предотвращаем дублирование метрик при hot reload uvicorn
-# При перезапуске модуля старые метрики остаются в REGISTRY, нужно их удалить
-def safe_create_metric(metric_type, name, description, **kwargs):
-    """Создать метрику с проверкой на существование (Context7: предотвращение дублирования)."""
-    try:
-        # Пытаемся найти существующую метрику в регистре
-        if hasattr(REGISTRY, '_names_to_collectors'):
-            existing = REGISTRY._names_to_collectors.get(name)
-            if existing:
-                # Удаляем существующую метрику перед созданием новой
-                try:
-                    REGISTRY.unregister(existing)
-                    logger.debug(f"Unregistered existing metric before recreation: {name}")
-                except (KeyError, ValueError):
-                    pass  # Метрика уже удалена или не найдена
-    except (AttributeError, KeyError, TypeError):
-        pass
+# Context7: Используем кастомный CollectorRegistry для изоляции метрик
+# Это best practice из prometheus/client_python для предотвращения дублирования при hot reload
+# Источник: https://github.com/prometheus/client_python/blob/master/docs/content/instrumenting/_index.md
+# Context7: Ленивая инициализация метрик - создаем только при первом запросе
+# Это предотвращает проблемы при hot reload uvicorn, когда модуль перезагружается
+_metrics_registry = CollectorRegistry()
+_metrics_initialized = False
+neo4j_query_duration_seconds = None
+neo4j_nodes_total = None
+neo4j_relationships_total = None
+neo4j_connections_active = None
+
+def init_metrics():
+    """Инициализировать метрики один раз (Context7: ленивая инициализация для предотвращения дублирования)."""
+    global _metrics_initialized, neo4j_query_duration_seconds, neo4j_nodes_total, neo4j_relationships_total, neo4j_connections_active, _metrics_registry
     
-    # Создаем новую метрику
-    return metric_type(name, description, **kwargs)
-
-# Prometheus метрики (Context7: защита от дублирования при hot reload)
-neo4j_query_duration_seconds = safe_create_metric(
-    Histogram,
-    'neo4j_query_duration_seconds',
-    'Neo4j query duration in seconds',
-    labelnames=['query_type']
-)
-
-neo4j_nodes_total = safe_create_metric(
-    Gauge,
-    'neo4j_nodes_total',
-    'Total number of nodes in the graph',
-    labelnames=['label']
-)
-
-neo4j_relationships_total = safe_create_metric(
-    Gauge,
-    'neo4j_relationships_total',
-    'Total number of relationships',
-    labelnames=['type']
-)
-
-neo4j_connections_active = safe_create_metric(
-    Gauge,
-    'neo4j_connections_active',
-    'Active Neo4j connections'
-)
+    if _metrics_initialized and all([neo4j_query_duration_seconds, neo4j_nodes_total, neo4j_relationships_total, neo4j_connections_active]):
+        return  # Метрики уже инициализированы
+    
+    # Context7: Пересоздаем registry полностью для полной изоляции
+    # Это гарантирует, что старые метрики не останутся при hot reload
+    _metrics_registry = CollectorRegistry()
+    
+    # Context7: Создаем метрики в кастомном registry с обработкой ошибок
+    try:
+        neo4j_query_duration_seconds = Histogram(
+            'neo4j_query_duration_seconds',
+            'Neo4j query duration in seconds',
+            labelnames=['query_type'],
+            registry=_metrics_registry
+        )
+        
+        neo4j_nodes_total = Gauge(
+            'neo4j_nodes_total',
+            'Total number of nodes in the graph',
+            labelnames=['label'],
+            registry=_metrics_registry
+        )
+        
+        neo4j_relationships_total = Gauge(
+            'neo4j_relationships_total',
+            'Total number of relationships',
+            labelnames=['type'],
+            registry=_metrics_registry
+        )
+        
+        neo4j_connections_active = Gauge(
+            'neo4j_connections_active',
+            'Active Neo4j connections',
+            registry=_metrics_registry
+        )
+        
+        _metrics_initialized = True
+        logger.info("Neo4j metrics initialized in custom registry")
+    except ValueError as e:
+        if 'Duplicated timeseries' in str(e):
+            # Context7: Если все еще возникает дублирование, пересоздаем registry заново
+            logger.warning(f"Metrics duplication detected, recreating registry: {e}")
+            _metrics_registry = CollectorRegistry()
+            # Повторная попытка создания
+            neo4j_query_duration_seconds = Histogram(
+                'neo4j_query_duration_seconds',
+                'Neo4j query duration in seconds',
+                labelnames=['query_type'],
+                registry=_metrics_registry
+            )
+            
+            neo4j_nodes_total = Gauge(
+                'neo4j_nodes_total',
+                'Total number of nodes in the graph',
+                labelnames=['label'],
+                registry=_metrics_registry
+            )
+            
+            neo4j_relationships_total = Gauge(
+                'neo4j_relationships_total',
+                'Total number of relationships',
+                labelnames=['type'],
+                registry=_metrics_registry
+            )
+            
+            neo4j_connections_active = Gauge(
+                'neo4j_connections_active',
+                'Active Neo4j connections',
+                registry=_metrics_registry
+            )
+            
+            _metrics_initialized = True
+            logger.info("Neo4j metrics reinitialized in new registry")
+        else:
+            raise
 
 # FastAPI приложение
 app = FastAPI(
@@ -138,6 +181,13 @@ async def get_neo4j_stats() -> Dict[str, Any]:
     if not driver:
         return {}
     
+    # Context7: Инициализируем метрики при первом запросе, если они не были инициализированы
+    if not _metrics_initialized:
+        try:
+            init_metrics()
+        except Exception as e:
+            logger.warning(f"Failed to initialize metrics on request: {e}")
+    
     stats = {}
     
     try:
@@ -151,10 +201,12 @@ async def get_neo4j_stats() -> Dict[str, Any]:
                 if labels:
                     label_key = ":".join(labels)
                     node_counts[label_key] = count
-                    neo4j_nodes_total.labels(label=label_key).set(count)
+                    if neo4j_nodes_total:
+                        neo4j_nodes_total.labels(label=label_key).set(count)
                 else:
                     node_counts["unlabeled"] = count
-                    neo4j_nodes_total.labels(label="unlabeled").set(count)
+                    if neo4j_nodes_total:
+                        neo4j_nodes_total.labels(label="unlabeled").set(count)
             
             stats["nodes"] = node_counts
             
@@ -165,7 +217,8 @@ async def get_neo4j_stats() -> Dict[str, Any]:
                 rel_type = record["type"]
                 count = record["count"]
                 rel_counts[rel_type] = count
-                neo4j_relationships_total.labels(type=rel_type).set(count)
+                if neo4j_relationships_total:
+                    neo4j_relationships_total.labels(type=rel_type).set(count)
             
             stats["relationships"] = rel_counts
             
@@ -179,7 +232,8 @@ async def get_neo4j_stats() -> Dict[str, Any]:
             stats["total_relationships"] = total_relationships
             
             # Активные соединения (приблизительно)
-            neo4j_connections_active.set(1)  # Если мы здесь, соединение активно
+            if neo4j_connections_active:
+                neo4j_connections_active.set(1)  # Если мы здесь, соединение активно
             
     except Exception as e:
         logger.error(f"Failed to get Neo4j stats: {e}")
@@ -218,11 +272,24 @@ async def detailed_health():
 @app.get("/metrics")
 async def metrics():
     """Prometheus metrics endpoint"""
+    # Context7: Инициализируем метрики при первом запросе (ленивая инициализация)
+    if not _metrics_initialized:
+        try:
+            init_metrics()
+        except Exception as e:
+            logger.error(f"Failed to initialize metrics: {e}")
+            # Возвращаем пустые метрики, если инициализация не удалась
+            return Response(
+                generate_latest(_metrics_registry),
+                media_type=CONTENT_TYPE_LATEST
+            )
+    
     # Обновляем метрики
     await get_neo4j_stats()
     
+    # Context7: Используем кастомный registry для генерации метрик
     return Response(
-        generate_latest(),
+        generate_latest(_metrics_registry),
         media_type=CONTENT_TYPE_LATEST
     )
 

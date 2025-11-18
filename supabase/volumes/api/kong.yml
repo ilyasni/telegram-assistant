@@ -266,7 +266,7 @@ services:
 
   # (Edge Functions disabled)
   - name: auth
-    service: gotrue
+    url: http://auth:9999/
     routes:
       - name: auth-all
         strip_path: true

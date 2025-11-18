@@ -1,13 +1,76 @@
-# binaries, dumps, logs
+# Context7: Cursor ignore patterns для оптимизации индексации
+# Обновлено: 2025-01-28
+
+# Environment variables (never index)
+.env
+.env.*
+!.env.example
+
+# Binaries and compiled files
 **/*.log
 **/*.sqlite
 **/*.pyc
+**/*.pyo
+**/*.pyd
 **/__pycache__/**
+**/*.so
+**/*.dll
+**/*.dylib
+
+# Sessions and secrets
 telethon/sessions/**
+**/sessions/**
+**/*session*
+
+# Data directories (large volumes)
 qdrant/storage/**
 redis/data/**
+postgres/data/**
+neo4j/data/**
+grafana/data/**
+supabase/volumes/**
+
+# Build artifacts
 node_modules/**
 dist/**
 build/**
-.env
-# .env.*
+.venv/**
+venv/**
+ENV/**
+
+# IDE and editor files
+.vscode/**
+.idea/**
+*.swp
+*.swo
+*~
+
+# Test results and artifacts
+test_results/**
+artifacts/**
+*.json
+!package.json
+!package-lock.json
+!tsconfig.json
+!pyproject.toml
+
+# Reports (auto-generated)
+docs/reports/*.csv
+docs/reports/*.json
+docs/reports/dead_code_*.md
+docs/reports/cleanup_candidates.md
+docs/reports/jscpd_report/**
+
+# Backup files
+*.dump
+*.rdb
+backups/archive/**
+
+# Large media files (if any)
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.zip
+*.tar.gz
+*.rar

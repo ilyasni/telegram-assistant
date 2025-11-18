@@ -18,19 +18,22 @@ logger = structlog.get_logger()
 rate_limit_hits_total = Counter(
     'rate_limit_hits_total',
     'Rate limit hits',
-    ['type']  # user, channel, global
+    ['type'],  # user, channel, global
+    namespace='telethon'
 )
 
 rate_limit_requests_total = Counter(
     'rate_limit_requests_total',
     'Rate limit requests',
-    ['type', 'result']  # user/channel/global, allowed/blocked
+    ['type', 'result'],  # user/channel/global, allowed/blocked
+    namespace='telethon'
 )
 
 active_rate_limits = Gauge(
     'active_rate_limits',
     'Currently active rate limits',
-    ['type']
+    ['type'],
+    namespace='telethon'
 )
 
 

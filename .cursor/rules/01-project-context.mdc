@@ -11,29 +11,40 @@
 
 ## Состояние проекта
 
-### Текущий статус: Переходная фаза
-- **Старая версия**: Документирована в `docs/OLD_*` файлах
-  - Монолитная архитектура с n8n/Flowise
-  - Сложная система с множественными зависимостями
-  - Репозиторий: https://github.com/ilyasni/t-bot-for-channels/tree/test-cleanup-fresh
-- **Новая архитектура**: Описана в `ARCHITECTURE_PRINCIPLES.md`
-  - Event-driven микросервисная архитектура
+### Текущий статус: Production-ready система
+- **Архитектура**: Event-driven микросервисная архитектура (описана в `ARCHITECTURE_PRINCIPLES.md`)
   - LangChain-ориентированная обработка
   - Минимально достаточная инфраструктура
-- **Реализация**: В процессе (папки `api/`, `worker/`, `telethon-ingest/` пустые)
+  - Полностью реализованные сервисы: `api/`, `worker/`, `telethon-ingest/`
+- **Реализованные функции**:
+  - ✅ Парсинг каналов и групп через Telethon
+  - ✅ Генерация дайджестов (каналы и группы)
+  - ✅ Обнаружение трендов (reactive + stable пайплайны)
+  - ✅ Vision analysis (GigaChat Vision + S3)
+  - ✅ RAG поиск (Qdrant + Neo4j GraphRAG)
+  - ✅ Обогащение контента (тегирование, OCR, crawl4ai)
+  - ✅ Обработка альбомов (event-driven сборка)
+- **Старая документация**: `docs/OLD_*` файлы — только для справки
 
 ### Приоритеты разработки
 1. **Новая архитектура** — основная для разработки
 2. **Старая документация** — только для справки и понимания эволюции
 3. **Не смешивать** — четко разделять контексты старого и нового
 
-### Roadmap реализации
-1. **Инициализация ядра** — Telethon + FastAPI + Postgres + Redis
-2. **Добавление orchestrator** — Redpanda/Redis Streams + LangChain
-3. **RAG модуль** — Qdrant + LangChain retrieval pipeline
-4. **Graph Intelligence** — Neo4j + GraphRAG
-5. **Quality Evaluation** — Ragas evaluator
-6. **Observability & Security** — OTel + RBAC + аудит
+### Реализованные компоненты
+1. ✅ **Ядро системы** — Telethon + FastAPI + Postgres + Redis
+2. ✅ **Orchestrator** — Redis Streams + LangChain workers
+3. ✅ **RAG модуль** — Qdrant + LangChain retrieval pipeline
+4. ✅ **Graph Intelligence** — Neo4j + GraphRAG
+5. ✅ **Digest Service** — генерация дайджестов каналов и групп
+6. ✅ **Trend Detection** — reactive и stable пайплайны
+7. ✅ **Vision Analysis** — GigaChat Vision + S3 storage
+8. ✅ **Observability** — Prometheus метрики + Grafana dashboards
+
+### Roadmap улучшений
+- **Quality Evaluation** — Ragas evaluator (опционально)
+- **OpenTelemetry** — полная трассировка (в планах)
+- **RBAC** — расширенная система ролей (в планах)
 
 ## Архитектурный обзор
 **Поток данных**: Telethon Ingest → FastAPI Gateway → LangChain Workers → Postgres+Qdrant+Neo4j → RAG/Graph API
@@ -67,10 +78,22 @@
 - `error_message`, `retry_count`
 
 ### DigestSettings
-- `user_id`, `channel_ids` (JSON array)
+- `user_id`, `topics` (JSON array), `channel_ids` (JSON array)
 - `frequency` (daily/weekly/monthly)
 - `delivery_method` (telegram/email/webhook)
-- `template_id`, `is_active`
+- `template_id`, `is_active`, `enabled`
+
+### GroupDigest
+- `id`, `window_id`, `requested_by_user_id`
+- `title`, `summary`, `payload` (JSON)
+- `delivery_channel`, `delivery_status`
+- `evaluation_scores` (JSON), `generated_at`
+
+### TrendCluster
+- `id`, `cluster_key`, `tenant_id`
+- `title`, `summary`, `keywords` (JSON array)
+- `burst_score`, `coherence`, `novelty`
+- `created_at`, `updated_at`
 
 ## Технологический стек
 

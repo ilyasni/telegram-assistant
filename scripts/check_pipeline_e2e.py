@@ -156,19 +156,26 @@ async def scan_iter(client: redis.Redis, pattern: str, count: int = 200):
             break
 
 
-async def stream_stats(client: redis.Redis, stream: str, group_hint: str | None = None) -> Dict[str, Any]:
+async def stream_stats(client: redis.Redis, stream: str, group_hint: str | None = None, include_pending_details: bool = False) -> Dict[str, Any]:
     """
     Статистика Redis Stream: xlen, группы, PEL summary.
+    
+    Context7: Поддержка детальной информации о pending messages через XPENDING с параметрами.
+    
+    Args:
+        include_pending_details: Если True, возвращает детальную информацию о pending messages
+                                 (message_id, consumer, time_since_delivered, delivery_count)
     
     Returns:
         {
             'xlen': int | None,
             'groups': [{'name', 'consumers', 'pending', 'last_delivered_id'}],
             'pending_summary': {'total', 'min_id', 'max_id'} | None,
+            'pending_messages': [{'message_id', 'consumer', 'time_since_delivered', 'delivery_count'}] | None,
             'errors': [str]
         }
     """
-    out = {'xlen': None, 'groups': [], 'pending_summary': None, 'errors': []}
+    out = {'xlen': None, 'groups': [], 'pending_summary': None, 'pending_messages': None, 'errors': []}
     
     try:
         out['xlen'] = await client.xlen(stream)
@@ -222,6 +229,7 @@ async def stream_stats(client: redis.Redis, stream: str, group_hint: str | None 
         grp = group_hint or (out['groups'][0]['name'] if out['groups'] else None)
         if grp:
             try:
+                # Context7: XPENDING для summary (без параметров - быстрая проверка)
                 pend = await client.xpending(stream, grp)
                 # pend = {'pending': N, 'min': id, 'max': id, 'consumers': [...]}
                 out['pending_summary'] = {
@@ -229,6 +237,43 @@ async def stream_stats(client: redis.Redis, stream: str, group_hint: str | None 
                     'min_id': pend.get('min'),
                     'max_id': pend.get('max')
                 }
+                
+                # Context7: Детальная информация о pending messages (если запрошена)
+                if include_pending_details and pend.get('pending', 0) > 0:
+                    try:
+                        # Context7: Используем xpending_range для получения детальной информации
+                        # Формат: XPENDING stream group [start] [end] [count] [consumer]
+                        # Используем min_id и max_id из summary, или '-', '+' для всех
+                        start_id = pend.get('min', '-')
+                        end_id = pend.get('max', '+')
+                        count = min(100, pend.get('pending', 0))  # Ограничиваем для производительности
+                        
+                        # Context7: Redis-py async использует xpending_range для детальной информации
+                        # xpending_range(name, groupname, min="-", max="+", count=100)
+                        pending_details_raw = await client.xpending_range(stream, grp, min=start_id, max=end_id, count=count)
+                        
+                        # Обработка результата: список [message_id, consumer, time_since_delivered, delivery_count]
+                        pending_messages = []
+                        if pending_details_raw:
+                            for item in pending_details_raw:
+                                if isinstance(item, (list, tuple)) and len(item) >= 4:
+                                    message_id = item[0].decode('utf-8') if isinstance(item[0], bytes) else str(item[0])
+                                    consumer = item[1].decode('utf-8') if isinstance(item[1], bytes) else str(item[1])
+                                    time_since_delivered = int(item[2]) if isinstance(item[2], (int, str)) else 0
+                                    delivery_count = int(item[3]) if isinstance(item[3], (int, str)) else 0
+                                    
+                                    pending_messages.append({
+                                        'message_id': message_id,
+                                        'consumer': consumer,
+                                        'time_since_delivered': time_since_delivered,
+                                        'delivery_count': delivery_count
+                                    })
+                        
+                        out['pending_messages'] = pending_messages
+                    except Exception as e:
+                        logger.debug("Failed to get pending messages details", error=str(e))
+                        out['errors'].append(f"xpending_details:{e}")
+                
             except Exception as e:
                 out['errors'].append(f"xpending:{e}")
     except Exception as e:
@@ -613,7 +658,9 @@ class PipelineChecker:
             try:
                 # Для indexed stream используем группу "indexing_monitoring" для XPENDING
                 group_hint = "indexing_monitoring" if stream_name == "stream:posts:indexed" else None
-                stats = await stream_stats(self.redis_client, stream_name, group_hint=group_hint)
+                # Для deep режима включаем детальную информацию о pending messages
+                include_details = self.mode == "deep"
+                stats = await stream_stats(self.redis_client, stream_name, group_hint=group_hint, include_pending_details=include_details)
                 streams_data[stream_name] = stats
                 
                 # Проверка порога pending
@@ -1082,7 +1129,9 @@ class PipelineChecker:
             
             for stream_name, group_hint in vision_streams:
                 try:
-                    stats = await stream_stats(self.redis_client, stream_name, group_hint=group_hint)
+                    # Для vision streams включаем детальную информацию о pending messages для проверки возраста
+                    include_details = True  # Всегда включаем для vision (нужно для проверки застрявших событий)
+                    stats = await stream_stats(self.redis_client, stream_name, group_hint=group_hint, include_pending_details=include_details)
                     vision_results['streams'][stream_name] = stats
                 except Exception as e:
                     logger.warning("Vision stream check failed", stream=stream_name, error=str(e))
@@ -1778,6 +1827,8 @@ class PipelineChecker:
         try:
             async with self.db_pool.acquire() as conn:
                 # Ищем посты с тегами (прошли тегирование)
+                # Context7: Ищем посты с непустыми тегами (cardinality > 0)
+                # Используем подзапрос для фильтрации постов с непустыми тегами
                 row = await conn.fetchrow("""
                     SELECT 
                         p.id as post_id,
@@ -1790,13 +1841,18 @@ class PipelineChecker:
                         isi.graph_status,
                         isi.error_message
                     FROM posts p
-                    LEFT JOIN post_enrichment pe_tags 
-                        ON p.id = pe_tags.post_id AND pe_tags.kind = 'tags'
+                    INNER JOIN (
+                        SELECT post_id, tags
+                        FROM post_enrichment
+                        WHERE kind = 'tags'
+                          AND tags IS NOT NULL
+                          AND tags != '{}'::text[]
+                          AND cardinality(tags) > 0
+                    ) pe_tags ON p.id = pe_tags.post_id
                     LEFT JOIN post_enrichment pe_crawl 
                         ON p.id = pe_crawl.post_id AND pe_crawl.kind = 'crawl'
                     LEFT JOIN indexing_status isi
                         ON p.id = isi.post_id
-                    WHERE pe_tags.post_id IS NOT NULL
                     ORDER BY p.posted_at DESC
                     LIMIT 1
                 """)
@@ -1891,7 +1947,27 @@ class PipelineChecker:
                 # 2. Пост проиндексирован в Qdrant И Neo4j, ИЛИ
                 # 3. Есть retryable ошибка (ожидается ретрай)
                 # 4. Пост был пропущен по валидным причинам (пустой текст - нормальное поведение)
-                has_tags = row['tags'] is not None and (isinstance(row['tags'], list) and len(row['tags']) > 0 if isinstance(row['tags'], list) else row['tags'] is not None)
+                # Context7: Проверяем наличие непустых тегов (массив или список с элементами)
+                tags_value = row['tags']
+                logger.debug("Checking tags for pipeline flow", 
+                           post_id=post_id,
+                           tags_value=tags_value,
+                           tags_type=type(tags_value).__name__)
+                
+                if tags_value is None:
+                    has_tags = False
+                    logger.debug("Tags are None", post_id=post_id)
+                elif isinstance(tags_value, (list, tuple)):
+                    has_tags = len(tags_value) > 0
+                    logger.debug("Tags are list/tuple", post_id=post_id, length=len(tags_value), has_tags=has_tags)
+                elif isinstance(tags_value, dict):
+                    # PostgreSQL array может вернуться как dict в некоторых случаях
+                    has_tags = len(tags_value) > 0
+                    logger.debug("Tags are dict", post_id=post_id, length=len(tags_value), has_tags=has_tags)
+                else:
+                    # Другие типы (например, строки) - считаем что теги есть
+                    has_tags = bool(tags_value)
+                    logger.debug("Tags are other type", post_id=post_id, type=type(tags_value).__name__, has_tags=has_tags)
                 
                 # Если статус failed, но ошибка retryable - считаем, что пайплайн работает корректно
                 if (embedding_status == 'failed' or graph_status == 'failed') and is_retryable_error:

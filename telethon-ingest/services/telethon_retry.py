@@ -7,6 +7,8 @@ Retry только для retriable ошибок:
 
 Не retry для:
 - UnauthorizedError, PhoneCodeInvalidError, PhoneNumberBannedError, AuthKeyError
+
+Context7 P0.2: Интеграция с FloodWaitManager для централизованного управления лимитами.
 """
 
 import asyncio
@@ -64,10 +66,13 @@ async def fetch_messages_with_retry(
     limit: int = 50,
     max_retries: int = MAX_RETRIES,
     redis_client: Optional[redis.Redis] = None,
-    offset_date: Optional[datetime] = None  # Context7: Для получения сообщений после определенной даты
+    offset_date: Optional[datetime] = None,  # Context7: Для получения сообщений после определенной даты
+    reverse: bool = False,  # Context7 P1.3: Reverse итерация (от старых к новым)
+    floodwait_manager: Optional[Any] = None,  # Context7 P0.2: FloodWaitManager для централизованного управления
+    account_id: Optional[str] = None  # Context7 P0.2: Идентификатор аккаунта для FloodWaitManager
 ) -> List[Message]:
     """
-    Context7: Retry с FloodWait и cooldown управлением.
+    Context7: Retry с FloodWait и cooldown управлением (Context7 P1.3: с поддержкой reverse).
     
     Args:
         client: TelegramClient
@@ -75,7 +80,10 @@ async def fetch_messages_with_retry(
         limit: Количество сообщений
         max_retries: Максимальное количество попыток
         redis_client: Redis клиент для cooldown
-        offset_date: Дата для получения сообщений после этой даты (опционально)
+        offset_date: Дата для получения сообщений (опционально)
+            - Если reverse=False: сообщения ПРЕДШЕСТВУЮЩИЕ этой дате (старше)
+            - Если reverse=True: сообщения ПОСЛЕ этой даты (новее, для backfilling)
+        reverse: Reverse итерация (от старых к новым) - для backfilling истории
         
     Returns:
         List[Message] или пустой список при ошибке
@@ -92,20 +100,27 @@ async def fetch_messages_with_retry(
                           channel_id=channel_id)
                 return []
             
-            # Context7: КРИТИЧНО - offset_date в Telethon возвращает сообщения ПРЕДШЕСТВУЮЩИЕ дате!
-            # Если offset_date указан - получаем сообщения СТАРШЕ этой даты (для historical режима)
-            # Если offset_date НЕ указан - получаем последние сообщения (для incremental режима)
+            # Context7 P1.3: Поддержка reverse итерации для backfilling
+            # КРИТИЧНО - offset_date в Telethon работает по-разному с reverse:
+            # - reverse=False (по умолчанию): offset_date возвращает сообщения ПРЕДШЕСТВУЮЩИЕ дате (старше)
+            # - reverse=True: offset_date возвращает сообщения ПОСЛЕ даты (новее) - идеально для backfilling
             messages = []
             iter_params = {"limit": limit}
+            
+            # Context7 P1.3: Reverse итерация для backfilling
+            if reverse:
+                iter_params["reverse"] = True
+            
             if offset_date:
-                # Context7: offset_date используется только для historical режима
-                # Он возвращает сообщения ПРЕДШЕСТВУЮЩИЕ указанной дате (exclusive)
+                # Context7 P1.3: offset_date с reverse=True возвращает сообщения ПОСЛЕ даты (для backfilling)
+                # offset_date с reverse=False возвращает сообщения ПРЕДШЕСТВУЮЩИЕ дате (для historical)
                 iter_params["offset_date"] = offset_date
             
             logger.debug("Fetching messages with iter_messages",
                         channel_id=channel_id,
                         limit=limit,
                         offset_date=offset_date.isoformat() if offset_date else None,
+                        reverse=reverse,
                         attempt=attempt + 1)
             
             async for msg in client.iter_messages(channel, **iter_params):
@@ -121,28 +136,43 @@ async def fetch_messages_with_retry(
                         channel_id=channel_id,
                         count=len(messages),
                         offset_date=offset_date.isoformat() if offset_date else None,
+                        reverse=reverse,
                         attempt=attempt + 1)
             return messages
             
         except errors.FloodWaitError as e:
-            # telegram_floodwait_seconds.observe(e.seconds)  # Метрика определена в main.py
-            
-            logger.warning("FloodWait error", 
-                          channel_id=channel_id,
-                          seconds=e.seconds, 
-                          attempt=attempt)
-            
-            if e.seconds > MAX_FLOOD_WAIT:
-                # Перевести канал в cooldown
-                if redis_client:
-                    await set_channel_cooldown(redis_client, channel_id, e.seconds)
-                logger.warning("Channel moved to cooldown", 
+            # Context7 P0.2: Используем FloodWaitManager если доступен
+            if floodwait_manager and account_id:
+                try:
+                    await floodwait_manager.handle_floodwait(
+                        e,
+                        account_id=account_id,
+                        method="iter_messages"
+                    )
+                except Exception as fw_err:
+                    logger.error("FloodWaitManager failed", 
+                               account_id=account_id,
+                               error=str(fw_err))
+                    # Fallback на стандартную обработку
+                    await asyncio.sleep(e.seconds + 1)
+            else:
+                # Стандартная обработка FloodWait
+                logger.warning("FloodWait error", 
                               channel_id=channel_id,
-                              seconds=e.seconds)
-                return []
+                              seconds=e.seconds, 
+                              attempt=attempt)
                 
-            # Ждем FloodWait + 1 секунда
-            await asyncio.sleep(e.seconds + 1)
+                if e.seconds > MAX_FLOOD_WAIT:
+                    # Перевести канал в cooldown
+                    if redis_client:
+                        await set_channel_cooldown(redis_client, channel_id, e.seconds)
+                    logger.warning("Channel moved to cooldown", 
+                                  channel_id=channel_id,
+                                  seconds=e.seconds)
+                    return []
+                    
+                # Ждем FloodWait + 1 секунда
+                await asyncio.sleep(e.seconds + 1)
             
         except NON_RETRIABLE_ERRORS as e:
             logger.error("Non-retriable error", 

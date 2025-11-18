@@ -19,6 +19,7 @@ from sqlalchemy import text, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from prometheus_client import Counter, Histogram
+from dateutil import parser as date_parser
 
 logger = structlog.get_logger()
 
@@ -45,6 +46,47 @@ db_transaction_rollbacks_total = Counter(
     'Transaction rollbacks',
     ['reason']
 )
+
+# Context7: Метрики для отслеживания проблем с парсингом
+# Context7: Импортируем метрики из channel_parser для предотвращения дублирования
+# Метрики уже определены в channel_parser.py с правильными labels
+try:
+    from services.channel_parser import (
+        channel_not_found_total,
+        album_save_failures_total,
+        session_rollback_failures_total
+    )
+except ImportError:
+    # Fallback: если channel_parser не импортирован, создаём метрики с проверкой на дублирование
+    from prometheus_client import REGISTRY
+    
+    def _get_or_create_counter(name, description, labels):
+        """Получить существующую метрику или создать новую."""
+        try:
+            existing = REGISTRY._names_to_collectors.get(name)
+            if existing:
+                return existing
+        except (AttributeError, KeyError):
+            pass
+        return Counter(name, description, labels)
+    
+    channel_not_found_total = _get_or_create_counter(
+        'channel_not_found_total',
+        'Total channel not found errors',
+        ['exists_in_db']  # Context7: Унифицированные labels (без channel_id для контроля кардинальности)
+    )
+    
+    album_save_failures_total = _get_or_create_counter(
+        'album_save_failures_total',
+        'Total album save failures',
+        ['error_type']  # Context7: Унифицированные labels (без channel_id для контроля кардинальности)
+    )
+    
+    session_rollback_failures_total = _get_or_create_counter(
+        'session_rollback_failures_total',
+        'Total session rollback failures',
+        ['operation']  # operation: 'before_parsing', 'before_entity', 'before_albums'
+    )
 
 db_users_upserted_total = Counter(
     'db_users_upserted_total',
@@ -138,30 +180,58 @@ class AtomicDBSaver:
             self.logger.warning("Failed to check/rollback session state", error=str(e))
         
         try:
+            # Context7: Детальное логирование начала транзакции
+            self.logger.debug("Starting atomic batch save transaction",
+                            posts_count=len(posts_data),
+                            telegram_id=user_data.get('telegram_id'),
+                            channel_telegram_id=channel_data.get('telegram_id'))
+            
             async with db_session.begin():
                 # 1. UPSERT user (ON CONFLICT telegram_id)
+                self.logger.debug("Upserting user", telegram_id=user_data.get('telegram_id'))
                 await self._upsert_user(db_session, user_data)
+                self.logger.debug("User upserted successfully", telegram_id=user_data.get('telegram_id'))
                 
                 # 2. UPSERT channel (ON CONFLICT telegram_id)
-                await self._upsert_channel(db_session, channel_data)
+                self.logger.debug("Upserting channel", telegram_id=channel_data.get('telegram_id'))
+                channel_id_uuid = await self._upsert_channel(db_session, channel_data)
+                self.logger.debug("Channel upserted successfully", 
+                                channel_id=channel_id_uuid,
+                                telegram_id=channel_data.get('telegram_id'))
+                
+                # 2.5. Context7 best practice: Создаём user_channel связь если её нет
+                # Это необходимо для корректной работы сохранения альбомов
+                # Context7: Не прерываем транзакцию при ошибке - это дополнительная операция
+                try:
+                    await self._ensure_user_channel(db_session, user_data, channel_data, channel_id_uuid)
+                except Exception as e:
+                    # Логируем, но не прерываем транзакцию
+                    self.logger.warning("_ensure_user_channel failed but continuing transaction",
+                                      error=str(e),
+                                      error_type=type(e).__name__)
                 
                 # 3. BULK INSERT posts (ON CONFLICT DO NOTHING)
+                self.logger.debug("Bulk inserting posts", posts_count=len(posts_data))
                 inserted_count = await self._bulk_insert_posts(
                     db_session, 
                     posts_data
                 )
+                self.logger.debug("Posts bulk inserted", inserted_count=inserted_count)
                 
             # Коммит успешен (context manager автоматически коммитит)
             duration = time.time() - start_time
             db_batch_commit_latency_seconds.observe(duration)
             db_posts_insert_success_total.inc(inserted_count)
             
+            # Context7: Детальное логирование успешного сохранения
             self.logger.info("Atomic batch save successful", 
                            user_id=user_data.get('telegram_id'),
                            channel_id=channel_data.get('telegram_id'),
+                           channel_id_uuid=channel_id_uuid,
                            posts_count=len(posts_data),
                            inserted_count=inserted_count,
-                           duration=duration)
+                           duration=duration,
+                           tenant_id=user_data.get('tenant_id'))
             
             return True, None, inserted_count
             
@@ -202,15 +272,19 @@ class AtomicDBSaver:
         from sqlalchemy import text
         
         try:
-            # Сохранение forwards
+            # Context7 P1.1: Сохранение forwards с расширенными полями MessageFwdHeader
             if forwards_data:
                 forwards_sql = text("""
                     INSERT INTO post_forwards (
                         post_id, from_chat_id, from_message_id,
-                        from_chat_title, from_chat_username, forwarded_at
+                        from_chat_title, from_chat_username, forwarded_at,
+                        from_id, from_name, post_author_signature,
+                        saved_from_peer, saved_from_msg_id, psa_type
                     ) VALUES (
                         :post_id, :from_chat_id, :from_message_id,
-                        :from_chat_title, :from_chat_username, :forwarded_at
+                        :from_chat_title, :from_chat_username, :forwarded_at,
+                        :from_id::jsonb, :from_name, :post_author_signature,
+                        :saved_from_peer::jsonb, :saved_from_msg_id, :psa_type
                     )
                     ON CONFLICT DO NOTHING
                 """)
@@ -222,7 +296,13 @@ class AtomicDBSaver:
                         'from_message_id': fwd.get('from_message_id'),
                         'from_chat_title': fwd.get('from_chat_title'),
                         'from_chat_username': fwd.get('from_chat_username'),
-                        'forwarded_at': fwd.get('forwarded_at')
+                        'forwarded_at': fwd.get('forwarded_at'),
+                        'from_id': json.dumps(fwd.get('from_id')) if fwd.get('from_id') else None,
+                        'from_name': fwd.get('from_name'),
+                        'post_author_signature': fwd.get('post_author_signature'),
+                        'saved_from_peer': json.dumps(fwd.get('saved_from_peer')) if fwd.get('saved_from_peer') else None,
+                        'saved_from_msg_id': fwd.get('saved_from_msg_id'),
+                        'psa_type': fwd.get('psa_type')
                     }
                     for fwd in forwards_data
                 ]
@@ -258,21 +338,45 @@ class AtomicDBSaver:
                     await db_session.execute(reactions_sql, reactions_params)
                     logger.debug("Saved reactions", post_id=post_id, count=len(reactions_data))
             
-            # Сохранение replies
+            # Context7 P1.1: Сохранение replies с поддержкой thread_id
             if replies_data:
                 replies_sql = text("""
                     INSERT INTO post_replies (
                         post_id, reply_to_post_id, reply_message_id, reply_chat_id,
-                        reply_author_tg_id, reply_author_username, reply_content, reply_posted_at
+                        reply_author_tg_id, reply_author_username, reply_content, reply_posted_at,
+                        thread_id
                     ) VALUES (
                         :post_id, :reply_to_post_id, :reply_message_id, :reply_chat_id,
-                        :reply_author_tg_id, :reply_author_username, :reply_content, :reply_posted_at
+                        :reply_author_tg_id, :reply_author_username, :reply_content, :reply_posted_at,
+                        :thread_id
                     )
                     ON CONFLICT DO NOTHING
                 """)
                 
-                replies_params = [
-                    {
+                # Context7: Конвертация reply_posted_at из ISO строки в datetime для asyncpg
+                replies_params = []
+                for reply in replies_data:
+                    reply_posted_at = reply.get('reply_posted_at')
+                    # Context7: Конвертируем ISO строку в datetime, если это строка
+                    if reply_posted_at and isinstance(reply_posted_at, str):
+                        try:
+                            # Пробуем fromisoformat для стандартного формата ISO 8601
+                            if 'T' in reply_posted_at or '+' in reply_posted_at or reply_posted_at.endswith('Z'):
+                                reply_posted_at = datetime.fromisoformat(reply_posted_at.replace('Z', '+00:00'))
+                            else:
+                                # Fallback на dateutil.parser для других форматов
+                                reply_posted_at = date_parser.parse(reply_posted_at)
+                        except (ValueError, TypeError) as e:
+                            logger.warning(
+                                "Failed to parse reply_posted_at",
+                                reply_posted_at=reply_posted_at,
+                                error=str(e),
+                                post_id=post_id
+                            )
+                            reply_posted_at = None
+                    # Если уже datetime объект, оставляем как есть
+                    
+                    replies_params.append({
                         'post_id': post_id,
                         'reply_to_post_id': reply.get('reply_to_post_id'),
                         'reply_message_id': reply.get('reply_message_id'),
@@ -280,10 +384,9 @@ class AtomicDBSaver:
                         'reply_author_tg_id': reply.get('reply_author_tg_id'),
                         'reply_author_username': reply.get('reply_author_username'),
                         'reply_content': reply.get('reply_content'),
-                        'reply_posted_at': reply.get('reply_posted_at')
-                    }
-                    for reply in replies_data
-                ]
+                        'reply_posted_at': reply_posted_at,
+                        'thread_id': reply.get('thread_id')
+                    })
                 
                 if replies_params:
                     await db_session.execute(replies_sql, replies_params)
@@ -402,10 +505,11 @@ class AtomicDBSaver:
             if post_media_map_params:
                 # Context7: Проверяем существующие связи (для метрик)
                 # Context7 best practice: asyncpg требует ANY() для IN с параметрами
+                # Context7: Исправлен SQL - убран ::text[] из параметра, используем CAST
                 sha256_list = [mf.sha256 for mf in media_files]
                 existing_map_check_sql = text("""
                     SELECT file_sha256 FROM post_media_map 
-                    WHERE post_id = :post_id AND file_sha256 = ANY(:sha256_list::text[])
+                    WHERE post_id = :post_id AND file_sha256 = ANY(CAST(:sha256_list AS text[]))
                 """)
                 existing_map_result = await db_session.execute(
                     existing_map_check_sql,
@@ -527,14 +631,20 @@ class AtomicDBSaver:
                               telegram_id=telegram_id)
             
         except Exception as e:
-            self.logger.error("Failed to upsert user", 
+            # Context7: Критическая ошибка - транзакция будет откачена
+            self.logger.error("Failed to upsert user - transaction will be rolled back", 
                             user_data=user_data,
-                            error=str(e))
+                            error=str(e),
+                            error_type=type(e).__name__,
+                            exc_info=True)
             raise
     
-    async def _upsert_channel(self, db_session: AsyncSession, channel_data: Dict[str, Any]) -> None:
+    async def _upsert_channel(self, db_session: AsyncSession, channel_data: Dict[str, Any]) -> str:
         """
         Context7: UPSERT канала с ON CONFLICT.
+        
+        Returns:
+            channel_id (UUID строка) - ID канала в БД
         """
         try:
             # Подготовка данных канала
@@ -553,8 +663,9 @@ class AtomicDBSaver:
             username_raw = channel_data.get('username', '')
             username_normalized = username_raw.lstrip('@') if username_raw else ''
             
+            channel_id = channel_data.get('id') or str(uuid.uuid4())
             channel_record = {
-                'id': str(uuid.uuid4()),
+                'id': channel_id,
                 'tg_channel_id': tg_channel_id,  # int для bigint в БД
                 'title': channel_data.get('title', ''),
                 'username': username_normalized,  # Сохраняем нормализованный username (без @)
@@ -563,6 +674,7 @@ class AtomicDBSaver:
             }
             
             # UPSERT через PostgreSQL ON CONFLICT (по tg_channel_id, без несуществующих полей)
+            # Context7: Получаем channel_id из существующей записи или используем новый
             sql = """
             INSERT INTO channels (id, tg_channel_id, title, username, is_active, created_at)
             VALUES (:id, :tg_channel_id, :title, :username, :is_active, :created_at)
@@ -571,19 +683,104 @@ class AtomicDBSaver:
                 title = EXCLUDED.title,
                 username = EXCLUDED.username,
                 is_active = EXCLUDED.is_active
+            RETURNING id
             """
             
-            await db_session.execute(text(sql), channel_record)
+            result = await db_session.execute(text(sql), channel_record)
+            returned_id = result.scalar_one()
+            channel_id_uuid = str(returned_id) if returned_id else channel_id
+            
             db_channels_upserted_total.inc()
             
             self.logger.debug("Channel upserted", 
-                            telegram_id=channel_data.get('telegram_id'))
+                            telegram_id=channel_data.get('telegram_id'),
+                            channel_id=channel_id_uuid)
+            
+            return channel_id_uuid
             
         except Exception as e:
             self.logger.error("Failed to upsert channel", 
                             channel_data=channel_data,
                             error=str(e))
             raise
+    
+    async def _ensure_user_channel(self, db_session: AsyncSession, user_data: Dict[str, Any], channel_data: Dict[str, Any], channel_id: str) -> None:
+        """
+        Context7 best practice: Создание user_channel связи если её нет.
+        Это необходимо для корректной работы сохранения альбомов и других операций,
+        требующих связь пользователя с каналом.
+        
+        Args:
+            db_session: AsyncSession
+            user_data: Данные пользователя с telegram_id и tenant_id
+            channel_data: Данные канала
+            channel_id: UUID канала (из _upsert_channel)
+        """
+        try:
+            # Получаем user_id по telegram_id
+            telegram_id = user_data.get('telegram_id')
+            if isinstance(telegram_id, str):
+                telegram_id = int(telegram_id)
+            
+            get_user_sql = text("""
+                SELECT id FROM users WHERE telegram_id = :telegram_id LIMIT 1
+            """)
+            result = await db_session.execute(get_user_sql, {"telegram_id": telegram_id})
+            user_row = result.fetchone()
+            
+            if not user_row:
+                self.logger.warning("User not found for user_channel creation",
+                                  telegram_id=telegram_id)
+                return
+            
+            user_id = str(user_row.id)
+            
+            # Проверяем существование user_channel связи
+            check_sql = text("""
+                SELECT user_id, channel_id FROM user_channel
+                WHERE user_id = :user_id AND channel_id = :channel_id
+                LIMIT 1
+            """)
+            check_result = await db_session.execute(
+                check_sql,
+                {"user_id": user_id, "channel_id": channel_id}
+            )
+            
+            if check_result.fetchone():
+                # Связь уже существует
+                self.logger.debug("user_channel already exists",
+                                user_id=user_id,
+                                channel_id=channel_id)
+                return
+            
+            # Создаём user_channel связь
+            # Context7: Идемпотентность через ON CONFLICT DO NOTHING
+            insert_sql = text("""
+                INSERT INTO user_channel (user_id, channel_id, is_active, subscribed_at, settings)
+                VALUES (:user_id, :channel_id, true, NOW(), '{}'::jsonb)
+                ON CONFLICT (user_id, channel_id) DO NOTHING
+            """)
+            await db_session.execute(
+                insert_sql,
+                {"user_id": user_id, "channel_id": channel_id}
+            )
+            
+            self.logger.info("user_channel created successfully",
+                           user_id=user_id,
+                           channel_id=channel_id,
+                           telegram_id=telegram_id,
+                           tenant_id=user_data.get('tenant_id'))
+            
+        except Exception as e:
+            # Context7: КРИТИЧНО - не прерываем транзакцию, но логируем детально
+            # Это может быть проблема с FK или другими ограничениями
+            self.logger.error("Failed to ensure user_channel - transaction will continue",
+                            user_data=user_data,
+                            channel_id=channel_id,
+                            error=str(e),
+                            error_type=type(e).__name__,
+                            exc_info=True)
+            # Не пробрасываем исключение - это дополнительная операция
     
     async def _bulk_insert_posts(self, db_session: AsyncSession, posts_data: List[Dict[str, Any]]) -> int:
         """
@@ -641,7 +838,17 @@ class AtomicDBSaver:
                     'noforwards': post.get('noforwards', False),
                     'invert_media': post.get('invert_media', False),
                     'telegram_post_url': post.get('telegram_post_url', ''),
-                    'grouped_id': post.get('grouped_id')  # Context7: ID альбома для дедупликации
+                    'grouped_id': post.get('grouped_id'),  # Context7: ID альбома для дедупликации
+                    # Context7 P1.1: Быстрые поля для forwards и replies
+                    # Context7: asyncpg требует явный NULL для jsonb, иначе будет ошибка типа
+                    # Используем пустую строку '' вместо None для корректной работы NULLIF
+                    'forward_from_peer_id': json.dumps(post.get('forward_from_peer_id')) if post.get('forward_from_peer_id') else '',
+                    'forward_from_chat_id': post.get('forward_from_chat_id'),
+                    'forward_from_message_id': post.get('forward_from_message_id'),
+                    'forward_date': post.get('forward_date'),
+                    'forward_from_name': post.get('forward_from_name'),
+                    'thread_id': post.get('thread_id'),
+                    'forum_topic_id': post.get('forum_topic_id')
                 }
                 prepared_posts.append(prepared_post)
             
@@ -657,7 +864,9 @@ class AtomicDBSaver:
                     views_count, forwards_count, reactions_count, replies_count,
                     is_pinned, is_edited, edited_at, post_author,
                     reply_to_message_id, reply_to_chat_id, via_bot_id, via_business_bot_id,
-                    is_silent, is_legacy, noforwards, invert_media, telegram_post_url, grouped_id
+                    is_silent, is_legacy, noforwards, invert_media, telegram_post_url, grouped_id,
+                    forward_from_peer_id, forward_from_chat_id, forward_from_message_id,
+                    forward_date, forward_from_name, thread_id, forum_topic_id
                 )
                 VALUES (
                     :id, :channel_id, :telegram_message_id, :content, :media_urls,
@@ -665,10 +874,50 @@ class AtomicDBSaver:
                     :views_count, :forwards_count, :reactions_count, :replies_count,
                     :is_pinned, :is_edited, :edited_at, :post_author,
                     :reply_to_message_id, :reply_to_chat_id, :via_bot_id, :via_business_bot_id,
-                    :is_silent, :is_legacy, :noforwards, :invert_media, :telegram_post_url, :grouped_id
+                    :is_silent, :is_legacy, :noforwards, :invert_media, :telegram_post_url, :grouped_id,
+                    NULLIF(:forward_from_peer_id, '')::jsonb, :forward_from_chat_id, :forward_from_message_id,
+                    :forward_date, :forward_from_name, :thread_id, :forum_topic_id
                 )
                 ON CONFLICT (channel_id, telegram_message_id)
-                DO NOTHING
+                DO UPDATE SET
+                    -- Context7: Обновление контента и медиа
+                    content = COALESCE(NULLIF(EXCLUDED.content, ''), posts.content),
+                    media_urls = COALESCE(EXCLUDED.media_urls, posts.media_urls),
+                    has_media = COALESCE(EXCLUDED.has_media, posts.has_media),
+                    telegram_post_url = COALESCE(EXCLUDED.telegram_post_url, posts.telegram_post_url),
+                    -- Context7: Обновление метрик - используем GREATEST для сохранения максимальных значений
+                    views_count = GREATEST(COALESCE(posts.views_count, 0), COALESCE(EXCLUDED.views_count, 0)),
+                    forwards_count = GREATEST(COALESCE(posts.forwards_count, 0), COALESCE(EXCLUDED.forwards_count, 0)),
+                    reactions_count = GREATEST(COALESCE(posts.reactions_count, 0), COALESCE(EXCLUDED.reactions_count, 0)),
+                    replies_count = GREATEST(COALESCE(posts.replies_count, 0), COALESCE(EXCLUDED.replies_count, 0)),
+                    -- Context7: Обновление информации об редактировании
+                    is_edited = COALESCE(EXCLUDED.is_edited, posts.is_edited),
+                    edited_at = COALESCE(EXCLUDED.edited_at, posts.edited_at),
+                    -- Context7: Обновление времени публикации - используем большее значение
+                    posted_at = GREATEST(COALESCE(posts.posted_at, '1970-01-01'::timestamp), COALESCE(EXCLUDED.posted_at, '1970-01-01'::timestamp)),
+                    -- Context7: Обновление информации об авторе
+                    post_author = COALESCE(NULLIF(EXCLUDED.post_author, ''), posts.post_author),
+                    -- Context7: Обновление флагов
+                    is_pinned = COALESCE(EXCLUDED.is_pinned, posts.is_pinned),
+                    is_silent = COALESCE(EXCLUDED.is_silent, posts.is_silent),
+                    is_legacy = COALESCE(EXCLUDED.is_legacy, posts.is_legacy),
+                    noforwards = COALESCE(EXCLUDED.noforwards, posts.noforwards),
+                    invert_media = COALESCE(EXCLUDED.invert_media, posts.invert_media),
+                    -- Context7: Обновление grouped_id для альбомов
+                    grouped_id = COALESCE(EXCLUDED.grouped_id, posts.grouped_id),
+                    -- Context7: Обновление полей forward/reply
+                    forward_from_peer_id = COALESCE(EXCLUDED.forward_from_peer_id, posts.forward_from_peer_id),
+                    forward_from_chat_id = COALESCE(EXCLUDED.forward_from_chat_id, posts.forward_from_chat_id),
+                    forward_from_message_id = COALESCE(EXCLUDED.forward_from_message_id, posts.forward_from_message_id),
+                    forward_date = COALESCE(EXCLUDED.forward_date, posts.forward_date),
+                    forward_from_name = COALESCE(NULLIF(EXCLUDED.forward_from_name, ''), posts.forward_from_name),
+                    thread_id = COALESCE(EXCLUDED.thread_id, posts.thread_id),
+                    forum_topic_id = COALESCE(EXCLUDED.forum_topic_id, posts.forum_topic_id),
+                    -- Context7: Обновление reply полей
+                    reply_to_message_id = COALESCE(EXCLUDED.reply_to_message_id, posts.reply_to_message_id),
+                    reply_to_chat_id = COALESCE(EXCLUDED.reply_to_chat_id, posts.reply_to_chat_id),
+                    via_bot_id = COALESCE(EXCLUDED.via_bot_id, posts.via_bot_id),
+                    via_business_bot_id = COALESCE(EXCLUDED.via_business_bot_id, posts.via_business_bot_id)
             """)
             
             # Context7 best practice: SQLAlchemy автоматически использует executemany
@@ -676,41 +925,44 @@ class AtomicDBSaver:
             # Это правильно обработает bulk insert и даст корректный rowcount
             result = await db_session.execute(sql, prepared_posts)
             
-            # Context7: Правильный подсчет вставленных строк
-            # result.rowcount возвращает количество действительно вставленных/обновленных строк
-            # При ON CONFLICT DO NOTHING это количество новых строк (не конфликтных)
+            # Context7: Правильный подсчет вставленных/обновленных строк
+            # result.rowcount возвращает количество обработанных строк (вставленных + обновленных)
+            # При ON CONFLICT DO UPDATE это количество всех обработанных строк (новые + обновленные)
             # Следим: при executemany с PostgreSQL rowcount может быть -1 (не поддерживается)
-            inserted_count = result.rowcount if result.rowcount is not None else 0
+            processed_count = result.rowcount if result.rowcount is not None else 0
             
             # Context7: Проверяем на некорректные значения rowcount
-            if inserted_count < 0:
+            if processed_count < 0:
                 # PostgreSQL/asyncpg может вернуть -1 для bulk операций
-                # В этом случае считаем, что все посты были вставлены (оптимистичный подход)
+                # В этом случае считаем, что все посты были обработаны (оптимистичный подход)
                 # Лучше пересчитать через SELECT, но это дорого - используем логику идемпотентности
-                self.logger.warning("Invalid rowcount from bulk insert, assuming all inserted",
+                self.logger.warning("Invalid rowcount from bulk insert, assuming all processed",
                                   total_count=len(prepared_posts),
                                   rowcount=result.rowcount)
-                inserted_count = len(prepared_posts)
+                processed_count = len(prepared_posts)
             
-            # Если rowcount недоступен (старые версии SQLAlchemy), используем приблизительную оценку
-            # Но для bulk insert с executemany это может быть неправильно
-            # Поэтому добавляем предупреждение если rowcount не совпадает с ожидаемым
-            if inserted_count == 0 and len(prepared_posts) > 0:
-                self.logger.warning("No posts inserted despite having data", 
+            # Context7: При ON CONFLICT DO UPDATE все посты должны быть обработаны (вставлены или обновлены)
+            # Если rowcount меньше количества постов, это может означать ошибку
+            if processed_count == 0 and len(prepared_posts) > 0:
+                self.logger.warning("No posts processed despite having data", 
                                   posts_count=len(prepared_posts),
                                   rowcount=result.rowcount)
-            elif inserted_count < len(prepared_posts):
-                self.logger.debug("Some posts were duplicates and not inserted",
+            elif processed_count < len(prepared_posts):
+                # Это необычная ситуация - все посты должны быть обработаны (вставлены или обновлены)
+                self.logger.warning("Some posts were not processed",
                                 total=len(prepared_posts),
-                                inserted=inserted_count,
-                                duplicates=len(prepared_posts) - inserted_count)
+                                processed=processed_count,
+                                unprocessed=len(prepared_posts) - processed_count)
             
-            self.logger.info("Posts bulk insert completed", 
+            # Context7: При ON CONFLICT DO UPDATE мы не можем точно определить, сколько было вставлено, а сколько обновлено
+            # Поэтому возвращаем общее количество обработанных постов
+            # Для точного подсчета нужно было бы делать отдельные запросы, что дорого
+            self.logger.info("Posts bulk insert/update completed", 
                             total_count=len(prepared_posts),
-                            inserted_count=inserted_count,
+                            processed_count=processed_count,
                             rowcount=result.rowcount)
             
-            return inserted_count
+            return processed_count
             
         except Exception as e:
             self.logger.error("Failed to bulk insert posts", 

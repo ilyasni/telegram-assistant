@@ -21,10 +21,30 @@ from crypto_utils import encrypt_session
 logger = structlog.get_logger()
 
 # Context7 best practice: Prometheus метрики для QR-авторизации (с multi-tenant лейблами)
-AUTH_QR_PUBLISHED = Counter("auth_qr_published_total", "QR URL published", ["tenant_id"])
-AUTH_QR_EXPIRED = Counter("auth_qr_expired_total", "QR session expired", ["tenant_id"])
-AUTH_QR_SUCCESS = Counter("auth_qr_success_total", "QR session authorized", ["tenant_id"])
-AUTH_QR_FAIL = Counter("auth_qr_fail_total", "QR session failed", ["tenant_id"])
+AUTH_QR_PUBLISHED = Counter(
+    "auth_qr_published_total",
+    "QR URL published",
+    ["tenant_id"],
+    namespace="telethon"
+)
+AUTH_QR_EXPIRED = Counter(
+    "auth_qr_expired_total",
+    "QR session expired",
+    ["tenant_id"],
+    namespace="telethon"
+)
+AUTH_QR_SUCCESS = Counter(
+    "auth_qr_success_total",
+    "QR session authorized",
+    ["tenant_id"],
+    namespace="telethon"
+)
+AUTH_QR_FAIL = Counter(
+    "auth_qr_fail_total",
+    "QR session failed",
+    ["tenant_id"],
+    namespace="telethon"
+)
 
 # Context7 best practice: Telethon метрики
 FLOODWAIT_TOTAL = Counter("telethon_floodwait_total", "FloodWait events", ["reason", "seconds"])
@@ -32,7 +52,7 @@ FLOODWAIT_DURATION = Histogram("telethon_floodwait_duration_seconds", "FloodWait
 SESSION_CLEANUP_TOTAL = Counter("telethon_session_cleanup_total", "Session cleanup operations", ["status"])
 SESSION_CLEANUP_DURATION = Histogram("telethon_session_cleanup_duration_seconds", "Session cleanup duration")
 QR_SESSION_TOTAL = Counter("telethon_qr_session_total", "QR sessions", ["status"])
-RATE_LIMIT_HITS = Counter("telethon_rate_limit_hits_total", "Rate limit hits", ["endpoint"])
+RATE_LIMIT_HITS = Counter("telethon_qr_rate_limit_hits_total", "Rate limit hits", ["endpoint"])
 THROTTLING_DELAY = Histogram("telethon_throttling_delay_seconds", "Request throttling delay")
 
 

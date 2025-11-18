@@ -109,22 +109,17 @@ async def get_vision_analysis(
     try:
         # Context7: API использует только sync операции (psycopg2, SQLAlchemy sync)
         result = db.execute(
+            # Context7: Используем data JSONB вместо legacy полей
             text("""
                 SELECT 
                     post_id,
-                    vision_classification,
-                    vision_description,
-                    vision_ocr_text,
-                    vision_is_meme,
-                    vision_provider,
-                    vision_model,
-                    vision_analyzed_at,
-                    vision_tokens_used,
-                    s3_vision_keys,
-                    s3_media_keys,
+                    data,
+                    updated_at,
+                    provider,
                     (SELECT COUNT(*) FROM post_media_map WHERE post_media_map.post_id = post_enrichment.post_id) as media_count
                 FROM post_enrichment
                 WHERE post_id = :post_id
+                AND kind = 'vision'
             """),
             {"post_id": str(post_id)}
         )
@@ -139,40 +134,52 @@ async def get_vision_analysis(
         # Преобразуем Row в dict для удобства
         row_dict = dict(row._mapping) if hasattr(row, '_mapping') else dict(row)
         
+        # Context7: Извлекаем данные из data JSONB
+        data = row_dict.get('data') or {}
+        
         # Парсим classification
         classification = None
-        if row_dict.get('vision_classification'):
+        if data.get('labels'):
             try:
-                if isinstance(row_dict['vision_classification'], str):
-                    cls_data = json.loads(row_dict['vision_classification'])
-                else:
-                    cls_data = row_dict['vision_classification']
+                labels_data = data.get('labels')
+                if isinstance(labels_data, str):
+                    labels_data = json.loads(labels_data)
                 
                 classification = VisionClassification(
-                    type=cls_data.get('type'),
-                    confidence=cls_data.get('confidence'),
-                    tags=cls_data.get('tags'),
-                    is_meme=cls_data.get('is_meme'),
-                    description=row_dict.get('vision_description')
+                    type=labels_data.get('type'),
+                    confidence=labels_data.get('confidence'),
+                    tags=labels_data.get('tags'),
+                    is_meme=data.get('is_meme'),
+                    description=data.get('caption') or data.get('description')
                 )
             except Exception as e:
-                logger.warning("Failed to parse vision_classification", 
+                logger.warning("Failed to parse vision labels", 
                              post_id=str(post_id), 
                              error=str(e),
                              trace_id=trace_id)
         
+        # Парсим analyzed_at
+        analyzed_at = None
+        if data.get('analyzed_at'):
+            try:
+                analyzed_at = datetime.fromisoformat(data['analyzed_at'].replace('Z', '+00:00'))
+            except Exception:
+                analyzed_at = row_dict.get('updated_at')
+        else:
+            analyzed_at = row_dict.get('updated_at')
+        
         result = VisionAnalysisResponse(
             post_id=str(row_dict['post_id']),
-            analyzed_at=row_dict.get('vision_analyzed_at'),
-            provider=row_dict.get('vision_provider'),
-            model=row_dict.get('vision_model'),
-            tokens_used=row_dict.get('vision_tokens_used'),
+            analyzed_at=analyzed_at,
+            provider=data.get('provider') or row_dict.get('provider'),
+            model=data.get('model'),
+            tokens_used=data.get('tokens_used'),
             classification=classification,
-            ocr_text=row_dict.get('vision_ocr_text'),
-            is_meme=row_dict.get('vision_is_meme'),
+            ocr_text=data.get('ocr', {}).get('text') if isinstance(data.get('ocr'), dict) else None,
+            is_meme=data.get('is_meme'),
             media_count=row_dict.get('media_count', 0),
-            s3_vision_keys=row_dict.get('s3_vision_keys') or [],
-            s3_media_keys=row_dict.get('s3_media_keys') or [],
+            s3_vision_keys=data.get('s3_keys', []) if isinstance(data.get('s3_keys'), list) else [],
+            s3_media_keys=[],  # Context7: Используем post_media_map для получения медиа
             trace_id=trace_id
         )
         
@@ -220,23 +227,17 @@ async def list_vision_analyses(
     """
     trace_id = get_trace_id(request)
     try:
+        # Context7: Используем data JSONB вместо legacy полей
         # Базовый запрос
         base_query = """
             SELECT 
                 pe.post_id,
-                pe.vision_classification,
-                pe.vision_description,
-                pe.vision_ocr_text,
-                pe.vision_is_meme,
-                pe.vision_provider,
-                pe.vision_model,
-                pe.vision_analyzed_at,
-                pe.vision_tokens_used,
-                pe.s3_vision_keys,
-                pe.s3_media_keys,
+                pe.data,
+                pe.updated_at,
                 (SELECT COUNT(*) FROM post_media_map WHERE post_media_map.post_id = pe.post_id) as media_count
             FROM post_enrichment pe
-            WHERE pe.vision_analyzed_at IS NOT NULL
+            WHERE pe.kind = 'vision'
+            AND pe.data->>'analyzed_at' IS NOT NULL
         """
         
         params = {}
@@ -247,15 +248,15 @@ async def list_vision_analyses(
             params["channel_id"] = str(channel_id)
         
         if has_meme is not None:
-            base_query += " AND pe.vision_is_meme = :has_meme"
+            base_query += " AND (pe.data->>'is_meme')::boolean = :has_meme"
             params["has_meme"] = has_meme
         
         if provider:
-            base_query += " AND pe.vision_provider = :provider"
+            base_query += " AND pe.provider = :provider"
             params["provider"] = provider
         
         if analyzed_after:
-            base_query += " AND pe.vision_analyzed_at >= :analyzed_after"
+            base_query += " AND (pe.data->>'analyzed_at')::timestamp >= :analyzed_after"
             params["analyzed_after"] = analyzed_after
         
         # Подсчёт всего
@@ -265,7 +266,7 @@ async def list_vision_analyses(
         
         # Пагинация
         offset = (page - 1) * page_size
-        base_query += " ORDER BY pe.vision_analyzed_at DESC LIMIT :limit OFFSET :offset"
+        base_query += " ORDER BY (pe.data->>'analyzed_at')::timestamp DESC NULLS LAST, pe.updated_at DESC LIMIT :limit OFFSET :offset"
         params["limit"] = page_size
         params["offset"] = offset
         
@@ -273,38 +274,51 @@ async def list_vision_analyses(
         
         # Преобразование результатов
         results = []
+        # Context7: Извлекаем данные из data JSONB
         for row in rows:
             row_dict = dict(row._mapping) if hasattr(row, '_mapping') else dict(row)
+            data = row_dict.get('data') or {}
+            
+            # Извлекаем данные из JSONB
             classification = None
-            if row_dict.get('vision_classification'):
+            if data.get('labels'):
                 try:
-                    if isinstance(row_dict['vision_classification'], str):
-                        cls_data = json.loads(row_dict['vision_classification'])
-                    else:
-                        cls_data = row_dict['vision_classification']
+                    labels_data = data.get('labels')
+                    if isinstance(labels_data, str):
+                        labels_data = json.loads(labels_data)
                     
                     classification = VisionClassification(
-                        type=cls_data.get('type'),
-                        confidence=cls_data.get('confidence'),
-                        tags=cls_data.get('tags'),
-                        is_meme=cls_data.get('is_meme'),
-                        description=row_dict.get('vision_description')
+                        type=labels_data.get('type'),
+                        confidence=labels_data.get('confidence'),
+                        tags=labels_data.get('tags'),
+                        is_meme=data.get('is_meme'),
+                        description=data.get('caption') or data.get('description')
                     )
                 except Exception:
                     pass
             
+            # Парсим analyzed_at из строки или используем updated_at
+            analyzed_at = None
+            if data.get('analyzed_at'):
+                try:
+                    analyzed_at = datetime.fromisoformat(data['analyzed_at'].replace('Z', '+00:00'))
+                except Exception:
+                    analyzed_at = row_dict.get('updated_at')
+            else:
+                analyzed_at = row_dict.get('updated_at')
+            
             results.append(VisionAnalysisResponse(
                 post_id=str(row_dict['post_id']),
-                analyzed_at=row_dict.get('vision_analyzed_at'),
-                provider=row_dict.get('vision_provider'),
-                model=row_dict.get('vision_model'),
-                tokens_used=row_dict.get('vision_tokens_used'),
+                analyzed_at=analyzed_at,
+                provider=data.get('provider') or row_dict.get('provider'),
+                model=data.get('model'),
+                tokens_used=data.get('tokens_used'),
                 classification=classification,
-                ocr_text=row_dict.get('vision_ocr_text'),
-                is_meme=row_dict.get('vision_is_meme'),
+                ocr_text=data.get('ocr', {}).get('text') if isinstance(data.get('ocr'), dict) else None,
+                is_meme=data.get('is_meme'),
                 media_count=row_dict.get('media_count', 0),
-                s3_vision_keys=row_dict.get('s3_vision_keys') or [],
-                s3_media_keys=row_dict.get('s3_media_keys') or [],
+                s3_vision_keys=data.get('s3_keys', []) if isinstance(data.get('s3_keys'), list) else [],
+                s3_media_keys=[],  # Context7: Используем post_media_map для получения медиа
                 trace_id=trace_id
             ))
         
@@ -361,13 +375,13 @@ async def get_media_vision_info(
                     mo.size_bytes,
                     mo.refs_count,
                     mo.last_seen_at,
-                    pe.vision_classification,
-                    pe.vision_analyzed_at
+                    pe.data,
+                    pe.updated_at
                 FROM media_objects mo
                 LEFT JOIN post_media_map pmm ON mo.file_sha256 = pmm.file_sha256
-                LEFT JOIN post_enrichment pe ON pmm.post_id = pe.post_id
+                LEFT JOIN post_enrichment pe ON pmm.post_id = pe.post_id AND pe.kind = 'vision'
                 WHERE mo.file_sha256 = :sha256
-                ORDER BY pe.vision_analyzed_at DESC NULLS LAST
+                ORDER BY (pe.data->>'analyzed_at')::timestamp DESC NULLS LAST, pe.updated_at DESC
                 LIMIT 1
             """),
             {"sha256": sha256}
@@ -381,13 +395,24 @@ async def get_media_vision_info(
             )
         
         row_dict = dict(row._mapping) if hasattr(row, '_mapping') else dict(row)
+        # Context7: Извлекаем данные из data JSONB
+        data = row_dict.get('data') or {}
+        analyzed_at = None
+        if data.get('analyzed_at'):
+            try:
+                analyzed_at = datetime.fromisoformat(data['analyzed_at'].replace('Z', '+00:00'))
+            except Exception:
+                analyzed_at = row_dict.get('updated_at')
+        else:
+            analyzed_at = row_dict.get('updated_at')
+        
         result = VisionMediaFile(
             sha256=row_dict['file_sha256'],
             s3_key=row_dict.get('s3_key'),
             mime_type=row_dict.get('mime'),
             size_bytes=row_dict.get('size_bytes'),
-            vision_classification=row_dict.get('vision_classification'),
-            analyzed_at=row_dict.get('vision_analyzed_at')
+            vision_classification=data.get('labels'),
+            analyzed_at=analyzed_at
         )
         
         return result

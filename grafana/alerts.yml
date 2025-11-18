@@ -5,7 +5,7 @@ groups:
   - name: qr_auth_funnel
     rules:
       - alert: QRSuccessRateLow
-        expr: sum(rate(auth_qr_success_total[5m])) / sum(rate(auth_qr_start_total[5m])) * 100 < 10
+        expr: sum(rate(api_auth_qr_success_total[5m])) / sum(rate(api_auth_qr_start_total[5m])) * 100 < 10
         for: 5m
         labels:
           severity: critical
@@ -38,7 +38,7 @@ groups:
           runbook_url: "https://docs.telegram-assistant.com/runbooks/telethon-session-cleanup"
 
       - alert: HighRateLimitBlocks
-        expr: rate(rate_limit_hits_total[5m]) > 10
+        expr: rate(telethon_rate_limit_hits_total[5m]) > 10
         for: 3m
         labels:
           severity: warning
@@ -49,7 +49,7 @@ groups:
           runbook_url: "https://docs.telegram-assistant.com/runbooks/api-rate-limiting"
 
       - alert: QRTimeoutRateHigh
-        expr: rate(auth_qr_expired_total[5m]) > 0.2
+        expr: rate(api_auth_qr_expired_total[5m]) > 0.2
         for: 3m
         labels:
           severity: warning
@@ -60,7 +60,7 @@ groups:
           runbook_url: "https://docs.telegram-assistant.com/runbooks/qr-timeout-rate"
 
       - alert: APIResponseTimeHigh
-        expr: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m])) > 1
+        expr: histogram_quantile(0.95, rate(api_http_request_duration_seconds_bucket[5m])) > 1
         for: 2m
         labels:
           severity: warning
@@ -71,7 +71,7 @@ groups:
           runbook_url: "https://docs.telegram-assistant.com/runbooks/api-performance"
 
       - alert: QRErrorsHigh
-        expr: rate(auth_qr_fail_total[5m]) > 5
+        expr: rate(api_auth_qr_fail_total[5m]) > 5
         for: 2m
         labels:
           severity: warning

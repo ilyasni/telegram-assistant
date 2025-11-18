@@ -1,0 +1,75 @@
+# Vision Policy Configuration
+# Context7 best practice: конфигурируемые политики обработки медиа
+
+# Лимиты размеров и квоты
+limits:
+  max_image_mb: 15  # GigaChat Vision лимит
+  max_document_mb: 40  # GigaChat документы лимит
+  max_daily_tokens_per_tenant: 250000
+  max_concurrent_requests: 3
+  max_queue_depth: 1000
+
+# Budget gates (проверка перед анализом)
+budget_gates:
+  check_before_analysis: true
+  fallback_to_ocr_if_exhausted: true
+  sampling_threshold_per_day: 100000  # tokens
+
+# Sampling стратегии (экономия токенов)
+sampling:
+  per_post_max_images: 2  # Максимум 2 изображения на пост
+  prefer_with_text_overlay: true  # Приоритет мемам/скриншотам
+  skip_small_images_kb: 10  # Пропускать < 10KB
+
+# Routing правила
+routing:
+  ocr_only_if:
+    - quota_exhausted  # OCR fallback при исчерпании квоты
+    - mime: ["application/pdf", "image/png", "image/jpeg"]  # Определённые типы
+  
+  skip_if_channel:
+    - "@large_memes_dump"  # Исключения по каналам
+  
+  skip_if_lang_not_in: ["ru", "en"]  # Только RU/EN
+
+# Fallback стратегии
+fallback:
+  ocr_engine: "paddle"  # paddle | openrouter | tesseract | rapidocr
+  openrouter_model: "qwen/qwen2.5-vl-32b-instruct:free"  # Модель для OpenRouter Vision
+  classification_model: "zero-shot-local"  # Лёгкий классификатор (не используется для OpenRouter)
+  
+# Prompt presets (Context7)
+prompt_presets:
+  default_key: default
+  templates:
+    default: "Верни JSON {\"classification\": \"photo|meme|document|screenshot|infographic|other\", \"description\": \"<=160 симв.\", \"is_meme\": bool, \"labels\": [], \"objects\": [], \"ocr\": {\"text\": \"...\", \"engine\": \"gigachat\"} или null}. Если есть текст — заполни ocr.text. Без пояснений."
+    document: "Документ: JSON как в default. classification='document'. Укажи ключевые разделы, обязательный OCR текст."
+    screenshot: "Скриншот: JSON как в default. classification='screenshot'. Опиши основные элементы интерфейса, OCR обязателен."
+    photo: "Фото/инфографика: JSON как в default. classification='photo'. Сделай короткое описание сцены, добавь текст если есть."
+  mime_mapping:
+    application/pdf: document
+    application/msword: document
+    application/vnd.openxmlformats-officedocument.wordprocessingml.document: document
+    image/png: screenshot
+    image/jpeg: photo
+    image/jpg: photo
+    image/webp: photo
+    image/bmp: photo
+
+# Allowed MIME types для GigaChat Vision
+allowed_mime_types:
+  images:
+    - "image/jpeg"
+    - "image/png"
+    - "image/tiff"
+    - "image/bmp"
+  
+  documents:
+    - "application/pdf"
+    - "application/msword"
+    - "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    - "text/plain"
+    - "application/epub+zip"
+    - "application/vnd.ms-powerpoint"
+    - "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+

@@ -52,6 +52,13 @@ VisionAnalyzedEventV1
 - **`worker/services/budget_gate.py`**: Token quota tracking и enforcement
 - **`worker/services/ocr_fallback.py`**: OCR fallback для quota exhausted
 - **`worker/tasks/vision_analysis_task.py`**: Vision worker с идемпотентностью
+- **`worker/services/experiment_manager.py`**: Пер-tenant эксперименты (Wave A/B/C, Context7 A/B контроль)
+
+#### Token Estimation (Context7)
+
+- `worker/ai_adapters/gigachat_vision.py` вызывает `/tokens/count` перед основным запросом Vision, чтобы прогнозировать расход токенов и логировать метрику `vision_tokens_estimated_total`.
+- Результат оценки сохраняется в `analysis.context.tokens_estimated`, что позволяет сравнивать предсказанные и фактические значения (`response.usage.total_tokens`).
+- При ошибке `tokens_count` пайплайн деградирует корректно (лог + метрика без инкремента), анализ продолжается.
 
 ### Event Schemas
 

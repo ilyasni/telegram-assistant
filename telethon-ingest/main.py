@@ -150,8 +150,18 @@ app_state = {
 }
 
 # Prometheus метрики
-request_count = Counter("http_requests_total", "Total HTTP requests", ["path"])
-request_duration = Histogram("http_request_duration_seconds", "HTTP request duration", ["path"])
+request_count = Counter(
+    "http_requests_total",
+    "Total HTTP requests",
+    ["path"],
+    namespace="telethon"
+)
+request_duration = Histogram(
+    "http_request_duration_seconds",
+    "HTTP request duration",
+    ["path"],
+    namespace="telethon"
+)
 
 # Context7 best practice: метрики для мониторинга крашей и критических событий
 crash_signals_total = Counter(
@@ -432,8 +442,14 @@ async def run_ingest_loop():
         # Context7: Инициализация MediaProcessor для обработки медиа в real-time событиях
         media_processor = None
         try:
+            # Context7: Добавляем корень проекта в sys.path для импорта модулей
+            import sys
+            project_root = '/opt/telegram-assistant'
+            if project_root not in sys.path:
+                sys.path.insert(0, project_root)
+            
             from api.services.s3_storage import S3StorageService
-            from api.services.storage_quota import StorageQuotaService
+            from worker.services.storage_quota import StorageQuotaService
             from services.media_processor import MediaProcessor
             
             # Инициализация S3StorageService с параметрами из env
@@ -658,9 +674,13 @@ async def run_scheduler_loop():
                 telegram_client=temp_client,  # Будет обновлён при обработке
                 s3_service=s3_service,
                 storage_quota=storage_quota,
-                redis_client=redis_for_media
+                redis_client=redis_for_media,
+                tenant_id=None  # Context7: tenant_id будет передаваться при обработке
             )
-            logger.info("MediaProcessor initialized for ChannelParser")
+            logger.info("MediaProcessor initialized for ChannelParser", 
+                       has_s3_service=s3_service is not None,
+                       has_storage_quota=storage_quota is not None,
+                       has_redis=redis_for_media is not None)
         except Exception as e:
             logger.warning(
                 "Failed to initialize MediaProcessor, continuing without media processing",
@@ -707,7 +727,10 @@ async def run_scheduler_loop():
         await scheduler.run_forever()
         
     except Exception as e:
-        logger.error("Scheduler loop error", error=str(e))
+        logger.error("Scheduler loop error", error=str(e), exc_info=True)
+        # Context7: Не прерываем выполнение, но логируем детально
+        import traceback
+        logger.error("Scheduler loop traceback", traceback=traceback.format_exc())
 
 
 async def main():
@@ -760,12 +783,18 @@ async def main():
         app_state["status"] = "ready"
         
         # Context7 best practice: параллельный запуск циклов
-        await asyncio.gather(
-            run_qr_loop(),
-            run_ingest_loop(),
-            run_scheduler_loop(),  # НОВЫЙ: Incremental parsing scheduler
-            return_exceptions=True
-        )
+        # Context7: Логируем запуск каждого цикла для диагностики
+        logger.info("Starting all loops in parallel", loops=["qr", "ingest", "scheduler"])
+        try:
+            await asyncio.gather(
+                run_qr_loop(),
+                run_ingest_loop(),
+                run_scheduler_loop(),  # НОВЫЙ: Incremental parsing scheduler
+                return_exceptions=True
+            )
+        except Exception as gather_error:
+            logger.error("Error in asyncio.gather", error=str(gather_error), exc_info=True)
+            raise
         
     except Exception as e:
         logger.error("Main loop error", error=str(e))

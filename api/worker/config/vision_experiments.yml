@@ -1,0 +1,31 @@
+experiments:
+  wave_a:
+    enabled: true
+    salt: "wave_a"
+    default_variant: "control"
+    variants:
+      control: 0.5
+      experiment: 0.5
+    force_tenants: {}
+    exclude_tenants: []
+
+  wave_b:
+    enabled: true
+    salt: "wave_b"
+    default_variant: "experiment"
+    variants:
+      control: 0.0
+      experiment: 1.0
+    force_tenants: {}
+    exclude_tenants: []
+
+  wave_c:
+    enabled: true
+    salt: "wave_c"
+    default_variant: "control"
+    variants:
+      control: 0.5
+      experiment: 0.5
+    force_tenants: {}
+    exclude_tenants: []
+

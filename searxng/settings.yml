@@ -1,0 +1,18 @@
+# Context7: Минимальная конфигурация SearXNG для внутреннего использования
+# Основано на best practices из n8n-installer: https://github.com/kossakovsky/n8n-installer
+# Context7: Используем дефолтные настройки с минимальными переопределениями
+use_default_settings: true
+
+server:
+  limiter: false
+  public_instance: false
+  secret_key: "vcfymLc0NUXiKLlkwfE75Y75yBORU3c"
+  # Context7: GET метод менее строгий для bot detection
+  method: "GET"
+  bind_address: "0.0.0.0"
+
+search:
+  safe_search: 0
+  formats:
+    - html
+    - json

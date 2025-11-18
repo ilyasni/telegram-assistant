@@ -109,7 +109,12 @@
               }
             ]
           },
-          "unit": "reqps"
+          "unit": "ops",
+          "decimals": 4,
+          "min": 0,
+          "max": null,
+          "nullValueMode": "null",
+          "noValue": "0 ops"
         },
         "overrides": []
       },
@@ -148,7 +153,13 @@
           "editorMode": "code",
           "expr": "sum(rate(posts_processed_total[5m]))",
           "legendFormat": "Posts Processing Rate",
-          "refId": "A"
+          "refId": "A",
+          "interval": "",
+          "intervalMs": 1000,
+          "exemplar": false,
+          "format": "table",
+          "instant": false,
+          "range": true
         }
       ],
       "description": "Current rate of posts being processed across all stages",
@@ -215,7 +226,10 @@
           "editorMode": "code",
           "expr": "sum(increase(posts_processed_total[24h]))",
           "legendFormat": "Posts Processed (24h)",
-          "refId": "A"
+          "refId": "A",
+          "maxDataPoints": 100,
+          "interval": "",
+          "intervalMs": 30000
         }
       ],
       "description": "Total number of posts processed in the last 24 hours",
@@ -397,7 +411,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(rate(http_requests_total[5m])) by (method, endpoint)",
+          "expr": "sum(rate(api_http_requests_total[5m])) by (method, endpoint)",
           "legendFormat": "{{method}} {{endpoint}}",
           "refId": "A"
         }
@@ -506,7 +520,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))",
+          "expr": "histogram_quantile(0.95, sum(rate(api_http_request_duration_seconds_bucket[5m])) by (le))",
           "legendFormat": "p95",
           "refId": "A"
         },
@@ -517,7 +531,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))",
+          "expr": "histogram_quantile(0.50, sum(rate(api_http_request_duration_seconds_bucket[5m])) by (le))",
           "legendFormat": "p50",
           "refId": "B"
         }
@@ -850,7 +864,10 @@
           "editorMode": "code",
           "expr": "sum(increase(posts_processed_total{stage=\"enrichment\", success=\"true\"}[24h]))",
           "legendFormat": "Total Enriched Processed (24h)",
-          "refId": "B"
+          "refId": "B",
+          "maxDataPoints": 100,
+          "interval": "",
+          "intervalMs": 30000
         },
         {
           "datasource": {
@@ -1083,7 +1100,7 @@
           "query": "label_values(posts_processed_total, stage)",
           "refId": "StandardVariableQuery"
         },
-        "refresh": 1,
+        "refresh": 2,
         "regex": "",
         "skipUrlSync": false,
         "sort": 1,

@@ -81,7 +81,7 @@
             "name": "Prometheus"
           },
           "editorMode": "code",
-          "expr": "storage_bucket_usage_gb{tenant_id=~\"$tenant_id\", content_type=\"media\"}",
+          "expr": "api_storage_bucket_usage_gb{tenant_id=~\"$tenant_id\", content_type=\"media\"}",
           "legendFormat": "Media",
           "refId": "A"
         },
@@ -92,7 +92,7 @@
             "name": "Prometheus"
           },
           "editorMode": "code",
-          "expr": "storage_bucket_usage_gb{tenant_id=~\"$tenant_id\", content_type=\"vision\"}",
+          "expr": "api_storage_bucket_usage_gb{tenant_id=~\"$tenant_id\", content_type=\"vision\"}",
           "legendFormat": "Vision Cache",
           "refId": "B"
         },
@@ -103,7 +103,7 @@
             "name": "Prometheus"
           },
           "editorMode": "code",
-          "expr": "storage_bucket_usage_gb{tenant_id=~\"$tenant_id\", content_type=\"crawl\"}",
+          "expr": "api_storage_bucket_usage_gb{tenant_id=~\"$tenant_id\", content_type=\"crawl\"}",
           "legendFormat": "Crawl Cache",
           "refId": "C"
         }
@@ -175,7 +175,7 @@
             "name": "Prometheus"
           },
           "editorMode": "code",
-          "expr": "storage_bucket_usage_gb{tenant_id=~\"$tenant_id\"}",
+          "expr": "api_storage_bucket_usage_gb{tenant_id=~\"$tenant_id\"}",
           "legendFormat": "{{content_type}}",
           "refId": "A"
         }
@@ -264,7 +264,7 @@
             "name": "Prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(rate(storage_emergency_cleanups_total[5m])) by (trigger_reason)",
+          "expr": "sum(rate(api_storage_emergency_cleanups_total[5m])) by (trigger_reason)",
           "legendFormat": "Cleanups - {{trigger_reason}}",
           "refId": "A"
         }
@@ -353,7 +353,7 @@
             "name": "Prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(rate(storage_lru_evictions_total{tenant_id=~\"$tenant_id\"}[5m])) by (tenant_id, content_type)",
+          "expr": "sum(rate(worker_storage_lru_evictions_total{tenant_id=~\"$tenant_id\"}[5m])) by (tenant_id, content_type)",
           "legendFormat": "Evictions - {{tenant_id}} ({{content_type}})",
           "refId": "A"
         }
@@ -542,7 +542,7 @@
             "name": "Prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum(rate(storage_quota_check_duration_seconds_bucket[5m])) by (le))",
+          "expr": "histogram_quantile(0.95, sum(rate(worker_storage_quota_check_duration_seconds_bucket[5m])) by (le))",
           "legendFormat": "P95 Duration",
           "refId": "A"
         }
@@ -573,7 +573,7 @@
           "type": "prometheus",
           "uid": "prometheus"
         },
-        "definition": "label_values(storage_lru_evictions_total, tenant_id)",
+        "definition": "label_values(worker_storage_lru_evictions_total, tenant_id)",
         "description": "Filter by tenant ID",
         "error": null,
         "hide": 0,
@@ -583,7 +583,7 @@
         "name": "tenant_id",
         "options": [],
         "query": {
-          "query": "label_values(storage_lru_evictions_total, tenant_id)",
+          "query": "label_values(worker_storage_lru_evictions_total, tenant_id)",
           "refId": "StandardVariableQuery"
         },
         "refresh": 1,

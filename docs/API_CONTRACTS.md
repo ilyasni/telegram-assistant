@@ -252,10 +252,263 @@ curl "https://your-domain.com/api/tg/qr/png/550e8400-e29b-41d4-a716-446655440000
 }
 ```
 
+### POST /api/groups/{group_id}/digest
+Запуск мультиагентного пайплайна группового дайджеста (LangGraph → worker). Возвращает `202 Accepted` после постановки события в очередь.
+
+**Feature flag / rollout**  
+Доступно только если `DIGEST_AGENT_ENABLED=1` или tenant присутствует в `DIGEST_AGENT_CANARY_TENANTS`. При отсутствии доступа API возвращает `403`.
+
+**Request Body**:
+```json
+{
+  "tenant_id": "uuid",
+  "user_id": "uuid",
+  "window_size_hours": 24,
+  "delivery_channel": "telegram",
+  "delivery_format": "telegram_html",
+  "trigger": "manual"
+}
+```
+
+- `window_size_hours` — только `4|6|12|24`.
+- `delivery_channel` — пока поддерживается только `telegram`.
+- `delivery_format` — `telegram_html` (по умолчанию), `json` или `cards`.
+- `trigger` — источник запуска (`manual|scheduler|retry`).
+- `context_stats` — агрегаты Stage 5 (кол-во сообщений до/после dedup, топ-k).
+- `context_ranking` — список top-k сообщений с оценками (`score`, `timestamp_iso`).
+- `context_duplicates` — карта `id → [duplicates]` для soft/hard dedup.
+- `context_history_links` — соответствия новых сообщений с историческими окнами (для анализа повторов).
+
+**Response 202**:
+```json
+{
+  "history_id": "uuid",
+  "group_window_id": "uuid",
+  "message_count": 42,
+  "participant_count": 7,
+  "status": "queued",
+  "context_stats": {
+    "deduplicated_messages": 38,
+    "duplicates_removed": 4
+  },
+  "context_ranking": [
+    {
+      "message_id": "1",
+      "score": 0.87
+    }
+  ],
+  "context_duplicates": {
+    "1": ["2"]
+  },
+  "context_history_links": {
+    "3": {
+      "matched_id": "hist-42",
+      "similarity": 0.92
+    }
+  ]
+}
+```
+
+**Ошибки**:
+- `400` — неверное значение `window_size_hours`.
+- `403` — фича недоступна для арендатора (feature flag).
+- `404` — группа не найдена для указанного tenant.
+- `422` — валидационные ошибки Pydantic.
+
+**Example**:
+```bash
+curl -X POST "https://your-domain.com/api/groups/3f6c0b3a-5f3a-4f93-a1e4-0fd3a3d2b6b5/digest" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <jwt>" \
+  -d '{
+    "tenant_id": "1d7a788c-5fc3-4a04-9d92-9d76c52d8110",
+    "user_id": "d9f0fddb-2d57-4dff-b7a7-0c1f0d9fb761",
+    "window_size_hours": 24,
+    "delivery_channel": "telegram",
+    "delivery_format": "telegram_html",
+    "trigger": "manual"
+  }'
+```
+
 ### DELETE /api/channels/users/{user_id}/channels/{channel_id}
 Удаление канала.
 
 **Response 204** - Канал удалён
+
+## Группы
+
+### GET /api/groups
+Получение списка групп арендатора.
+
+**Query Parameters**:
+- `tenant_id` (uuid, optional) — по умолчанию tenant текущего пользователя
+- `status` (`active|disabled`) — фильтр по активности
+- `limit` / `offset` — постраничная навигация
+
+**Response 200**:
+```json
+{
+  "groups": [
+    {
+      "id": "uuid",
+      "tg_chat_id": -1009876543210,
+      "title": "Product Support",
+      "username": "product_support",
+      "is_active": true,
+      "last_checked_at": "2025-11-09T08:15:00Z",
+      "created_at": "2025-10-01T12:00:00Z",
+      "settings": {
+        "digest": {
+          "default_window_hours": 12,
+          "delivery_channel": "telegram"
+        },
+        "limits": {
+          "max_daily_digests": 4
+        }
+      }
+    }
+  ],
+  "total": 1,
+  "limit": 50,
+  "offset": 0
+}
+```
+
+### POST /api/groups
+Подключение новой Telegram-группы. Используется Mini App или Bot команды.
+
+**Request Body**:
+```json
+{
+  "tg_chat_id": -1009876543210,
+  "title": "Product Support",
+  "username": "product_support",
+  "invite_link": "https://t.me/+abc123",
+  "settings": {
+    "digest": {
+      "default_window_hours": 12,
+      "delivery_channel": "telegram"
+    }
+  }
+}
+```
+
+**Response 201**:
+```json
+{
+  "id": "uuid",
+  "tg_chat_id": -1009876543210,
+  "title": "Product Support",
+  "username": "product_support",
+  "is_active": true,
+  "created_at": "2025-11-09T08:15:00Z"
+}
+```
+
+### PATCH /api/groups/{group_id}
+Обновление настроек группы (лимиты дайджеста, активность).
+
+**Request Body**:
+```json
+{
+  "is_active": false,
+  "settings": {
+    "digest": {
+      "default_window_hours": 24,
+      "delivery_channel": "email",
+      "delivery_address": "ops@example.com"
+    },
+    "limits": {
+      "max_daily_digests": 2
+    }
+  }
+}
+```
+
+**Response 200** — обновлённый объект группы.
+
+### POST /api/groups/{group_id}/digest
+Запросить дайджест обсуждений в группе. Допускает окна 4/6/12/24 часа.
+
+**Request Body**:
+```json
+{
+  "window_size_hours": 24,
+  "format": "markdown",
+  "delivery_channel": "telegram",
+  "delivery_address": null,
+  "include_sections": ["topics", "metrics", "participants"],
+  "force_regeneration": false
+}
+```
+
+**Response 202**:
+```json
+{
+  "request_id": "uuid",
+  "window_id": "uuid",
+  "group_id": "uuid",
+  "status": "queued"
+}
+```
+
+### GET /api/groups/{group_id}/digests/{digest_id}
+Получение готового дайджеста (внутренний API/админка).
+
+**Response 200**:
+```json
+{
+  "digest_id": "uuid",
+  "group_id": "uuid",
+  "window": {
+    "size_hours": 24,
+    "start": "2025-11-08T08:00:00Z",
+    "end": "2025-11-09T08:00:00Z"
+  },
+  "summary": "Основные обсуждения сконцентрированы вокруг...",
+  "metrics": {
+    "tone": "neutral",
+    "sentiment": 0.1,
+    "conflict": 0.2,
+    "collaboration": 0.8,
+    "stress": 0.4,
+    "enthusiasm": 0.6
+  },
+  "topics": [
+    {
+      "topic": "Проблема с вебвью",
+      "priority": "high",
+      "message_count": 15,
+      "highlights": [
+        {
+          "message_id": "uuid",
+          "excerpt": "Вебвью падает при переходе на страницу оплаты"
+        }
+      ]
+    }
+  ],
+  "participants": [
+    {
+      "telegram_id": 1234567,
+      "username": "boyversus",
+      "role": "initiator",
+      "message_count": 10,
+      "summary": "Инициировал обсуждение, предложил workaround"
+    }
+  ],
+  "attachments": [],
+  "evaluation_scores": {
+    "ragas": {
+      "faithfulness": 0.92,
+      "answer_relevance": 0.88
+    },
+    "trajectory": {
+      "llm_as_judge": 0.93
+    }
+  },
+  "delivery_status": "sent"
+}
+```
 
 ## RAG Поиск
 
@@ -455,6 +708,75 @@ Prometheus метрики.
   "detail": "Описание ошибки",
   "error_code": "INVALID_INVITE_CODE",
   "timestamp": "2025-01-15T10:30:00Z"
+}
+```
+
+## Event Bus
+
+### Channel Events
+- `ChannelSubscribedEventV1`
+- `ChannelUnsubscribedEventV1`
+
+### Group Events
+- `GroupLinkedEventV1` — пользователь подключил группу (Источник: Mini App / Bot). Payload соответствует `api/events/schemas/groups_v1.py`.
+- `GroupConversationWindowReadyEventV1` — окно обсуждений подготовлено ingestion/worker сервисом.
+- `GroupDigestRequestedEventV1` — пользователь инициировал генерацию дайджеста (4/6/12/24 часа).
+- `GroupDigestGeneratedEventV1` — мультиагентная система завершила генерацию дайджеста, доступны темы, участники, метрики, оценки качества.
+- `GroupDigestDeliveredEventV1` — дайджест доставлен по выбранному каналу (Telegram, e-mail или webhook).
+
+**Общие требования:**
+- `trace_id` и `idempotency_key` обязательны для всех событий.
+- В payload всегда указывается `tenant_id` и `group_id`.
+- Индикаторы (`conflict`, `collaboration`, `stress`, `enthusiasm`) передаются в нормированном виде `[0;1]`.
+- Оценки качества (`evaluation_scores`) хранятся в формате LangSmith (`trajectory_accuracy`, `faithfulness`, `answer_relevance`).
+
+**Пример: GroupDigestGeneratedEventV1**
+```json
+{
+  "event_id": "f1f17fbe-4725-4b11-8ac1-6f4f92fc6af3",
+  "schema_version": "v1",
+  "trace_id": "req-2025-11-09-12345",
+  "occurred_at": "2025-11-09T09:05:00Z",
+  "idempotency_key": "digest-group-42-window-24h",
+  "tenant_id": "550e8400-e29b-41d4-a716-446655440000",
+  "digest_id": "9b89ee8d-8396-46a6-9e40-4f5abf505f12",
+  "window_id": "95c2c6bd-1d8f-4d82-a2b5-9146f17b6319",
+  "window_size_hours": 24,
+  "summary": "Основные обсуждения сфокусированы на проблеме вебвью...",
+  "topics": [
+    {
+      "topic": "Проблема с вебвью",
+      "priority": "high",
+      "message_count": 15,
+      "highlights": [
+        {"message_id": "dc5d97b0-044f-4f9c-a7f0-8aa18d74b7fb", "excerpt": "Вебвью падает при оплате"}
+      ]
+    }
+  ],
+  "participants": [
+    {
+      "telegram_id": 1234567,
+      "username": "boyversus",
+      "role": "initiator",
+      "message_count": 10,
+      "summary": "Инициировал обсуждение и предложил обходной путь"
+    }
+  ],
+  "metrics": {
+    "tone": "neutral",
+    "sentiment": 0.12,
+    "stress": 0.4,
+    "conflict": 0.2,
+    "collaboration": 0.8,
+    "enthusiasm": 0.6
+  },
+  "evaluation_scores": {
+    "ragas": {
+      "faithfulness": 0.94,
+      "answer_relevance": 0.91
+    },
+    "trajectory_accuracy": 0.95
+  }
 }
 ```
 

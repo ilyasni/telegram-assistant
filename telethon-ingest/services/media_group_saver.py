@@ -228,21 +228,48 @@ async def save_media_group(
             RETURNING id
         """)
         
-        result = await db_session.execute(
-            upsert_group_sql,
-            {
-                "user_id": user_id,
-                "channel_id": channel_id,
-                "grouped_id": grouped_id,
-                "album_kind": album_kind,
-                "items_count": len(post_ids),
-                "content_hash": content_hash,
-                "caption_text": caption_text,
-                "posted_at": posted_at,
-                "cover_media_id": final_cover_media_id
-            }
-        )
-        group_id = result.scalar_one()
+        # Context7: Детальное логирование перед сохранением альбома
+        logger.debug("Saving media group",
+                    user_id=user_id,
+                    channel_id=channel_id,
+                    grouped_id=grouped_id,
+                    post_ids_count=len(post_ids),
+                    media_types_count=len(media_types),
+                    album_kind=album_kind,
+                    trace_id=trace_id)
+        
+        try:
+            result = await db_session.execute(
+                upsert_group_sql,
+                {
+                    "user_id": user_id,
+                    "channel_id": channel_id,
+                    "grouped_id": grouped_id,
+                    "album_kind": album_kind,
+                    "items_count": len(post_ids),
+                    "content_hash": content_hash,
+                    "caption_text": caption_text,
+                    "posted_at": posted_at,
+                    "cover_media_id": final_cover_media_id
+                }
+            )
+            group_id = result.scalar_one()
+            
+            logger.info("Media group upserted successfully",
+                       group_id=group_id,
+                       grouped_id=grouped_id,
+                       items_count=len(post_ids),
+                       trace_id=trace_id)
+        except Exception as e:
+            logger.error("Failed to upsert media_group",
+                        user_id=user_id,
+                        channel_id=channel_id,
+                        grouped_id=grouped_id,
+                        error=str(e),
+                        error_type=type(e).__name__,
+                        trace_id=trace_id,
+                        exc_info=True)
+            raise
         
         # Context7: Удаляем старые элементы (если альбом изменился)
         # Затем вставляем новые с правильным порядком
@@ -266,6 +293,11 @@ async def save_media_group(
                 # Маппинг media_type на media_kind
                 media_kind = media_type if media_type in ['photo', 'video', 'document', 'audio'] else None
             
+            # Context7: asyncpg требует JSON строку для JSONB при executemany
+            # Используем json.dumps() для преобразования dict в JSON строку
+            # Это аналогично подходу в enrichment_repository.py (строка 160)
+            meta_value = json.dumps({}, ensure_ascii=False)
+            
             item_data = {
                 "group_id": group_id,
                 "post_id": post_id,
@@ -276,11 +308,14 @@ async def save_media_group(
                 "sha256": sha256,  # Дублируем для поля sha256
                 "media_object_id": media_object_id,
                 "media_kind": media_kind,
-                "meta": json.dumps({})
+                "meta": meta_value  # Context7: JSON строка для asyncpg JSONB
             }
             items_params.append(item_data)
         
         if items_params:
+            # Context7: Исправлен SQL запрос - используем CAST(:meta AS jsonb) для asyncpg
+            # При executemany через SQLAlchemy asyncpg требует явного CAST для JSON строк
+            # Это аналогично подходу в enrichment_repository.py, но с именованными параметрами
             insert_items_sql = text("""
                 INSERT INTO media_group_items (
                     group_id, post_id, position, media_type,
@@ -289,7 +324,7 @@ async def save_media_group(
                 ) VALUES (
                     :group_id, :post_id, :position, :media_type,
                     :media_bytes, :media_sha256, :sha256,
-                    :media_object_id, :media_kind, :meta::jsonb
+                    :media_object_id, :media_kind, CAST(:meta AS jsonb)
                 )
                 ON CONFLICT (group_id, position) DO UPDATE SET
                     post_id = EXCLUDED.post_id,
@@ -301,7 +336,10 @@ async def save_media_group(
                     media_kind = COALESCE(EXCLUDED.media_kind, media_group_items.media_kind)
             """)
             
-            await db_session.execute(insert_items_sql, items_params)
+            # Context7: Выполняем вставку по одному элементу, так как executemany может не работать с CAST
+            # Это менее эффективно, но гарантирует правильную обработку JSONB
+            for item_param in items_params:
+                await db_session.execute(insert_items_sql, item_param)
         
         logger.info(
             "Media group saved",

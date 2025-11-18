@@ -157,30 +157,59 @@ class EnrichmentRepository:
         
         try:
             updated_at = datetime.now(timezone.utc)
+            # Context7: Логируем данные перед сериализацией для диагностики OCR и params_hash
+            has_ocr = bool(data.get("ocr") and (isinstance(data.get("ocr"), dict) and data["ocr"].get("text")))
+            ocr_text_length = len(data.get("ocr", {}).get("text", "")) if isinstance(data.get("ocr"), dict) else 0
+            logger.debug(
+                "Upserting enrichment to DB",
+                post_id=post_id,
+                kind=kind,
+                provider=provider,
+                params_hash=params_hash,
+                has_ocr=has_ocr,
+                ocr_text_length=ocr_text_length,
+                data_keys=list(data.keys()) if isinstance(data, dict) else [],
+                trace_id=trace_id
+            )
+            
+            # Context7: Сериализация JSON с сохранением None значений
+            # ВАЖНО: json.dumps сохраняет None как null в JSON, что корректно для PostgreSQL JSONB
             data_jsonb = json.dumps(data, ensure_ascii=False, default=str)
+            
+            # Context7: Проверяем, что OCR сохранился после сериализации
+            data_parsed = json.loads(data_jsonb)
+            has_ocr_after = bool(data_parsed.get("ocr") and (isinstance(data_parsed.get("ocr"), dict) and data_parsed["ocr"].get("text")))
+            if has_ocr != has_ocr_after:
+                logger.warning(
+                    "OCR data lost during JSON serialization",
+                    post_id=post_id,
+                    kind=kind,
+                    has_ocr_before=has_ocr,
+                    has_ocr_after=has_ocr_after,
+                    trace_id=trace_id
+                )
             
             if self._is_asyncpg:
                 # asyncpg.Pool
                 async with self.db_session.acquire() as conn:
+                    # Context7: Убрана ссылка на несуществующую колонку enriched_at
                     await conn.execute("""
                         INSERT INTO post_enrichment (
                             post_id, kind, provider, params_hash, data, status, error,
-                            updated_at, enriched_at
+                            updated_at
                         ) VALUES (
-                            $1, $2, $3, $4, $5::jsonb, $6, $7, $8, COALESCE(
-                                (SELECT enriched_at FROM post_enrichment WHERE post_id = $1 AND kind = $2),
-                                $8
-                            )
+                            $1, $2, $3, $4, $5::jsonb, $6, $7, $8
                         )
                         ON CONFLICT (post_id, kind) DO UPDATE SET
                             provider = EXCLUDED.provider,
-                            params_hash = EXCLUDED.params_hash,
+                            params_hash = COALESCE(EXCLUDED.params_hash, post_enrichment.params_hash),
                             data = EXCLUDED.data,
                             status = EXCLUDED.status,
                             error = EXCLUDED.error,
                             updated_at = EXCLUDED.updated_at
                             -- Context7: Legacy поля обновляются только для vision через отдельный UPDATE после INSERT
                             -- Это избегает проблем с ambiguous column references в ON CONFLICT DO UPDATE SET
+                            -- Context7: params_hash использует COALESCE чтобы не перезаписывать существующий hash на NULL
                     """,
                         post_id,
                         kind,
@@ -192,24 +221,26 @@ class EnrichmentRepository:
                         updated_at
                     )
                     
-                    # Context7: Обновление legacy полей для vision после основного upsert
-                    if kind == 'vision':
-                        await conn.execute("""
-                            UPDATE post_enrichment
-                            SET 
-                                vision_description = COALESCE($1::jsonb->>'description', $1::jsonb->>'caption', vision_description),
-                                vision_classification = COALESCE(($1::jsonb->'labels')::jsonb, vision_classification),
-                                vision_is_meme = COALESCE(($1::jsonb->>'is_meme')::boolean, vision_is_meme),
-                                vision_ocr_text = COALESCE($1::jsonb->'ocr'->>'text', vision_ocr_text),
-                                vision_analyzed_at = COALESCE(
-                                    CASE WHEN $1::jsonb->>'analyzed_at' IS NOT NULL 
-                                    THEN ($1::jsonb->>'analyzed_at')::timestamp 
-                                    ELSE NULL END,
-                                    vision_analyzed_at,
-                                    $2
-                                )
-                            WHERE post_id = $3 AND kind = 'vision'
-                        """, data_jsonb, updated_at, post_id)
+                    # Context7: Legacy поля удалены из БД миграцией 20251117_remove_legacy
+                    # Все данные хранятся только в data JSONB
+                    # Проверяем, что данные сохранились правильно после upsert
+                    check_row = await conn.fetchrow("""
+                        SELECT data, params_hash 
+                        FROM post_enrichment 
+                        WHERE post_id = $1 AND kind = $2
+                    """, post_id, kind)
+                    
+                    if check_row:
+                        saved_data = check_row['data']
+                        saved_params_hash = check_row['params_hash']
+                        logger.debug(
+                            "Enrichment saved to DB - verification",
+                            post_id=post_id,
+                            kind=kind,
+                            params_hash_saved=bool(saved_params_hash),
+                            params_hash_value=saved_params_hash[:16] + "..." if saved_params_hash else None,
+                            trace_id=trace_id
+                        )
             
             elif self._is_sqlalchemy:
                 # SQLAlchemy AsyncSession
@@ -217,53 +248,24 @@ class EnrichmentRepository:
                 
                 # Context7: Используем CAST вместо :: для совместимости с SQLAlchemy
                 await self.db_session.execute(
+                    # Context7: Убрана ссылка на несуществующую колонку enriched_at
                     text("""
                         INSERT INTO post_enrichment (
                             post_id, kind, provider, params_hash, data, status, error,
-                            updated_at, enriched_at
+                            updated_at
                         ) VALUES (
                             :post_id, :kind, :provider, :params_hash, CAST(:data AS jsonb), :status, :error,
-                            :updated_at, COALESCE(
-                                (SELECT enriched_at FROM post_enrichment WHERE post_id = :post_id_sub AND kind = :kind_sub),
-                                :updated_at_sub
-                            )
+                            :updated_at
                         )
                         ON CONFLICT (post_id, kind) DO UPDATE SET
                             provider = EXCLUDED.provider,
-                            params_hash = EXCLUDED.params_hash,
+                            params_hash = COALESCE(EXCLUDED.params_hash, post_enrichment.params_hash),
                             data = EXCLUDED.data,
                             status = EXCLUDED.status,
                             error = EXCLUDED.error,
-                            updated_at = EXCLUDED.updated_at,
-                            -- Context7: Синхронизация legacy полей для обратной совместимости (vision)
-                            vision_description = CASE 
-                                WHEN EXCLUDED.kind = 'vision' THEN COALESCE(EXCLUDED.data->>'description', EXCLUDED.data->>'caption', post_enrichment.vision_description)
-                                ELSE post_enrichment.vision_description
-                            END,
-                            vision_classification = CASE 
-                                WHEN EXCLUDED.kind = 'vision' THEN COALESCE(EXCLUDED.data->'labels', post_enrichment.vision_classification)
-                                ELSE post_enrichment.vision_classification
-                            END,
-                            vision_is_meme = CASE 
-                                WHEN EXCLUDED.kind = 'vision' THEN COALESCE((EXCLUDED.data->>'is_meme')::boolean, post_enrichment.vision_is_meme)
-                                ELSE post_enrichment.vision_is_meme
-                            END,
-                            vision_ocr_text = CASE 
-                                WHEN EXCLUDED.kind = 'vision' THEN COALESCE(EXCLUDED.data->'ocr'->>'text', post_enrichment.vision_ocr_text)
-                                ELSE post_enrichment.vision_ocr_text
-                            END,
-                            vision_analyzed_at = CASE 
-                                WHEN EXCLUDED.kind = 'vision' THEN COALESCE(
-                                    CASE 
-                                        WHEN EXCLUDED.data->>'analyzed_at' IS NOT NULL 
-                                        THEN (EXCLUDED.data->>'analyzed_at')::timestamp 
-                                        ELSE NULL
-                                    END, 
-                                    post_enrichment.vision_analyzed_at, 
-                                    EXCLUDED.updated_at
-                                )
-                                ELSE post_enrichment.vision_analyzed_at
-                            END
+                            updated_at = EXCLUDED.updated_at
+                            -- Context7: Legacy поля удалены из БД миграцией 20251117_remove_legacy
+                            -- Все данные хранятся только в data JSONB
                     """),
                     {
                         "post_id": post_id,

@@ -58,7 +58,9 @@
         "justifyMode": "auto",
         "orientation": "auto",
         "reduceOptions": {
-          "calcs": ["lastNotNull"],
+          "calcs": [
+            "lastNotNull"
+          ],
           "fields": "",
           "values": false
         },
@@ -115,7 +117,9 @@
         "justifyMode": "auto",
         "orientation": "auto",
         "reduceOptions": {
-          "calcs": ["lastNotNull"],
+          "calcs": [
+            "lastNotNull"
+          ],
           "fields": "",
           "values": false
         },
@@ -128,7 +132,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(auth_qr_start_total) by (tenant_id)",
+          "expr": "sum(api_auth_qr_start_total) by (tenant_id)",
           "legendFormat": "QR Auth Starts",
           "refId": "A"
         }
@@ -194,7 +198,10 @@
       "id": 3,
       "options": {
         "legend": {
-          "calcs": ["lastNotNull", "max"],
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
           "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
@@ -277,7 +284,10 @@
       "id": 4,
       "options": {
         "legend": {
-          "calcs": ["lastNotNull", "max"],
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
           "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
@@ -294,7 +304,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(rate(http_requests_total{tenant_id=~\"$tenant_id\"}[5m])) by (tenant_id, method, endpoint, status)",
+          "expr": "sum(rate(api_http_requests_total{tenant_id=~\"$tenant_id\"}[5m])) by (tenant_id, method, endpoint, status)",
           "legendFormat": "{{tenant_id}} - {{method}} {{endpoint}} ({{status}})",
           "refId": "A"
         }
@@ -352,7 +362,9 @@
       "id": 5,
       "options": {
         "legend": {
-          "calcs": ["lastNotNull"],
+          "calcs": [
+            "lastNotNull"
+          ],
           "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
@@ -368,7 +380,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(auth_qr_start_total) by (tenant_id)",
+          "expr": "sum(api_auth_qr_start_total) by (tenant_id)",
           "legendFormat": "{{tenant_id}}",
           "refId": "A"
         },
@@ -378,7 +390,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(auth_qr_success_total) by (tenant_id)",
+          "expr": "sum(api_auth_qr_success_total) by (tenant_id)",
           "legendFormat": "{{tenant_id}} (success)",
           "refId": "B"
         },
@@ -388,7 +400,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(auth_qr_fail_total) by (tenant_id)",
+          "expr": "sum(api_auth_qr_fail_total) by (tenant_id)",
           "legendFormat": "{{tenant_id}} (fail)",
           "refId": "C"
         }
@@ -454,7 +466,11 @@
       "id": 6,
       "options": {
         "legend": {
-          "calcs": ["lastNotNull", "max", "mean"],
+          "calcs": [
+            "lastNotNull",
+            "max",
+            "mean"
+          ],
           "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
@@ -539,7 +555,9 @@
       "id": 7,
       "options": {
         "legend": {
-          "calcs": ["lastNotNull"],
+          "calcs": [
+            "lastNotNull"
+          ],
           "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
@@ -555,7 +573,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(auth_qr_expired_total) by (tenant_id)",
+          "expr": "sum(api_auth_qr_expired_total) by (tenant_id)",
           "legendFormat": "Expired - {{tenant_id}}",
           "refId": "A"
         }
@@ -567,7 +585,11 @@
   "refresh": "30s",
   "schemaVersion": 42,
   "style": "dark",
-  "tags": ["telegram-assistant", "multi-tenant", "monitoring"],
+  "tags": [
+    "telegram-assistant",
+    "multi-tenant",
+    "monitoring"
+  ],
   "templating": {
     "list": [
       {
@@ -637,11 +659,22 @@
     "to": "now"
   },
   "timepicker": {
-    "refresh_intervals": ["15s", "30s", "1m", "5m", "15m", "30m", "1h", "2h", "6h", "12h", "24h"]
+    "refresh_intervals": [
+      "15s",
+      "30s",
+      "1m",
+      "5m",
+      "15m",
+      "30m",
+      "1h",
+      "2h",
+      "6h",
+      "12h",
+      "24h"
+    ]
   },
   "timezone": "browser",
   "title": "Multi-Tenant Overview (Context7)",
   "uid": "multi-tenant-overview",
   "version": 1
 }
-

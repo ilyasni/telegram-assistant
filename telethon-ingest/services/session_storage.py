@@ -453,8 +453,19 @@ class SessionStorageService:
         Fallback на users для обратной совместимости.
         """
         with self.db_connection.cursor(cursor_factory=RealDictCursor) as cursor:
-            # 1) Пробуем получить из telegram_sessions
-            cursor.execute("""
+            conditions = ["ts.status = 'authorized'"]
+            params: list[str] = []
+
+            if tenant_id:
+                conditions.append("ts.tenant_id::text = %s")
+                params.append(tenant_id)
+
+            use_user_filter = bool(user_id) and user_id != tenant_id
+            if use_user_filter:
+                conditions.append("ts.user_id::text = %s")
+                params.append(user_id)
+
+            query = f"""
                 SELECT 
                     ts.id,
                     ts.session_string_enc,
@@ -465,32 +476,49 @@ class SessionStorageService:
                     u.telegram_id as telegram_user_id
                 FROM telegram_sessions ts
                 LEFT JOIN users u ON u.id::uuid = ts.user_id::uuid
-                WHERE ts.tenant_id::text = %s 
-                  AND ts.status = 'authorized'
+                WHERE {' AND '.join(conditions)}
                 ORDER BY ts.updated_at DESC
                 LIMIT 1
-            """, (tenant_id,))
-            
+            """
+
+            cursor.execute(query, params)
             result = cursor.fetchone()
             if result:
                 return dict(result)
-            
+
             # 2) Fallback: получаем из users (обратная совместимость)
-            cursor.execute("""
-                SELECT 
-                    u.id,
-                    u.telegram_session_enc as session_string_enc,
-                    u.telegram_auth_status as status,
-                    u.telegram_auth_created_at as created_at,
-                    u.telegram_session_key_id as key_id,
-                    u.telegram_auth_updated_at as updated_at,
-                    u.telegram_id as telegram_user_id
-                FROM users u
-                WHERE u.telegram_id = %s AND u.telegram_auth_status = 'authorized'
-                ORDER BY u.telegram_auth_created_at DESC
-                LIMIT 1
-            """, (tenant_id,))
-            
+            if use_user_filter:
+                cursor.execute("""
+                    SELECT 
+                        u.id,
+                        u.telegram_session_enc as session_string_enc,
+                        u.telegram_auth_status as status,
+                        u.telegram_auth_created_at as created_at,
+                        u.telegram_session_key_id as key_id,
+                        u.telegram_auth_updated_at as updated_at,
+                        u.telegram_id as telegram_user_id
+                    FROM users u
+                    WHERE u.id::text = %s AND u.telegram_auth_status = 'authorized'
+                    ORDER BY u.telegram_auth_created_at DESC
+                    LIMIT 1
+                """, (user_id,))
+            else:
+                cursor.execute("""
+                    SELECT 
+                        u.id,
+                        u.telegram_session_enc as session_string_enc,
+                        u.telegram_auth_status as status,
+                        u.telegram_auth_created_at as created_at,
+                        u.telegram_session_key_id as key_id,
+                        u.telegram_auth_updated_at as updated_at,
+                        u.telegram_id as telegram_user_id
+                    FROM users u
+                    WHERE u.telegram_auth_status = 'authorized'
+                      AND u.telegram_id = %s
+                    ORDER BY u.telegram_auth_created_at DESC
+                    LIMIT 1
+                """, (tenant_id,))
+
             result = cursor.fetchone()
             return dict(result) if result else None
     

@@ -1,16 +1,84 @@
-# Ignore large data directories and temporary files
+# Context7: Cursor indexing ignore patterns для оптимизации индексации
+# Обновлено: 2025-01-28
+# Используется для исключения больших директорий и временных файлов из индексации
+
+# Environment variables (never index)
+.env
+.env.*
+!.env.example
+
+# Data directories (large volumes, never index)
 qdrant/storage/**
 redis/data/**
 postgres/data/**
 neo4j/data/**
 grafana/data/**
+supabase/volumes/**
+
+# Sessions and secrets
 telethon/sessions/**
-**/*.log
-**/*.sqlite
-**/*.pyc
-**/__pycache__/**
+**/sessions/**
+**/*session*
+
+# Build artifacts and dependencies
 node_modules/**
 dist/**
 build/**
-.env
-# .env.*
+.venv/**
+venv/**
+ENV/**
+
+# Temporary and log files
+**/*.log
+**/*.log.*
+**/*.sqlite
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/__pycache__/**
+*.tmp
+*.temp
+*.cache
+
+# Test results and artifacts (large JSON files)
+test_results/**
+artifacts/**
+*.json
+!package.json
+!package-lock.json
+!tsconfig.json
+!pyproject.toml
+!composer.json
+
+# Auto-generated reports
+docs/reports/*.csv
+docs/reports/*.json
+docs/reports/dead_code_*.md
+docs/reports/cleanup_candidates.md
+docs/reports/jscpd_report/**
+
+# Backup files
+*.dump
+*.rdb
+*.sql
+!supabase/migrations/*.sql
+backups/archive/**
+
+# IDE and editor files
+.vscode/**
+.idea/**
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Large media files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.zip
+*.tar.gz
+*.rar
+*.7z

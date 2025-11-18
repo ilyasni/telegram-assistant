@@ -143,7 +143,7 @@ class ParseAllChannelsTask:
     def __init__(self, config, db_url: str, redis_client: Optional[Any], parser=None, app_state: Optional[Dict] = None, telegram_client_manager: Optional[Any] = None, media_processor: Optional[Any] = None):
         self.config = config
         self.db_url = db_url
-        self.redis: Optional[redis.Redis] = None
+        self.redis: Optional[redis.Redis] = redis_client  # Context7: Используем переданный async Redis клиент
         self.parser = parser  # Будет инициализирован при необходимости
         self.app_state = app_state
         self.telegram_client_manager = telegram_client_manager  # TelegramClientManager для парсинга
@@ -204,7 +204,14 @@ class ParseAllChannelsTask:
         try:
             # Initialize Redis if not available
             if self.redis is None:
-                self.redis = redis.from_url(settings.redis_url)
+                # Context7: Создаём async Redis клиент (redis.asyncio)
+                self.redis = redis.from_url(
+                    settings.redis_url,
+                    decode_responses=True,
+                    socket_connect_timeout=10,
+                    socket_timeout=30,
+                    retry_on_timeout=True
+                )
                 logger.info("Redis initialized for lock acquisition")
             
             # Context7: async Redis - используем await для set()
@@ -231,11 +238,21 @@ class ParseAllChannelsTask:
         """Release scheduler lock"""
         try:
             # Context7: async Redis - используем await для delete()
-            await self.redis.delete("parse_all_channels:lock")
+            # Context7: Проверяем, что lock существует перед удалением
+            lock_key = "parse_all_channels:lock"
+            deleted = await self.redis.delete(lock_key)
+            if deleted > 0:
+                logger.debug("Lock released successfully", lock_key=lock_key)
+            else:
+                logger.warning("Lock was not found when trying to release", lock_key=lock_key)
+            
             if self.app_state:
                 self.app_state["scheduler"]["lock_owner"] = None
         except Exception as e:
-            logger.error(f"Failed to release lock: {str(e)}")
+            logger.error("Failed to release lock", 
+                        error=str(e), 
+                        error_type=type(e).__name__,
+                        exc_info=True)
     
     async def _update_hwm(self, channel_id: str, max_message_date: datetime):
         """Update Redis HWM watermark"""
@@ -409,6 +426,22 @@ class ParseAllChannelsTask:
                     
             except Exception as e:
                 error_type = type(e).__name__
+                # Context7: Проверяем состояние db_session после ошибки
+                # Если сессия в неправильном состоянии, пересоздаем parser с новой сессией
+                if self.parser and hasattr(self.parser, 'db_session'):
+                    try:
+                        if self.parser.db_session.in_transaction():
+                            logger.warning("Session in transaction after error, rolling back",
+                                         channel_id=channel.get('id'),
+                                         error_type=error_type)
+                            await self.parser.db_session.rollback()
+                    except Exception as session_error:
+                        logger.warning("Failed to check/rollback session after error, may need to recreate parser",
+                                     channel_id=channel.get('id'),
+                                     error_type=error_type,
+                                     session_error=str(session_error))
+                        # Context7: Если не можем восстановить сессию, сбрасываем parser для пересоздания
+                        self.parser = None
                 
                 # FloodWait handling
                 if "FloodWait" in error_type or "FLOOD_WAIT" in str(e):
@@ -456,6 +489,7 @@ class ParseAllChannelsTask:
             logger.info("Lock held by another instance, skipping tick")
             return
         
+        tick_start_time = datetime.now(timezone.utc)
         try:
             logger.info("Running scheduler tick (lock acquired)")
             
@@ -469,9 +503,36 @@ class ParseAllChannelsTask:
             
             if not channels:
                 logger.warning("No active channels found for parsing")
-                return
+                # Context7: Не делаем return здесь, чтобы finally блок освободил lock
+                # Просто пропускаем парсинг каналов
             
-            for channel in channels:
+            # Context7: Ограничиваем время выполнения tick, чтобы lock не зависал
+            # TTL lock = interval_sec * 2, поэтому tick должен завершиться быстрее
+            max_tick_duration = self.interval_sec * 1.5  # 90% от TTL lock
+            channels_processed = 0
+            
+            # Context7: Сортируем каналы по last_parsed_at (старые первыми) для равномерного парсинга
+            # Это гарантирует, что каналы с давно не обновленными данными обрабатываются в первую очередь
+            channels_sorted = sorted(
+                channels,
+                key=lambda c: (
+                    c.get('last_parsed_at') is None,  # Новые каналы (None) первыми
+                    c.get('last_parsed_at') or datetime.min.replace(tzinfo=timezone.utc)  # Затем по дате (старые первыми)
+                )
+            )
+            
+            for idx, channel in enumerate(channels_sorted):
+                # Context7: Проверяем, не превысили ли мы максимальное время выполнения
+                elapsed = (datetime.now(timezone.utc) - tick_start_time).total_seconds()
+                if elapsed > max_tick_duration:
+                    logger.warning(
+                        "Tick duration exceeded maximum, stopping channel processing",
+                        channels_processed=channels_processed,
+                        channels_total=len(channels),
+                        elapsed_seconds=elapsed,
+                        max_duration_seconds=max_tick_duration
+                    )
+                    break
                 try:
                     # Get HWM from Redis
                     hwm_key = f"parse_hwm:{channel['id']}"
@@ -529,9 +590,21 @@ class ParseAllChannelsTask:
                     
                     # Context7: [C7-ID: backfill-missing-posts-001] Проверка и запуск backfill при пропусках
                     await self._check_and_trigger_backfill(channel)
+                    
+                    channels_processed += 1
+                    # Context7: Логируем прогресс каждые 10 каналов
+                    if channels_processed % 10 == 0:
+                        elapsed = (datetime.now(timezone.utc) - tick_start_time).total_seconds()
+                        logger.info(
+                            "Tick progress",
+                            channels_processed=channels_processed,
+                            channels_total=len(channels),
+                            elapsed_seconds=elapsed
+                        )
                         
                 except Exception as e:
                     logger.error(f"Failed to monitor channel {channel['id']}: {str(e)}")
+                    channels_processed += 1
             
             # Update scheduler freshness metric
             now_ts = datetime.now(timezone.utc).timestamp()
@@ -542,10 +615,26 @@ class ParseAllChannelsTask:
                 self.app_state["scheduler"]["last_tick_ts"] = datetime.now(timezone.utc).isoformat()
                 self.app_state["scheduler"]["status"] = "running"
             
-            logger.info("Scheduler tick completed")
+            tick_duration = (datetime.now(timezone.utc) - tick_start_time).total_seconds()
+            logger.info(
+                "Scheduler tick completed",
+                channels_processed=channels_processed,
+                channels_total=len(channels) if channels else 0,
+                duration_seconds=tick_duration
+            )
             
         finally:
-            await self._release_lock()
+            # Context7: Всегда освобождаем lock в finally блоке
+            # Context7: Логируем освобождение lock для диагностики
+            try:
+                await self._release_lock()
+                logger.debug("Lock released after tick", 
+                           tick_duration_seconds=(datetime.now(timezone.utc) - tick_start_time).total_seconds() if 'tick_start_time' in locals() else None)
+            except Exception as release_error:
+                logger.error("Failed to release lock in finally block", 
+                           error=str(release_error), 
+                           error_type=type(release_error).__name__,
+                           exc_info=True)
     
     async def _check_and_trigger_backfill(self, channel: Dict[str, Any]):
         """

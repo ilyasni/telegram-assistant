@@ -1,0 +1,733 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Telegram Assistant — Админ-панель</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <script src="js/admin-utils.js"></script>
+    <script src="js/admin.js"></script>
+    <script src="js/admin-users.js"></script>
+    <script src="js/admin-invites.js"></script>
+    <script src="js/admin-subscriptions.js"></script>
+    <script src="js/admin-feedback.js"></script>
+    <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <style>
+        :root {
+            --tg-bg-color: #ffffff;
+            --tg-text-color: #0f172a;
+            --tg-section-bg-color: #f8f8f8;
+            --tg-hint-color: #708499;
+            --admin-panel-bg: rgba(255, 255, 255, 0.92);
+            --admin-panel-shadow: rgba(15, 23, 42, 0.12);
+            --admin-card-bg: rgba(255, 255, 255, 0.96);
+            --admin-card-shadow: rgba(15, 23, 42, 0.08);
+            --admin-content-bg: rgba(15, 23, 42, 0.04);
+            --admin-tab-bg: rgba(15, 23, 42, 0.05);
+            --admin-tab-active-bg: #2481cc;
+            --admin-tab-active-text: #ffffff;
+            --admin-loading-bg: rgba(36, 129, 204, 0.08);
+            --admin-error-bg: rgba(220, 38, 38, 0.12);
+            --admin-error-text: #dc2626;
+            --admin-surface-weak-bg: rgba(15, 23, 42, 0.05);
+            --admin-surface-strong-bg: rgba(15, 23, 42, 0.08);
+            --admin-border-color: rgba(15, 23, 42, 0.12);
+            --admin-input-bg: rgba(255, 255, 255, 0.9);
+            --admin-button-neutral-bg: rgba(15, 23, 42, 0.08);
+            --admin-button-neutral-text: inherit;
+            --admin-button-primary-bg: #2563eb;
+            --admin-button-primary-text: #ffffff;
+            --admin-button-secondary-bg: rgba(15, 23, 42, 0.12);
+            --admin-button-secondary-text: inherit;
+            --admin-button-danger-bg: #dc2626;
+            --admin-button-danger-text: #ffffff;
+            --admin-button-warning-bg: #f59e0b;
+            --admin-button-warning-text: #1f2937;
+            --admin-button-success-bg: #16a34a;
+            --admin-button-success-text: #ffffff;
+            --admin-highlight-bg: rgba(36, 129, 204, 0.08);
+            --admin-badge-bg: rgba(36, 129, 204, 0.12);
+            --admin-badge-text: #2563eb;
+        }
+
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --tg-bg-color: #0f172a;
+                --tg-text-color: #f8fafc;
+                --tg-section-bg-color: #1f2937;
+                --tg-hint-color: #9ca3af;
+                --admin-panel-bg: rgba(31, 41, 55, 0.95);
+                --admin-panel-shadow: rgba(0, 0, 0, 0.4);
+                --admin-card-bg: rgba(17, 24, 39, 0.95);
+                --admin-card-shadow: rgba(0, 0, 0, 0.35);
+                --admin-content-bg: rgba(15, 23, 42, 0.35);
+                --admin-tab-bg: rgba(255, 255, 255, 0.08);
+                --admin-badge-bg: rgba(96, 165, 250, 0.2);
+                --admin-badge-text: #bfdbfe;
+                --admin-button-neutral-bg: rgba(255, 255, 255, 0.08);
+                --admin-button-secondary-bg: rgba(255, 255, 255, 0.12);
+                --admin-input-bg: rgba(255, 255, 255, 0.08);
+                --admin-border-color: rgba(255, 255, 255, 0.12);
+                --admin-surface-weak-bg: rgba(255, 255, 255, 0.05);
+                --admin-surface-strong-bg: rgba(255, 255, 255, 0.1);
+            }
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background-color: var(--tg-bg-color);
+            color: var(--tg-text-color);
+            min-height: 100vh;
+        }
+
+        .status {
+            text-align: center;
+            padding: 32px 16px;
+            color: var(--tg-hint-color);
+        }
+
+        .status strong {
+            display: block;
+            margin-bottom: 12px;
+            color: var(--tg-text-color);
+        }
+
+        .admin-panel {
+            padding: 16px;
+            border-radius: 16px;
+            background: var(--admin-panel-bg);
+            box-shadow: 0 20px 50px var(--admin-panel-shadow);
+            margin: 0 16px 24px;
+        }
+
+        .admin-header {
+            margin-bottom: 16px;
+        }
+
+        .admin-header h1 {
+            font-size: 20px;
+            font-weight: 600;
+            color: var(--tg-text-color);
+            margin: 0;
+        }
+
+        .admin-tabs {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 16px;
+            flex-wrap: wrap;
+        }
+
+        .tab-btn {
+            flex: 1;
+            min-width: 120px;
+            padding: 10px 12px;
+            border-radius: 12px;
+            border: 1px solid var(--admin-border-color);
+            background: var(--admin-tab-bg);
+            color: var(--tg-text-color);
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .tab-btn.active {
+            background: var(--admin-tab-active-bg);
+            color: var(--admin-tab-active-text);
+            box-shadow: 0 10px 30px rgba(36, 129, 204, 0.25);
+        }
+
+        .admin-content {
+            border-radius: 12px;
+            background: var(--admin-content-bg);
+            padding: 12px;
+            min-height: 200px;
+        }
+
+        .loading,
+        .error,
+        .empty-state,
+        .info-message {
+            padding: 16px;
+            border-radius: 12px;
+            text-align: center;
+            font-weight: 500;
+        }
+
+        .loading {
+            background: var(--admin-loading-bg);
+            color: var(--tg-text-color);
+        }
+
+        .error {
+            background: var(--admin-error-bg);
+            color: var(--admin-error-text);
+        }
+
+        .empty-state,
+        .info-message {
+            background: var(--admin-surface-weak-bg);
+            color: var(--tg-hint-color);
+        }
+
+        .admin-filters {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            margin-bottom: 16px;
+        }
+
+        .filter-input,
+        .filter-select,
+        .form-control {
+            flex: 1;
+            min-width: 120px;
+            padding: 10px 12px;
+            border-radius: 10px;
+            border: 1px solid var(--admin-border-color);
+            background: var(--admin-input-bg);
+            color: var(--tg-text-color);
+        }
+
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            padding: 10px 16px;
+            border-radius: 12px;
+            border: none;
+            font-weight: 600;
+            cursor: pointer;
+            background: var(--admin-button-neutral-bg);
+            color: var(--admin-button-neutral-text);
+            transition: transform 0.15s ease, box-shadow 0.15s ease;
+        }
+
+        .btn:active {
+            transform: translateY(1px);
+        }
+
+        .btn-sm {
+            padding: 6px 12px;
+            border-radius: 10px;
+            font-size: 13px;
+        }
+
+        .btn-primary {
+            background: var(--admin-button-primary-bg);
+            color: var(--admin-button-primary-text);
+            box-shadow: 0 10px 25px rgba(37, 99, 235, 0.25);
+        }
+
+        .btn-secondary {
+            background: var(--admin-button-secondary-bg);
+            color: var(--admin-button-secondary-text);
+        }
+
+        .btn-danger {
+            background: var(--admin-button-danger-bg);
+            color: var(--admin-button-danger-text);
+        }
+
+        .btn-warning {
+            background: var(--admin-button-warning-bg);
+            color: var(--admin-button-warning-text);
+        }
+
+        .btn-success {
+            background: var(--admin-button-success-bg);
+            color: var(--admin-button-success-text);
+        }
+
+        .user-card,
+        .invite-card,
+        .subscription-card,
+        .feedback-card,
+        .admin-card {
+            border-radius: 16px;
+            padding: 16px;
+            background: var(--admin-card-bg);
+            box-shadow: 0 15px 35px var(--admin-card-shadow);
+            margin-bottom: 12px;
+        }
+
+        .user-info,
+        .invite-info,
+        .subscription-info {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+
+        .user-actions,
+        .invite-actions,
+        .subscription-actions,
+        .detail-actions {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            margin-top: 12px;
+        }
+
+        .detail-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid var(--admin-border-color);
+            font-size: 14px;
+        }
+
+        .detail-item strong {
+            color: var(--tg-hint-color);
+            font-weight: 500;
+        }
+
+        .pagination,
+        .pagination-controls {
+            display: flex;
+            justify-content: center;
+            gap: 8px;
+            margin-top: 16px;
+        }
+
+        .admin-access-denied {
+            text-align: center;
+            padding: 40px 20px;
+            border-radius: 16px;
+            background: var(--admin-error-bg);
+            color: var(--admin-error-text);
+        }
+
+        .admin-header-actions {
+            display: flex;
+            justify-content: flex-end;
+            margin-bottom: 12px;
+        }
+
+        .users-list,
+        .invites-list,
+        .subscriptions-list {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .subscriptions-summary {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 12px;
+            margin-bottom: 16px;
+        }
+
+        .subscriptions-group {
+            padding: 12px;
+            border-radius: 12px;
+            background: var(--admin-surface-weak-bg);
+        }
+
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            padding: 4px 10px;
+            border-radius: 999px;
+            font-size: 12px;
+            font-weight: 600;
+            background: var(--admin-badge-bg);
+            color: var(--admin-badge-text);
+        }
+
+        .form-group {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            width: 100%;
+        }
+
+        .form-group label {
+            font-size: 13px;
+            color: var(--tg-hint-color);
+        }
+
+        .admin-users-section,
+        .admin-invites-section,
+        .admin-subscriptions-section,
+        .admin-feedback-section {
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+        
+        .feedback-list {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+        
+        .feedback-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        
+        .feedback-status-badge {
+            display: inline-flex;
+        }
+        
+        .feedback-meta {
+            display: flex;
+            gap: 12px;
+            font-size: 13px;
+            color: var(--tg-hint-color);
+            flex-wrap: wrap;
+        }
+        
+        .feedback-message {
+            margin: 12px 0;
+            padding: 12px;
+            background: var(--admin-surface-weak-bg);
+            border-radius: 8px;
+            font-size: 14px;
+            line-height: 1.5;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+        
+        .feedback-admin-notes {
+            margin-top: 8px;
+            padding: 12px;
+            background: var(--admin-highlight-bg);
+            border-radius: 8px;
+            font-size: 13px;
+            color: var(--tg-hint-color);
+        }
+        
+        .feedback-actions {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            margin-top: 12px;
+        }
+
+        .user-name,
+        .invite-code,
+        .subscription-title {
+            font-weight: 600;
+            font-size: 16px;
+            color: var(--tg-text-color);
+        }
+
+        .user-meta,
+        .invite-meta,
+        .subscription-meta,
+        .user-date {
+            font-size: 13px;
+            color: var(--tg-hint-color);
+        }
+    </style>
+</head>
+<body>
+    <div id="status" class="status">
+        <strong>Проверяем права администратора…</strong>
+        Отключать Mini App не нужно.
+    </div>
+    <div id="admin-section" style="display: none;"></div>
+
+    <script>
+        (function() {
+            'use strict';
+
+            const API_BASE = (window.location.origin.includes('produman.studio') || window.location.origin.startsWith('https://produman.studio'))
+                ? 'https://produman.studio'
+                : '';
+            const searchParams = new URLSearchParams(window.location.search);
+            const fallbackToken = searchParams.get('token');
+            let cachedInitData = '';
+            let tenantId = null;
+
+            function setStatus(message, isError = false) {
+                const statusEl = document.getElementById('status');
+                if (!statusEl) return;
+                statusEl.innerHTML = `<strong>${message}</strong>`;
+                statusEl.style.color = isError ? 'var(--tg-destructive-color, #ff3b30)' : 'var(--tg-text-color)';
+            }
+
+            function hideStatus() {
+                const statusEl = document.getElementById('status');
+                if (statusEl) {
+                    statusEl.style.display = 'none';
+                }
+            }
+
+            function redirectToQR(reason) {
+                console.warn('[Admin Entry] Redirecting to QR:', reason);
+                const target = new URL('qr.html', location.href);
+                target.search = location.search;
+                window.location.replace(target.toString());
+            }
+
+            function getInitDataFromUrl() {
+                try {
+                    const searchParams = new URLSearchParams(window.location.search);
+                    const tgParam = searchParams.get('tgWebAppData');
+                    if (tgParam) {
+                        const decoded = decodeURIComponent(tgParam);
+                        if (decoded) {
+                            console.log('[Admin Entry] initData from URL search, length:', decoded.length);
+                            return decoded;
+                        }
+                    }
+
+                    if (window.location.hash && window.location.hash.includes('tgWebAppData=')) {
+                        const hashParams = new URLSearchParams(window.location.hash.replace('#', ''));
+                        const tgParamHash = hashParams.get('tgWebAppData');
+                        if (tgParamHash) {
+                            const decodedHash = decodeURIComponent(tgParamHash);
+                            if (decodedHash) {
+                                console.log('[Admin Entry] initData from URL hash, length:', decodedHash.length);
+                                return decodedHash;
+                            }
+                        }
+                    }
+                } catch (error) {
+                    console.error('[Admin Entry] Failed to read initData from URL:', error);
+                }
+                return '';
+            }
+
+            function getThemeColors() {
+                if (window.Telegram && window.Telegram.WebApp && window.Telegram.WebApp.themeParams) {
+                    return window.Telegram.WebApp.themeParams;
+                }
+                return null;
+            }
+
+            function colorWithAlpha(color, alpha) {
+                if (!color) return '';
+                color = String(color).trim();
+                if (color.startsWith('#')) {
+                    let hex = color.slice(1);
+                    if (hex.length === 3) {
+                        hex = hex.split('').map(char => char + char).join('');
+                    }
+                    const bigint = parseInt(hex, 16);
+                    const r = (bigint >> 16) & 255;
+                    const g = (bigint >> 8) & 255;
+                    const b = bigint & 255;
+                    return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+                }
+                if (color.startsWith('rgba(')) {
+                    const parts = color.replace('rgba(', '').replace(')', '').split(',');
+                    if (parts.length >= 3) {
+                        const [r, g, b] = parts;
+                        return `rgba(${r.trim()}, ${g.trim()}, ${b.trim()}, ${alpha})`;
+                    }
+                }
+                if (color.startsWith('rgb(')) {
+                    return color.replace('rgb(', 'rgba(').replace(')', `, ${alpha})`);
+                }
+                return color;
+            }
+
+            function applyTheme() {
+                const theme = getThemeColors();
+                if (!theme) return;
+                const root = document.documentElement;
+                const baseBg = theme.bg_color || getComputedStyle(root).getPropertyValue('--tg-bg-color') || '#ffffff';
+                const secondaryBg = theme.secondary_bg_color || theme.section_bg_color || baseBg;
+                const textColor = theme.text_color || getComputedStyle(root).getPropertyValue('--tg-text-color') || '#0f172a';
+                const hintColor = theme.hint_color || getComputedStyle(root).getPropertyValue('--tg-hint-color') || '#94a3b8';
+                const buttonColor = theme.button_color || getComputedStyle(root).getPropertyValue('--tg-button-color') || '#2481cc';
+                const buttonTextColor = theme.button_text_color || getComputedStyle(root).getPropertyValue('--tg-button-text-color') || '#ffffff';
+
+                const map = {
+                    '--tg-bg-color': theme.bg_color,
+                    '--tg-text-color': theme.text_color,
+                    '--tg-section-bg-color': theme.section_bg_color,
+                    '--tg-hint-color': hintColor,
+                    '--tg-button-color': buttonColor,
+                    '--tg-button-text-color': buttonTextColor,
+                    '--admin-panel-bg': colorWithAlpha(secondaryBg, 0.95),
+                    '--admin-panel-shadow': colorWithAlpha(textColor, 0.3),
+                    '--admin-card-bg': colorWithAlpha(baseBg, 0.97),
+                    '--admin-card-shadow': colorWithAlpha(textColor, 0.25),
+                    '--admin-content-bg': colorWithAlpha(secondaryBg, 0.15),
+                    '--admin-tab-bg': colorWithAlpha(secondaryBg, 0.2),
+                    '--admin-tab-active-bg': buttonColor,
+                    '--admin-tab-active-text': buttonTextColor,
+                    '--admin-loading-bg': colorWithAlpha(buttonColor, 0.16),
+                    '--admin-highlight-bg': colorWithAlpha(buttonColor, 0.16),
+                    '--admin-surface-weak-bg': colorWithAlpha(secondaryBg, 0.12),
+                    '--admin-surface-strong-bg': colorWithAlpha(secondaryBg, 0.2),
+                    '--admin-border-color': colorWithAlpha(textColor, 0.18),
+                    '--admin-input-bg': colorWithAlpha(baseBg, 0.88),
+                    '--admin-button-neutral-bg': colorWithAlpha(textColor, 0.18),
+                    '--admin-button-neutral-text': textColor,
+                    '--admin-button-primary-bg': buttonColor,
+                    '--admin-button-primary-text': buttonTextColor,
+                    '--admin-button-secondary-bg': colorWithAlpha(textColor, 0.25),
+                    '--admin-button-secondary-text': textColor,
+                    '--admin-badge-bg': colorWithAlpha(buttonColor, 0.25),
+                    '--admin-badge-text': buttonColor,
+                };
+
+                Object.entries(map).forEach(([key, value]) => {
+                    if (value) {
+                        root.style.setProperty(key, value);
+                    }
+                });
+            }
+
+            function initTelegramWebApp() {
+                if (window.Telegram && window.Telegram.WebApp) {
+                    window.Telegram.WebApp.ready();
+                    window.Telegram.WebApp.expand();
+                    window.Telegram.WebApp.setHeaderColor('bg_color');
+                    window.Telegram.WebApp.setBackgroundColor('bg_color');
+                    applyTheme();
+                    if (window.Telegram.WebApp.onEvent) {
+                        window.Telegram.WebApp.onEvent('themeChanged', applyTheme);
+                    }
+                }
+            }
+
+            function getInitData() {
+                if (cachedInitData) {
+                    return cachedInitData;
+                }
+
+                const urlInitData = getInitDataFromUrl();
+                if (urlInitData) {
+                    cachedInitData = urlInitData;
+                    return cachedInitData;
+                }
+
+                if (window.Telegram?.WebApp?.initData && window.Telegram.WebApp.initData.length > 0) {
+                    cachedInitData = window.Telegram.WebApp.initData;
+                    return cachedInitData;
+                }
+
+                if (window.Telegram?.WebApp?.initDataUnsafe) {
+                    try {
+                        cachedInitData = JSON.stringify(window.Telegram.WebApp.initDataUnsafe);
+                        return cachedInitData;
+                    } catch (error) {
+                        console.error('[Admin Entry] Failed to stringify initDataUnsafe:', error);
+                    }
+                }
+
+                return '';
+            }
+
+            function parseJWT(token) {
+                const parts = token.split('.');
+                if (parts.length !== 3) {
+                    throw new Error('Invalid token format');
+                }
+                let payloadBase64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+                while (payloadBase64.length % 4) {
+                    payloadBase64 += '=';
+                }
+                return JSON.parse(atob(payloadBase64));
+            }
+
+            async function authenticateAdmin() {
+                const initData = getInitData();
+                if (!initData && !fallbackToken) {
+                    throw new Error('initData отсутствует и fallback токен не передан. Запустите Mini App через Telegram.');
+                }
+
+                const payload = {};
+                if (initData) {
+                    payload.init_data = initData;
+                }
+                if (!initData && fallbackToken) {
+                    payload.token = fallbackToken;
+                }
+                const authUrl = `${API_BASE || ''}/api/auth/telegram-webapp`;
+                const response = await fetch(authUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                if (!response.ok) {
+                    throw new Error(`Авторизация отклонена: HTTP ${response.status}`);
+                }
+
+                const data = await response.json();
+                window.accessToken = data.access_token;
+
+                const tokenPayload = parseJWT(data.access_token);
+                console.log('[Admin Entry] JWT payload:', tokenPayload);
+
+                tenantId = tokenPayload.tenant_id || null;
+                if (tokenPayload.role !== 'admin') {
+                    throw new Error(`Недостаточно прав. role=${tokenPayload.role}`);
+                }
+            }
+
+            function initializeAdminPanel() {
+                hideStatus();
+                const adminSection = document.getElementById('admin-section');
+                if (adminSection) {
+                    adminSection.style.display = 'block';
+                }
+
+                let attempts = 0;
+                const maxAttempts = 50;
+                const timer = setInterval(() => {
+                    attempts += 1;
+                    if (typeof window.initAdmin === 'function') {
+                        clearInterval(timer);
+                        window.initAdmin();
+                    } else if (attempts > maxAttempts) {
+                        clearInterval(timer);
+                        console.error('[Admin Entry] initAdmin not loaded');
+                        setStatus('Ошибка загрузки модулей админки. Перезапустите Mini App.', true);
+                    }
+                }, 100);
+            }
+
+            document.addEventListener('DOMContentLoaded', async () => {
+                try {
+                    initTelegramWebApp();
+
+                    if (window.Telegram && window.Telegram.WebApp) {
+                        await new Promise(resolve => {
+                            if (window.Telegram.WebApp.isReady) {
+                                resolve();
+                            } else {
+                                window.Telegram.WebApp.ready();
+                                setTimeout(resolve, 100);
+                            }
+                        });
+                    }
+
+                    setStatus('Запрашиваем токен администратора…');
+                    await authenticateAdmin();
+                    setStatus('Загружаем админ-панель…');
+                    initializeAdminPanel();
+                } catch (error) {
+                    console.error('[Admin Entry] Access denied:', error);
+                    setStatus('Нет доступа к админ-панели. Перенаправление…', true);
+                    setTimeout(() => redirectToQR(error.message), 1200);
+                }
+            });
+        })();
+    </script>
+</body>
+</html>
+
