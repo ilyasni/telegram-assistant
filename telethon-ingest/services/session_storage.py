@@ -46,7 +46,8 @@ class SessionStorageService:
         first_name: Optional[str] = None,
         last_name: Optional[str] = None,
         username: Optional[str] = None,
-        invite_code: Optional[str] = None
+        invite_code: Optional[str] = None,
+        dc_id: Optional[int] = None
     ) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
         """
         Context7 best practice: сохранение Telegram сессии в БД с улучшенной диагностикой.
@@ -80,6 +81,18 @@ class SessionStorageService:
             
             session_id = str(uuid.uuid4())
             
+            # Context7: извлекаем dc_id из session_string если не передан
+            if dc_id is None:
+                try:
+                    from telethon.sessions import StringSession
+                    session = StringSession(session_string)
+                    # Context7: dc_id обычно 2 для большинства сессий, но можно извлечь из session
+                    # Если не удается извлечь, используем значение по умолчанию
+                    dc_id = getattr(session, 'dc_id', 2) or 2
+                except Exception as e:
+                    logger.warning("Failed to extract dc_id from session, using default", error=str(e))
+                    dc_id = 2  # Context7: значение по умолчанию для DC
+            
             # Context7 best practice: сохранение в БД с проверкой уникальности
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(
@@ -94,7 +107,8 @@ class SessionStorageService:
                 first_name,
                 last_name,
                 username,
-                invite_code
+                invite_code,
+                dc_id
             )
             
             logger.info(
@@ -153,27 +167,50 @@ class SessionStorageService:
         first_name: Optional[str],
         last_name: Optional[str],
         username: Optional[str],
-        invite_code: Optional[str]
+        invite_code: Optional[str],
+        dc_id: int = 2
     ):
         """
-        Context7 best practice: сохранение сессии в telegram_sessions (single source of truth).
+        Context7 best practice: сохранение сессии в telegram_sessions с использованием Identity/Membership модели.
         
-        Сохраняет в таблицу telegram_sessions и также обновляет users для обратной совместимости.
+        Сохраняет в таблицу telegram_sessions (новая схема с identity_id) и создает/обновляет Identity и User.
         """
-        with self.db_connection.cursor() as cursor:
+        import sys
+        import os
+        import uuid as _uuid
+        # Context7: добавляем путь к api для импорта утилит
+        api_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'api')
+        if api_path not in sys.path:
+            sys.path.insert(0, api_path)
+        
+        from utils.identity_membership import upsert_identity_sync, upsert_membership_sync
+        from sqlalchemy.orm import Session
+        from sqlalchemy import create_engine
+        from config import settings
+        
+        # Context7: создаем SQLAlchemy Session для использования утилит
+        engine = create_engine(settings.database_url)
+        SessionLocal = __import__('sqlalchemy.orm', fromlist=['sessionmaker']).sessionmaker(bind=engine)
+        db_session = SessionLocal()
+        
+        try:
+            # Context7: используем SQLAlchemy Session для всех операций
+            # Для операций с invite_codes и tenants используем db_session
+            from sqlalchemy import text
+            
             # 1) Если передан invite_code — валидируем и получаем tenant и роль
             resolved_tenant_id = tenant_id
             resolved_role = None
             if invite_code:
-                cursor.execute(
-                    """
-                    SELECT tenant_id, role, uses_limit, uses_count, active, expires_at
-                    FROM invite_codes
-                    WHERE code = %s
-                    """,
-                    (invite_code,)
+                result = db_session.execute(
+                    text("""
+                        SELECT tenant_id, role, uses_limit, uses_count, active, expires_at
+                        FROM invite_codes
+                        WHERE code = :code
+                    """),
+                    {"code": invite_code}
                 )
-                row = cursor.fetchone()
+                row = result.fetchone()
                 if row:
                     (inv_tenant_id, inv_role, uses_limit, uses_count, active, expires_at) = row
                     import datetime as _dt
@@ -181,163 +218,215 @@ class SessionStorageService:
                         resolved_tenant_id = str(inv_tenant_id)
                         resolved_role = inv_role
                         # отметим использование
-                        cursor.execute(
-                            """
-                            UPDATE invite_codes
-                            SET uses_count = uses_count + 1, last_used_at = NOW()
-                            WHERE code = %s
-                            """,
-                            (invite_code,)
+                        db_session.execute(
+                            text("""
+                                UPDATE invite_codes
+                                SET uses_count = uses_count + 1, last_used_at = NOW()
+                                WHERE code = :code
+                            """),
+                            {"code": invite_code}
                         )
-            # Context7 best practice: сохранение в telegram_sessions (основная таблица)
-            # Сначала отзываем старые сессии для этого tenant+user
-            cursor.execute("""
-                UPDATE telegram_sessions 
-                SET status = 'revoked', updated_at = NOW()
-                WHERE tenant_id::text = %s 
-                  AND (user_id::text = %s OR user_id IS NULL)
-                  AND status = 'authorized'
-            """, (resolved_tenant_id, user_id))
             
-            # Context7: Получаем user_id из БД (если существует)
-            # Context7 best practice: tenant_id в telegram_sessions - это character varying, не UUID
-            # Используем строковое значение resolved_tenant_id напрямую
-            db_user_id = None
-            cursor.execute("""
-                SELECT id::text
-                FROM users
-                WHERE telegram_id = %s
-                LIMIT 1
-            """, (telegram_user_id,))
-            user_result = cursor.fetchone()
-            if user_result:
-                db_user_id = user_result[0]
-            
-            # Context7: INSERT в telegram_sessions (после отзыва старых сессий)
-            # Context7 best practice: используем простой INSERT, так как старые сессии уже отозваны
-            # Context7: tenant_id хранится как character varying (строка), не UUID
-            cursor.execute("""
-                INSERT INTO telegram_sessions (
-                    id, tenant_id, user_id, session_string_enc, key_id, status, created_at, updated_at
-                ) VALUES (
-                    %s, %s, %s, %s, %s, 'authorized', NOW(), NOW()
-                )
-            """, (session_id, resolved_tenant_id, db_user_id, encrypted_session, key_id))
-            
-            # Context7 best practice: получаем или создаем tenant_id UUID для users
-            db_tenant_uuid_for_users = None
+            # Context7 best practice: получаем или создаем tenant_id UUID для Identity/Membership
+            db_tenant_uuid = None
             if resolved_tenant_id:
                 # Пробуем найти существующий tenant
-                cursor.execute("""
-                    SELECT id FROM tenants WHERE id::text = %s LIMIT 1
-                """, (resolved_tenant_id,))
-                tenant_result = cursor.fetchone()
+                result = db_session.execute(
+                    text("SELECT id FROM tenants WHERE id::text = :tenant_id LIMIT 1"),
+                    {"tenant_id": resolved_tenant_id}
+                )
+                tenant_result = result.fetchone()
                 if tenant_result:
-                    db_tenant_uuid_for_users = tenant_result[0]
+                    db_tenant_uuid = tenant_result[0]
                 else:
                     # Context7: если tenant не найден, создаем его (для новых пользователей)
-                    # Используем resolved_tenant_id как UUID или создаем новый
                     try:
-                        import uuid as _uuid
                         # Пробуем использовать resolved_tenant_id как UUID
-                        db_tenant_uuid_for_users = _uuid.UUID(resolved_tenant_id)
+                        db_tenant_uuid = _uuid.UUID(resolved_tenant_id)
                     except (ValueError, AttributeError):
                         # Если не UUID, создаем новый tenant
                         new_tenant_id = _uuid.uuid4()
-                        cursor.execute("""
-                            INSERT INTO tenants (id, name, created_at, updated_at)
-                            VALUES (%s, %s, NOW(), NOW())
-                            ON CONFLICT (id) DO NOTHING
-                        """, (new_tenant_id, f"Tenant {telegram_user_id}"))
-                        db_tenant_uuid_for_users = new_tenant_id
+                        db_session.execute(
+                            text("""
+                                INSERT INTO tenants (id, name, created_at, updated_at)
+                                VALUES (:id, :name, NOW(), NOW())
+                                ON CONFLICT (id) DO NOTHING
+                            """),
+                            {"id": new_tenant_id, "name": f"Tenant {telegram_user_id}"}
+                        )
+                        db_tenant_uuid = new_tenant_id
             
-            # Context7 best practice: создаем или обновляем пользователя
-            # Context7: сначала проверяем, существует ли пользователь
-            cursor.execute("""
-                SELECT id FROM users WHERE telegram_id = %s LIMIT 1
-            """, (telegram_user_id,))
-            existing_user = cursor.fetchone()
-            
-            if existing_user:
-                # Обновляем существующего пользователя
-                cursor.execute("""
-                    UPDATE users 
-                    SET 
-                        telegram_session_enc = %s,
-                        telegram_session_key_id = %s,
-                        telegram_auth_status = 'authorized',
-                        telegram_auth_created_at = NOW(),
-                        telegram_auth_updated_at = NOW(),
-                        telegram_auth_error = NULL,
-                        first_name = COALESCE(%s, first_name),
-                        last_name = COALESCE(%s, last_name),
-                        username = COALESCE(%s, username),
-                        tenant_id = COALESCE(%s, tenant_id),
-                        role = COALESCE(%s, role)
-                    WHERE telegram_id = %s
-                """, (encrypted_session, key_id, first_name, last_name, username, db_tenant_uuid_for_users, resolved_role, telegram_user_id))
-            else:
-                # Context7: создаем нового пользователя, если его нет
-                import uuid as _uuid
-                new_user_id = _uuid.uuid4()
-                cursor.execute("""
-                    INSERT INTO users (
-                        id, telegram_id, username, first_name, last_name,
-                        telegram_session_enc, telegram_session_key_id,
-                        telegram_auth_status, telegram_auth_created_at, telegram_auth_updated_at,
-                        tenant_id, role, created_at, updated_at
-                    ) VALUES (
-                        %s, %s, %s, %s, %s,
-                        %s, %s,
-                        'authorized', NOW(), NOW(),
-                        %s, %s, NOW(), NOW()
-                    )
-                """, (
-                    new_user_id, telegram_user_id, username, first_name, last_name,
-                    encrypted_session, key_id,
-                    db_tenant_uuid_for_users, resolved_role or 'user'
-                ))
-                logger.info(
-                    "Created new user during QR auth",
-                    user_id=str(new_user_id),
-                    telegram_id=telegram_user_id,
-                    tenant_id=str(db_tenant_uuid_for_users) if db_tenant_uuid_for_users else None
+            # Context7: если tenant не найден и не создан, создаем новый
+            if not db_tenant_uuid:
+                new_tenant_id = _uuid.uuid4()
+                db_session.execute(
+                    text("""
+                        INSERT INTO tenants (id, name, created_at, updated_at)
+                        VALUES (:id, :name, NOW(), NOW())
+                        ON CONFLICT (id) DO NOTHING
+                    """),
+                    {"id": new_tenant_id, "name": f"Tenant {telegram_user_id}"}
                 )
-            
-            # Context7 best practice: логирование события авторизации
-            # Context7: получаем user_id для события (теперь пользователь точно создан)
-            event_user_id = None
-            cursor.execute("""
-                SELECT id::text FROM users WHERE telegram_id = %s LIMIT 1
-            """, (telegram_user_id,))
-            user_result = cursor.fetchone()
-            if user_result:
-                event_user_id = user_result[0]
-            
-            # Context7: вставляем событие только если user_id найден
-            # Для новых пользователей событие может быть пропущено, но это не критично
-            if event_user_id:
-                cursor.execute("""
-                    INSERT INTO telegram_auth_events (
-                        id, user_id, event, reason, at, meta
-                    ) VALUES (
-                        %s, %s, 'qr_authorized', %s, NOW(), %s
+                db_tenant_uuid = new_tenant_id
+                
+                # Context7 best practice: создаем/находим Identity и Membership через утилиты
+                # Используем SQLAlchemy Session для работы с утилитами
+                # Context7: ВАЖНО - все операции должны быть в одной транзакции
+                # Используем db_session для всех операций, включая telegram_sessions
+                try:
+                    # Context7: проверка обязательных полей перед созданием
+                    if not telegram_user_id:
+                        raise ValueError("telegram_user_id is required")
+                    if not db_tenant_uuid:
+                        raise ValueError("tenant_id is required")
+                    
+                    # 1. Создаем/находим Identity
+                    identity_id = upsert_identity_sync(db_session, telegram_user_id)
+                    if not identity_id:
+                        raise ValueError(f"Failed to create/find identity for telegram_id={telegram_user_id}")
+                    logger.debug("Identity upserted", 
+                               telegram_id=telegram_user_id, 
+                               identity_id=str(identity_id))
+                    
+                    # 2. Создаем/обновляем Membership (User)
+                    user_id = upsert_membership_sync(
+                        db=db_session,
+                        tenant_id=db_tenant_uuid,
+                        identity_id=identity_id,
+                        telegram_id=telegram_user_id,
+                        username=username,
+                        first_name=first_name,
+                        last_name=last_name,
+                        tier="free"
                     )
-                """, (
-                    str(uuid.uuid4()),
-                    event_user_id,
-                    f"telegram_user_id={telegram_user_id}",
-                    Json({"invite_code": invite_code} if invite_code else {})
-                ))
-            else:
-                # Context7: логируем, что событие не было создано (не критично)
-                logger.warning(
-                    "Cannot create auth event - user not found",
-                    telegram_user_id=telegram_user_id,
-                    tenant_id=tenant_id
-                )
+                    if not user_id:
+                        raise ValueError(f"Failed to create/find membership for identity_id={identity_id}, tenant_id={db_tenant_uuid}")
+                    logger.debug("Membership upserted",
+                               tenant_id=str(db_tenant_uuid),
+                               identity_id=str(identity_id),
+                               user_id=str(user_id))
+                    
+                    # 3. Обновляем role если передан через invite_code
+                    if resolved_role:
+                        from sqlalchemy import text
+                        db_session.execute(
+                            text("UPDATE users SET role = :role WHERE id = :user_id"),
+                            {"role": resolved_role, "user_id": user_id}
+                        )
+                    
+                    # 4. Обновляем legacy поля для обратной совместимости
+                    from sqlalchemy import text
+                    db_session.execute(
+                        text("""
+                            UPDATE users 
+                            SET 
+                                telegram_session_enc = :encrypted_session,
+                                telegram_session_key_id = :key_id,
+                                telegram_auth_status = 'authorized',
+                                telegram_auth_created_at = NOW(),
+                                telegram_auth_updated_at = NOW(),
+                                telegram_auth_error = NULL
+                            WHERE id = :user_id
+                        """),
+                        {
+                            "encrypted_session": encrypted_session,
+                            "key_id": key_id,
+                            "user_id": user_id
+                        }
+                    )
+                    
+                    # Context7: проверка обязательных полей перед сохранением сессии
+                    if not identity_id:
+                        raise ValueError("identity_id is required for telegram_sessions")
+                    if not telegram_user_id:
+                        raise ValueError("telegram_id is required for telegram_sessions")
+                    if not encrypted_session:
+                        raise ValueError("session_string_enc is required for telegram_sessions")
+                    if dc_id is None:
+                        raise ValueError("dc_id is required for telegram_sessions")
+                    
+                    # 5. Отзываем старые сессии для этой Identity
+                    db_session.execute(
+                        text("""
+                            UPDATE telegram_sessions 
+                            SET is_active = false, updated_at = NOW()
+                            WHERE identity_id = :identity_id 
+                              AND is_active = true
+                        """),
+                        {"identity_id": identity_id}
+                    )
+                    
+                    # 6. INSERT в telegram_sessions (новая схема с identity_id)
+                    # Context7 best practice: используем новую схему с identity_id, telegram_id, dc_id
+                    db_session.execute(
+                        text("""
+                            INSERT INTO telegram_sessions (
+                                id, identity_id, telegram_id, session_string_enc, dc_id, is_active, created_at, updated_at
+                            ) VALUES (
+                                :session_id, :identity_id, :telegram_id, :encrypted_session, :dc_id, true, NOW(), NOW()
+                            )
+                            ON CONFLICT (identity_id, dc_id) 
+                            DO UPDATE SET
+                                session_string_enc = EXCLUDED.session_string_enc,
+                                is_active = true,
+                                updated_at = NOW()
+                        """),
+                        {
+                            "session_id": session_id,
+                            "identity_id": identity_id,
+                            "telegram_id": telegram_user_id,
+                            "encrypted_session": encrypted_session,
+                            "dc_id": dc_id
+                        }
+                    )
+                    
+                    # 7. Логирование события авторизации
+                    try:
+                        from psycopg2.extras import Json
+                        db_session.execute(
+                            text("""
+                                INSERT INTO telegram_auth_events (
+                                    id, user_id, event, reason, at, meta
+                                ) VALUES (
+                                    :event_id, :user_id, 'qr_authorized', :reason, NOW(), :meta
+                                )
+                            """),
+                            {
+                                "event_id": str(_uuid.uuid4()),
+                                "user_id": user_id,
+                                "reason": f"telegram_user_id={telegram_user_id}",
+                                "meta": Json({"invite_code": invite_code} if invite_code else {})
+                            }
+                        )
+                    except Exception as e:
+                        logger.warning("Failed to create auth event", 
+                                     error=str(e), 
+                                     user_id=str(user_id))
+                    
+                    # Context7: ВАЖНО - коммитим все операции одной транзакцией
+                    db_session.commit()
+                    
+                    logger.info(
+                        "Telegram session saved with Identity/Membership",
+                        session_id=session_id,
+                        identity_id=str(identity_id),
+                        user_id=str(user_id),
+                        telegram_id=telegram_user_id,
+                        tenant_id=str(db_tenant_uuid),
+                        dc_id=dc_id
+                    )
+                    
+                except Exception as e:
+                    db_session.rollback()
+                    logger.error("Failed to save session (Identity/Membership/Session)", 
+                               error=str(e), 
+                               telegram_id=telegram_user_id,
+                               exc_info=True)
+                    raise
             
-            self.db_connection.commit()
+        finally:
+            # Context7: закрываем SQLAlchemy Session
+            db_session.close()
     
     async def _get_active_encryption_key(self) -> Optional[str]:
         """Получение активного ключа шифрования с retry логикой."""

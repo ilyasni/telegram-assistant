@@ -15,6 +15,8 @@ httpx==0.27.2
 qrcode==7.4.2
 Pillow==10.4.0
 cryptography==41.0.7
+# Context7: Telethon для проверки 2FA пароля в QR-авторизации
+telethon>=1.34.0
 # S3 Storage (Cloud.ru) - Context7: для Vision + S3 Integration
 boto3>=1.34.0
 botocore>=1.34.0
@@ -46,3 +48,6 @@ mistune>=3.0.0
 # Testing
 pytest>=7.4.0,<8.0.0
 pytest-asyncio>=0.21.0,<0.22.0
+
+# JSON validation (используется в worker/common/json_guard.py, который импортируется из api/)
+jsonschema>=4.21.1

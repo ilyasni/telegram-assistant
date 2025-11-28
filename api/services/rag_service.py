@@ -10,7 +10,7 @@ import hashlib
 from collections import defaultdict
 from typing import List, Dict, Any, Optional
 from uuid import UUID
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import structlog
 from sqlalchemy.orm import Session, selectinload
@@ -28,6 +28,8 @@ from models.database import Post, PostEnrichment, User
 from services.intent_classifier import get_intent_classifier, IntentResponse
 from services.searxng_service import get_searxng_service
 from services.graph_service import get_graph_service
+from worker.agents.context_router_agent import get_context_router
+from worker.services.episodic_memory_service import get_episodic_memory_service
 from config import settings
 
 logger = structlog.get_logger()
@@ -54,6 +56,10 @@ class RAGResult(BaseModel):
     confidence: float
     intent: str
     processing_time_ms: int
+    # Performance metrics (для отслеживания Performance KPIs)
+    llm_calls: int = 1
+    tokens_used: int = 0
+    agent_steps: int = 1
 
 
 # ============================================================================
@@ -87,8 +93,16 @@ class RAGService:
         self.qdrant_client = qdrant_client or QdrantClient(url=qdrant_url)
         self.redis_client = redis_client
         
-        # Инициализация IntentClassifier
+        # Инициализация IntentClassifier (fallback)
         self.intent_classifier = get_intent_classifier(redis_client=redis_client)
+        
+        # Context Router Agent для интеллектуальной маршрутизации
+        # Performance: сверхлёгкий router с эвристикой и кэшем
+        try:
+            self.context_router = get_context_router()
+        except Exception as exc:
+            logger.warning("context_router.initialization_failed", error=str(exc))
+            self.context_router = None
         
         # Инициализация SearXNG
         self.searxng_service = get_searxng_service(redis_client=redis_client)
@@ -105,11 +119,33 @@ class RAGService:
         os.environ.setdefault("OPENAI_API_BASE", api_base)
         os.environ.setdefault("OPENAI_API_KEY", api_key)
         
+        # Context7: Получаем credentials как строку (не SecretStr)
+        # Используем load_gigachat_credentials для правильного формата
+        try:
+            from api.worker.tasks.group_digest_agent import load_gigachat_credentials
+            gigachat_creds = load_gigachat_credentials()
+            credentials_str = gigachat_creds.get("credentials")
+            scope_str = gigachat_creds.get("scope", "GIGACHAT_API_PERS")
+            base_url_giga = gigachat_creds.get("base_url") or api_base
+            verify_ssl = gigachat_creds.get("verify_ssl_certs", False)
+        except Exception as e:
+            logger.warning("rag_service.gigachat_credentials_load_failed", error=str(e))
+            # Fallback на env переменные
+            credentials_str = os.getenv('GIGACHAT_CREDENTIALS', '')
+            scope_str = os.getenv('GIGACHAT_SCOPE', 'GIGACHAT_API_PERS')
+            base_url_giga = api_base
+            verify_ssl = False
+        
+        # Context7: Преобразуем SecretStr в строку, если нужно
+        if hasattr(credentials_str, 'get_secret_value'):
+            credentials_str = credentials_str.get_secret_value()
+        
         self.llm = GigaChat(
-            credentials=getattr(settings, 'gigachat_credentials', '') or os.getenv('GIGACHAT_CREDENTIALS', ''),
-            scope=getattr(settings, 'gigachat_scope', None) or os.getenv('GIGACHAT_SCOPE', 'GIGACHAT_API_PERS'),
+            credentials=credentials_str,
+            scope=scope_str,
+            base_url=base_url_giga,
+            verify_ssl_certs=verify_ssl,
             model="GigaChat",
-            base_url=api_base,
             temperature=0.7,
         )
         
@@ -266,7 +302,9 @@ class RAGService:
         query_embedding: List[float],
         tenant_id: str,
         limit: int = 10,
-        channel_ids: Optional[List[str]] = None
+        channel_ids: Optional[List[str]] = None,
+        time_filter: Optional[tuple[datetime, Optional[datetime]]] = None,
+        db: Optional[Session] = None
     ) -> List[Dict[str, Any]]:
         """Поиск в Qdrant по вектору."""
         try:
@@ -297,12 +335,16 @@ class RAGService:
             
             search_filter = Filter(must=filter_conditions) if filter_conditions else None
             
+            # Context7: Qdrant не поддерживает фильтрацию по времени напрямую
+            # Берем больше результатов для последующей фильтрации по времени
+            search_limit = limit * 3 if time_filter else limit
+            
             # Поиск
             search_results = self.qdrant_client.search(
                 collection_name=collection_name,
                 query_vector=query_embedding,
                 query_filter=search_filter,
-                limit=limit
+                limit=search_limit
             )
             
             results = []
@@ -313,11 +355,164 @@ class RAGService:
                     'payload': result.payload
                 })
             
+            # Context7: Фильтруем результаты по времени после получения из БД
+            if time_filter and db and results:
+                start_time, end_time = time_filter
+                post_ids = [UUID(r['post_id']) for r in results if r.get('post_id')]
+                
+                if post_ids:
+                    # Загружаем посты из БД для проверки времени
+                    posts = db.query(Post).filter(Post.id.in_(post_ids)).all()
+                    post_map = {str(post.id): post for post in posts}
+                    
+                    # Фильтруем результаты по времени
+                    filtered_results = []
+                    for result in results:
+                        post_id = result.get('post_id')
+                        if not post_id:
+                            continue
+                        
+                        post = post_map.get(post_id)
+                        if not post or not post.posted_at:
+                            continue
+                        
+                        # Проверяем временной фильтр
+                        if start_time and post.posted_at < start_time:
+                            continue
+                        if end_time and post.posted_at > end_time:
+                            continue
+                        
+                        filtered_results.append(result)
+                    
+                    # Ограничиваем количество результатов
+                    results = filtered_results[:limit]
+            
             return results
         
         except Exception as e:
             logger.error("Error searching Qdrant", error=str(e))
             return []
+    
+    def _parse_time_filter(self, query: str) -> Optional[tuple[datetime, Optional[datetime]]]:
+        """
+        Парсит временные фразы из запроса и возвращает временной интервал.
+        
+        Context7: Поддерживает различные временные фразы для фильтрации постов по времени публикации.
+        
+        Args:
+            query: Текст запроса пользователя
+            
+        Returns:
+            Tuple (start_time, end_time) или None если временная фраза не найдена.
+            end_time может быть None для открытых интервалов (например, "сегодня").
+        """
+        query_lower = query.lower()
+        now = datetime.now(timezone.utc)
+        
+        # "сегодня" → [today 00:00 UTC; now)
+        if "сегодня" in query_lower:
+            start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            return (start, None)
+        
+        # "вчера" → [yesterday 00:00 UTC; yesterday 23:59:59 UTC]
+        if "вчера" in query_lower:
+            yesterday = now - timedelta(days=1)
+            start = yesterday.replace(hour=0, minute=0, second=0, microsecond=0)
+            end = yesterday.replace(hour=23, minute=59, second=59, microsecond=999999)
+            return (start, end)
+        
+        # "за эту неделю", "на этой неделе" → [понедельник 00:00 UTC; now)
+        if "за эту неделю" in query_lower or "на этой неделе" in query_lower or "эту неделю" in query_lower:
+            # Находим понедельник текущей недели
+            days_since_monday = now.weekday()  # 0 = понедельник
+            monday = now - timedelta(days=days_since_monday)
+            start = monday.replace(hour=0, minute=0, second=0, microsecond=0)
+            return (start, None)
+        
+        # "за прошлую неделю" → [понедельник прошлой недели 00:00; воскресенье 23:59:59]
+        if "за прошлую неделю" in query_lower or "на прошлой неделе" in query_lower:
+            days_since_monday = now.weekday()
+            # Понедельник прошлой недели
+            last_monday = now - timedelta(days=days_since_monday + 7)
+            start = last_monday.replace(hour=0, minute=0, second=0, microsecond=0)
+            # Воскресенье прошлой недели
+            last_sunday = last_monday + timedelta(days=6)
+            end = last_sunday.replace(hour=23, minute=59, second=59, microsecond=999999)
+            return (start, end)
+        
+        # "за последние 24 часа" / "за последние N часов"
+        import re
+        hours_match = re.search(r'за последние (\d+)\s*час', query_lower)
+        if hours_match:
+            hours = int(hours_match.group(1))
+            start = now - timedelta(hours=hours)
+            return (start, None)
+        
+        # "за последние 7 дней" / "за последнюю неделю"
+        if "за последние 7 дней" in query_lower or "за последнюю неделю" in query_lower:
+            start = now - timedelta(days=7)
+            return (start, None)
+        
+        # "за последний месяц"
+        if "за последний месяц" in query_lower:
+            start = now - timedelta(days=30)
+            return (start, None)
+        
+        # "за день" / "за неделю" / "за месяц"
+        if "за день" in query_lower:
+            start = now - timedelta(days=1)
+            return (start, None)
+        
+        if "за неделю" in query_lower:
+            start = now - timedelta(days=7)
+            return (start, None)
+        
+        if "за месяц" in query_lower:
+            start = now - timedelta(days=30)
+            return (start, None)
+        
+        # "за последние N дней"
+        days_match = re.search(r'за последние (\d+)\s*дн', query_lower)
+        if days_match:
+            days = int(days_match.group(1))
+            start = now - timedelta(days=days)
+            return (start, None)
+        
+        return None
+    
+    def _extract_keywords_for_fts(self, query: str) -> str:
+        """
+        Извлекает ключевые слова из запроса для FTS.
+        
+        Context7: Убирает служебные слова и временные фразы, оставляет только значимые термины.
+        """
+        # Список стоп-слов для русского и английского
+        stop_words = {
+            'найти', 'найди', 'найти', 'поиск', 'искать', 'ищу',
+            'новости', 'новость', 'новостей', 'новостями',
+            'по', 'за', 'за последние', 'за последние 24 часа', 'за последний', 'за день', 'за неделю',
+            'последние', 'последний', 'последних', 'последними',
+            '24', 'часа', 'час', 'часов', 'часам',
+            'день', 'дня', 'дней', 'дням',
+            'неделя', 'недели', 'недель', 'неделям',
+            'месяц', 'месяца', 'месяцев', 'месяцам',
+            'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+            'have', 'has', 'had', 'having', 'do', 'does', 'did', 'doing',
+            'will', 'would', 'could', 'should', 'may', 'might', 'must',
+            'find', 'search', 'look', 'for', 'news', 'about', 'last', 'hours', 'days'
+        }
+        
+        # Разбиваем запрос на слова и фильтруем
+        words = query.lower().split()
+        keywords = [w for w in words if w not in stop_words and len(w) > 2]
+        
+        # Если ключевых слов нет, возвращаем упрощенный запрос
+        if not keywords:
+            # Пытаемся найти хотя бы одно значимое слово
+            all_words = query.lower().split()
+            keywords = [w for w in all_words if len(w) > 2][:5]  # Берем первые 5 слов длиннее 2 символов
+        
+        return ' '.join(keywords) if keywords else query
     
     async def _search_postgres_fts(
         self,
@@ -325,16 +520,20 @@ class RAGService:
         tenant_id: str,
         limit: int = 10,
         channel_ids: Optional[List[str]] = None,
-        db: Optional[Session] = None
+        db: Optional[Session] = None,
+        time_filter: Optional[tuple[datetime, Optional[datetime]]] = None
     ) -> List[Dict[str, Any]]:
         """Поиск через PostgreSQL Full-Text Search."""
         if not db:
             return []
         
         try:
+            # Context7: Извлекаем ключевые слова из запроса для более точного поиска
+            fts_query_text = self._extract_keywords_for_fts(query)
+            
             # Context7: PostgreSQL FTS для keyword search
             # Используем tsvector для поиска по content
-            # Context7: Фильтрация по tenant_id через JOIN с user_channel и по channel_ids
+            # Context7: Фильтрация по tenant_id через JOIN с user_channel и users (каналы глобальные, нет tenant_id)
             base_query = """
                 SELECT DISTINCT
                     p.id,
@@ -350,7 +549,17 @@ class RAGService:
                     AND u.tenant_id = CAST(:tenant_id AS uuid)
             """
             
-            params = {"query": query, "tenant_id": tenant_id, "limit": limit}
+            params = {"query": fts_query_text, "tenant_id": tenant_id, "limit": limit}
+            
+            # Добавляем фильтрацию по времени, если указана
+            if time_filter:
+                start_time, end_time = time_filter
+                if start_time:
+                    base_query += " AND p.posted_at >= :start_time"
+                    params["start_time"] = start_time
+                if end_time:
+                    base_query += " AND p.posted_at <= :end_time"
+                    params["end_time"] = end_time
             
             # Добавляем фильтрацию по channel_ids если указаны
             if channel_ids:
@@ -379,13 +588,102 @@ class RAGService:
             logger.error("Error searching PostgreSQL FTS", error=str(e))
             return []
     
+    async def _search_postgres_fts_relaxed(
+        self,
+        query: str,
+        tenant_id: str,
+        limit: int = 10,
+        channel_ids: Optional[List[str]] = None,
+        db: Optional[Session] = None,
+        time_filter: Optional[tuple[datetime, Optional[datetime]]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Relaxed PostgreSQL FTS поиск - использует ILIKE для частичного совпадения.
+        
+        Context7: Используется как fallback когда точный FTS не находит результаты.
+        Ищет по отдельным словам запроса, а не по всем словам сразу.
+        """
+        if not db:
+            return []
+        
+        try:
+            # Разбиваем запрос на слова
+            query_words = query.split()
+            if not query_words:
+                return []
+            
+            # Context7: Используем ILIKE для поиска по отдельным словам
+            # Это более мягкий поиск, который найдет посты содержащие хотя бы одно слово
+            # Context7: Фильтрация по tenant_id через JOIN с user_channel и users (каналы глобальные)
+            word_conditions = " OR ".join([f"p.content ILIKE :word_{i}" for i in range(len(query_words))])
+            
+            base_query = f"""
+                SELECT DISTINCT
+                    p.id,
+                    p.channel_id,
+                    p.content,
+                    p.telegram_post_url,
+                    p.posted_at,
+                    0.5 as rank
+                FROM posts p
+                JOIN channels c ON p.channel_id = c.id
+                JOIN user_channel uc ON uc.channel_id = c.id
+                JOIN users u ON u.id = uc.user_id
+                WHERE ({word_conditions})
+                    AND u.tenant_id = CAST(:tenant_id AS uuid)
+                    AND p.content IS NOT NULL
+                    AND p.content != ''
+            """
+            
+            params = {"tenant_id": tenant_id, "limit": limit}
+            for i, word in enumerate(query_words):
+                params[f"word_{i}"] = f"%{word}%"
+            
+            # Добавляем фильтрацию по времени, если указана
+            if time_filter:
+                start_time, end_time = time_filter
+                if start_time:
+                    base_query += " AND p.posted_at >= :start_time"
+                    params["start_time"] = start_time
+                if end_time:
+                    base_query += " AND p.posted_at <= :end_time"
+                    params["end_time"] = end_time
+            
+            # Добавляем фильтрацию по channel_ids если указаны
+            if channel_ids:
+                base_query += " AND p.channel_id = ANY(CAST(:channel_ids AS uuid[]))"
+                params["channel_ids"] = channel_ids
+            
+            base_query += " ORDER BY p.posted_at DESC LIMIT :limit"
+            
+            fts_query = text(base_query)
+            result = db.execute(fts_query, params)
+            rows = result.fetchall()
+            
+            results = []
+            for row in rows:
+                results.append({
+                    'post_id': str(row.id),
+                    'channel_id': str(row.channel_id),
+                    'content': row.content,
+                    'permalink': row.telegram_post_url,
+                    'score': float(row.rank) if row.rank else 0.3  # Низкий score для relaxed поиска
+                })
+            
+            return results
+        
+        except Exception as e:
+            logger.error("Error searching PostgreSQL FTS relaxed", error=str(e))
+            return []
+    
     async def _search_neo4j_graph(
         self,
         query: str,
         user_id: Optional[str] = None,
         tenant_id: Optional[str] = None,
         limit: int = 10,
-        max_depth: Optional[int] = None
+        max_depth: Optional[int] = None,
+        time_filter: Optional[tuple[datetime, Optional[datetime]]] = None
     ) -> List[Dict[str, Any]]:
         """
         GraphRAG поиск через Neo4j.
@@ -397,14 +695,16 @@ class RAGService:
             user_id: ID пользователя (для фильтрации по интересам)
             limit: Максимальное количество результатов
             max_depth: Максимальная глубина обхода графа
+            time_filter: Временной фильтр (start_time, end_time)
         
         Returns:
             Список связанных постов из графа
         """
         try:
-            # Context7: Проверка кэша Redis
+            # Context7: Проверка кэша Redis (включаем time_filter в ключ кэша)
             if self.redis_client:
-                cache_key = f"graphrag:query:{hashlib.sha1((query + (user_id or '')).encode()).hexdigest()}"
+                time_filter_str = f"{time_filter[0].isoformat() if time_filter and time_filter[0] else ''}_{time_filter[1].isoformat() if time_filter and time_filter[1] else ''}" if time_filter else ""
+                cache_key = f"graphrag:query:{hashlib.sha1((query + (user_id or '') + time_filter_str).encode()).hexdigest()}"
                 cached = self.redis_client.get(cache_key)
                 if cached:
                     logger.debug("GraphRAG cache hit", query=query[:50])
@@ -423,7 +723,8 @@ class RAGService:
                 topic=None,  # Можно извлечь тему из запроса
                 tenant_id=tenant_id,
                 limit=limit * 2,
-                max_depth=max_depth
+                max_depth=max_depth,
+                time_filter=time_filter
             )
             
             # Преобразуем результаты в формат, совместимый с hybrid_search
@@ -464,7 +765,8 @@ class RAGService:
         limit: int = 10,
         channel_ids: Optional[List[str]] = None,
         db: Optional[Session] = None,
-        user_id: Optional[str] = None
+        user_id: Optional[str] = None,
+        time_filter: Optional[tuple[datetime, Optional[datetime]]] = None
     ) -> List[Dict[str, Any]]:
         """
         Hybrid search: Qdrant ANN + PostgreSQL FTS + Neo4j GraphRAG с re-ranking.
@@ -475,13 +777,13 @@ class RAGService:
         - Neo4j GraphRAG (вес 0.3) - графовые связи и интересы пользователя
         """
         # Параллельный поиск в Qdrant, PostgreSQL и Neo4j
-        qdrant_results = await self._search_qdrant(query_embedding, tenant_id, limit * 2, channel_ids)
-        fts_results = await self._search_postgres_fts(query, tenant_id, limit * 2, channel_ids, db)
+        qdrant_results = await self._search_qdrant(query_embedding, tenant_id, limit * 2, channel_ids, time_filter=time_filter, db=db)
+        fts_results = await self._search_postgres_fts(query, tenant_id, limit * 2, channel_ids, db, time_filter=time_filter)
         
         # Context7: GraphRAG поиск (с fallback при недоступности Neo4j)
         graph_results = []
         try:
-            graph_results = await self._search_neo4j_graph(query, user_id, tenant_id=tenant_id, limit=limit * 2)
+            graph_results = await self._search_neo4j_graph(query, user_id, tenant_id=tenant_id, limit=limit * 2, time_filter=time_filter)
         except Exception as e:
             logger.warning("GraphRAG search failed, continuing without graph results", error=str(e))
         
@@ -1071,6 +1373,22 @@ class RAGService:
         """
         start_time = time.time()
         
+        # Episodic Memory: запись события run_started для RAG
+        try:
+            episodic_memory = get_episodic_memory_service()
+            episodic_memory.record_event(
+                tenant_id=tenant_id,
+                entity_type="rag",
+                event_type="run_started",
+                metadata={
+                    "user_id": str(user_id),
+                    "query_length": len(query),
+                    "has_audio": audio_file_id is not None,
+                },
+            )
+        except Exception as mem_exc:
+            logger.warning("episodic_memory.record_start_failed", error=str(mem_exc), tenant_id=tenant_id)
+        
         try:
             # Context7: Получаем историю разговора для контекста
             # Используем настройки из config если не указаны явно
@@ -1085,16 +1403,80 @@ class RAGService:
                     max_turns=max_turns
                 )
             
-            # 1. Классификация намерения
-            # Context7: Если передан intent_override, используем его вместо классификации
+            # 1. Классификация намерения через Context Router Agent
+            # Performance: сначала Context Router (эвристика + кэш), fallback на IntentClassifier
             if intent_override:
                 intent = intent_override
                 confidence = 1.0  # Высокая уверенность для принудительного намерения
                 logger.debug("Using intent override", intent=intent, query=query[:50])
             else:
-                intent_result = await self.intent_classifier.classify(query, str(user_id))
-                intent = intent_result.intent
-                confidence = intent_result.confidence
+                # Получаем последние события из episodic memory для диагностики
+                recent_events = []
+                try:
+                    episodic_memory = get_episodic_memory_service()
+                    recent_events = episodic_memory.get_recent_events(
+                        tenant_id=tenant_id,
+                        entity_type="rag",
+                        limit=5,
+                        hours=24,
+                    )
+                    # Преобразуем в формат для Context Router
+                    recent_events = [
+                        {
+                            "event_type": event.event_type,
+                            "entity_type": event.entity_type,
+                            "created_at": event.created_at.isoformat() if hasattr(event.created_at, 'isoformat') else str(event.created_at),
+                        }
+                        for event in recent_events
+                    ]
+                except Exception as mem_exc:
+                    logger.warning("episodic_memory.fetch_failed", error=str(mem_exc))
+                
+                # Используем Context Router Agent (если доступен)
+                if self.context_router:
+                    try:
+                        route_result = self.context_router.route(
+                            query=query,
+                            tenant_id=tenant_id,
+                            user_id=str(user_id),
+                            recent_events=recent_events,
+                        )
+                        
+                        # Маппинг route_type в intent для обратной совместимости
+                        route_to_intent = {
+                            "digest": "digest",
+                            "qna": "ask",
+                            "trend": "trend",
+                            "search": "search",
+                            "enrichment": "search",  # Обогащение → поиск
+                            "admin": "search",  # Админ → поиск
+                        }
+                        intent = route_to_intent.get(route_result.route_type, "ask")
+                        confidence = route_result.confidence
+                        
+                        logger.info(
+                            "context_router.route_success",
+                            query=query[:50],
+                            route_type=route_result.route_type,
+                            intent=intent,
+                            confidence=confidence,
+                            method=route_result.method,
+                        )
+                    except Exception as router_exc:
+                        # Fallback на IntentClassifier при ошибке Context Router
+                        logger.warning(
+                            "context_router.route_failed",
+                            error=str(router_exc),
+                            falling_back_to="intent_classifier"
+                        )
+                        intent_result = await self.intent_classifier.classify(query, str(user_id))
+                        intent = intent_result.intent
+                        confidence = intent_result.confidence
+                else:
+                    # Fallback на IntentClassifier, если Context Router недоступен
+                    intent_result = await self.intent_classifier.classify(query, str(user_id))
+                    intent = intent_result.intent
+                    confidence = intent_result.confidence
             
             # Context7: Для intent="recommend" используем RecommendationService
             if intent == "recommend":
@@ -1238,7 +1620,10 @@ class RAGService:
                             sources=sources[:limit],
                             confidence=confidence,
                             intent=intent,
-                            processing_time_ms=processing_time
+                            processing_time_ms=processing_time,
+                            llm_calls=1,  # Один вызов LLM для генерации ответа
+                            tokens_used=0,  # TODO: отслеживать токены из LLM ответа
+                            agent_steps=1  # Один шаг агента для рекомендаций
                         )
                 else:
                     # Fallback на обычный поиск если нет рекомендаций
@@ -1252,23 +1637,34 @@ class RAGService:
                 confidence=confidence
             )
             
-            # 2. Генерация embedding для запроса
+            # 2. Парсинг временного фильтра из запроса
+            time_filter = self._parse_time_filter(query)
+            if time_filter:
+                start_time, end_time = time_filter
+                logger.info(
+                    "Time filter applied",
+                    query=query[:50],
+                    start_time=start_time.isoformat() if start_time else None,
+                    end_time=end_time.isoformat() if end_time else None
+                )
+            
+            # 3. Генерация embedding для запроса
             query_embedding = await self._generate_embedding(query)
             
             if not query_embedding:
                 logger.warning("Failed to generate embedding, falling back to FTS only")
             
-            # 3. Hybrid search (Qdrant + PostgreSQL FTS + Neo4j GraphRAG)
+            # 4. Hybrid search (Qdrant + PostgreSQL FTS + Neo4j GraphRAG)
             if query_embedding:
                 search_results = await self._hybrid_search(
-                    query, query_embedding, tenant_id, limit * 2, channel_ids, db, user_id=str(user_id)
+                    query, query_embedding, tenant_id, limit * 2, channel_ids, db, user_id=str(user_id), time_filter=time_filter
                 )
             else:
                 # Fallback на FTS + GraphRAG (без векторов)
                 fts_results = await self._search_postgres_fts(
-                    query, tenant_id, limit * 2, channel_ids, db
+                    query, tenant_id, limit * 2, channel_ids, db, time_filter=time_filter
                 )
-                graph_results = await self._search_neo4j_graph(query, str(user_id), tenant_id=tenant_id, limit=limit * 2)
+                graph_results = await self._search_neo4j_graph(query, str(user_id), tenant_id=tenant_id, limit=limit * 2, time_filter=time_filter)
                 
                 # Объединяем результаты
                 post_scores = {}
@@ -1300,42 +1696,130 @@ class RAGService:
                 )[:limit * 2]
             
             if not search_results:
-                logger.warning("No search results found", query=query[:50])
-                # Пробуем внешний поиск через SearXNG
-                searxng_response = await self.searxng_service.search(
-                    query, str(user_id), lang="ru"
+                logger.warning("No search results found", query=query[:50], tenant_id=tenant_id)
+                # Context7: Улучшенная обработка отсутствия результатов
+                # Сначала пытаемся найти похожие посты через более мягкий поиск
+                # (без точного совпадения всех слов)
+                logger.info("Trying relaxed FTS search", query=query[:50])
+                relaxed_fts_results = await self._search_postgres_fts_relaxed(
+                    query, tenant_id, limit * 2, channel_ids, db, time_filter=time_filter
                 )
                 
-                if searxng_response.results:
-                    external_sources = [
-                        RAGSource(
-                            post_id=f"external_{idx}",
-                            channel_id="external",
-                            channel_title=result.title,
-                            channel_username=None,
-                            content=result.snippet,
-                            score=0.5,
-                            permalink=str(result.url)
-                        )
-                        for idx, result in enumerate(searxng_response.results[:3])
-                    ]
-                    
-                    result = RAGResult(
-                        answer=f"По вашему запросу найдена информация из внешних источников:\n\n" + 
-                               "\n".join([f"• {s.title}: {s.content[:200]}" for s in searxng_response.results[:3]]),
-                        sources=external_sources,
-                        confidence=0.4,
-                        intent=intent,
-                        processing_time_ms=int((time.time() - start_time) * 1000)
-                    )
+                if relaxed_fts_results:
+                    logger.info("Found results with relaxed search", count=len(relaxed_fts_results))
+                    # Преобразуем relaxed результаты в формат search_results для дальнейшей обработки
+                    # Context7: Формат должен быть совместим с _assemble_context (нужен прямой доступ к полям)
+                    search_results = []
+                    for r in relaxed_fts_results:
+                        search_results.append({
+                            'post_id': r['post_id'],
+                            'channel_id': r.get('channel_id'),
+                            'content': r.get('content', ''),
+                            'permalink': r.get('permalink'),
+                            'score': r['score'],
+                            'hybrid_score': r['score']
+                        })
                 else:
-                    result = RAGResult(
-                        answer="К сожалению, по вашему запросу не найдено информации в каналах.",
-                        sources=[],
-                        confidence=0.0,
-                        intent=intent,
-                        processing_time_ms=int((time.time() - start_time) * 1000)
+                    # Только если и relaxed поиск не дал результатов - используем SearXNG
+                    logger.info("No results even with relaxed search, using SearXNG fallback")
+                    searxng_response = await self.searxng_service.search(
+                        query, str(user_id), lang="ru"
                     )
+                    
+                    if searxng_response.results:
+                        # Context7: Даже внешние источники должны проходить через LLM для структурированного ответа
+                        external_sources = [
+                            RAGSource(
+                                post_id=f"external_{idx}",
+                                channel_id="external",
+                                channel_title=result.title,
+                                channel_username=None,
+                                content=result.snippet,
+                                score=0.5,
+                                permalink=str(result.url)
+                            )
+                            for idx, result in enumerate(searxng_response.results[:5])  # Берем больше для контекста
+                        ]
+                        
+                        # Context7: Формируем контекст из внешних источников для LLM
+                        external_context_parts = []
+                        for idx, source in enumerate(external_sources, 1):
+                            if source.permalink:
+                                external_context_parts.append(
+                                    f"[Внешний источник {idx}] [{source.channel_title}]({source.permalink}): {source.content}"
+                                )
+                            else:
+                                external_context_parts.append(
+                                    f"[Внешний источник {idx}] {source.channel_title}: {source.content}"
+                                )
+                        
+                        context = "Внешние источники:\n\n" + "\n\n".join(external_context_parts)
+                        
+                        # Context7: Генерируем структурированный ответ через LLM
+                        history_messages = []
+                        if conversation_history:
+                            for msg in conversation_history:
+                                if msg.get("role") == "user":
+                                    history_messages.append(HumanMessage(content=msg.get("content", "")))
+                                elif msg.get("role") == "assistant":
+                                    history_messages.append(AIMessage(content=msg.get("content", "")))
+                        
+                        router_input = {
+                            "query": query,
+                            "context": context,
+                            "intent": intent,
+                            "conversation_history": history_messages if history_messages else []
+                        }
+                        
+                        answer = await self.intent_router.ainvoke(router_input)
+                        
+                        result = RAGResult(
+                            answer=answer,
+                            sources=external_sources[:limit],  # Ограничиваем количество источников
+                            confidence=0.4,
+                            intent=intent,
+                            processing_time_ms=int((time.time() - start_time) * 1000),
+                            llm_calls=1,
+                            tokens_used=0,  # TODO: отслеживать токены
+                            agent_steps=1
+                        )
+                        
+                        # Сохраняем в историю
+                        try:
+                            from models.database import RAGQueryHistory
+                            rag_history = RAGQueryHistory(
+                                user_id=user_id,
+                                query_text=query,
+                                query_type=intent,
+                                intent=intent,
+                                confidence=0.4,
+                                response_text=answer[:5000],
+                                sources_count=len(external_sources),
+                                processing_time_ms=result.processing_time_ms,
+                                audio_file_id=audio_file_id,
+                                transcription_text=transcription_text,
+                                transcription_provider="salutespeech" if transcription_text else None
+                            )
+                            db.add(rag_history)
+                            db.commit()
+                        except Exception as e:
+                            logger.warning("Failed to save RAG query to history (external only)", error=str(e))
+                            try:
+                                db.rollback()
+                            except Exception:
+                                pass
+                        
+                        return result
+                    else:
+                        result = RAGResult(
+                            answer="К сожалению, по вашему запросу не найдено информации в каналах.",
+                            sources=[],
+                            confidence=0.0,
+                            intent=intent,
+                            processing_time_ms=int((time.time() - start_time) * 1000)
+                        )
+                        # Возвращаем результат сразу, не продолжаем обработку
+                        return result
                 
                 # Context7: Сохранение в историю даже при отсутствии результатов (критично для аналитики)
                 try:
@@ -1556,6 +2040,25 @@ class RAGService:
             
             processing_time = int((time.time() - start_time) * 1000)
             
+            # Episodic Memory: запись события run_completed для RAG
+            try:
+                episodic_memory = get_episodic_memory_service()
+                episodic_memory.record_event(
+                    tenant_id=tenant_id,
+                    entity_type="rag",
+                    event_type="run_completed",
+                    metadata={
+                        "user_id": str(user_id),
+                        "intent": intent,
+                        "confidence": confidence,
+                        "sources_count": len(sources),
+                        "processing_time_ms": processing_time,
+                        "enrichment_applied": enrichment_applied,
+                    },
+                )
+            except Exception as mem_exc:
+                logger.warning("episodic_memory.record_complete_failed", error=str(mem_exc), tenant_id=tenant_id)
+            
             logger.info(
                 "RAG query completed",
                 query=query[:50],
@@ -1566,22 +2069,55 @@ class RAGService:
                 processing_time_ms=processing_time
             )
             
+            # Подсчет метрик производительности
+            # LLM вызовы: router (1) + генерация ответа (1) = 2 минимум
+            llm_calls_count = 2
+            # Если использовался Context Router с LLM, добавляем еще один вызов
+            if self.context_router and hasattr(self.context_router, '_llm_chain') and self.context_router._llm_chain:
+                # Context Router может использовать LLM для маршрутизации
+                # Но если использовалась эвристика, то LLM не вызывался
+                # Для простоты считаем, что router может использовать LLM
+                pass  # Уже учтено в базовом подсчете
+            
             return RAGResult(
                 answer=answer,
                 sources=sources[:limit],
                 confidence=confidence,
                 intent=intent,
-                processing_time_ms=processing_time
+                processing_time_ms=processing_time,
+                llm_calls=llm_calls_count,
+                tokens_used=0,  # TODO: отслеживать токены из LLM ответа
+                agent_steps=1  # Один шаг агента для RAG запроса
             )
         
         except Exception as e:
             logger.error("Error in RAG query", error=str(e), query=query[:50])
+            
+            # Episodic Memory: запись события error для RAG
+            try:
+                episodic_memory = get_episodic_memory_service()
+                episodic_memory.record_event(
+                    tenant_id=tenant_id,
+                    entity_type="rag",
+                    event_type="error",
+                    metadata={
+                        "user_id": str(user_id),
+                        "error_type": type(e).__name__,
+                        "error_message": str(e)[:500],
+                    },
+                )
+            except Exception as mem_exc:
+                logger.warning("episodic_memory.record_error_failed", error=str(mem_exc), tenant_id=tenant_id)
+            
             error_result = RAGResult(
                 answer="Произошла ошибка при обработке запроса. Попробуйте позже.",
                 sources=[],
                 confidence=0.0,
                 intent="search",
-                processing_time_ms=int((time.time() - start_time) * 1000)
+                processing_time_ms=int((time.time() - start_time) * 1000),
+                llm_calls=0,  # При ошибке LLM не вызывался
+                tokens_used=0,
+                agent_steps=0
             )
             
             # Context7: Сохранение в историю даже при ошибке (критично для аналитики и отладки)

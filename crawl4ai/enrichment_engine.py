@@ -12,6 +12,7 @@ import logging
 import time
 from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional, Tuple
+from bs4 import BeautifulSoup
 from urllib.parse import urlparse
 import aiohttp
 import redis.asyncio as redis
@@ -635,26 +636,109 @@ class EnrichmentEngine:
             return None
     
     async def _extract_content_data(self, content: str, url: str) -> Dict[str, Any]:
-        """Извлечение данных из HTML контента."""
-        # Здесь должна быть логика извлечения данных из HTML
-        # Для примера - простая структура
+        """Извлечение данных из HTML контента, включая Open Graph Protocol мета-теги."""
+        from bs4 import BeautifulSoup
+        
+        soup = BeautifulSoup(content, 'lxml')
+        
+        # Извлечение Open Graph Protocol мета-тегов
+        og_meta = self._extract_og_meta(soup)
+        
+        # Извлечение базовых метаданных
+        title = self._extract_title_from_soup(soup) or self._extract_title(content)
+        description = self._extract_description_from_soup(soup) or self._generate_summary(content)
         
         return {
-            'title': self._extract_title(content),
+            'title': title,
             'content': self._clean_content(content),
-            'summary': self._generate_summary(content),
+            'summary': description,
             'author': self._extract_author(content),
             'published_at': self._extract_publish_date(content),
             'word_count': len(content.split()),
             'language': self._detect_language(content),
             'url': url,
             'extracted_at': datetime.now(timezone.utc).isoformat(),
+            'og': og_meta,  # Context7: Open Graph Protocol метаданные
             # Context7: url_hash и content_sha256 будут добавлены в _enrich_url
         }
     
+    def _extract_og_meta(self, soup: BeautifulSoup) -> Dict[str, Any]:
+        """Извлечение Open Graph Protocol мета-тегов из HTML."""
+        og_meta = {}
+        
+        # Основные OCP мета-теги
+        og_tags = {
+            'og:title': 'title',
+            'og:description': 'description',
+            'og:image': 'image',
+            'og:url': 'url',
+            'og:type': 'type',
+            'og:site_name': 'site_name',
+            'og:locale': 'locale',
+        }
+        
+        for og_property, key in og_tags.items():
+            meta_tag = soup.find('meta', property=og_property)
+            if meta_tag and meta_tag.get('content'):
+                og_meta[key] = meta_tag['content']
+        
+        # Дополнительные мета-теги (Twitter Cards, если нет OCP)
+        if not og_meta.get('title'):
+            twitter_title = soup.find('meta', attrs={'name': 'twitter:title'})
+            if twitter_title and twitter_title.get('content'):
+                og_meta['title'] = twitter_title['content']
+        
+        if not og_meta.get('description'):
+            twitter_desc = soup.find('meta', attrs={'name': 'twitter:description'})
+            if twitter_desc and twitter_desc.get('content'):
+                og_meta['description'] = twitter_desc['content']
+        
+        if not og_meta.get('image'):
+            twitter_image = soup.find('meta', attrs={'name': 'twitter:image'})
+            if twitter_image and twitter_image.get('content'):
+                og_meta['image'] = twitter_image['content']
+        
+        return og_meta
+    
+    def _extract_title_from_soup(self, soup: BeautifulSoup) -> Optional[str]:
+        """Извлечение заголовка через BeautifulSoup."""
+        # Приоритет: og:title > title > h1
+        og_title = soup.find('meta', property='og:title')
+        if og_title and og_title.get('content'):
+            return og_title['content']
+        
+        title_tag = soup.find('title')
+        if title_tag:
+            return title_tag.get_text(strip=True)
+        
+        h1_tag = soup.find('h1')
+        if h1_tag:
+            return h1_tag.get_text(strip=True)
+        
+        return None
+    
+    def _extract_description_from_soup(self, soup: BeautifulSoup) -> Optional[str]:
+        """Извлечение описания через BeautifulSoup."""
+        # Приоритет: og:description > meta description > первый параграф
+        og_desc = soup.find('meta', property='og:description')
+        if og_desc and og_desc.get('content'):
+            return og_desc['content']
+        
+        meta_desc = soup.find('meta', attrs={'name': 'description'})
+        if meta_desc and meta_desc.get('content'):
+            return meta_desc['content']
+        
+        # Первый параграф как fallback
+        first_p = soup.find('p')
+        if first_p:
+            text = first_p.get_text(strip=True)
+            if len(text) > 50:  # Минимальная длина для описания
+                return text[:300]  # Ограничиваем длину
+        
+        return None
+    
     def _extract_title(self, content: str) -> str:
-        """Извлечение заголовка из HTML."""
-        # Простая реализация - в production нужен BeautifulSoup
+        """Извлечение заголовка из HTML (fallback через regex)."""
         import re
         title_match = re.search(r'<title>(.*?)</title>', content, re.IGNORECASE)
         return title_match.group(1) if title_match else "No title"

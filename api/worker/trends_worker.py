@@ -29,6 +29,11 @@ from integrations.qdrant_client import QdrantClient
 from ai_providers.gigachain_adapter import create_gigachain_adapter
 from ai_providers.embedding_service import create_embedding_service, EmbeddingService
 from config import settings
+from api.worker.trends_coherence_agent import create_coherence_agent, TrendCoherenceAgent
+from api.worker.trends_graph_validator import GraphClusterValidator
+from api.worker.trends_drift_detector import DriftDetectorAgent
+from api.worker.trends_keyword_extractor import create_keyword_extractor, TrendKeywordExtractor
+from api.services.graph_service import get_graph_service
 from events.schemas import TrendEmergingEventV1
 from shared.trends import TrendRedisSchema, TrendWindow, TRENDS_EMERGING_STREAM
 
@@ -118,6 +123,31 @@ trend_detection_threshold_reasons = Counter(
     ["reason"],  # reason: ratio_too_low|source_diversity_too_low|coherence_too_low|cooldown|all_passed
 )
 
+# Context7: Метрики для мониторинга новых компонентов валидации кластеризации
+trend_clustering_rejected_total = Counter(
+    "trend_clustering_rejected_total",
+    "Posts rejected from clusters by validation components",
+    ["reason"],  # reason: dynamic_threshold|topic_gate|coherence_agent|graph_validation|drift_detection
+)
+
+trend_clustering_coherence_score_histogram = Histogram(
+    "trend_clustering_coherence_score",
+    "Coherence score distribution for cluster validation",
+    buckets=(0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1.0),
+)
+
+trend_clustering_cluster_size_histogram = Histogram(
+    "trend_clustering_cluster_size",
+    "Cluster size distribution when validation is performed",
+    buckets=(0, 1, 2, 3, 5, 10, 15, 20, 30, 50, 100),
+)
+
+trend_clustering_llm_gate_latency_seconds = Histogram(
+    "trend_clustering_llm_gate_latency_seconds",
+    "Latency of LLM Topic Gate validation",
+    buckets=(0.0, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0),
+)
+
 
 # ============================================================================
 # DATA MODELS
@@ -167,6 +197,10 @@ class TrendDetectionWorker:
         self.qdrant_client: Optional[QdrantClient] = None
         self.embedding_service: Optional[EmbeddingService] = None
         self.db_pool: Optional[asyncpg.Pool] = None
+        self.coherence_agent: Optional[TrendCoherenceAgent] = None
+        self.graph_service = None
+        self.drift_detector: Optional[DriftDetectorAgent] = None
+        self.keyword_extractor: Optional[TrendKeywordExtractor] = None
 
         self.redis_schema = TrendRedisSchema()
         self.collection_name = os.getenv("TRENDS_HOT_COLLECTION", "trends_hot")
@@ -184,6 +218,17 @@ class TrendDetectionWorker:
         self.card_llm_refresh_minutes = int(os.getenv("TREND_CARD_REFRESH_MINUTES", "10"))
         self.cluster_sample_limit = int(os.getenv("TREND_CLUSTER_SAMPLE_LIMIT", "10"))
         self.card_refresh_tracker: Dict[str, float] = {}
+        # Context7: Конфигурация для LLM Topic Gate
+        self.topic_gate_enabled = os.getenv("TREND_TOPIC_GATE_ENABLED", "true").lower() == "true"
+        self.topic_gate_threshold = float(os.getenv("TREND_TOPIC_GATE_THRESHOLD", "0.70"))
+        self.topic_gate_cluster_size = int(os.getenv("TREND_TOPIC_GATE_CLUSTER_SIZE", "3"))
+        # Context7: Конфигурация для Coherence Agent
+        self.coherence_agent_enabled = os.getenv("TREND_COHERENCE_AGENT_ENABLED", "true").lower() == "true"
+        self.coherence_agent_threshold = float(os.getenv("TREND_COHERENCE_AGENT_THRESHOLD", "0.65"))
+        # Context7: Конфигурация для Graph и Drift Detector
+        self.graph_validation_enabled = os.getenv("TREND_GRAPH_VALIDATION_ENABLED", "true").lower() == "true"
+        self.drift_detection_enabled = os.getenv("TREND_DRIFT_DETECTION_ENABLED", "true").lower() == "true"
+        self.drift_threshold = float(os.getenv("TREND_DRIFT_THRESHOLD", "0.05"))
         user_stopwords = {
             token.strip().lower()
             for token in os.getenv("TREND_STOPWORDS", "").split(",")
@@ -259,6 +304,33 @@ class TrendDetectionWorker:
         ai_adapter = await create_gigachain_adapter()
         self.embedding_service = await create_embedding_service(ai_adapter)
 
+        # Context7: Инициализация Coherence Agent
+        if self.coherence_agent_enabled:
+            self.coherence_agent = create_coherence_agent()
+            logger.info("TrendCoherenceAgent initialized in TrendDetectionWorker")
+
+        # Context7: Инициализация GraphService для Graph-RAG валидации
+        graph_validation_enabled = os.getenv("TREND_GRAPH_VALIDATION_ENABLED", "true").lower() == "true"
+        if graph_validation_enabled:
+            try:
+                self.graph_service = get_graph_service()
+                await self.graph_service.connect()
+                logger.info("GraphService initialized in TrendDetectionWorker")
+            except Exception as exc:
+                logger.warning("Failed to initialize GraphService", error=str(exc))
+                self.graph_service = None
+
+        # Context7: Инициализация Drift Detector
+        if self.drift_detection_enabled and self.db_pool:
+            self.drift_detector = DriftDetectorAgent(db_pool=self.db_pool)
+            logger.info("DriftDetectorAgent initialized in TrendDetectionWorker")
+
+        # Context7: Инициализация Keyword Extractor для c-TF-IDF
+        keyword_extractor_enabled = os.getenv("TREND_CTFIDF_ENABLED", "true").lower() == "true"
+        if keyword_extractor_enabled and self.db_pool:
+            self.keyword_extractor = create_keyword_extractor(db_pool=self.db_pool)
+            logger.info("TrendKeywordExtractor initialized in TrendDetectionWorker")
+
     # ------------------------------------------------------------------ #
     # Event processing
     # ------------------------------------------------------------------ #
@@ -315,9 +387,156 @@ class TrendDetectionWorker:
             coherence = similarity if similarity is not None else 0.0
             novelty = max(0.0, 1.0 - coherence) if similarity is not None else 1.0
 
+            # Context7: Coherence Agent - валидация тематической когерентности
+            if (
+                self.coherence_agent_enabled
+                and self.coherence_agent
+                and cluster_id is not None
+                and similarity is not None
+                and similarity >= self.coherence_agent_threshold
+            ):
+                cluster_data = await self._get_cluster_data(cluster_id)
+                if cluster_data:
+                    coherence_validation = await self.coherence_agent.validate_post_cluster_match(
+                        post_content=snapshot.content or "",
+                        post_keywords=snapshot.keywords or [],
+                        post_topics=snapshot.topics or [],
+                        cluster_label=cluster_data.get("label") or cluster_data.get("primary_topic") or "",
+                        cluster_summary=cluster_data.get("summary") or "",
+                        cluster_keywords=cluster_data.get("keywords") or [],
+                        cluster_topics=cluster_data.get("topics") or [],
+                        similarity=similarity,
+                    )
+                    decision = coherence_validation.get("decision", "accept")
+                    if decision == "reject":
+                        logger.debug(
+                            "trend_worker_coherence_agent_rejected",
+                            cluster_id=cluster_id,
+                            post_id=post_id,
+                            similarity=similarity,
+                            reasoning=coherence_validation.get("reasoning"),
+                        )
+                        trend_clustering_rejected_total.labels(reason="coherence_agent").inc()
+                        # Создаем новый кластер вместо добавления в существующий
+                        cluster_id = None
+                        cluster_key = None
+                        coherence = max(coherence, 0.6)
+                    elif decision == "split":
+                        logger.info(
+                            "trend_worker_coherence_agent_split_suggestion",
+                            cluster_id=cluster_id,
+                            post_id=post_id,
+                            similarity=similarity,
+                            reasoning=coherence_validation.get("reasoning"),
+                        )
+                        # Пока не разделяем автоматически, только логируем
+                        # В будущем можно добавить автоматическое разделение
+
+            # Context7: Graph Validator - проверка связности тем через граф
+            if (
+                self.graph_validation_enabled
+                and self.graph_service
+                and cluster_id is not None
+            ):
+                try:
+                    cluster_data = await self._get_cluster_data(cluster_id)
+                    if cluster_data:
+                        graph_validator = GraphClusterValidator(self.graph_service)
+                        graph_check = await graph_validator.validate_cluster_topic(
+                            post_topics=snapshot.topics or [],
+                            post_entities=snapshot.entities or [],
+                            cluster_id=cluster_id,
+                            cluster_topics=cluster_data.get("topics") or [],
+                        )
+                        if graph_check.get("is_disconnected", False):
+                            logger.debug(
+                                "trend_worker_graph_validator_rejected",
+                                cluster_id=cluster_id,
+                                post_id=post_id,
+                                post_topics=snapshot.topics,
+                                cluster_topics=cluster_data.get("topics"),
+                                reasoning=graph_check.get("reasoning"),
+                            )
+                            trend_clustering_rejected_total.labels(reason="graph_validation").inc()
+                            # Создаем новый кластер вместо добавления в существующий
+                            cluster_id = None
+                            cluster_key = None
+                            coherence = max(coherence, 0.6)
+                except Exception as exc:
+                    logger.debug(
+                        "trend_worker_graph_validator_failed",
+                        error=str(exc),
+                        cluster_id=cluster_id,
+                        post_id=post_id,
+                    )
+                    # При ошибке продолжаем обработку
+
+            # Context7: Drift Detector - проверка дрейфа темы кластера
+            if (
+                self.drift_detection_enabled
+                and self.drift_detector
+                and cluster_id is not None
+                and embedding is not None
+            ):
+                cluster_size = await self._get_cluster_size(cluster_id)
+                # Проверяем дрейф только для кластеров с достаточным количеством постов
+                if cluster_size >= 5:
+                    try:
+                        drift_result = await self.drift_detector.detect_drift(
+                            cluster_id=cluster_id, new_post_embedding=embedding
+                        )
+                        if drift_result.get("drift_detected", False):
+                            logger.info(
+                                "trend_worker_drift_detected",
+                                cluster_id=cluster_id,
+                                post_id=post_id,
+                                delta=drift_result.get("delta"),
+                                reasoning=drift_result.get("reasoning"),
+                            )
+                            trend_clustering_rejected_total.labels(reason="drift_detection").inc()
+                            # Пока только логируем, не блокируем добавление поста
+                            # В будущем можно создать новый кластер при обнаружении дрейфа
+                    except Exception as exc:
+                        logger.debug(
+                            "trend_worker_drift_detector_failed",
+                            error=str(exc),
+                            cluster_id=cluster_id,
+                            post_id=post_id,
+                        )
+                        # При ошибке продолжаем обработку
+
+            # Context7: Вычисляем primary_topic заранее для проверки дубликатов
+            raw_topics = snapshot.topics or []
+            raw_keywords = snapshot.keywords or []
+            raw_entities = snapshot.entities or []
+            filtered_topics = self._filter_terms(raw_topics)
+            filtered_keywords = self._filter_terms(raw_keywords)
+            filtered_entities = self._filter_terms(raw_entities)
+            candidates = filtered_entities + filtered_topics + filtered_keywords
+            if not candidates:
+                candidates = self._filter_terms(self._extract_entities_from_content(snapshot.content))
+            primary_topic = self._build_primary_label(
+                entities=filtered_entities,
+                topics=filtered_topics,
+                keywords=filtered_keywords,
+                content=snapshot.content,
+            )
+            
             if cluster_id is None or cluster_key is None:
-                cluster_id = str(uuid.uuid4())
-                cluster_key = self._build_cluster_key(snapshot)
+                # Context7: Проверяем существующие кластеры с таким же primary_topic/label перед созданием нового
+                existing_cluster = await self._find_cluster_by_label(primary_topic)
+                if existing_cluster:
+                    cluster_id = existing_cluster["id"]
+                    cluster_key = existing_cluster["cluster_key"]
+                    logger.info(
+                        "trend_worker_reused_existing_cluster",
+                        cluster_id=cluster_id,
+                        label=primary_topic,
+                        post_id=snapshot.post_id,
+                    )
+                else:
+                    cluster_id = str(uuid.uuid4())
+                    cluster_key = self._build_cluster_key(snapshot)
                 coherence = max(coherence, 0.6)
             cluster_id = self._normalize_cluster_id(cluster_id)
 
@@ -334,24 +553,19 @@ class TrendDetectionWorker:
             window_end = datetime.now(timezone.utc)
             window_start = window_end - timedelta(seconds=self.card_window_seconds)
             summary_text = (snapshot.content or "")[:400]
-            raw_topics = snapshot.topics or []
-            raw_keywords = snapshot.keywords or []
-            raw_entities = snapshot.entities or []
-            filtered_topics = self._filter_terms(raw_topics)
-            filtered_keywords = self._filter_terms(raw_keywords)
-            filtered_entities = self._filter_terms(raw_entities)
-            candidates = filtered_entities + filtered_topics + filtered_keywords
-            if not candidates:
-                candidates = self._filter_terms(self._extract_entities_from_content(snapshot.content))
-            primary_topic = self._build_primary_label(
-                entities=filtered_entities,
-                topics=filtered_topics,
-                keywords=filtered_keywords,
-                content=snapshot.content,
-            )
+            is_generic = self._is_generic_label(primary_topic)
+            # Context7: Определяем topics и keywords_for_card ДО вызова _estimate_quality
             secondary = [term for term in candidates if term != primary_topic]
             topics = (filtered_entities + filtered_topics)[:5] or secondary[:5]
             keywords_for_card = (filtered_keywords + filtered_topics + filtered_entities)[:10] or filtered_keywords or raw_keywords[:10]
+            quality_score = self._estimate_quality(
+                primary_topic=primary_topic,
+                burst_score=burst_window,
+                source_diversity=source_diversity,
+                window_mentions=window_mentions,
+                len_keywords=len(keywords_for_card),
+                len_topics=len(topics),
+            )
             why_important = self._build_why_important(
                 window_mentions=window_mentions,
                 window_baseline=window_baseline,
@@ -364,6 +578,42 @@ class TrendDetectionWorker:
             )
             if not sample_posts:
                 sample_posts = [self._snapshot_to_example(snapshot)]
+            
+            # Context7: Вычисление c-TF-IDF для улучшения keywords кластера
+            if self.keyword_extractor and cluster_id:
+                try:
+                    # Получаем keywords всех постов кластера
+                    cluster_posts_keywords = await self._get_cluster_posts_keywords(cluster_id)
+                    if cluster_posts_keywords:
+                        # Добавляем keywords текущего поста
+                        current_post_keywords = [snapshot.keywords] if snapshot.keywords else []
+                        all_posts_keywords = cluster_posts_keywords + current_post_keywords
+                        
+                        # Вычисляем c-TF-IDF
+                        ctfidf_keywords = await self.keyword_extractor.compute_ctfidf_keywords_simple(
+                            cluster_keywords=keywords_for_card,
+                            cluster_posts_keywords=all_posts_keywords,
+                            all_clusters_keywords=None,  # Опционально: можно передать для лучшего IDF
+                            top_n=10,
+                        )
+                        
+                        # Обновляем keywords_for_card взвешенными keywords из c-TF-IDF
+                        if ctfidf_keywords:
+                            weighted_keywords = [kw for kw, _ in ctfidf_keywords]
+                            # Объединяем: сначала c-TF-IDF keywords (приоритет), затем существующие
+                            seen = {kw.lower().strip() for kw in weighted_keywords}
+                            keywords_for_card = weighted_keywords + [
+                                kw for kw in keywords_for_card
+                                if kw.lower().strip() not in seen
+                            ][:10]
+                except Exception as exc:
+                    logger.debug(
+                        "trend_worker_ctfidf_failed",
+                        error=str(exc),
+                        cluster_id=cluster_id,
+                    )
+                    # При ошибке продолжаем с обычными keywords
+            
             llm_card = await self._enhance_card_with_llm(
                 cluster_id=cluster_id,
                 primary_topic=primary_topic,
@@ -403,6 +653,25 @@ class TrendDetectionWorker:
                 sample_posts=sample_posts,
             )
 
+            # Context7: Получаем существующий label кластера, чтобы не перезаписать хороший label плохим primary_topic
+            existing_cluster_data = await self._get_cluster_data(cluster_id) if cluster_id else None
+            existing_label = existing_cluster_data.get("label") if existing_cluster_data else None
+            
+            # Context7: Используем label для card_payload.title, если он лучше primary_topic
+            # Если существует хороший label (не generic), используем его, иначе используем primary_topic из LLM или текущий
+            card_title = existing_label if (existing_label and not self._is_generic_label(existing_label)) else primary_topic
+            if llm_card and llm_card.get("title"):
+                # LLM-заголовок имеет приоритет, если он не generic
+                llm_title = llm_card.get("title")
+                if not self._is_generic_label(llm_title):
+                    card_title = llm_title
+            
+            # Обновляем card_payload с правильным title
+            card_payload["title"] = card_title
+            
+            # Context7: Определяем label для сохранения в БД - приоритет LLM title, затем существующий label, затем primary_topic
+            db_label = card_title  # Используем card_title как label для БД
+            
             cluster_id = await self._upsert_cluster(
                 cluster_id=cluster_id,
                 cluster_key=cluster_key,
@@ -412,6 +681,7 @@ class TrendDetectionWorker:
                 novelty=novelty,
                 source_diversity=source_diversity,
                 primary_topic=primary_topic,
+                label=db_label,  # Context7: Передаём label явно
                 summary=summary_text,
                 window_start=window_start,
                 window_end=window_end,
@@ -422,6 +692,8 @@ class TrendDetectionWorker:
                 why_important=why_important,
                 topics=topics,
                 card_payload=card_payload,
+                is_generic=is_generic,
+                quality_score=quality_score,
             )
             await self._upsert_metrics(
                 cluster_id=cluster_id,
@@ -439,6 +711,9 @@ class TrendDetectionWorker:
             trend_detection_ratio_histogram.observe(ratio)
             trend_detection_coherence_histogram.observe(coherence)
             trend_detection_source_diversity_histogram.observe(source_diversity)
+            # Context7: Дополнительная метрика coherence для валидации кластеризации (если кластер найден)
+            if cluster_id is not None:
+                trend_clustering_coherence_score_histogram.observe(coherence)
             
             # Context7: Детальное логирование значений для диагностики
             logger.debug(
@@ -536,8 +811,10 @@ class TrendDetectionWorker:
             except (ValueError, TypeError):
                 channel_uuid = None
         snippet = (snapshot.content or "").strip()
+        # Context7: Используем fallback на channel_title или post_id, если snippet пустой
+        # Это позволяет сохранять посты даже без текста (например, только медиа)
         if not snippet:
-            return
+            snippet = snapshot.channel_title or f"Post {snapshot.post_id[:8]}"
         snippet = snippet[:600]
         posted_at = snapshot.posted_at
         insert_query = """
@@ -621,6 +898,105 @@ class TrendDetectionWorker:
                 }
             )
         return samples
+
+    async def _get_cluster_size(self, cluster_id: str) -> int:
+        """Получить количество постов в кластере."""
+        if not self.db_pool:
+            return 0
+        try:
+            cluster_uuid = uuid.UUID(cluster_id)
+        except (ValueError, TypeError):
+            return 0
+        query = """
+            SELECT COUNT(*) FROM trend_cluster_posts
+            WHERE cluster_id = $1;
+        """
+        async with self.db_pool.acquire() as conn:
+            count = await conn.fetchval(query, cluster_uuid)
+        return count or 0
+
+    async def _get_cluster_posts_keywords(self, cluster_id: str) -> List[List[str]]:
+        """Получить keywords всех постов кластера для c-TF-IDF."""
+        if not self.db_pool:
+            return []
+        try:
+            cluster_uuid = uuid.UUID(cluster_id)
+        except (ValueError, TypeError):
+            return []
+        
+        query = """
+            SELECT COALESCE(pe.data->'keywords', '[]'::jsonb) AS keywords
+            FROM trend_cluster_posts tcp
+            JOIN posts p ON p.id = tcp.post_id
+            LEFT JOIN post_enrichment pe ON pe.post_id = p.id AND pe.kind = 'classify'
+            WHERE tcp.cluster_id = $1
+            AND pe.data->'keywords' IS NOT NULL
+            LIMIT 100;  -- Ограничиваем для производительности
+        """
+        async with self.db_pool.acquire() as conn:
+            records = await conn.fetch(query, cluster_uuid)
+        
+        all_keywords = []
+        for record in records:
+            keywords_raw = record.get("keywords")
+            if isinstance(keywords_raw, list):
+                all_keywords.append(keywords_raw)
+            elif isinstance(keywords_raw, str):
+                try:
+                    keywords = json.loads(keywords_raw)
+                    if isinstance(keywords, list):
+                        all_keywords.append(keywords)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        
+        return all_keywords
+
+    async def _get_cluster_label(self, cluster_id: str) -> Optional[str]:
+        """Получить label (primary_topic или label) кластера."""
+        if not self.db_pool:
+            return None
+        try:
+            cluster_uuid = uuid.UUID(cluster_id)
+        except (ValueError, TypeError):
+            return None
+        query = """
+            SELECT COALESCE(label, primary_topic) as cluster_label
+            FROM trend_clusters
+            WHERE id = $1;
+        """
+        async with self.db_pool.acquire() as conn:
+            label = await conn.fetchval(query, cluster_uuid)
+        return label
+
+    async def _get_cluster_data(self, cluster_id: str) -> Optional[Dict[str, Any]]:
+        """Получить данные кластера (label, summary, keywords, topics, primary_topic)."""
+        if not self.db_pool:
+            return None
+        try:
+            cluster_uuid = uuid.UUID(cluster_id)
+        except (ValueError, TypeError):
+            return None
+        query = """
+            SELECT 
+                label,
+                summary,
+                keywords,
+                topics,
+                primary_topic
+            FROM trend_clusters
+            WHERE id = $1;
+        """
+        async with self.db_pool.acquire() as conn:
+            record = await conn.fetchrow(query, cluster_uuid)
+        if not record:
+            return None
+        return {
+            "label": record.get("label"),
+            "summary": record.get("summary"),
+            "keywords": record.get("keywords") or [],
+            "topics": record.get("topics") or [],
+            "primary_topic": record.get("primary_topic"),
+        }
 
     async def _fetch_post_snapshot(self, post_id: str) -> Optional[PostSnapshot]:
         """Load post + enrichment details from Postgres."""
@@ -733,9 +1109,130 @@ class TrendDetectionWorker:
         cluster_id = payload.get("cluster_id")
         cluster_key = payload.get("cluster_key")
 
-        if similarity < self.similarity_threshold or not cluster_id or not cluster_key:
+        # Context7: Динамический порог когерентности в зависимости от размера кластера
+        cluster_size = 0
+        if cluster_id:
+            cluster_size = await self._get_cluster_size(cluster_id)
+            min_similarity = self._calculate_dynamic_threshold(cluster_size)
+            # Метрики для мониторинга (только размер кластера, coherence измеряется в _handle_message)
+            trend_clustering_cluster_size_histogram.observe(cluster_size)
+        else:
+            min_similarity = self.similarity_threshold
+
+        if similarity < min_similarity or not cluster_id or not cluster_key:
+            if cluster_id and similarity < min_similarity:
+                trend_clustering_rejected_total.labels(reason="dynamic_threshold").inc()
             return None, None, similarity
+
+        # Context7: LLM Topic Gate - дополнительная проверка тематической когерентности
+        if (
+            self.topic_gate_enabled
+            and cluster_id
+            and cluster_size >= self.topic_gate_cluster_size
+            and similarity < self.topic_gate_threshold
+        ):
+            cluster_label = await self._get_cluster_label(cluster_id)
+            if cluster_label:
+                topic_gate_start = time.time()
+                is_on_topic = await self._llm_topic_gate(
+                    post_content=snapshot.content or "",
+                    cluster_label=cluster_label,
+                    similarity=similarity,
+                )
+                topic_gate_latency = time.time() - topic_gate_start
+                trend_clustering_llm_gate_latency_seconds.observe(topic_gate_latency)
+                if not is_on_topic:
+                    logger.debug(
+                        "trend_worker_topic_gate_rejected_post",
+                        cluster_id=cluster_id,
+                        cluster_label=cluster_label,
+                        similarity=similarity,
+                        post_id=snapshot.post_id,
+                    )
+                    trend_clustering_rejected_total.labels(reason="topic_gate").inc()
+                    return None, None, similarity
+
         return cluster_id, cluster_key, similarity
+
+    async def _find_cluster_by_label(self, label: str) -> Optional[Dict[str, Any]]:
+        """
+        Context7: Найти существующий кластер с таким же label/primary_topic.
+        
+        Best Practice: Проверяем дубликаты перед созданием нового кластера,
+        чтобы избежать множественных кластеров с одинаковым label.
+        Используем Redis кэш для оптимизации производительности (TTL 5 минут).
+        """
+        if not self.db_pool or not label:
+            return None
+        
+        # Context7: Кэширование результатов в Redis для оптимизации
+        cache_key = f"trend:cluster_by_label:{label[:50]}"  # Ограничиваем длину ключа
+        cache_ttl = 300  # 5 минут
+        
+        try:
+            # Проверяем кэш
+            if self.redis_client and self.redis_client.client:
+                cached = await self.redis_client.client.get(cache_key)
+                if cached:
+                    import json
+                    result = json.loads(cached)
+                    logger.debug(
+                        "trend_worker_find_cluster_by_label_cache_hit",
+                        label=label,
+                        cluster_id=result.get("id"),
+                    )
+                    return result
+        except Exception as exc:
+            logger.debug("trend_worker_find_cluster_by_label_cache_error", error=str(exc), label=label)
+        
+        try:
+            query = """
+                SELECT id, cluster_key, label
+                FROM trend_clusters
+                WHERE status = 'emerging'
+                  AND (label = $1 OR primary_topic = $1)
+                  AND is_generic = false
+                ORDER BY last_activity_at DESC
+                LIMIT 1;
+            """
+            async with self.db_pool.acquire() as conn:
+                record = await conn.fetchrow(query, label)
+                if record:
+                    result = {
+                        "id": str(record.get("id")),
+                        "cluster_key": record.get("cluster_key"),
+                        "label": record.get("label"),
+                    }
+                    # Сохраняем в кэш
+                    try:
+                        if self.redis_client and self.redis_client.client:
+                            import json
+                            await self.redis_client.client.setex(
+                                cache_key,
+                                cache_ttl,
+                                json.dumps(result),
+                            )
+                    except Exception as exc:
+                        logger.debug("trend_worker_find_cluster_by_label_cache_set_error", error=str(exc), label=label)
+                    return result
+        except Exception as exc:
+            logger.debug("trend_worker_find_cluster_by_label_failed", error=str(exc), label=label)
+        return None
+
+    def _calculate_dynamic_threshold(self, cluster_size: int) -> float:
+        """
+        Рассчитывает динамический порог когерентности в зависимости от размера кластера.
+        
+        Context7: Чем больше кластер, тем выше порог для предотвращения смешивания тем.
+        """
+        if cluster_size <= 2:
+            return 0.55  # Базовый порог для новых кластеров
+        elif cluster_size <= 5:
+            return 0.65  # Повышенный порог для небольших кластеров
+        elif cluster_size <= 10:
+            return 0.70  # Высокий порог для средних кластеров
+        else:
+            return 0.75  # Очень высокий порог для больших кластеров
 
     def _build_cluster_key(self, snapshot: PostSnapshot) -> str:
         tokens = self._filter_terms(snapshot.entities + snapshot.topics + snapshot.keywords)
@@ -767,6 +1264,9 @@ class TrendDetectionWorker:
         why_important: Optional[str],
         topics: List[str],
         card_payload: Dict[str, Any],
+        is_generic: bool,
+        quality_score: float,
+        label: Optional[str] = None,  # Context7: Явный label параметр
     ) -> str:
         if not self.db_pool:
             return cluster_id
@@ -794,7 +1294,9 @@ class TrendDetectionWorker:
                 channels_count,
                 why_important,
                 topics,
-                card_payload
+                card_payload,
+                is_generic,
+                quality_score
             )
             VALUES (
                 $1,
@@ -819,7 +1321,9 @@ class TrendDetectionWorker:
                 $17,
                 $18,
                 $19::jsonb,
-                $20::jsonb
+                $20::jsonb,
+                $21,
+                $22
             )
             ON CONFLICT (cluster_key)
             DO UPDATE SET
@@ -830,6 +1334,25 @@ class TrendDetectionWorker:
                     ELSE trend_clusters.keywords
                 END,
                 primary_topic = COALESCE(EXCLUDED.primary_topic, trend_clusters.primary_topic),
+                label = CASE
+                    -- Context7: Сохраняем существующий label, если он не generic и новый label хуже
+                    WHEN trend_clusters.label IS NOT NULL 
+                         AND LENGTH(trend_clusters.label) > 10 
+                         AND trend_clusters.label NOT LIKE '%жизнь%' 
+                         AND trend_clusters.label NOT LIKE '%летаю%'
+                         AND (EXCLUDED.label IS NULL OR LENGTH(EXCLUDED.label) <= 10 OR EXCLUDED.label LIKE '%жизнь%' OR EXCLUDED.label LIKE '%летаю%')
+                    THEN trend_clusters.label
+                    -- Если передан явный label и он хороший, используем его
+                    WHEN EXCLUDED.label IS NOT NULL AND LENGTH(EXCLUDED.label) > 4 
+                         AND EXCLUDED.label NOT LIKE '%жизнь%' AND EXCLUDED.label NOT LIKE '%летаю%'
+                    THEN EXCLUDED.label
+                    -- Иначе пытаемся использовать primary_topic, если он хороший
+                    WHEN EXCLUDED.primary_topic IS NOT NULL AND LENGTH(EXCLUDED.primary_topic) > 4 
+                         AND EXCLUDED.primary_topic NOT LIKE '%жизнь%' AND EXCLUDED.primary_topic NOT LIKE '%летаю%'
+                    THEN EXCLUDED.primary_topic
+                    -- Fallback на существующий label или primary_topic
+                    ELSE COALESCE(trend_clusters.label, EXCLUDED.label, EXCLUDED.primary_topic)
+                END,
                 novelty_score = COALESCE(EXCLUDED.novelty_score, trend_clusters.novelty_score),
                 coherence_score = COALESCE(EXCLUDED.coherence_score, trend_clusters.coherence_score),
                 source_diversity = GREATEST(trend_clusters.source_diversity, EXCLUDED.source_diversity),
@@ -846,7 +1369,9 @@ class TrendDetectionWorker:
                     WHEN jsonb_array_length(EXCLUDED.topics) > 0 THEN EXCLUDED.topics
                     ELSE trend_clusters.topics
                 END,
-                card_payload = EXCLUDED.card_payload
+                card_payload = EXCLUDED.card_payload,
+                is_generic = EXCLUDED.is_generic,
+                quality_score = EXCLUDED.quality_score
             RETURNING id;
         """
         embedding_value = self._serialize_embedding(embedding) if embedding else None
@@ -854,29 +1379,33 @@ class TrendDetectionWorker:
         keywords_json = json.dumps(card_payload.get("keywords", [])) if card_payload.get("keywords") else "[]"
         topics_json = json.dumps(topics) if topics else "[]"
         card_payload_json = json.dumps(card_payload) if card_payload else "{}"
+        # Context7: Используем label если передан, иначе primary_topic
+        label_value = (label or primary_topic)[:255] if (label or primary_topic) else "Тренд"
         async with self.db_pool.acquire() as conn:
             db_cluster_id = await conn.fetchval(
                 query,
-                cluster_uuid,
-                cluster_key,
-                primary_topic[:255],
-                summary,
-                keywords_json,
-                primary_topic[:255],
-                novelty,
-                coherence,
-                source_diversity,
-                embedding_value,
-                window_start,
-                window_end,
-                window_mentions,
-                freq_baseline,
-                burst_window,
-                source_diversity,
-                channels_count,
-                why_important,
-                topics_json,
-                card_payload_json,
+                cluster_uuid,        # $1
+                cluster_key,         # $2
+                label_value,         # $3 (label для INSERT, используется как EXCLUDED.label в ON CONFLICT)
+                summary,             # $4
+                keywords_json,       # $5
+                primary_topic[:255], # $6 (primary_topic)
+                novelty,             # $7
+                coherence,           # $8
+                source_diversity,     # $9
+                embedding_value,     # $10
+                window_start,        # $11
+                window_end,          # $12
+                window_mentions,     # $13
+                freq_baseline,       # $14
+                burst_window,        # $15
+                source_diversity,    # $16 (sources_count)
+                channels_count,      # $17
+                why_important,       # $18
+                topics_json,         # $19
+                card_payload_json,   # $20
+                is_generic,          # $21
+                quality_score,       # $22
             )
         cluster_id_str = str(db_cluster_id) if db_cluster_id else cluster_id
 
@@ -1173,7 +1702,12 @@ class TrendDetectionWorker:
         return freq_baseline / buckets
 
     def _compute_burst(self, observed: int, expected: float) -> float:
-        baseline = max(1.0, expected)
+        # Context7: Исправляем расчет burst score
+        # Если expected < 1.0, это означает, что baseline очень низкий
+        # В этом случае burst должен быть выше, поэтому используем минимальный baseline = 0.1
+        if expected <= 0:
+            return float(observed)  # Если baseline = 0, burst = observed
+        baseline = max(0.1, expected)  # Минимальный baseline = 0.1, а не 1.0
         return round(observed / baseline, 2)
 
     def _build_why_important(
@@ -1378,6 +1912,117 @@ class TrendDetectionWorker:
             logger.debug("trend_worker_llm_failure", error=str(exc))
             return None
 
+    async def _llm_topic_gate(
+        self, post_content: str, cluster_label: str, similarity: float
+    ) -> bool:
+        """
+        LLM Topic Gate: проверяет, принадлежит ли пост теме кластера.
+        
+        Context7: Используется для валидации тематической когерентности
+        когда similarity ниже порога, но кластер достаточно большой.
+        
+        Returns:
+            True если пост принадлежит теме кластера, False в противном случае
+        """
+        if not self.topic_gate_enabled:
+            return True  # Если отключен, пропускаем проверку
+        
+        api_base = (
+            getattr(settings, "openai_api_base", None)
+            or os.getenv("OPENAI_API_BASE")
+            or os.getenv("GIGACHAT_PROXY_URL")
+            or "http://gpt2giga-proxy:8090"
+        )
+        api_base = api_base.rstrip("/")
+        if not api_base.endswith("/v1"):
+            api_base = f"{api_base}/v1"
+
+        credentials = os.getenv("GIGACHAT_CREDENTIALS")
+        scope = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
+        api_key = (
+            getattr(settings, "openai_api_key", None)
+            or os.getenv("OPENAI_API_KEY")
+            or ""
+        )
+        if credentials:
+            auth_header = f"Bearer giga-cred-{credentials}:{scope}"
+        elif api_key:
+            auth_header = f"Bearer {api_key}"
+        else:
+            auth_header = None
+
+        system_message = (
+            "Ты — валидатор тематической когерентности. "
+            "Проверяешь, принадлежит ли пост теме кластера. "
+            "Ответь только одним словом: yes, no или borderline."
+        )
+        user_message = (
+            f"Пост: {post_content[:500]}\n"
+            f"Тема кластера: {cluster_label}\n"
+            f"Семантическое сходство: {similarity:.2f}\n\n"
+            f"Принадлежит ли этот пост теме кластера? "
+            f"Ответь только: yes/no/borderline"
+        )
+
+        try:
+            headers = {"Content-Type": "application/json"}
+            if auth_header:
+                headers["Authorization"] = auth_header
+            endpoint_base = api_base.rstrip("/")
+            if endpoint_base.endswith("/chat/completions"):
+                endpoint = endpoint_base
+            elif endpoint_base.endswith("/v1"):
+                endpoint = f"{endpoint_base}/chat/completions"
+            else:
+                endpoint = f"{endpoint_base}/v1/chat/completions"
+            
+            async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+                response = await client.post(
+                    endpoint,
+                    headers=headers,
+                    json={
+                        "model": self.card_llm_model,
+                        "messages": [
+                            {"role": "system", "content": system_message},
+                            {"role": "user", "content": user_message},
+                        ],
+                        "temperature": 0.1,
+                        "max_tokens": 10,
+                    },
+                )
+            if response.status_code != 200:
+                logger.debug(
+                    "trend_worker_topic_gate_llm_error",
+                    status=response.status_code,
+                    body=response.text[:200],
+                )
+                return True  # При ошибке пропускаем проверку
+            data = response.json()
+            content = data["choices"][0]["message"]["content"].strip().lower()
+            
+            # Парсинг ответа: yes -> True, no -> False, borderline -> True (но с логированием)
+            if "yes" in content or "да" in content:
+                return True
+            elif "no" in content or "нет" in content:
+                logger.debug(
+                    "trend_worker_topic_gate_rejected",
+                    cluster_label=cluster_label,
+                    similarity=similarity,
+                )
+                return False
+            else:
+                # borderline или неопределенный ответ - пропускаем с логированием
+                logger.debug(
+                    "trend_worker_topic_gate_borderline",
+                    cluster_label=cluster_label,
+                    similarity=similarity,
+                    response=content,
+                )
+                return True
+        except Exception as exc:
+            logger.debug("trend_worker_topic_gate_failure", error=str(exc))
+            return True  # При ошибке пропускаем проверку
+
     def _normalize_database_url(self, url: str) -> str:
         if "+asyncpg" in url:
             return url.replace("+asyncpg", "")
@@ -1521,6 +2166,40 @@ class TrendDetectionWorker:
         if " " not in lower and not lower.startswith("#"):
             return True
         return False
+
+    def _estimate_quality(
+        self,
+        primary_topic: str,
+        burst_score: float,
+        source_diversity: int,
+        window_mentions: int,
+        len_keywords: int,
+        len_topics: int,
+    ) -> float:
+        """Оценка качества кластера (0.0-1.0)."""
+        score = 0.0
+        # Базовые метрики
+        if burst_score >= 3.0:
+            score += 0.3
+        elif burst_score >= 1.5:
+            score += 0.15
+        if source_diversity >= 5:
+            score += 0.2
+        elif source_diversity >= 3:
+            score += 0.1
+        if window_mentions >= 10:
+            score += 0.2
+        elif window_mentions >= 5:
+            score += 0.1
+        # Качество контента
+        if len_keywords >= 5:
+            score += 0.1
+        if len_topics >= 3:
+            score += 0.1
+        # Штраф за generic title
+        if self._is_generic_label(primary_topic):
+            score *= 0.3  # Сильный штраф
+        return min(1.0, score)
 
     def _build_primary_label(
         self,

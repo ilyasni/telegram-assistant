@@ -45,6 +45,12 @@ AUTH_QR_FAIL = Counter(
     ["tenant_id"],
     namespace="telethon"
 )
+AUTH_QR_2FA_REQUIRED = Counter(
+    "auth_qr_2fa_required_total",
+    "QR session requires 2FA password",
+    ["tenant_id"],
+    namespace="telethon"
+)
 
 # Context7 best practice: Telethon метрики
 FLOODWAIT_TOTAL = Counter("telethon_floodwait_total", "FloodWait events", ["reason", "seconds"])
@@ -175,6 +181,11 @@ class QrAuthService:
                             logger.info("Deleted expired QR session", key=key, tenant_id=tenant_id)
                         except Exception as e:
                             logger.warning("Failed to delete expired session", key=key, error=str(e))
+                        continue
+                    
+                    # Context7: пропускаем password_required сессии - они ждут ввода пароля через API
+                    if status == "password_required":
+                        logger.debug("Skipping password_required session - waiting for password input", key=key, tenant_id=tenant_id)
                         continue
                     
                     if status not in ["pending", "failed", "authorized", "in_progress", "awaiting_scan"]:
@@ -725,22 +736,52 @@ class QrAuthService:
             QR_SESSION_TOTAL.labels(status="created").inc()
             
             # Ожидание авторизации с timeout
+            # Context7: ВАЖНО! Обрабатываем SessionPasswordNeededError ПЕРВЫМ, до других исключений
+            # Это гарантирует что статус password_required сохраняется в Redis ДО отключения клиента
             try:
                 await asyncio.wait_for(qr_login.wait(), timeout=590)
+            except SessionPasswordNeededError as e:
+                # Context7: ВАЖНО! Обрабатываем ПЕРВЫМ, до других исключений
+                logger.info("SessionPasswordNeededError caught during QR login", 
+                          tenant_id=tenant_id,
+                          error_type=type(e).__name__)
+                
+                # Context7: сохраняем session_string для последующего ввода пароля
+                session_string = client.session.save()
+                
+                # Context7: сохраняем дополнительную информацию для диагностики
+                try:
+                    is_connected = client.is_connected()
+                    logger.debug("Client state before saving session", 
+                               tenant_id=tenant_id, 
+                               is_connected=is_connected,
+                               session_string_length=len(session_string))
+                except Exception as state_err:
+                    logger.warning("Error checking client state", error=str(state_err), tenant_id=tenant_id)
+                
+                # Context7: сохраняем статус password_required в Redis СРАЗУ
+                self.redis_client.hset(redis_key, mapping={
+                    "status": "password_required", 
+                    "reason": "password_required",
+                    "session_string": session_string,
+                    "password_required_at": str(int(time.time()))
+                })
+                # Продлеваем TTL для сессии, ожидающей пароль (30 минут)
+                self.redis_client.expire(redis_key, 1800)
+                
+                logger.warning("QR login requires 2FA - status saved to Redis", 
+                             tenant_id=tenant_id, 
+                             session_string_length=len(session_string),
+                             note="Session saved, waiting for password via API")
+                AUTH_QR_2FA_REQUIRED.labels(tenant_id=tenant_id or "unknown").inc()
+                QR_SESSION_TOTAL.labels(status="password_required").inc()
+                # Context7: ВАЖНО: выходим сразу, не обрабатываем дальше
+                return
             except asyncio.TimeoutError:
                 self.redis_client.hset(redis_key, "status", "expired")
                 logger.warning("QR login timeout", tenant_id=tenant_id)
                 AUTH_QR_EXPIRED.labels(tenant_id=tenant_id or "unknown").inc()
                 QR_SESSION_TOTAL.labels(status="expired").inc()
-                return
-            except SessionPasswordNeededError:
-                self.redis_client.hset(redis_key, mapping={
-                    "status": "failed", 
-                    "reason": "password_required"
-                })
-                logger.warning("QR login requires 2FA", tenant_id=tenant_id)
-                AUTH_QR_FAIL.labels(tenant_id=tenant_id or "unknown").inc()
-                QR_SESSION_TOTAL.labels(status="failed").inc()
                 return
             
             # Context7 best practice: усиленная проверка владельца
@@ -821,31 +862,31 @@ class QrAuthService:
             # Context7 best practice: сохранение StringSession в БД
             session_string = client.session.save()
             
+            # Context7: получаем dc_id из клиента
+            dc_id = getattr(client.session, 'dc_id', None) or 2
+            
             # Context7 best practice: инициализация session storage если нужно
             if not self.session_storage.db_connection:
                 await self.session_storage.init_db()
             
-            # Context7 best practice: получаем правильный tenant_id из БД
-            with self.session_storage.db_connection.cursor() as cursor:
-                cursor.execute("SELECT tenant_id FROM users WHERE telegram_id = %s", (me.id,))
-                result = cursor.fetchone()
-                if result:
-                    db_tenant_id = str(result[0])
-                else:
-                    # Если пользователь не найден, используем переданный tenant_id как fallback
-                    db_tenant_id = tenant_id
+            # Context7: получаем invite_code из Redis если есть
+            invite_code = self.redis_client.hget(redis_key, "invite_code")
+            if invite_code and isinstance(invite_code, bytes):
+                invite_code = invite_code.decode('utf-8')
             
             # Context7 best practice: сохранение сессии в БД с данными пользователя
+            # Identity и Membership будут созданы автоматически в session_storage
             # Детектор правды: детальная диагностика ошибок
             success, session_id, error_code, error_details = await self.session_storage.save_telegram_session(
-                tenant_id=db_tenant_id,
-                user_id=db_tenant_id,
+                tenant_id=tenant_id,
+                user_id=tenant_id,  # Context7: будет заменено на реальный user_id в session_storage
                 session_string=session_string,
                 telegram_user_id=me.id,
                 first_name=getattr(me, 'first_name', None),
                 last_name=getattr(me, 'last_name', None),
                 username=getattr(me, 'username', None),
-                invite_code=None  # TODO: получать invite_code из запроса
+                invite_code=invite_code,
+                dc_id=dc_id
             )
             
             if not success:
@@ -945,13 +986,26 @@ class QrAuthService:
             })
             AUTH_QR_FAIL.labels(tenant_id=tenant_id or "unknown").inc()
         except Exception as e:
-            logger.error("QR login error", error=str(e), tenant_id=tenant_id)
-            self.redis_client.hset(redis_key, "status", "failed")
-            AUTH_QR_FAIL.labels(tenant_id=tenant_id or "unknown").inc()
+            # Context7: сохраняем детальную информацию об ошибке для диагностики
+            error_type = type(e).__name__
+            error_message = str(e)
+            logger.error("QR login error", 
+                       error=error_message, 
+                       error_type=error_type,
+                       tenant_id=tenant_id,
+                       exc_info=True)  # Context7: включаем traceback для диагностики
+            
+            # Context7: сохраняем причину ошибки в Redis
+            self.redis_client.hset(redis_key, mapping={
+                "status": "failed",
+                "reason": f"qr_login_error_{error_type.lower()}",
+                "error_message": error_message[:500]  # Ограничиваем длину сообщения
+            })
+            AUTH_QR_FAIL.labels(tenant_id=tenant_id or "unknown", reason=f"qr_login_error_{error_type.lower()}").inc()
         finally:
             # Context7 best practice: гарантированная остановка клиента
             # [C7-ID: telethon-cleanup-003]
-            import time
+            # Context7: time уже импортирован в начале файла, не импортируем повторно
             start_time = time.time()
             
             try:

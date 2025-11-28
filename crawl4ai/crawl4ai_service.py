@@ -329,6 +329,9 @@ class Crawl4AIService:
             urls_data = []
             s3_keys = {}  # Context7: Агрегированные s3_keys для всех URL
             checksums = {}  # Context7: Агрегированные checksums для целостности
+            og_meta = {}  # Context7: Open Graph Protocol метаданные (приоритет первому URL с данными)
+            title = None  # Context7: Извлечённый title
+            description = None  # Context7: Извлечённое описание
             
             for url, url_data in enrichment_data.items():
                 if url_data.get('markdown'):
@@ -343,6 +346,17 @@ class Crawl4AIService:
                         'url': url,
                         'labels': url_data['vision_labels']
                     })
+                
+                # Context7: Извлекаем OCP метаданные (приоритет первому URL с данными)
+                if url_data.get('og') and not og_meta:
+                    og_meta = url_data.get('og', {})
+                
+                # Context7: Извлекаем title и description (приоритет первому URL с данными)
+                if url_data.get('title') and not title:
+                    title = url_data.get('title')
+                
+                if url_data.get('summary') and not description:
+                    description = url_data.get('summary')
                 
                 # Context7: Агрегируем s3_keys и checksums для каждого URL
                 url_s3_keys = url_data.get('s3_keys', {})
@@ -368,7 +382,7 @@ class Crawl4AIService:
                 })
             
             # Сохраняем всё в едином обогащении kind='crawl'
-            if crawl_md_parts or ocr_texts or vision_labels_list or s3_keys:
+            if crawl_md_parts or ocr_texts or vision_labels_list or s3_keys or og_meta:
                 await self._save_enrichment(
                     post_id=post_id,
                     crawl_md='\n\n---\n\n'.join(crawl_md_parts) if crawl_md_parts else None,
@@ -380,7 +394,10 @@ class Crawl4AIService:
                         'source': 'crawl4ai',
                         'trace_id': trace_id,
                         's3_keys': s3_keys,  # Context7: s3_keys для всех URL
-                        'checksums': checksums  # Context7: checksums для целостности
+                        'checksums': checksums,  # Context7: checksums для целостности
+                        'og': og_meta,  # Context7: Open Graph Protocol метаданные
+                        'title': title,  # Context7: Извлечённый title
+                        'description': description  # Context7: Извлечённое описание
                     }
                 )
             
@@ -428,6 +445,11 @@ class Crawl4AIService:
         s3_keys = metadata.get('s3_keys', {}) if metadata else {}
         checksums = metadata.get('checksums', {}) if metadata else {}
         
+        # Context7: Извлекаем OCP метаданные из metadata
+        og_meta = metadata.get('og', {}) if metadata else {}
+        title = metadata.get('title') if metadata else None
+        description = metadata.get('description') if metadata else None
+        
         # Формируем md_excerpt (первые ~1-2k символов) для быстрого доступа
         md_excerpt = None
         if crawl_md and len(crawl_md) > 0:
@@ -449,12 +471,14 @@ class Crawl4AIService:
             'source': metadata.get('source', 'crawl4ai') if metadata else 'crawl4ai',
             'trace_id': metadata.get('trace_id') if metadata else None,
             'checksums': checksums,  # {url: {'html_md5': '...', 'md_md5': '...'}}
+            'og': og_meta,  # Context7: Open Graph Protocol метаданные
             'meta': {
-                'title': None,  # TODO: извлечь из enrichment_data
+                'title': title,  # Context7: Извлечённый title из enrichment_data
+                'description': description,  # Context7: Извлечённое описание
                 'lang': None,  # TODO: извлечь из enrichment_data
                 'word_count': sum(url.get('word_count', 0) or 0 for url in urls_metadata)
             },
-            'metadata': {k: v for k, v in (metadata or {}).items() if k not in ['urls', 'source', 'trace_id', 's3_keys', 'checksums']}
+            'metadata': {k: v for k, v in (metadata or {}).items() if k not in ['urls', 'source', 'trace_id', 's3_keys', 'checksums', 'og', 'title', 'description']}
         }
         
         # Используем EnrichmentRepository (принимает asyncpg.Pool)

@@ -99,7 +99,7 @@ class ParserConfig:
     idempotency_window_hours: int = 24  # Окно для проверки дубликатов
     
     # Concurrency and retries
-    max_concurrency: int = int(os.getenv("PARSER_MAX_CONCURRENCY", "4"))
+    max_concurrency: int = int(os.getenv("PARSER_MAX_CONCURRENCY", "8"))  # Увеличено с 4 до 8 для лучшей параллельности
     retry_max: int = int(os.getenv("PARSER_RETRY_MAX", "3"))
     
     # Redis
@@ -394,9 +394,48 @@ class ChannelParser:
                 session_rollback_failures_total.labels(operation='before_entity').inc()
             
             # Получение entity канала и tg_channel_id
+            # Context7: Улучшенная обработка ошибок для каналов без tg_channel_id или с проблемами доступа
             channel_result = await self._get_channel_entity(telegram_client, channel_id)
             if not channel_result:
-                raise ValueError(f"Channel {channel_id} not found")
+                # Context7: Логируем детальную информацию для диагностики
+                # Получаем информацию о канале из БД для лучшей диагностики
+                try:
+                    channel_info_result = await self.db_session.execute(
+                        text("SELECT title, username, tg_channel_id FROM channels WHERE id = :channel_id"),
+                        {"channel_id": channel_id}
+                    )
+                    channel_info = channel_info_result.fetchone()
+                    channel_title = channel_info.title if channel_info else None
+                    channel_username = channel_info.username if channel_info else None
+                    channel_tg_id = channel_info.tg_channel_id if channel_info else None
+                except Exception as e:
+                    logger.warning("Failed to get channel info for error logging", 
+                                 channel_id=channel_id, error=str(e))
+                    channel_title = None
+                    channel_username = None
+                    channel_tg_id = None
+                
+                logger.error(
+                    "Failed to get channel entity - channel may be missing tg_channel_id or inaccessible",
+                    channel_id=channel_id,
+                    channel_title=channel_title,
+                    channel_username=channel_username,
+                    channel_tg_channel_id=channel_tg_id,
+                    user_id=user_id,
+                    mode=mode,
+                    has_username=channel_username is not None,
+                    has_tg_channel_id=channel_tg_id is not None
+                )
+                # Context7: Возвращаем результат с ошибкой вместо исключения для graceful degradation
+                self.stats['errors'] += 1
+                return {
+                    'status': 'error',
+                    'error': 'channel_not_found',
+                    'processed': 0,
+                    'skipped': 0,
+                    'max_date': None,
+                    'messages_processed': 0
+                }
             
             channel_entity, tg_channel_id = channel_result
             
@@ -480,13 +519,25 @@ class ChannelParser:
                     message_batch, channel_id, user_id, tenant_id, tg_channel_id, channel_entity, mode, telegram_client
                 )
                 
-                messages_processed += batch_result['processed']
-                self.stats['messages_parsed'] += batch_result['processed']
-                self.stats['messages_skipped'] += batch_result['skipped']
+                # Context7: Безопасная обработка результата батча с проверкой наличия ключей
+                if not isinstance(batch_result, dict):
+                    logger.error("Unexpected batch_result type", 
+                               channel_id=channel_id,
+                               batch_result_type=type(batch_result),
+                               batch_result=str(batch_result)[:200])
+                    continue
+                
+                # Context7: Безопасное извлечение значений с fallback на 0
+                batch_processed = batch_result.get('processed', 0)
+                batch_skipped = batch_result.get('skipped', 0)
+                
+                messages_processed += batch_processed
+                self.stats['messages_parsed'] += batch_processed
+                self.stats['messages_skipped'] += batch_skipped
                 
                 # Context7: Отслеживаем успешное сохранение - если processed > 0, значит сохранение прошло успешно
                 # (в _process_message_batch processed увеличивается только после успешного save_batch_atomic)
-                if batch_result['processed'] > 0:
+                if batch_processed > 0:
                     has_successful_save = True
                 
                 # Track max_message_date across all batches
@@ -719,7 +770,15 @@ class ChannelParser:
                                        channel_id=channel_id, tg_channel_id=tg_channel_id_db, error=str(e2))
                             return None
                     else:
-                        logger.error("No username and no tg_channel_id", channel_id=channel_id, title=title)
+                        # Context7: Для каналов без username и tg_channel_id логируем предупреждение
+                        logger.warning(
+                            "Channel has no username and no tg_channel_id, cannot resolve entity",
+                            channel_id=channel_id,
+                            title=title,
+                            username=username
+                        )
+                        # Context7: Метрика для отслеживания каналов без tg_channel_id
+                        channel_not_found_total.labels(exists_in_db='true').inc()
                         return None
             elif tg_channel_id_db is not None:
                 # Fallback: используем tg_channel_id если username отсутствует
@@ -731,8 +790,15 @@ class ChannelParser:
                                channel_id=channel_id, tg_channel_id=tg_channel_id_db, error=str(e))
                     return None
             else:
-                logger.error("Channel has neither username nor tg_channel_id", 
-                           channel_id=channel_id, title=title)
+                # Context7: Для каналов без username и tg_channel_id логируем предупреждение
+                # Это может произойти для каналов, которые были созданы без полной информации
+                logger.warning(
+                    "Channel has neither username nor tg_channel_id, cannot resolve entity",
+                    channel_id=channel_id,
+                    title=title
+                )
+                # Context7: Метрика для отслеживания каналов без tg_channel_id
+                channel_not_found_total.labels(exists_in_db='true').inc()
                 return None
             
             # Context7 best practice: Автоматическое заполнение tg_channel_id в БД, если отсутствует
@@ -1630,6 +1696,17 @@ class ChannelParser:
                     # Context7: Извлекаем SHA256 для передачи в событие
                     post_data['media_sha256_list'] = [mf.sha256 for mf in media_files]
                 
+                # Context7: КРИТИЧНО - сохраняем grouped_id в post_data для обработки альбомов
+                # grouped_id извлекается из сообщения выше (строка 1530), но может быть не в post_data
+                if grouped_id is not None:
+                    post_data['grouped_id'] = grouped_id
+                    logger.debug(
+                        "Grouped ID added to post_data",
+                        post_id=post_id,
+                        grouped_id=grouped_id,
+                        channel_id=channel_id
+                    )
+                
                 posts_data.append(post_data)
                 
                 # Context7: Сохраняем mapping для последующего извлечения forwards/reactions/replies
@@ -1733,16 +1810,50 @@ class ChannelParser:
                     'username': channel_username
                 }
                 
-                # Context7: Создаём user и channel, чтобы user_channel мог быть создан
-                # Context7: Проверяем состояние транзакции перед началом новой
-                if self.db_session.in_transaction():
-                    await self.db_session.rollback()
-                async with self.db_session.begin():
-                    await self.atomic_saver._upsert_user(self.db_session, user_data)
-                    channel_id_uuid = await self.atomic_saver._upsert_channel(self.db_session, channel_data)
-                    await self.atomic_saver._ensure_user_channel(self.db_session, user_data, channel_data, channel_id_uuid)
+                # Context7: Проверка подписки с поддержкой системного парсинга
+                # Для системного парсинга (scheduler) разрешаем парсинг активных каналов,
+                # так как AtomicDBSaver автоматически создаст/активирует подписку при сохранении постов
+                # Context7: Преобразуем user_id в int для SQL запроса (telegram_id в БД - bigint)
+                telegram_id_int = int(user_id) if isinstance(user_id, str) else user_id
                 
-                logger.info("Ensured user_channel for existing channel (no new posts)",
+                # Проверяем активность канала
+                channel_active_check = await self.db_session.execute(
+                    text("SELECT is_active FROM channels WHERE id = :channel_id LIMIT 1"),
+                    {"channel_id": channel_id}
+                )
+                channel_active_row = channel_active_check.fetchone()
+                is_channel_active = channel_active_row and channel_active_row.is_active
+                
+                # Проверяем подписку
+                check_subscription = await self.db_session.execute(
+                    text("""
+                        SELECT user_id FROM user_channel 
+                        WHERE user_id = (SELECT id FROM users WHERE telegram_id = :telegram_id LIMIT 1)
+                          AND channel_id = :channel_id
+                          AND is_active = true
+                        LIMIT 1
+                    """),
+                    {"telegram_id": telegram_id_int, "channel_id": channel_id}
+                )
+                
+                subscription_exists = check_subscription.fetchone() is not None
+                
+                if not subscription_exists:
+                    if is_channel_active:
+                        # Context7: Канал активен - разрешаем парсинг для системного парсинга
+                        # AtomicDBSaver автоматически создаст/активирует подписку при сохранении постов
+                        logger.info("Channel is active, allowing parsing for system parsing (subscription will be created by AtomicDBSaver)",
+                                  channel_id=channel_id,
+                                  telegram_id=user_id)
+                    else:
+                        # Канал неактивен - блокируем парсинг
+                        logger.warning("User not subscribed to inactive channel, skipping parsing",
+                                      channel_id=channel_id,
+                                      telegram_id=user_id)
+                        return {"status": "skipped", "reason": "not_subscribed_inactive_channel", "parsed": 0, "max_message_date": None}
+                else:
+                    # Пользователь подписан - продолжаем парсинг
+                    logger.info("User subscribed to channel, continuing parsing",
                            channel_id=channel_id,
                            telegram_id=user_id)
             except Exception as e:
@@ -1898,6 +2009,41 @@ class ChannelParser:
                                            has_grouped_ids_in_batch=len(grouped_ids_in_batch) > 0)
                         except Exception as e:
                             logger.warning("Failed to check for missing albums",
+                                         channel_id=channel_id,
+                                         error=str(e))
+                    
+                    # Context7: КРИТИЧНО - также проверяем grouped_id из БД для всех постов с grouped_id без альбомов
+                    # Это гарантирует, что альбомы будут созданы даже если grouped_id не попал в batch
+                    if processed > 0:
+                        try:
+                            # Получаем все grouped_id из канала, которые ещё не имеют альбомов (без ограничения по batch)
+                            all_missing_albums_result = await self.db_session.execute(
+                                text("""
+                                    SELECT DISTINCT p.grouped_id
+                                    FROM posts p
+                                    LEFT JOIN media_groups mg ON mg.channel_id = p.channel_id 
+                                                              AND mg.grouped_id = p.grouped_id
+                                    WHERE p.channel_id = :channel_id
+                                      AND p.grouped_id IS NOT NULL
+                                      AND mg.id IS NULL
+                                    LIMIT 20
+                                """),
+                                {
+                                    "channel_id": channel_id
+                                }
+                            )
+                            all_missing_albums = all_missing_albums_result.fetchall()
+                            for row in all_missing_albums:
+                                if row.grouped_id:
+                                    grouped_ids_in_batch.add(row.grouped_id)
+                            
+                            if all_missing_albums:
+                                logger.info("Found all missing albums for channel",
+                                           channel_id=channel_id,
+                                           missing_albums_count=len(all_missing_albums),
+                                           total_grouped_ids=len(grouped_ids_in_batch))
+                        except Exception as e:
+                            logger.warning("Failed to check for all missing albums",
                                          channel_id=channel_id,
                                          error=str(e))
                     
@@ -2071,12 +2217,32 @@ class ChannelParser:
                                         'username': channel_username
                                     }
                                     
-                                    # Создаём user и channel
-                                    await self.atomic_saver._upsert_user(self.db_session, user_data)
-                                    channel_id_uuid = await self.atomic_saver._upsert_channel(self.db_session, channel_data)
-                                    await self.atomic_saver._ensure_user_channel(self.db_session, user_data, channel_data, channel_id_uuid)
+                                    # Context7: НЕ создаем user_channel автоматически при парсинге!
+                                    # Подписки должны создаваться только при явном запросе пользователя через API
+                                    # Проверяем, подписан ли пользователь на канал
+                                    check_subscription = await self.db_session.execute(
+                                        text("""
+                                            SELECT user_id FROM user_channel 
+                                            WHERE user_id = (SELECT id FROM users WHERE telegram_id = :telegram_id LIMIT 1)
+                                              AND channel_id = :channel_id
+                                              AND is_active = true
+                                            LIMIT 1
+                                        """),
+                                        {"telegram_id": int(user_id) if isinstance(user_id, str) else user_id, "channel_id": channel_id}
+                                    )
                                     
-                                    # Повторно пытаемся получить user_uuid
+                                    if not check_subscription.fetchone():
+                                        # Пользователь не подписан или подписка неактивна - НЕ создаем подписку автоматически
+                                        logger.warning("User not subscribed to channel or subscription inactive, cannot process albums",
+                                                     channel_id=channel_id,
+                                                     telegram_id=user_id)
+                                        user_uuid = None
+                                    else:
+                                        # Пользователь подписан - создаем user если нужно
+                                        await self.atomic_saver._upsert_user(self.db_session, user_data)
+                                        channel_id_uuid = await self.atomic_saver._upsert_channel(self.db_session, channel_data)
+                                        
+                                        # Повторно пытаемся получить user_uuid
                                     result3 = await self.db_session.execute(
                                         text("SELECT id::text FROM users WHERE telegram_id = :telegram_id LIMIT 1"),
                                         {"telegram_id": int(user_id) if user_id else None}
@@ -3216,18 +3382,48 @@ class ChannelParser:
                                channel_id=channel_id,
                                error=str(rollback_error))
     
-    async def handle_flood_wait(self, error: errors.FloodWaitError):
-        """Обработка FloodWait ошибки."""
+    async def handle_flood_wait(self, error: errors.FloodWaitError, channel_id: str):
+        """Обработка FloodWait ошибки с установкой blocked_until в БД.
+        
+        Context7: Вместо sleep обновляем blocked_until в БД, чтобы канал был пропущен
+        в следующих тиках до истечения cooldown периода.
+        
+        Args:
+            error: FloodWaitError из Telethon
+            channel_id: ID канала в БД
+        """
         wait_time = min(error.seconds, self.config.max_flood_wait)
+        blocked_until = datetime.now(timezone.utc) + timedelta(seconds=wait_time)
         
-        logger.warning(f"FloodWait: waiting {wait_time} seconds")
-        
-        # Экспоненциальный backoff с джиттером
-        base_delay = min(wait_time, 2 ** min(wait_time // 10, 6))
-        jitter = 0.1 + (0.2 * (wait_time / self.config.max_flood_wait))
-        actual_delay = base_delay + jitter
-        
-        await asyncio.sleep(actual_delay)
+        # Context7: Обновляем blocked_until в БД вместо sleep
+        try:
+            if self.db_session.in_transaction():
+                await self.db_session.rollback()
+            
+            async with self.db_session.begin():
+                await self.db_session.execute(
+                    text("""
+                        UPDATE channels 
+                        SET blocked_until = :blocked_until 
+                        WHERE id = :channel_id
+                    """),
+                    {"blocked_until": blocked_until, "channel_id": channel_id}
+                )
+            
+            logger.warning(
+                "Channel blocked due to FloodWait",
+                channel_id=channel_id,
+                wait_seconds=wait_time,
+                blocked_until=blocked_until.isoformat()
+            )
+        except Exception as e:
+            logger.error("Failed to set blocked_until for channel",
+                        channel_id=channel_id,
+                        error=str(e),
+                        error_type=type(e).__name__,
+                        exc_info=True)
+            # Fallback: используем sleep если не удалось обновить БД
+            await asyncio.sleep(wait_time)
         
         self.stats['flood_wait_count'] += 1
     

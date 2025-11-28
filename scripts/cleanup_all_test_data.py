@@ -88,6 +88,12 @@ POSTGRES_TABLES = [
     "posts",
 ]
 
+# Тестовые каналы для очистки (Context7: идентификация по паттернам)
+TEST_CHANNEL_PATTERNS = [
+    ("title", "Test E2E Channel"),
+    ("username", "test_e2e_channel"),
+]
+
 # ============================================================================
 # POSTGRESQL ОЧИСТКА
 # ============================================================================
@@ -161,6 +167,41 @@ async def cleanup_postgres(
                 logger.info("Очищено поле posts.grouped_id")
             except Exception as e:
                 logger.warning(f"Не удалось очистить posts.grouped_id", error=str(e))
+            
+            # Context7: Очистка тестовых каналов (после удаления зависимых данных)
+            try:
+                logger.info("Очищаем тестовые каналы...")
+                
+                # Сначала удаляем связанные данные (user_channel, posts уже удалены выше)
+                # Но нужно удалить user_channel для тестовых каналов
+                test_channels_result = await session.execute(text("""
+                    SELECT id FROM channels 
+                    WHERE title = 'Test E2E Channel' OR username = 'test_e2e_channel'
+                """))
+                test_channel_ids = [row[0] for row in test_channels_result.fetchall()]
+                
+                if test_channel_ids:
+                    logger.info(f"Найдено {len(test_channel_ids)} тестовых каналов")
+                    
+                    # Удаляем user_channel для тестовых каналов
+                    await session.execute(text("""
+                        DELETE FROM user_channel 
+                        WHERE channel_id = ANY(:channel_ids)
+                    """), {"channel_ids": test_channel_ids})
+                    
+                    # Удаляем тестовые каналы
+                    deleted_channels = await session.execute(text("""
+                        DELETE FROM channels 
+                        WHERE title = 'Test E2E Channel' OR username = 'test_e2e_channel'
+                        RETURNING id
+                    """))
+                    deleted_count = len(deleted_channels.fetchall())
+                    logger.info(f"Удалено {deleted_count} тестовых каналов")
+                else:
+                    logger.info("Тестовые каналы не найдены")
+                    
+            except Exception as e:
+                logger.warning(f"Не удалось очистить тестовые каналы", error=str(e))
             
             # Коммитим транзакцию
             await session.commit()

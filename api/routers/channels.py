@@ -22,6 +22,7 @@ from models.database import get_db
 from middleware.tracing import get_trace_id
 from repositories.outbox import OutboxRepository, get_outbox_repository
 from events.schemas.channels_v1 import ChannelSubscribedEventV1, ChannelUnsubscribedEventV1
+from services.telegram_channel_resolver import get_tg_channel_id_by_username
 
 logger = structlog.get_logger()
 
@@ -85,10 +86,11 @@ TIER_LIMITS = {
 # ============================================================================
 
 @router.post("/users/{user_id}/subscribe", response_model=None, status_code=201)
-def subscribe_to_channel(
+async def subscribe_to_channel(
     user_id: str,
     request: ChannelSubscribeRequest,
     req: Request,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     outbox: OutboxRepository = Depends(get_outbox_repository)
 ):
@@ -133,11 +135,45 @@ def subscribe_to_channel(
                 detail={"error": "invalid_channel", "trace_id": trace_id}
             )
         
+        # Context7: Если telegram_id не передан, пытаемся получить его по username
+        telegram_id = request.telegram_id
+        if not telegram_id and request.username:
+            # Пытаемся получить tg_channel_id из Telegram API с retry
+            # Context7: Делаем несколько попыток для надежности
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    tg_channel_id = await get_tg_channel_id_by_username(request.username)
+                    if tg_channel_id:
+                        telegram_id = tg_channel_id
+                        logger.info("Got tg_channel_id from Telegram API", 
+                                   username=request.username, 
+                                   tg_channel_id=tg_channel_id,
+                                   attempt=attempt + 1)
+                        break
+                    else:
+                        logger.warning("Failed to get tg_channel_id from Telegram API (returned None)", 
+                                     username=request.username,
+                                     attempt=attempt + 1)
+                        # Context7: Продолжаем цикл для следующей попытки
+                        if attempt < max_retries - 1:
+                            delay = attempt + 1  # Linear backoff: 1s, 2s, 3s
+                            await asyncio.sleep(delay)
+                except Exception as e:
+                    logger.warning("Failed to get tg_channel_id from Telegram API", 
+                                 username=request.username, 
+                                 error=str(e),
+                                 attempt=attempt + 1)
+                    # Context7: Продолжаем цикл для следующей попытки
+                    if attempt < max_retries - 1:
+                        delay = attempt + 1  # Linear backoff: 1s, 2s, 3s
+                        await asyncio.sleep(delay)
+        
         # Получение или создание канала
         channel = _get_or_create_channel(
             tenant_id=tenant_id,
             username=request.username,
-            telegram_id=request.telegram_id,
+            telegram_id=telegram_id,
             title=request.title,
             db=db
         )
@@ -186,6 +222,14 @@ def subscribe_to_channel(
             aggregate_id=channel['id'],
             idempotency_key=idempotency_key
         )
+        
+        # Context7: Если канал создан без tg_channel_id, запускаем фоновую задачу для его заполнения
+        if not telegram_id and request.username:
+            background_tasks.add_task(
+                _fill_tg_channel_id_background,
+                channel_id=channel['id'],
+                username=request.username
+            )
         
         logger.info("User subscribed to channel",
                    user_id=user_id,
@@ -501,14 +545,35 @@ def _get_or_create_channel(
             # Context7: [C7-ID: username-search-normalization-001] Поиск с нормализацией username в SQL
             # Используем LTRIM для поиска, чтобы найти каналы как с @, так и без @
             existing_result = db.execute(
-                text("SELECT id FROM channels WHERE LTRIM(username, '@') = :username"),
+                text("SELECT id, tg_channel_id FROM channels WHERE LTRIM(username, '@') = :username"),
                 {"username": normalized_username}
             )
             existing_row = existing_result.fetchone()
             if existing_row:
-                return {"id": str(existing_row.id)}
+                existing_id = str(existing_row.id)
+                existing_tg_id = existing_row.tg_channel_id
+                
+                # Context7: Если канал существует без tg_channel_id, но мы получили telegram_id - обновляем
+                if not existing_tg_id and telegram_id:
+                    db.execute(
+                        text("UPDATE channels SET tg_channel_id = :telegram_id WHERE id = :channel_id"),
+                        {"telegram_id": telegram_id, "channel_id": existing_id}
+                    )
+                    db.commit()
+                    logger.info("Updated tg_channel_id for existing channel",
+                               channel_id=existing_id,
+                               username=normalized_username,
+                               tg_channel_id=telegram_id)
+                
+                return {"id": existing_id}
         
         # Создание нового канала (username уже нормализован выше)
+        # Context7: Предупреждение, если создаем канал без tg_channel_id
+        if not telegram_id:
+            logger.warning("Creating channel without tg_channel_id - will be filled in background", 
+                         username=normalized_username,
+                         tenant_id=tenant_id)
+        
         channel_id = str(uuid.uuid4())
         
         db.execute(
@@ -626,3 +691,97 @@ async def _trigger_channel_parsing(user_id: str, channel_id: str, tenant_id: str
         
     except Exception as e:
         logger.error(f"Failed to trigger channel parsing: {e}")
+
+async def _fill_tg_channel_id_background(channel_id: str, username: str):
+    """
+    Фоновая задача для заполнения tg_channel_id для канала.
+    
+    Context7: Используется для каналов, созданных без tg_channel_id.
+    Добавлена retry логика для надежности.
+    """
+    max_retries = 5
+    retry_delays = [2, 5, 10, 30, 60]  # секунды между попытками
+    errors = []  # Собираем все ошибки для финального логирования
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info("Filling tg_channel_id in background", 
+                       channel_id=channel_id, 
+                       username=username,
+                       attempt=attempt + 1,
+                       max_retries=max_retries)
+            
+            tg_channel_id = await get_tg_channel_id_by_username(username)
+            if tg_channel_id:
+                # Обновляем канал в БД
+                from models.database import get_db
+                db = next(get_db())
+                try:
+                    result = db.execute(
+                        text("""
+                            UPDATE channels 
+                            SET tg_channel_id = :tg_channel_id 
+                            WHERE id = :channel_id AND tg_channel_id IS NULL
+                        """),
+                        {"tg_channel_id": tg_channel_id, "channel_id": channel_id}
+                    )
+                    db.commit()
+                    
+                    if result.rowcount > 0:
+                        logger.info("Updated tg_channel_id in background", 
+                                   channel_id=channel_id, 
+                                   tg_channel_id=tg_channel_id,
+                                   attempt=attempt + 1)
+                        return  # Успешно обновлено
+                    else:
+                        # Канал уже обновлен или не найден
+                        logger.info("Channel tg_channel_id already set or channel not found", 
+                                   channel_id=channel_id)
+                        return
+                except Exception as e:
+                    error_msg = f"DB update error: {str(e)}"
+                    errors.append(error_msg)
+                    logger.error("Failed to update tg_channel_id in DB", 
+                               channel_id=channel_id, 
+                               error=str(e),
+                               attempt=attempt + 1)
+                    db.rollback()
+                finally:
+                    db.close()
+            else:
+                error_msg = "Failed to get tg_channel_id from Telegram API"
+                errors.append(error_msg)
+                logger.warning("Failed to get tg_channel_id from Telegram API", 
+                             channel_id=channel_id, 
+                             username=username,
+                             attempt=attempt + 1)
+                
+                # Если это не последняя попытка, ждем перед следующей
+                if attempt < max_retries - 1:
+                    delay = retry_delays[attempt]
+                    logger.info("Retrying after delay", 
+                               channel_id=channel_id,
+                               delay_seconds=delay,
+                               next_attempt=attempt + 2)
+                    await asyncio.sleep(delay)
+        except Exception as e:
+            error_msg = f"Exception in attempt {attempt + 1}: {str(e)}"
+            errors.append(error_msg)
+            logger.error("Error in background tg_channel_id fill", 
+                        channel_id=channel_id, 
+                        username=username, 
+                        error=str(e),
+                        attempt=attempt + 1)
+            
+            # Если это не последняя попытка, ждем перед следующей
+            if attempt < max_retries - 1:
+                delay = retry_delays[attempt]
+                await asyncio.sleep(delay)
+    
+    # Context7: Логируем финальный результат после всех попыток
+    logger.error("Failed to fill tg_channel_id after all retries", 
+                channel_id=channel_id,
+                username=username,
+                total_attempts=max_retries,
+                errors=errors,
+                note="Background task completed with failure, manual intervention may be required")

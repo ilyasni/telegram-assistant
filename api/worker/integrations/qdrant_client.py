@@ -166,6 +166,71 @@ class QdrantClient:
                         error=str(e))
             return False
     
+    async def retrieve_vectors(
+        self,
+        collection_name: str,
+        vector_ids: List[str],
+        with_vectors: bool = True,
+        with_payload: bool = True
+    ) -> List[Dict[str, Any]]:
+        """
+        Получение векторов из Qdrant по их ID.
+        
+        Context7 best practice: используем retrieve для batch получения точек по ID.
+        Это эффективнее, чем scroll с фильтром для получения конкретных точек.
+        
+        Args:
+            collection_name: Название коллекции
+            vector_ids: Список ID векторов для получения
+            with_vectors: Включать ли векторы в результат
+            with_payload: Включать ли payload в результат
+        
+        Returns:
+            Список словарей с полями:
+            - id: ID точки
+            - vector: Вектор (если with_vectors=True)
+            - payload: Payload (если with_payload=True)
+        """
+        if not vector_ids:
+            return []
+        
+        try:
+            # Context7: Используем retrieve для batch получения точек
+            # Qdrant SDK поддерживает до 100 точек за запрос
+            batch_size = 100
+            all_points = []
+            
+            for i in range(0, len(vector_ids), batch_size):
+                batch_ids = vector_ids[i:i + batch_size]
+                
+                retrieved_points = self.client.retrieve(
+                    collection_name=collection_name,
+                    ids=batch_ids,
+                    with_vectors=with_vectors,
+                    with_payload=with_payload
+                )
+                
+                for point in retrieved_points:
+                    all_points.append({
+                        'id': str(point.id),
+                        'vector': point.vector if with_vectors else None,
+                        'payload': point.payload if with_payload else None
+                    })
+            
+            logger.debug("Vectors retrieved successfully",
+                        collection=collection_name,
+                        requested_count=len(vector_ids),
+                        retrieved_count=len(all_points))
+            
+            return all_points
+            
+        except Exception as e:
+            logger.error("Error retrieving vectors",
+                        collection=collection_name,
+                        vector_ids_count=len(vector_ids),
+                        error=str(e))
+            return []
+    
     async def search_vectors(
         self, 
         collection_name: str, 

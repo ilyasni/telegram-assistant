@@ -15,6 +15,18 @@ from fastapi.staticfiles import StaticFiles
 from bot.webhook import router as bot_router, init_bot, ensure_webhook
 from bot.handlers.base import router as bot_handlers
 
+# Импорт Performance Metrics для регистрации метрик в Prometheus
+try:
+    from api.worker.common.performance_metrics import (
+        fast_path_latency_seconds,
+        llm_calls_per_request,
+        tokens_per_request,
+        agent_steps_per_request,
+    )
+except Exception as e:
+    # logger еще не определен на этом этапе, используем print
+    print(f"Warning: Failed to import performance metrics: {e}")
+
 # Middleware imports
 from middleware.tracing import TracingMiddleware
 from middleware.rate_limiter import RateLimiterMiddleware, init_rate_limiter
@@ -490,6 +502,13 @@ async def serve_admin_app():
 
 @app.get("/app/qr")
 async def serve_qr_app_compat():
+    from fastapi.responses import FileResponse
+    return FileResponse("webapp/qr.html")
+
+
+@app.get("/qr.html")
+async def serve_qr_html():
+    """Context7: Прямой доступ к qr.html для совместимости."""
     from fastapi.responses import FileResponse
     return FileResponse("webapp/qr.html")
 

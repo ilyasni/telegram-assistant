@@ -9,6 +9,7 @@ import asyncio
 import html
 import math
 import os
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID
@@ -287,6 +288,51 @@ async def _connect_group(
             error=str(exc),
         )
         return False, str(exc)
+
+
+def _extract_username_from_telegram_url(text: str) -> Optional[str]:
+    """
+    Извлекает username из Telegram URL или username.
+    
+    Context7: Поддерживает различные форматы:
+    - https://t.me/username
+    - http://t.me/username
+    - t.me/username
+    - @username
+    - username
+    
+    Args:
+        text: Текст, содержащий URL или username
+        
+    Returns:
+        Username без @ или None, если не удалось извлечь
+    """
+    if not text:
+        return None
+    
+    text = text.strip()
+    
+    # Убираем @ если есть
+    if text.startswith('@'):
+        username = text[1:]
+        # Валидация username (только буквы, цифры, подчёркивания, 5-32 символа)
+        if re.match(r'^[a-zA-Z0-9_]{5,32}$', username):
+            return username
+        return None
+    
+    # Парсинг URL
+    # Паттерн для https://t.me/username или http://t.me/username
+    url_pattern = r'(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/([a-zA-Z0-9_]{5,32})'
+    match = re.search(url_pattern, text)
+    if match:
+        username = match.group(1)
+        return username
+    
+    # Если это просто username без @
+    if re.match(r'^[a-zA-Z0-9_]{5,32}$', text):
+        return text
+    
+    return None
 
 
 # ============================================================================
@@ -709,6 +755,175 @@ async def cmd_group_discovery_status(msg: Message, state: FSMContext):
         keyboard = _discovery_keyboard(discovery, str(discovery["id"]), page=0)
 
     await msg.answer(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+@router.message(Command("add_group"))
+async def cmd_add_group(msg: Message, state: FSMContext):
+    """
+    Команда добавления группы по username или ссылке.
+    
+    Context7: Поддерживает различные форматы:
+    - /add_group @group_name
+    - /add_group https://t.me/group_name
+    - /add_group group_name
+    
+    Context7: Использует telegram_channel_resolver для получения tg_chat_id через Telegram API.
+    """
+    user_ctx = await _get_user_context(msg.from_user.id)
+    if not user_ctx:
+        await msg.answer("❌ Пользователь не найден. Используй /start для регистрации.")
+        return
+
+    tenant_id = str(user_ctx["tenant_id"])
+    
+    # Извлекаем аргументы из команды
+    command_text = msg.text or ""
+    args = command_text.replace("/add_group", "").strip()
+    
+    if not args:
+        await msg.answer(
+            "👥 <b>Добавление группы</b>\n\n"
+            "Использование:\n"
+            "• <code>/add_group @group_name</code>\n"
+            "• <code>/add_group https://t.me/group_name</code>\n"
+            "• <code>/add_group group_name</code>\n\n"
+            "Пример:\n"
+            "• <code>/add_group @SergeXXI</code>\n"
+            "• <code>/add_group https://t.me/SergeXXI</code>",
+            parse_mode="HTML"
+        )
+        return
+    
+    # Извлекаем username из аргументов
+    username = _extract_username_from_telegram_url(args)
+    
+    if not username:
+        await msg.answer(
+            "❌ Неверный формат!\n\n"
+            "Используйте один из форматов:\n"
+            "• <code>/add_group @group_name</code>\n"
+            "• <code>/add_group https://t.me/group_name</code>\n"
+            "• <code>/add_group group_name</code>\n\n"
+            "Username должен содержать только буквы, цифры и подчёркивания (5-32 символа).",
+            parse_mode="HTML"
+        )
+        return
+    
+    # Показываем, что обрабатываем запрос
+    processing_msg = await msg.answer(
+        f"⏳ Обрабатываю запрос на добавление группы <code>@{username}</code>...",
+        parse_mode="HTML"
+    )
+    
+    # Context7: Получаем tg_chat_id через Telegram API
+    try:
+        # Импортируем сервис для получения tg_chat_id
+        from services.telegram_channel_resolver import get_tg_channel_id_by_username
+        
+        tg_chat_id = await get_tg_channel_id_by_username(username)
+        
+        if not tg_chat_id:
+            # Если не удалось получить tg_chat_id, создаём группу с минимальными данными
+            # и предлагаем использовать discovery для полной настройки
+            await processing_msg.edit_text(
+                f"⚠️ <b>Не удалось получить информацию о группе</b>\n\n"
+                f"Группа <code>@{username}</code> не найдена или недоступна через Telegram API.\n\n"
+                f"💡 <b>Рекомендации:</b>\n"
+                f"• Убедись, что группа существует и имеет публичный username\n"
+                f"• Используй /group_discovery для поиска доступных групп\n"
+                f"• Если группа приватная, добавь бота в группу и используй discovery",
+                parse_mode="HTML"
+            )
+            logger.warning(
+                "Failed to get tg_chat_id for group",
+                tenant_id=tenant_id,
+                username=username,
+            )
+            return
+        
+        # Получаем информацию о группе для title
+        # Context7: Используем username как временное название, можно улучшить через get_entity
+        group_title = username  # Будет обновлено при discovery или при получении полной информации
+        
+        # Создаём группу через API
+        payload = {
+            "tenant_id": tenant_id,
+            "tg_chat_id": tg_chat_id,
+            "title": group_title,
+            "username": username,
+            "settings": {
+                "source": "bot_manual",
+                "added_by": str(user_ctx["id"]),
+            },
+        }
+        
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.post(f"{API_BASE}/api/groups/", json=payload)
+            
+            if resp.status_code in (200, 201):
+                group_data = resp.json()
+                await processing_msg.edit_text(
+                    f"✅ <b>Группа добавлена!</b>\n\n"
+                    f"👥 Группа: <code>@{username}</code>\n"
+                    f"📝 Название: {html.escape(group_data.get('title', username))}\n"
+                    f"🔢 ID: <code>{tg_chat_id}</code>\n\n"
+                    f"💡 <i>Используй /groups для просмотра списка групп.</i>",
+                    parse_mode="HTML"
+                )
+                logger.info(
+                    "Group added via /add_group command",
+                    tenant_id=tenant_id,
+                    username=username,
+                    tg_chat_id=tg_chat_id,
+                    group_id=group_data.get("id"),
+                )
+            elif resp.status_code == 409:
+                await processing_msg.edit_text(
+                    f"ℹ️ <b>Группа уже добавлена</b>\n\n"
+                    f"👥 Группа <code>@{username}</code> уже подключена к системе.\n"
+                    f"Используй /groups для просмотра списка групп.",
+                    parse_mode="HTML"
+                )
+            else:
+                error_msg = resp.text.strip() or resp.reason_phrase or "Неизвестная ошибка"
+                try:
+                    error_payload = resp.json()
+                    if isinstance(error_payload, dict):
+                        detail = error_payload.get("detail") or error_payload.get("message")
+                        if detail:
+                            error_msg = str(detail)
+                except Exception:
+                    pass
+                
+                logger.warning(
+                    "Failed to add group via /add_group",
+                    tenant_id=tenant_id,
+                    username=username,
+                    tg_chat_id=tg_chat_id,
+                    status_code=resp.status_code,
+                    error=error_msg,
+                )
+                await processing_msg.edit_text(
+                    f"❌ <b>Ошибка добавления группы</b>\n\n"
+                    f"Не удалось добавить группу <code>@{username}</code>.\n"
+                    f"Ошибка: {html.escape(error_msg[:200])}\n\n"
+                    f"💡 Попробуй использовать /group_discovery для поиска доступных групп.",
+                    parse_mode="HTML"
+                )
+    except Exception as exc:
+        logger.error(
+            "Exception in cmd_add_group",
+            tenant_id=tenant_id,
+            username=username,
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
+        await processing_msg.edit_text(
+            f"❌ <b>Произошла ошибка</b>\n\n"
+            f"Не удалось обработать запрос на добавление группы.\n"
+            f"Попробуй позже или используй /group_discovery.",
+            parse_mode="HTML"
+        )
 
 
 # ============================================================================
@@ -1437,19 +1652,46 @@ async def _poll_discovery_results(
                 data = resp.json()
                 status = data.get("status")
                 if status == "completed":
-                    text = _render_discovery_text(data, page=0)
-                    keyboard = _discovery_keyboard(data, request_id, page=0)
-                    await bot.send_message(
-                        chat_id,
-                        text,
-                        parse_mode="HTML",
-                        reply_markup=keyboard,
-                    )
-                    return
+                    try:
+                        text = _render_discovery_text(data, page=0)
+                        keyboard = _discovery_keyboard(data, request_id, page=0)
+                        await bot.send_message(
+                            chat_id,
+                            text,
+                            parse_mode="HTML",
+                            reply_markup=keyboard,
+                        )
+                        logger.info(
+                            "Discovery results sent successfully",
+                            request_id=request_id,
+                            tenant_id=tenant_id,
+                            results_count=len(data.get("results", [])),
+                        )
+                        return
+                    except Exception as send_err:
+                        logger.error(
+                            "Failed to send discovery results",
+                            request_id=request_id,
+                            tenant_id=tenant_id,
+                            error=str(send_err),
+                            error_type=type(send_err).__name__,
+                            exc_info=True,
+                        )
+                        raise
                 if status == "failed":
-                    text = _render_discovery_text(data, page=0)
-                    await bot.send_message(chat_id, text, parse_mode="HTML")
-                    return
+                    try:
+                        text = _render_discovery_text(data, page=0)
+                        await bot.send_message(chat_id, text, parse_mode="HTML")
+                        return
+                    except Exception as send_err:
+                        logger.error(
+                            "Failed to send discovery failure message",
+                            request_id=request_id,
+                            tenant_id=tenant_id,
+                            error=str(send_err),
+                            exc_info=True,
+                        )
+                        raise
                 await asyncio.sleep(poll_interval)
         await bot.send_message(
             chat_id,

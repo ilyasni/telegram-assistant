@@ -16,7 +16,7 @@ from langchain_gigachat import GigaChat
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnableParallel
-from pydantic import BaseModel
+from pydantic import BaseModel, SecretStr
 
 from models.database import Post, PostEnrichment, Channel, TrendDetection
 from api.services.rag_service import RAGService  # Для генерации embedding
@@ -87,9 +87,36 @@ class TrendDetectionService:
         import os
         os.environ.setdefault("OPENAI_API_BASE", api_base)
         
+        # Context7: Преобразуем SecretStr в строку, если нужно
+        credentials_value = getattr(settings, 'gigachat_credentials', None)
+        if credentials_value:
+            if isinstance(credentials_value, SecretStr):
+                credentials_value = credentials_value.get_secret_value()
+            # Если после преобразования строка пустая, используем fallback
+            if not credentials_value:
+                credentials_value = os.getenv('GIGACHAT_CREDENTIALS', '')
+        else:
+            credentials_value = os.getenv('GIGACHAT_CREDENTIALS', '')
+        
+        # Явно преобразуем в строку для гарантии
+        credentials_value = str(credentials_value) if credentials_value else ''
+        
+        scope_value = getattr(settings, 'gigachat_scope', None)
+        if scope_value:
+            if isinstance(scope_value, SecretStr):
+                scope_value = scope_value.get_secret_value()
+            # Если после преобразования строка пустая, используем fallback
+            if not scope_value:
+                scope_value = os.getenv('GIGACHAT_SCOPE', 'GIGACHAT_API_PERS')
+        else:
+            scope_value = os.getenv('GIGACHAT_SCOPE', 'GIGACHAT_API_PERS')
+        
+        # Явно преобразуем в строку для гарантии
+        scope_value = str(scope_value) if scope_value else 'GIGACHAT_API_PERS'
+        
         self.llm = GigaChat(
-            credentials=getattr(settings, 'gigachat_credentials', '') or os.getenv('GIGACHAT_CREDENTIALS', ''),
-            scope=getattr(settings, 'gigachat_scope', None) or os.getenv('GIGACHAT_SCOPE', 'GIGACHAT_API_PERS'),
+            credentials=credentials_value,
+            scope=scope_value,
             model="GigaChat",
             base_url=api_base,
             temperature=0.3,  # Низкая температура для более детерминированных результатов
@@ -143,19 +170,75 @@ class TrendDetectionService:
         return topics[:10]  # Ограничиваем количество тем
     
     async def _classify_trend(self, trend_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Классификация тренда через LLM (Trend Classifier Agent)."""
+        """
+        Классификация тренда через LLM (Trend Classifier Agent).
+        
+        Context7: Использует более гибкую логику определения тренда.
+        Если частота >= 10 и engagement >= 5.0, считаем это потенциальным трендом.
+        """
+        # Context7: Если метрики достаточно высокие, пропускаем LLM классификацию
+        # для ускорения и уменьшения ложных отрицательных результатов
+        frequency = trend_data.get('frequency', 0)
+        engagement_score = trend_data.get('engagement_score', 0.0)
+        channels_count = trend_data.get('channels_count', 0)
+        
+        # Context7: Расширенный auto-approval для ускорения (меньше LLM вызовов)
+        # Если метрики достаточно высокие, считаем трендом без LLM проверки
+        if (frequency >= 12 and engagement_score >= 6.0) or (frequency >= 15 and engagement_score >= 5.0) or (frequency >= 20):
+            logger.debug(
+                "Candidate auto-approved by high metrics",
+                keyword=trend_data.get('keyword'),
+                frequency=frequency,
+                engagement_score=engagement_score
+            )
+            return {"classification": "Auto-approved by metrics", "is_trend": True}
+        
+        # Для остальных используем LLM классификацию
         prompt = ChatPromptTemplate.from_messages([
-            ("system", """Ты — эксперт по определению трендов.
+            ("system", """Ты — эксперт по определению трендов в социальных сетях.
 Твоя задача: определить, является ли набор данных трендом.
-Учитывай: частоту упоминаний, рост упоминаний, engagement метрики.
-Верни краткий ответ: является ли это трендом и почему."""),
-            ("human", "Данные для анализа: {trend_data}\n\nКлассифицируй тренд:")
+
+Критерии тренда:
+- Частота упоминаний >= 10
+- Engagement score >= 5.0
+- Упоминания в нескольких каналах
+
+Верни краткий ответ в формате: "ДА, это тренд" или "НЕТ, это не тренд", затем объясни почему."""),
+            ("human", "Данные для анализа:\nЧастота: {frequency}\nEngagement: {engagement_score}\nКаналы: {channels_count}\nКлючевое слово: {keyword}\n\nКлассифицируй тренд:")
         ])
         
-        chain = prompt | self.llm | StrOutputParser()
-        result = await chain.ainvoke({"trend_data": str(trend_data)})
-        
-        return {"classification": result, "is_trend": "тренд" in result.lower() or "trend" in result.lower()}
+        try:
+            chain = prompt | self.llm | StrOutputParser()
+            result = await chain.ainvoke({
+                "trend_data": str(trend_data),
+                "frequency": frequency,
+                "engagement_score": engagement_score,
+                "channels_count": channels_count,
+                "keyword": trend_data.get('keyword', '')
+            })
+            
+            # Context7: Более гибкая проверка - ищем положительные индикаторы
+            result_lower = result.lower()
+            is_trend = (
+                "да" in result_lower or "yes" in result_lower or
+                "тренд" in result_lower or "trend" in result_lower or
+                ("это" in result_lower and "тренд" in result_lower) or
+                ("is" in result_lower and "trend" in result_lower)
+            ) and not (
+                "нет" in result_lower or "no" in result_lower or
+                "не тренд" in result_lower or "not a trend" in result_lower
+            )
+            
+            return {"classification": result, "is_trend": is_trend}
+        except Exception as e:
+            logger.warning(
+                "LLM classification failed, using fallback",
+                error=str(e),
+                keyword=trend_data.get('keyword')
+            )
+            # Fallback: если LLM не работает, используем метрики
+            is_trend = frequency >= 10 and engagement_score >= 5.0
+            return {"classification": f"Fallback: {is_trend}", "is_trend": is_trend}
     
     async def _collect_all_posts(
         self,
@@ -313,12 +396,14 @@ class TrendDetectionService:
         start_time = time.time()
         
         # Стадия A: Сбор постов и аналитика
-        logger.info("Stage A: Collecting posts and analyzing...")
+        logger.info("Stage A: Collecting posts and analyzing...", days=days)
         posts = await self._collect_all_posts(days=days, db=db)
         
         if not posts:
-            logger.warning("No posts found for trend analysis")
+            logger.warning("No posts found for trend analysis", days=days)
             return []
+        
+        logger.info("Posts collected for analysis", posts_count=len(posts), days=days)
         
         # Стадия A: Подсчет частот ключевых слов/фраз
         keyword_counts = {}
@@ -327,17 +412,48 @@ class TrendDetectionService:
         keyword_posts = {}
         
         for post in posts:
-            # Используем keywords из enrichment
+            # Context7: Приоритет topics над keywords (topics более осмысленные)
+            # Используем topics из enrichment, если есть, иначе keywords
+            topics = post.get('topics', [])
             keywords = post.get('keywords', [])
-            if not keywords:
-                # Fallback: извлекаем простые слова из content
+            
+            # Объединяем topics и keywords, убираем дубликаты
+            combined_terms = []
+            if topics:
+                combined_terms.extend(topics)
+            if keywords:
+                combined_terms.extend(keywords)
+            
+            # Убираем дубликаты и нормализуем
+            seen = set()
+            normalized_terms = []
+            for term in combined_terms:
+                if not term or not isinstance(term, str):
+                    continue
+                # Нормализуем: убираем знаки препинания в конце, приводим к нижнему регистру
+                normalized = term.strip().rstrip('.,!?;:').lower()
+                if normalized and len(normalized) > 2:  # Минимум 3 символа
+                    # Пропускаем стоп-слова и слишком короткие слова
+                    if normalized not in seen and len(normalized) >= 3:
+                        seen.add(normalized)
+                        normalized_terms.append(normalized)
+            
+            # Context7: Пропускаем LLM извлечение тем для ускорения
+            # Если нет topics/keywords, используем простую эвристику вместо LLM
+            if not normalized_terms:
                 content = post.get('content', '')
                 if content:
-                    # Простая токенизация (в реальности использовать NLP)
-                    words = content.lower().split()
-                    keywords = [w for w in words if len(w) > 4][:10]
+                    # Простая эвристика: извлекаем существительные (слова с большой буквы или длинные слова)
+                    words = content.split()
+                    # Берем слова с большой буквы (вероятно, имена собственные) или длинные слова
+                    heuristic_terms = [
+                        w.rstrip('.,!?;:').lower() 
+                        for w in words 
+                        if (w[0].isupper() and len(w) > 3) or (len(w) > 5 and w.isalpha())
+                    ][:5]
+                    normalized_terms.extend(heuristic_terms)
             
-            for keyword in keywords:
+            for keyword in normalized_terms:
                 if keyword not in keyword_counts:
                     keyword_counts[keyword] = 0
                     keyword_engagement[keyword] = 0.0
@@ -360,8 +476,43 @@ class TrendDetectionService:
             if keyword_counts[keyword] > 0:
                 keyword_engagement[keyword] /= keyword_counts[keyword]
         
+        # Context7: Группировка похожих терминов (например, "рублей" и "рублей.")
+        # Объединяем термины, которые отличаются только знаками препинания или регистром
+        grouped_keywords = {}
+        for keyword in keyword_counts.keys():
+            # Нормализуем для группировки
+            normalized_key = keyword.strip().rstrip('.,!?;:').lower()
+            if normalized_key not in grouped_keywords:
+                grouped_keywords[normalized_key] = keyword  # Используем первый вариант как основной
+            else:
+                # Объединяем статистику
+                main_keyword = grouped_keywords[normalized_key]
+                keyword_counts[main_keyword] += keyword_counts[keyword]
+                keyword_engagement[main_keyword] = (
+                    (keyword_engagement[main_keyword] * keyword_counts[main_keyword] - keyword_counts[keyword] + 
+                     keyword_engagement[keyword] * keyword_counts[keyword]) / keyword_counts[main_keyword]
+                )
+                keyword_channels[main_keyword].update(keyword_channels[keyword])
+                keyword_posts[main_keyword].extend(keyword_posts[keyword][:10 - len(keyword_posts[main_keyword])])
+                # Удаляем дубликат
+                del keyword_counts[keyword]
+                del keyword_engagement[keyword]
+                del keyword_channels[keyword]
+                del keyword_posts[keyword]
+        
         # Фильтруем по порогам
         candidates = []
+        filtered_by_frequency = 0
+        filtered_by_engagement = 0
+        
+        logger.info(
+            "Filtering candidates",
+            total_keywords=len(keyword_counts),
+            min_frequency=min_frequency,
+            min_engagement=min_engagement,
+            min_growth=min_growth
+        )
+        
         for keyword, count in keyword_counts.items():
             if count >= min_frequency:
                 avg_engagement = keyword_engagement[keyword]
@@ -377,6 +528,18 @@ class TrendDetectionService:
                         channels_affected=list(keyword_channels[keyword]),
                         posts_sample=keyword_posts[keyword]
                     ))
+                else:
+                    filtered_by_engagement += 1
+            else:
+                filtered_by_frequency += 1
+        
+        logger.info(
+            "Candidates filtered",
+            candidates_count=len(candidates),
+            filtered_by_frequency=filtered_by_frequency,
+            filtered_by_engagement=filtered_by_engagement,
+            total_keywords=len(keyword_counts)
+        )
         
         # Сортируем по engagement и частоте
         candidates.sort(key=lambda x: (x.engagement_score, x.frequency), reverse=True)
@@ -386,7 +549,7 @@ class TrendDetectionService:
             if await self.graph_service.health_check():
                 # Находим связанные темы через граф для кластеризации
                 topic_clusters = {}
-                for candidate in candidates[:20]:
+                for candidate in candidates[:15]:  # Ограничиваем для производительности
                     similar_topics = await self.graph_service.find_similar_topics(candidate.keyword, limit=5)
                     # Создаем кластер на основе похожих тем
                     cluster_key = candidate.keyword
@@ -412,10 +575,26 @@ class TrendDetectionService:
             logger.warning("Neo4j community detection failed, continuing without graph", error=str(e))
         
         # Стадия B: Используем multi-agent систему для классификации и формулирования
-        logger.info(f"Stage B: Classifying {len(candidates)} candidates...")
+        logger.info(
+            "Stage B: Classifying candidates",
+            candidates_count=len(candidates),
+            max_to_process=min(20, len(candidates))
+        )
+        
+        if not candidates:
+            logger.warning("No candidates found after filtering", 
+                          min_frequency=min_frequency,
+                          min_engagement=min_engagement)
+            return []
         
         trends = []
-        for candidate in candidates[:20]:  # Обрабатываем топ-20 кандидатов
+        classification_errors = 0
+        classification_rejected = 0
+        
+        # Context7: Ограничиваем количество кандидатов для ускорения
+        max_candidates = min(15, len(candidates))  # Уменьшили с 20 до 15
+        
+        for candidate in candidates[:max_candidates]:
             try:
                 # Используем Trend Classifier для классификации
                 trend_data = {
@@ -430,6 +609,18 @@ class TrendDetectionService:
                 # Классификация через LLM
                 classification_result = await self._classify_trend(trend_data)
                 
+                # Context7: Проверяем результат классификации
+                is_trend = classification_result.get("is_trend", False)
+                if not is_trend:
+                    classification_rejected += 1
+                    logger.debug(
+                        "Candidate rejected by LLM classification",
+                        keyword=candidate.keyword,
+                        frequency=candidate.frequency,
+                        engagement_score=candidate.engagement_score
+                    )
+                    continue
+                
                 # Сохраняем в БД
                 trend = TrendDetection(
                     trend_keyword=candidate.keyword,
@@ -443,18 +634,25 @@ class TrendDetectionService:
                     status="active"
                 )
                 
-                # Генерируем embedding для тренда
-                rag_service = RAGService(self.qdrant_url, self.qdrant_client)
-                embedding = await rag_service._generate_embedding(candidate.keyword)
-                embedding = self._normalize_embedding_dim(embedding)
-                if embedding:
-                    # Сохраняем embedding (VectorType автоматически конвертирует list в vector)
-                    trend.trend_embedding = embedding
-                
+                # Context7: Генерируем embedding асинхронно, но не блокируем сохранение
+                # Embedding можно сгенерировать позже в фоне для ускорения
                 if db:
                     db.add(trend)
                     db.commit()
                     db.refresh(trend)
+                
+                # Генерируем embedding после сохранения (не блокирует основной поток)
+                try:
+                    rag_service = RAGService(self.qdrant_url, self.qdrant_client)
+                    embedding = await rag_service._generate_embedding(candidate.keyword)
+                    embedding = self._normalize_embedding_dim(embedding)
+                    if embedding and db:
+                        # Обновляем embedding в отдельном коммите
+                        trend.trend_embedding = embedding
+                        db.commit()
+                except Exception as e:
+                    logger.debug("Failed to generate embedding, continuing without it", error=str(e))
+                    # Продолжаем без embedding - он не критичен для сохранения тренда
                 
                 trends.append(TrendResult(
                     trend_id=trend.id,
@@ -468,8 +666,22 @@ class TrendDetectionService:
                 ))
                 
             except Exception as e:
-                logger.error("Error processing trend candidate", keyword=candidate.keyword, error=str(e))
+                classification_errors += 1
+                logger.error(
+                    "Error processing trend candidate",
+                    keyword=candidate.keyword,
+                    error=str(e),
+                    error_type=type(e).__name__
+                )
                 continue
+        
+        logger.info(
+            "Trend detection completed",
+            trends_found=len(trends),
+            candidates_processed=min(20, len(candidates)),
+            classification_errors=classification_errors,
+            classification_rejected=classification_rejected
+        )
         
         processing_time = int((time.time() - start_time) * 1000)
         logger.info(

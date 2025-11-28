@@ -70,6 +70,8 @@ AlbumAssemblerTask = _import_task("album_assembler_task", "AlbumAssemblerTask")
 TrendDetectionWorker = _import_task("trends_worker", "TrendDetectionWorker")
 TrendEditorAgent = _import_task("trends_editor_agent", "TrendEditorAgent")
 create_trend_editor_agent = _import_task("trends_editor_agent", "create_trend_editor_agent")
+TrendRefinementTask = _import_task("trends_refinement_task", "TrendRefinementTask")
+create_refinement_task = _import_task("trends_refinement_task", "create_refinement_task")
 
 digest_worker = _import_task("digest_worker")
 create_digest_worker_task = getattr(digest_worker, "create_digest_worker_task")
@@ -315,6 +317,13 @@ async def create_trend_editor_agent_task():
     agent = await create_trend_editor_agent()
     await agent.start()
 
+async def create_trend_refinement_task():
+    """Context7: Создание и запуск TrendRefinementTask (периодический рефайнмент кластеров)."""
+    # Импортируем функцию напрямую, так как глобальный импорт может не работать
+    _create_refinement_task = _import_task("trends_refinement_task", "create_refinement_task")
+    task = _create_refinement_task()
+    await task.start()
+
 async def create_vision_analysis_task():
     """Context7: Создание и запуск Vision Analysis Task."""
     try:
@@ -417,6 +426,15 @@ async def main():
         )
     except ImportError:
         logger.debug("AlbumAssemblerTask metrics not available (module may not be loaded)")
+    
+    # Context7: Метрики refinement автоматически регистрируются при импорте модуля
+    # Импорт здесь не нужен, чтобы избежать дублирования регистрации
+    try:
+        # Только проверяем, что модуль доступен для импорта
+        import api.worker.trends_refinement_service
+        logger.debug("Trend refinement service module available")
+    except ImportError:
+        logger.debug("Trend refinement service not available (module may not be loaded)")
     
     # Context7: Инициализация метрик нулевыми значениями для экспорта в Prometheus
     # Метрики должны быть установлены хотя бы раз, чтобы Prometheus их увидел
@@ -594,6 +612,30 @@ async def main():
         max_backoff=60.0,
         backoff_multiplier=2.0
     ))
+    
+    # Context7: Trend Refinement Task для периодического улучшения качества кластеров
+    refinement_enabled = os.getenv("TREND_REFINEMENT_ENABLED", "true").lower() == "true"
+    if refinement_enabled:
+        try:
+            # Пробуем импортировать функцию напрямую
+            _create_refinement_task_func = _import_task("trends_refinement_task", "create_refinement_task")
+            
+            async def _create_trend_refinement_task():
+                """Обёртка для создания TrendRefinementTask."""
+                task = _create_refinement_task_func()
+                await task.start()
+            
+            supervisor.register_task(TaskConfig(
+                name="trend_refinement",
+                task_func=_create_trend_refinement_task,
+                max_retries=5,
+                initial_backoff=1.0,
+                max_backoff=60.0,
+                backoff_multiplier=2.0
+            ))
+            logger.info("Trend refinement task registered successfully")
+        except Exception as exc:
+            logger.error("Failed to register trend refinement task", error=str(exc), exc_info=True)
     
     try:
         await supervisor.start_all()

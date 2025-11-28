@@ -5,6 +5,7 @@ global:
 rule_files:
   - "alerts.yml"
   - "alerts/storage_quota_alerts.yml"
+  - "alerts/performance_metrics_alerts.yml"
 
 scrape_configs:
   - job_name: 'worker'
@@ -21,3 +22,9 @@ scrape_configs:
     static_configs:
       - targets: ['api:8000']
     metrics_path: /metrics
+
+  - job_name: 'telethon-ingest'
+    static_configs:
+      - targets: ['telegram-assistant-telethon-ingest-1:8011']
+    metrics_path: /metrics
+    scrape_interval: 15s

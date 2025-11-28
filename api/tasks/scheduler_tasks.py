@@ -11,7 +11,7 @@ import json
 import structlog
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from prometheus_client import Counter, REGISTRY
+from prometheus_client import Counter, Histogram, REGISTRY
 from sqlalchemy.orm import Session
 
 from models.database import (
@@ -43,6 +43,59 @@ from worker.event_bus import EventPublisher, RedisStreamsClient, DigestGenerateE
 from uuid import UUID
 
 logger = structlog.get_logger()
+
+# ============================================================================
+# PROMETHEUS METRICS для scheduled tasks
+# ============================================================================
+
+# Context7: Метрики для trends_stable_task - проверяем, что не дублируются с trends_worker
+# Используем префикс "trends_stable_" чтобы избежать конфликтов
+# Проверяем существование метрик перед созданием, чтобы избежать дублирования при повторном импорте
+def _get_or_create_metric(metric_type, name, *args, **kwargs):
+    """Создает метрику только если она еще не существует в REGISTRY."""
+    try:
+        # Пытаемся получить существующую метрику
+        existing = REGISTRY._names_to_collectors.get(name)
+        if existing:
+            return existing
+    except (AttributeError, KeyError):
+        pass
+    
+    # Создаем новую метрику
+    return metric_type(name, *args, **kwargs)
+
+trends_stable_task_runs_total = _get_or_create_metric(
+    Counter,
+    "trends_stable_task_runs_total",
+    "Total number of trends_stable_task executions",
+    ["outcome"],  # outcome: success|error
+)
+
+trends_stable_clusters_checked_total = _get_or_create_metric(
+    Counter,
+    "trends_stable_clusters_checked_total",
+    "Total number of clusters checked by trends_stable_task",
+)
+
+trends_stable_clusters_promoted_total = _get_or_create_metric(
+    Counter,
+    "trends_stable_clusters_promoted_total",
+    "Total number of clusters promoted to stable status",
+)
+
+trends_stable_clusters_skipped_total = _get_or_create_metric(
+    Counter,
+    "trends_stable_clusters_skipped_total",
+    "Total number of clusters skipped by trends_stable_task",
+    ["reason"],  # reason: no_metrics|freq_too_low|sources_too_low|burst_too_low|is_generic
+)
+
+trends_stable_task_duration_seconds = _get_or_create_metric(
+    Histogram,
+    "trends_stable_task_duration_seconds",
+    "Duration of trends_stable_task execution",
+    buckets=(1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0),
+)
 
 # Добавляем api/worker в путь для импорта
 worker_dir = Path(__file__).resolve().parent.parent / "worker"
@@ -197,6 +250,19 @@ async def generate_digest_for_user(
         if existing:
             if existing.status in {"scheduled", "pending", "processing"}:
                 if force_new:
+                    # Context7: При manual trigger перезаписываем только если прошло достаточно времени
+                    # Предотвращаем дубликаты при быстром двойном нажатии
+                    from datetime import timezone
+                    age_seconds = (datetime.now(timezone.utc) - existing.created_at).total_seconds()
+                    if age_seconds < 30:  # Меньше 30 секунд - игнорируем второй запрос
+                        logger.warning(
+                            "Duplicate digest request ignored (too recent)",
+                            user_id=user_id,
+                            digest_id=str(existing.id),
+                            age_seconds=age_seconds
+                        )
+                        return existing
+                    
                     logger.warning(
                         "Manual trigger overriding in-flight digest",
                         user_id=user_id,
@@ -342,19 +408,81 @@ async def enqueue_group_digest(
         window_start = now_utc - timedelta(hours=window_size_hours)
         window_end = now_utc
 
+        # Context7: Конвертируем timezone-aware datetime в naive UTC для сравнения
+        # с naive datetime в БД (posted_at хранится как naive datetime в UTC)
+        window_start_naive = window_start.replace(tzinfo=None)
+        window_end_naive = window_end.replace(tzinfo=None)
+
+        # Context7: Диагностический запрос - проверяем общее количество сообщений в группе
+        total_messages_in_group = (
+            db.query(GroupMessage)
+            .filter(GroupMessage.group_id == group_uuid)
+            .count()
+        )
+
+        # Context7: Проверяем сообщения в окне с правильной фильтрацией по времени
         messages_query = (
             db.query(GroupMessage)
             .filter(
                 GroupMessage.group_id == group_uuid,
-                GroupMessage.posted_at >= window_start,
-                GroupMessage.posted_at <= window_end,
+                GroupMessage.posted_at >= window_start_naive,
+                GroupMessage.posted_at <= window_end_naive,
             )
         )
         message_count = messages_query.count()
+        
+        # Context7: Дополнительная диагностика - проверяем сообщения без верхней границы
+        messages_after_start = (
+            db.query(GroupMessage)
+            .filter(
+                GroupMessage.group_id == group_uuid,
+                GroupMessage.posted_at >= window_start_naive,
+            )
+            .count()
+        )
+
         participant_count = (
             messages_query.distinct(GroupMessage.sender_tg_id)
             .count()
         )
+
+        # Context7: Детальное логирование для диагностики проблемы с подсчетом
+        logger.info(
+            "Group digest message count calculation",
+            tenant_id=tenant_id,
+            group_id=group_id,
+            window_size_hours=window_size_hours,
+            window_start=window_start_naive.isoformat(),
+            window_end=window_end_naive.isoformat(),
+            total_messages_in_group=total_messages_in_group,
+            messages_after_start=messages_after_start,
+            message_count_in_window=message_count,
+            participant_count=participant_count,
+        )
+
+        # Context7: Предупреждение, если сообщения есть в группе, но не попадают в окно
+        if total_messages_in_group > 0 and message_count == 0:
+            # Проверяем последнее сообщение в группе для диагностики
+            last_message = (
+                db.query(GroupMessage)
+                .filter(GroupMessage.group_id == group_uuid)
+                .order_by(GroupMessage.posted_at.desc())
+                .first()
+            )
+            if last_message:
+                last_message_age_hours = (window_end_naive - last_message.posted_at).total_seconds() / 3600.0
+                logger.warning(
+                    "Messages exist in group but none in window - last message is too old",
+                    tenant_id=tenant_id,
+                    group_id=group_id,
+                    window_size_hours=window_size_hours,
+                    window_start=window_start_naive.isoformat(),
+                    window_end=window_end_naive.isoformat(),
+                    last_message_posted_at=last_message.posted_at.isoformat() if last_message.posted_at else None,
+                    last_message_age_hours=round(last_message_age_hours, 2),
+                    total_messages_in_group=total_messages_in_group,
+                    suggestion=f"Last message is {round(last_message_age_hours, 1)} hours old. Try increasing window_size_hours or check if new messages are being ingested.",
+                )
 
         window = GroupConversationWindow(
             group_id=group_uuid,
@@ -584,9 +712,15 @@ async def detect_trends_task():
             trends_count=len(trends)
         )
         
-        # Отправка уведомлений о трендах пользователям
-        if trends:
+        # Context7: Отправка уведомлений о трендах пользователям (управляется через TREND_ALERTS_ENABLED)
+        alerts_enabled = os.getenv("TREND_ALERTS_ENABLED", "false").lower() == "true"
+        if trends and alerts_enabled:
             await send_trend_alerts_to_users(trends, db)
+        elif trends and not alerts_enabled:
+            logger.debug(
+                "Trend alerts disabled via TREND_ALERTS_ENABLED",
+                trends_count=len(trends)
+            )
         
         db.close()
     
@@ -601,6 +735,8 @@ async def trends_stable_task():
     Context7: Использует trend_metrics для вычисления baseline и переносит
     emerging кластеры в таблицу TrendDetection.
     """
+    import time
+    task_start = time.time()
     db = None
     try:
         db = next(get_db())
@@ -609,13 +745,21 @@ async def trends_stable_task():
         min_burst = getattr(settings, "trend_stable_min_burst", 1.5)
 
         clusters = db.query(TrendCluster).filter(
-            TrendCluster.status.in_(["emerging", "stable"])
+            TrendCluster.status.in_(["emerging", "stable"]),
+            TrendCluster.is_generic == False
         ).all()
 
         promoted = 0
         updated = 0
+        skipped_no_metrics = 0
+        skipped_freq = 0
+        skipped_sources = 0
+        skipped_burst = 0
+        skipped_generic = 0
 
         for cluster in clusters:
+            trends_stable_clusters_checked_total.inc()
+            
             metrics = (
                 db.query(TrendMetrics)
                 .filter(TrendMetrics.cluster_id == cluster.id)
@@ -623,13 +767,63 @@ async def trends_stable_task():
                 .first()
             )
             if not metrics:
+                skipped_no_metrics += 1
+                trends_stable_clusters_skipped_total.labels(reason="no_metrics").inc()
+                # Context7: Логируем причину пропуска для диагностики
+                logger.debug(
+                    "trends_stable_task_skipped",
+                    cluster_id=str(cluster.id),
+                    reason="no_metrics",
+                    label=cluster.label,
+                )
                 continue
 
+            # Context7: Проверяем пороги и логируем причины пропуска
             if (metrics.freq_long or 0) < min_freq:
+                skipped_freq += 1
+                trends_stable_clusters_skipped_total.labels(reason="freq_too_low").inc()
+                logger.debug(
+                    "trends_stable_task_skipped",
+                    cluster_id=str(cluster.id),
+                    reason="freq_too_low",
+                    freq_long=metrics.freq_long,
+                    min_freq=min_freq,
+                    label=cluster.label,
+                )
                 continue
             if (metrics.source_diversity or 0) < min_sources:
+                skipped_sources += 1
+                trends_stable_clusters_skipped_total.labels(reason="sources_too_low").inc()
+                logger.debug(
+                    "trends_stable_task_skipped",
+                    cluster_id=str(cluster.id),
+                    reason="sources_too_low",
+                    source_diversity=metrics.source_diversity,
+                    min_sources=min_sources,
+                    label=cluster.label,
+                )
                 continue
             if (metrics.burst_score or 0) < min_burst:
+                skipped_burst += 1
+                trends_stable_clusters_skipped_total.labels(reason="burst_too_low").inc()
+                logger.debug(
+                    "trends_stable_task_skipped",
+                    cluster_id=str(cluster.id),
+                    reason="burst_too_low",
+                    burst_score=metrics.burst_score,
+                    min_burst=min_burst,
+                    label=cluster.label,
+                )
+                continue
+            if cluster.is_generic:
+                skipped_generic += 1
+                trends_stable_clusters_skipped_total.labels(reason="is_generic").inc()
+                logger.debug(
+                    "trends_stable_task_skipped",
+                    cluster_id=str(cluster.id),
+                    reason="is_generic",
+                    label=cluster.label,
+                )
                 continue
 
             if cluster.status != "stable":
@@ -653,24 +847,40 @@ async def trends_stable_task():
                 db.flush()
                 cluster.resolved_trend_id = trend.id
                 promoted += 1
+                trends_stable_clusters_promoted_total.inc()
 
         if promoted or updated:
             db.commit()
         else:
             db.rollback()
 
+        task_duration = time.time() - task_start
+        trends_stable_task_duration_seconds.observe(task_duration)
+        trends_stable_task_runs_total.labels(outcome="success").inc()
+
         logger.info(
             "Trends stable task completed",
             clusters_checked=len(clusters),
             clusters_promoted=promoted,
             clusters_updated=updated,
+            skipped={
+                "no_metrics": skipped_no_metrics,
+                "freq_too_low": skipped_freq,
+                "sources_too_low": skipped_sources,
+                "burst_too_low": skipped_burst,
+                "is_generic": skipped_generic,
+            },
             thresholds={
                 "min_freq": min_freq,
                 "min_sources": min_sources,
                 "min_burst": min_burst,
             },
+            duration_seconds=round(task_duration, 2),
         )
     except Exception as e:
+        trends_stable_task_runs_total.labels(outcome="error").inc()
+        task_duration = time.time() - task_start
+        trends_stable_task_duration_seconds.observe(task_duration)
         if db:
             db.rollback()
         logger.error("Error in trends_stable_task", error=str(e), exc_info=True)

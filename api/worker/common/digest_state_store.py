@@ -14,7 +14,7 @@ import os
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Protocol
 
 import redis
@@ -413,6 +413,8 @@ class SupportsDigestState(Protocol):
     def load_metadata(self) -> Dict[str, Any]: ...
 
     def update_metadata(self, **kwargs: Any) -> None: ...
+    
+    def get_manifest(self) -> Dict[str, Any]: ...
 
 
 class DigestStateHandle(SupportsDigestState):
@@ -518,6 +520,58 @@ class DigestStateHandle(SupportsDigestState):
         self._metadata_cache = meta
         if self._lock:
             self._store.renew_lock(self._lock)
+    
+    def get_manifest(self) -> Dict[str, Any]:
+        """
+        Получить Unified State Manifest - полный JSON состояния пайплайна.
+        
+        Performance guardrails:
+        - Manifest хранит только ссылки (ids, hashes), а не full текст контента
+        - Большие артефакты в отдельных таблицах/файлах, manifest хранит artifact_id
+        - Ограничить размер manifest, например 50-100 KB
+        """
+        metadata = self.load_metadata()
+        stages = {}
+        
+        # Загружаем только метаданные стадий, не полные артефакты
+        for stage_name in ["ingest_validator", "thread_builder", "segmenter_agent", 
+                          "emotion_agent", "roles_agent", "topic_agent", 
+                          "synthesis_agent", "evaluation_agent", "delivery_manager"]:
+            stage_data = self.get_stage(stage_name)
+            if stage_data:
+                # Храним только ссылки и метаданные, не полный контент
+                stages[stage_name] = {
+                    "schema_version": stage_data.get("schema_version"),
+                    "metadata": stage_data.get("metadata", {}),
+                    "payload_size": len(str(stage_data.get("payload", {}))),
+                    # Не включаем полный payload для экономии места
+                }
+        
+        manifest = {
+            "tenant_id": self._tenant_id,
+            "group_id": self._group_id,
+            "window_id": self._window_id,
+            "digest_version": self._digest_version,
+            "schema_version": self._store.schema_version,
+            "metadata": metadata,
+            "stages": stages,
+            "created_at": metadata.get("updated_at") or datetime.now(timezone.utc).isoformat(),
+        }
+        
+        # Проверка размера manifest
+        manifest_size = len(str(manifest))
+        if manifest_size > 100 * 1024:  # 100 KB
+            logger.warning(
+                "digest_state.manifest_too_large",
+                size=manifest_size,
+                tenant_id=self._tenant_id,
+                window_id=self._window_id
+            )
+            # Урезаем stages до минимума
+            manifest["stages"] = {k: {"metadata": v.get("metadata", {})} 
+                                 for k, v in stages.items()}
+        
+        return manifest
 
 
 class DigestStateStoreFactory:

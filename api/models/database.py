@@ -1207,6 +1207,10 @@ class TrendCluster(Base):
     editor_notes = Column(Text, nullable=True)
     taxonomy_categories = Column(JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb"))
     last_edited_at = Column(DateTime(timezone=True), nullable=True)
+    is_generic = Column(Boolean, nullable=False, server_default=text("false"))
+    # Context7: Поля для иерархической кластеризации (двухуровневая структура)
+    parent_cluster_id = Column(UUID(as_uuid=True), ForeignKey("trend_clusters.id", ondelete="SET NULL"), nullable=True)  # Родительский кластер (NULL для level 1)
+    cluster_level = Column(Integer, nullable=False, server_default=text("1"))  # Уровень иерархии: 1 = основной топик, 2 = подтема
 
     resolved_trend = relationship("TrendDetection", backref="clusters")
 
@@ -1215,6 +1219,10 @@ class TrendCluster(Base):
         Index('idx_trend_clusters_last_activity', 'last_activity_at', postgresql_ops={'last_activity_at': 'DESC'}),
         Index('idx_trend_clusters_novelty', 'novelty_score', postgresql_ops={'novelty_score': 'DESC NULLS LAST'}),
         Index('idx_trend_clusters_quality_score', 'quality_score', postgresql_ops={'quality_score': 'DESC NULLS LAST'}),
+        # Context7: Индексы для иерархической кластеризации
+        Index('idx_trend_clusters_parent', 'parent_cluster_id'),
+        Index('idx_trend_clusters_level', 'cluster_level'),
+        Index('idx_trend_clusters_parent_level', 'parent_cluster_id', 'cluster_level'),
     )
 
 
@@ -1347,15 +1355,82 @@ class TrendThresholdSuggestion(Base):
     threshold_name = Column(String(64), nullable=False)  # 'TREND_FREQ_RATIO_THRESHOLD'
     current_value = Column(REAL, nullable=False)
     suggested_value = Column(REAL, nullable=False)
-    reasoning = Column(Text, nullable=True)
-    confidence = Column(REAL, nullable=True)
-    analysis_period_start = Column(DateTime(timezone=True), nullable=False)
-    analysis_period_end = Column(DateTime(timezone=True), nullable=False)
-    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
-    status = Column(String(32), nullable=False, server_default="'pending'")  # 'pending', 'accepted', 'rejected'
+    reasoning = Column(Text, nullable=True)  # Объяснение предложения
+    confidence = Column(REAL, nullable=True)  # Уверенность в предложении (0.0-1.0)
+    analysis_period_start = Column(DateTime(timezone=True), nullable=False)  # Начало периода анализа
+    analysis_period_end = Column(DateTime(timezone=True), nullable=False)  # Конец периода анализа
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())  # Время создания предложения
+    status = Column(String(32), nullable=False, default="pending")  # 'pending', 'accepted', 'rejected'
     
     __table_args__ = (
         Index('idx_trend_threshold_suggestions_status', 'status'),
         Index('idx_trend_threshold_suggestions_created_at', 'created_at', postgresql_ops={'created_at': 'DESC'}),
         Index('idx_trend_threshold_suggestions_threshold_name', 'threshold_name'),
+    )
+
+
+class EpisodicMemory(Base):
+    """Episodic Memory Layer - история действий, ошибок и попыток для self-tuning.
+    
+    Performance guardrails:
+    - Логируем только высокоуровневые события: run_started/run_completed/error/retry
+    - Retention: 30-90 дней (настраивается через TTL/partitioning)
+    - Индексы только по полям для чтения: tenant_id, entity_type, created_at
+    """
+    __tablename__ = "episodic_memory"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
+    entity_type = Column(String(50), nullable=False)  # 'digest', 'trend', 'enrichment', 'indexing', 'rag'
+    entity_id = Column(UUID(as_uuid=True), nullable=True)  # ID сущности (digest_id, trend_id и т.д.)
+    event_type = Column(String(50), nullable=False)  # 'run_started', 'run_completed', 'error', 'retry', 'quality_low'
+    event_metadata = Column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))  # Детали события (metadata - зарезервированное слово в SQLAlchemy)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), index=True)
+    
+    # Relationships
+    tenant = relationship("Tenant", backref="episodic_memories")
+    
+    __table_args__ = (
+        Index('idx_episodic_memory_tenant_entity', 'tenant_id', 'entity_type', 'created_at', postgresql_ops={'created_at': 'DESC'}),
+        Index('idx_episodic_memory_entity', 'entity_type', 'entity_id', 'created_at', postgresql_ops={'created_at': 'DESC'}),
+        Index('idx_episodic_memory_event_type', 'event_type', 'created_at', postgresql_ops={'created_at': 'DESC'}),
+        # Partitioning hint: можно добавить partition by tenant_id и created_at для больших объемов
+    )
+
+
+class DLQEvent(Base):
+    """Dead Letter Queue - события, которые не удалось обработать после всех попыток.
+    
+    Performance guardrails:
+    - max_attempts per event (например 3)
+    - Поле next_retry_at и exponential backoff
+    - Если превышено - помечаем event как permanent_failure, только ручной разбор
+    """
+    __tablename__ = "dlq_events"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
+    entity_type = Column(String(50), nullable=False)  # 'digest', 'trend', 'enrichment', 'indexing', 'rag'
+    entity_id = Column(UUID(as_uuid=True), nullable=True)
+    event_type = Column(String(100), nullable=False)  # Тип исходного события
+    payload = Column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
+    error_code = Column(String(100), nullable=True)
+    error_message = Column(Text, nullable=True)
+    stack_trace = Column(Text, nullable=True)
+    retry_count = Column(Integer, nullable=False, default=0)
+    max_attempts = Column(Integer, nullable=False, default=3)
+    next_retry_at = Column(DateTime(timezone=True), nullable=True)
+    first_seen_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    last_attempt_at = Column(DateTime(timezone=True), nullable=True)
+    status = Column(String(32), nullable=False, default="pending")  # 'pending', 'reprocessed', 'permanent_failure'
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    
+    # Relationships
+    tenant = relationship("Tenant", backref="dlq_events")
+    
+    __table_args__ = (
+        Index('idx_dlq_events_tenant_status', 'tenant_id', 'status', 'next_retry_at'),
+        Index('idx_dlq_events_entity', 'entity_type', 'entity_id'),
+        Index('idx_dlq_events_status', 'status', 'next_retry_at'),
+        Index('idx_dlq_events_retry_count', 'retry_count', 'max_attempts'),
     )

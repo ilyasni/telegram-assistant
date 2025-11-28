@@ -164,6 +164,10 @@ class TrendClusterResponse(BaseModel):
     resolved_trend_id: Optional[UUID]
     latest_metrics: Optional[TrendMetricsResponse] = None
     card: Optional[TrendCard] = None
+    # Context7: Поля для иерархической кластеризации
+    parent_cluster_id: Optional[UUID] = None
+    cluster_level: int = 1
+    subclusters: Optional[List["TrendClusterResponse"]] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -237,6 +241,40 @@ def _parse_window_param(window: str) -> timedelta:
     raise HTTPException(status_code=422, detail="Unsupported window unit")
 
 
+# Стоп-слова для фильтрации generic-трендов (синхронизировано с worker)
+DEFAULT_TREND_STOPWORDS = {
+    "можно", "тащусь", "рублей", "сервис", "крупнейший", "мужчина", "женщина",
+    "первый", "просто", "очень", "сегодня", "которые", "начали", "против", "начнут",
+}
+EXPANDED_STOPWORDS = {
+    "это", "как", "так", "его", "еще", "уже", "ли", "или", "для", "при", "без",
+    "по", "во", "на", "в", "и", "а", "но", "же", "то", "не", "ни", "да",
+    "к", "ко", "из", "под", "над", "от", "до", "если", "то", "чтобы",
+    "почти", "вышел", "вышла", "своего", "свои", "наш", "ваш", "их", "его",
+    "могут", "может", "нужно", "надо", "будет", "есть", "нет",
+    "the", "a", "an", "and", "or", "of", "in", "on", "to", "is", "are", "was", "were",
+}
+TREND_STOPWORDS = DEFAULT_TREND_STOPWORDS | EXPANDED_STOPWORDS
+
+
+def _is_generic_trend_keyword(keyword: str) -> bool:
+    """
+    Проверяет, является ли keyword generic-трендом.
+    Использует ту же логику, что и TrendDetectionWorker._is_generic_label.
+    """
+    if not keyword:
+        return True
+    lower = keyword.lower().strip()
+    if lower in TREND_STOPWORDS:
+        return True
+    if len(lower) < 4:
+        return True
+    # одиночное слово без хэштега/сущности
+    if " " not in lower and not lower.startswith("#"):
+        return True
+    return False
+
+
 def _json_dict(data: Any) -> Dict[str, Any]:
     if not data:
         return {}
@@ -263,9 +301,16 @@ def _build_trend_card(cluster: TrendCluster) -> Optional[TrendCard]:
         if len(s) < 4:
             return True
         low = s.lower()
-        generic = {"trend", "тренд", "индивидуальные", "работы"}
+        generic = {"trend", "тренд", "индивидуальные", "работы", "жизнь летаю"}
         if low in generic:
             return True
+        # Проверка на бессмысленные комбинации слов (типа "жизнь летаю")
+        if " " in s:
+            words = s.split()
+            if len(words) == 2:
+                # Проверяем, не являются ли оба слова стоп-словами или generic
+                if all(w.lower() in TREND_STOPWORDS or len(w) < 4 for w in words):
+                    return True
         if " " not in s and not s.startswith("#"):
             return True
         return False
@@ -305,8 +350,15 @@ def _build_trend_card(cluster: TrendCluster) -> Optional[TrendCard]:
         coherence=cluster.coherence_score,
     )
     raw_payload = _json_dict(cluster.card_payload)
-    # Санитизация заголовка: если generic — пытаемся вывести более содержательный
-    base_title = cluster.label or cluster.primary_topic
+    # Санитизация заголовка: приоритет primary_topic над label, если label generic
+    # Context7: label может быть устаревшим или generic, primary_topic более актуален
+    if cluster.label and not _is_generic_title(cluster.label):
+        base_title = cluster.label
+    elif cluster.primary_topic and not _is_generic_title(cluster.primary_topic):
+        base_title = cluster.primary_topic
+    else:
+        base_title = cluster.label or cluster.primary_topic
+    
     if _is_generic_title(base_title):
         derived = _derive_better_title(raw_payload)
         if derived and not _is_generic_title(derived):
@@ -635,6 +687,10 @@ def _cluster_to_response(
         resolved_trend_id=cluster.resolved_trend_id,
         latest_metrics=metrics_payload,
         card=_build_trend_card(cluster),
+        # Context7: Поля для иерархической кластеризации
+        parent_cluster_id=cluster.parent_cluster_id,
+        cluster_level=cluster.cluster_level,
+        subclusters=None,  # Загружается отдельно при необходимости
     )
 
 
@@ -788,12 +844,37 @@ async def get_emerging_trends(
 ):
     """Получить список emerging кластеров трендов."""
     window_delta = _parse_window_param(window)
+    # Context7: Для emerging трендов расширяем окно до 24 часов, если трендов в окне window нет
     cutoff = datetime.now(timezone.utc) - window_delta
+    # Context7: Для emerging трендов ослабляем фильтры - quality_score может быть NULL
+    min_quality = float(os.getenv("TREND_EMERGING_MIN_QUALITY_SCORE", "0.3"))  # Ослабляем для emerging
     base_query = (
         db.query(TrendCluster)
         .filter(TrendCluster.status == "emerging")
-        .filter(TrendCluster.last_activity_at >= cutoff)
+        .filter(TrendCluster.is_generic == False)
+        .filter(
+            # Quality score может быть NULL или >= min_quality (NULL считается валидным для emerging)
+            (TrendCluster.quality_score.is_(None)) | (TrendCluster.quality_score >= min_quality)
+        )
+        # Summary может быть NULL для emerging трендов (еще не обработаны)
+        # .filter(TrendCluster.summary.isnot(None))  # Убираем строгий фильтр для emerging
     )
+    # Context7: Применяем фильтры по min_sources и min_burst к кластерам TrendCluster
+    if min_sources > 0:
+        base_query = base_query.filter(TrendCluster.sources_count >= min_sources)
+    if min_burst > 0:
+        base_query = base_query.filter(TrendCluster.burst_score >= min_burst)
+    
+    # Context7: Применяем окно, но расширяем до 7 дней, если в окне window нет трендов
+    base_query_window = base_query.filter(TrendCluster.last_activity_at >= cutoff)
+    clusters_in_window = base_query_window.count()
+    if clusters_in_window == 0:
+        # Расширяем окно до 7 дней для emerging трендов, если нет свежих
+        cutoff_7d = datetime.now(timezone.utc) - timedelta(days=7)
+        logger.info("No emerging clusters in window, expanding to 7 days", window=window, cutoff=cutoff)
+        base_query = base_query.filter(TrendCluster.last_activity_at >= cutoff_7d)
+    else:
+        base_query = base_query_window
     if user_id:
         try:
             trends_personal_requests_total.labels(endpoint="emerging", outcome="requested").inc()
@@ -807,8 +888,114 @@ async def get_emerging_trends(
         .all()
     )
 
+    # Context7: Fallback на TrendDetection, если кластеров нет
+    if not clusters:
+        logger.info("No emerging clusters found, falling back to TrendDetection", window=window)
+        cutoff = datetime.now(timezone.utc) - window_delta
+        # Context7: Берем больше трендов, чтобы после фильтрации generic осталось достаточно
+        trend_detections = (
+            db.query(TrendDetection)
+            .filter(TrendDetection.status == "active")
+            .filter(TrendDetection.detected_at >= cutoff)
+            .order_by(TrendDetection.detected_at.desc())
+            .limit(page_size * 5)  # Увеличиваем лимит для компенсации фильтрации
+            .all()
+        )
+        if trend_detections:
+            # Конвертируем TrendDetection в TrendClusterResponse с фильтрацией
+            responses = []
+            window_minutes = int(window_delta.total_seconds() / 60)  # Используем window вместо разницы first/last
+            for td in trend_detections:
+                # Context7: Фильтрация generic-слов
+                if _is_generic_trend_keyword(td.trend_keyword):
+                    continue
+                
+                # Context7: Фильтрация по min_sources
+                source_count = len(td.channels_affected or [])
+                if source_count < min_sources:
+                    continue
+                
+                # Context7: Фильтрация по min_burst (ослабляем для emerging - допускаем 0.0 если нет данных)
+                burst = td.growth_rate or 0.0
+                if min_burst > 0 and burst > 0 and burst < min_burst:
+                    continue
+                
+                # Создаем минимальную карточку с правильным окном
+                end_time = td.last_mentioned_at or td.detected_at or datetime.now(timezone.utc)
+                start_time = end_time - window_delta
+                
+                time_window = TrendTimeWindow(
+                    start=start_time,
+                    end=end_time,
+                    duration_minutes=window_minutes
+                )
+                
+                card = TrendCard(
+                    title=td.trend_keyword,
+                    summary=f"Тренд обнаружен: {td.trend_keyword}",
+                    topics=[td.trend_keyword],
+                    keywords=[td.trend_keyword],
+                    time_window=time_window,
+                    stats=TrendStats(
+                        mentions=td.frequency_count,
+                        baseline=0,
+                        burst_score=burst,
+                        sources=source_count,
+                        channels=source_count,
+                        coherence=None
+                    ),
+                    why_important=f"Частота упоминаний: {td.frequency_count}, Engagement: {td.engagement_score or 0.0}",
+                    example_posts=[]
+                )
+                # Создаем упрощенный TrendClusterResponse
+                import uuid
+                cluster_key = str(td.id)[:32]  # Используем первые 32 символа UUID как cluster_key
+                responses.append(TrendClusterResponse(
+                    id=td.id,
+                    cluster_key=cluster_key,
+                    status="emerging",
+                    label=td.trend_keyword,
+                    summary=f"Тренд обнаружен: {td.trend_keyword}",
+                    primary_topic=td.trend_keyword,
+                    keywords=[td.trend_keyword],
+                    topics=[td.trend_keyword],
+                    novelty_score=None,
+                    coherence_score=None,
+                    source_diversity=source_count,
+                    first_detected_at=td.first_mentioned_at,
+                    last_activity_at=td.last_mentioned_at or td.detected_at,
+                    resolved_trend_id=None,
+                    latest_metrics=None,
+                    card=card
+                ))
+                if len(responses) >= page_size:
+                    break  # Ограничиваем количество после фильтрации
+            logger.info("Using TrendDetection fallback for emerging trends", count=len(responses), filtered=len(trend_detections) - len(responses))
+            return TrendClusterListResponse(
+                clusters=responses,
+                total=len(responses),
+                page=page,
+                page_size=page_size,
+                window=window,
+            )
+
     # Context7: Фильтрация через QA-агента перед показом
-    clusters = await _filter_trends_with_qa(clusters, user_id, db, limit=page_size * 2)
+    # Временно отключаем QA-фильтрацию для диагностики - она может отсеивать все тренды
+    qa_enabled = os.getenv("TREND_QA_ENABLED", "true").lower() == "true"
+    if qa_enabled and len(clusters) > 0:
+        # Пробуем QA-фильтрацию, но если она отсеяла все - используем исходные кластеры
+        filtered_clusters = await _filter_trends_with_qa(clusters, user_id, db, limit=page_size * 2)
+        if len(filtered_clusters) > 0:
+            clusters = filtered_clusters
+        else:
+            logger.warning(
+                "QA filter removed all clusters, using original clusters",
+                original_count=len(clusters),
+                user_id=str(user_id) if user_id else None
+            )
+            clusters = clusters[:page_size * 2]  # Ограничиваем без QA-фильтрации
+    else:
+        clusters = clusters[:page_size * 2]
 
     metrics_map = _load_latest_metrics_map(db, clusters)
     responses: List[TrendClusterResponse] = []
@@ -822,9 +1009,16 @@ async def get_emerging_trends(
         base = _cluster_to_response(cluster, metric)
         # персонализация (фильтрация по каналам пользователя)
         card = _apply_personalization(db, cluster, base.card, user_id) if base.card else None
+        # Context7: Если персонализация дала пустой результат, показываем базовую карточку
+        # Это улучшает UX - пользователь видит тренды, даже если они не из его каналов
         if user_id and card and card.stats.mentions <= 0:
-            # пусто для данного пользователя — пропускаем
-            continue
+            # Используем базовую карточку вместо персонализированной, если персонализация пуста
+            card = base.card
+            logger.debug(
+                "Using base card for cluster (personalization empty)",
+                cluster_id=str(cluster.id),
+                user_id=str(user_id)
+            )
         responses.append(
             TrendClusterResponse(
                 **{**base.model_dump(), "card": card or base.card}
@@ -851,15 +1045,37 @@ async def list_trend_clusters(
     window: Optional[str] = Query(
         None, description="Окно анализа тренда (формат: 30m, 3h, 7d)", pattern="^[0-9]+[mhd]$"
     ),
+    min_frequency: Optional[int] = Query(None, ge=0, description="Минимум упоминаний (window_mentions)"),
     page: int = Query(1, ge=1, description="Номер страницы"),
     page_size: int = Query(20, ge=1, le=100, description="Размер страницы"),
     user_id: Optional[UUID] = Query(None, description="Персонализация по user_id"),
+    include_subtopics: bool = Query(False, description="Включить подтемы (sub-clusters) в ответ"),
     db: Session = Depends(get_db),
 ):
     """Получить список кластеров трендов."""
+    min_quality = float(os.getenv("TREND_MIN_QUALITY_SCORE", "0.5"))
     query = db.query(TrendCluster)
     if status:
         query = query.filter(TrendCluster.status == status)
+    # Quality filters
+    query = query.filter(TrendCluster.is_generic == False)
+    # Context7: Для stable трендов ослабляем фильтр quality_score - если нет stable, fallback на emerging
+    if status == "stable":
+        query = query.filter(TrendCluster.quality_score >= min_quality)
+        query = query.filter(TrendCluster.summary.isnot(None))
+    else:
+        # Для emerging и других статусов используем ослабленные фильтры
+        min_quality_emerging = float(os.getenv("TREND_EMERGING_MIN_QUALITY_SCORE", "0.3"))
+        query = query.filter(
+            (TrendCluster.quality_score.is_(None)) | (TrendCluster.quality_score >= min_quality_emerging)
+        )
+        # Summary может быть NULL для emerging
+    # Context7: Фильтр по min_frequency (window_mentions)
+    if min_frequency and min_frequency > 0:
+        query = query.filter(TrendCluster.window_mentions >= min_frequency)
+    # Context7: По умолчанию показываем только основные кластеры (не подтемы)
+    if not include_subtopics:
+        query = query.filter(TrendCluster.cluster_level == 1)
     requested_window = None
     if window:
         window_delta = _parse_window_param(window)
@@ -867,30 +1083,206 @@ async def list_trend_clusters(
         cutoff = datetime.now(timezone.utc) - window_delta
         query = query.filter(TrendCluster.last_activity_at >= cutoff)
 
-    total = query.count()
+    # Context7: Fallback на emerging кластеры, если stable нет и запрошен status=stable
     offset = (page - 1) * page_size
-    clusters = (
-        query.order_by(TrendCluster.last_activity_at.desc())
-        .offset(offset)
-        .limit(page_size * 2)  # Берём больше для фильтрации
-        .all()
-    )
+    if status == "stable":
+        stable_count = query.count()
+        if stable_count == 0:
+            logger.info("No stable clusters found, falling back to emerging clusters", user_id=str(user_id) if user_id else None)
+            # Переключаемся на emerging кластеры с ослабленными фильтрами
+            fallback_query = db.query(TrendCluster)
+            fallback_query = fallback_query.filter(TrendCluster.status == "emerging")
+            fallback_query = fallback_query.filter(TrendCluster.is_generic == False)
+            # Ослабляем фильтр quality_score для emerging
+            min_quality_emerging = float(os.getenv("TREND_EMERGING_MIN_QUALITY_SCORE", "0.3"))
+            fallback_query = fallback_query.filter(
+                (TrendCluster.quality_score.is_(None)) | (TrendCluster.quality_score >= min_quality_emerging)
+            )
+            # Summary может быть NULL для emerging
+            # fallback_query = fallback_query.filter(TrendCluster.summary.isnot(None))  # Убираем для emerging
+            if not include_subtopics:
+                fallback_query = fallback_query.filter(TrendCluster.cluster_level == 1)
+            if window:
+                window_delta = _parse_window_param(window)
+                cutoff = datetime.now(timezone.utc) - window_delta
+                fallback_query = fallback_query.filter(TrendCluster.last_activity_at >= cutoff)
+            # Context7: Применяем фильтр min_frequency к fallback на emerging
+            if min_frequency and min_frequency > 0:
+                fallback_query = fallback_query.filter(TrendCluster.window_mentions >= min_frequency)
+            total = fallback_query.count()
+            clusters = (
+                fallback_query.order_by(TrendCluster.last_activity_at.desc())
+                .offset(offset)
+                .limit(page_size)
+                .all()
+            )
+            status = "emerging"  # Обновляем статус для ответа
+            if clusters:
+                logger.info("Using emerging clusters as fallback for stable", count=len(clusters), user_id=str(user_id) if user_id else None)
+        else:
+            total = stable_count
+            clusters = (
+                query.order_by(TrendCluster.last_activity_at.desc())
+                .offset(offset)
+                .limit(page_size)
+                .all()
+            )
+    else:
+        total = query.count()
+        clusters = (
+            query.order_by(TrendCluster.last_activity_at.desc())
+            .offset(offset)
+            .limit(page_size)
+            .all()
+        )
     
+    # Context7: Fallback на TrendDetection, если кластеров нет ДО фильтрации
+    if total == 0:
+        logger.info("No clusters found, falling back to TrendDetection", status=status, window=requested_window)
+        from datetime import datetime, timedelta, timezone
+        cutoff = datetime.now(timezone.utc) - timedelta(days=7)  # По умолчанию 7 дней
+        if requested_window:
+            window_delta = _parse_window_param(requested_window)
+            cutoff = datetime.now(timezone.utc) - window_delta
+        
+        trend_detections = (
+            db.query(TrendDetection)
+            .filter(TrendDetection.status == "active")
+            .filter(TrendDetection.detected_at >= cutoff)
+            .order_by(TrendDetection.detected_at.desc())
+            .limit(page_size * 2)  # Берем больше, чтобы после фильтрации осталось достаточно
+            .all()
+        )
+        if trend_detections:
+            # Конвертируем TrendDetection в TrendClusterResponse
+            responses = []
+            for td in trend_detections:
+                # Фильтруем generic-тренды
+                if _is_generic_trend_keyword(td.trend_keyword):
+                    continue
+                # Ограничиваем количество после фильтрации
+                if len(responses) >= page_size:
+                    break
+                # Создаем минимальную карточку
+                start_time = td.first_mentioned_at or td.detected_at
+                end_time = td.last_mentioned_at or td.detected_at
+                duration_minutes = int((end_time - start_time).total_seconds() / 60) if start_time and end_time else 0
+                
+                time_window = TrendTimeWindow(
+                    start=start_time,
+                    end=end_time,
+                    duration_minutes=duration_minutes
+                )
+                
+                card = TrendCard(
+                    title=td.trend_keyword,
+                    summary=f"Тренд обнаружен: {td.trend_keyword}",
+                    topics=[td.trend_keyword],
+                    keywords=[td.trend_keyword],
+                    time_window=time_window,
+                    stats=TrendStats(
+                        mentions=td.frequency_count,
+                        baseline=0,
+                        burst_score=td.growth_rate or 0.0,
+                        sources=len(td.channels_affected or []),
+                        channels=len(td.channels_affected or []),
+                        coherence=None
+                    ),
+                    why_important=f"Частота упоминаний: {td.frequency_count}, Engagement: {td.engagement_score or 0.0}",
+                    example_posts=[]
+                )
+                # Создаем упрощенный TrendClusterResponse
+                import uuid
+                cluster_key = str(td.id)[:32]
+                responses.append(TrendClusterResponse(
+                    id=td.id,
+                    cluster_key=cluster_key,
+                    status=status or "stable",
+                    label=td.trend_keyword,
+                    summary=f"Тренд обнаружен: {td.trend_keyword}",
+                    primary_topic=td.trend_keyword,
+                    keywords=[td.trend_keyword],
+                    topics=[td.trend_keyword],
+                    novelty_score=None,
+                    coherence_score=None,
+                    source_diversity=len(td.channels_affected or []),
+                    first_detected_at=td.first_mentioned_at,
+                    last_activity_at=td.last_mentioned_at or td.detected_at,
+                    resolved_trend_id=None,
+                    latest_metrics=None,
+                    card=card
+                ))
+            # Context7: Подсчитываем total после фильтрации generic-трендов
+            # Берем все тренды и фильтруем в памяти для точного подсчета
+            all_trends = (
+                db.query(TrendDetection)
+                .filter(TrendDetection.status == "active")
+                .filter(TrendDetection.detected_at >= cutoff)
+                .all()
+            )
+            total = sum(1 for td in all_trends if not _is_generic_trend_keyword(td.trend_keyword))
+            logger.info("Using TrendDetection fallback for clusters", count=len(responses), total=total, filtered_from=len(all_trends))
+            return TrendClusterListResponse(
+                clusters=responses,
+                total=total,
+                page=page,
+                page_size=page_size,
+                window=requested_window,
+            )
+
     # Context7: Фильтрация через QA-агента перед показом
-    clusters = await _filter_trends_with_qa(clusters, user_id, db, limit=page_size)
+    # Пробуем QA-фильтрацию, но если она отсеяла все - используем исходные кластеры
+    qa_enabled = os.getenv("TREND_QA_ENABLED", "true").lower() == "true"
+    if qa_enabled and len(clusters) > 0:
+        filtered_clusters = await _filter_trends_with_qa(clusters, user_id, db, limit=page_size)
+        if len(filtered_clusters) > 0:
+            clusters = filtered_clusters
+        else:
+            logger.warning(
+                "QA filter removed all clusters, using original clusters",
+                original_count=len(clusters),
+                user_id=str(user_id) if user_id else None,
+                status=status
+            )
+            clusters = clusters[:page_size]  # Ограничиваем без QA-фильтрации
+    else:
+        clusters = clusters[:page_size]
     
     metrics_map = _load_latest_metrics_map(db, clusters)
     responses: List[TrendClusterResponse] = []
     for cluster in clusters:
         base = _cluster_to_response(cluster, metrics_map.get(cluster.id))
         card = _apply_personalization(db, cluster, base.card, user_id) if base.card else None
+        # Context7: Если персонализация дала пустой результат, показываем базовую карточку
         if user_id and card and card.stats.mentions <= 0:
-            continue
-        responses.append(
-            TrendClusterResponse(
-                **{**base.model_dump(), "card": card or base.card}
+            card = base.card
+            logger.debug(
+                "Using base card for cluster (personalization empty)",
+                cluster_id=str(cluster.id),
+                user_id=str(user_id)
             )
-        )
+        
+        response_data = {**base.model_dump(), "card": card or base.card}
+        
+        # Context7: Загружаем подтемы (sub-clusters), если запрошено
+        if include_subtopics:
+            subclusters = (
+                db.query(TrendCluster)
+                .filter(TrendCluster.parent_cluster_id == cluster.id)
+                .filter(TrendCluster.status == "active")
+                .order_by(TrendCluster.last_activity_at.desc())
+                .limit(10)  # Ограничиваем количество подтем
+                .all()
+            )
+            if subclusters:
+                subcluster_responses = []
+                for subcluster in subclusters:
+                    sub_metric = metrics_map.get(subcluster.id)
+                    sub_base = _cluster_to_response(subcluster, sub_metric)
+                    subcluster_responses.append(sub_base)
+                response_data["subclusters"] = subcluster_responses
+        
+        responses.append(TrendClusterResponse(**response_data))
     if user_id:
         try:
             trends_personal_requests_total.labels(endpoint="clusters", outcome="success").inc()
@@ -910,20 +1302,84 @@ async def list_trend_clusters(
 async def get_trend_cluster(
     cluster_id: UUID,
     user_id: Optional[UUID] = Query(None, description="Персонализация по user_id"),
+    include_subtopics: bool = Query(False, description="Включить подтемы (sub-clusters) в ответ"),
     db: Session = Depends(get_db),
 ):
     """Получить информацию о кластере тренда."""
     cluster = db.query(TrendCluster).filter(TrendCluster.id == cluster_id).first()
     if not cluster:
+        # Context7: Fallback на TrendDetection, если кластер не найден
+        trend_detection = db.query(TrendDetection).filter(TrendDetection.id == cluster_id).first()
+        if trend_detection:
+            # Конвертируем TrendDetection в TrendClusterResponse
+            window_delta = timedelta(hours=3)  # По умолчанию 3 часа для emerging
+            window_minutes = int(window_delta.total_seconds() / 60)
+            end_time = trend_detection.last_mentioned_at or trend_detection.detected_at or datetime.now(timezone.utc)
+            start_time = end_time - window_delta
+            
+            time_window = TrendTimeWindow(
+                start=start_time,
+                end=end_time,
+                duration_minutes=window_minutes
+            )
+            
+            source_count = len(trend_detection.channels_affected or [])
+            burst = trend_detection.growth_rate or 0.0
+            
+            card = TrendCard(
+                title=trend_detection.trend_keyword,
+                summary=f"Тренд обнаружен: {trend_detection.trend_keyword}",
+                topics=[trend_detection.trend_keyword],
+                keywords=[trend_detection.trend_keyword],
+                time_window=time_window,
+                stats=TrendStats(
+                    mentions=trend_detection.frequency_count,
+                    baseline=0,
+                    burst_score=burst,
+                    sources=source_count,
+                    channels=source_count,
+                    coherence=None
+                ),
+                why_important=f"Частота упоминаний: {trend_detection.frequency_count}, Engagement: {trend_detection.engagement_score or 0.0}",
+                example_posts=[]
+            )
+            
+            cluster_key = str(trend_detection.id)[:32]
+            return TrendClusterResponse(
+                id=trend_detection.id,
+                cluster_key=cluster_key,
+                status="emerging",
+                label=trend_detection.trend_keyword,
+                summary=f"Тренд обнаружен: {trend_detection.trend_keyword}",
+                primary_topic=trend_detection.trend_keyword,
+                keywords=[trend_detection.trend_keyword],
+                topics=[trend_detection.trend_keyword],
+                novelty_score=None,
+                coherence_score=None,
+                source_diversity=source_count,
+                first_detected_at=trend_detection.first_mentioned_at,
+                last_activity_at=trend_detection.last_mentioned_at or trend_detection.detected_at,
+                resolved_trend_id=None,
+                latest_metrics=None,
+                card=card
+            )
         raise HTTPException(status_code=404, detail="Trend cluster not found")
     
-    # Context7: Проверка через QA-агента
+    # Context7: Проверка через QA-агента (ослаблена - не блокируем показ)
     user_profile = None
     if user_id:
         user_profile = _load_user_profile(db, user_id)
-    qa_result = await _call_qa_agent(cluster, user_id, user_profile, db)
-    if not qa_result or not qa_result.get("should_show", True):
-        raise HTTPException(status_code=404, detail="Trend cluster not available")
+    qa_enabled = os.getenv("TREND_QA_ENABLED", "true").lower() == "true"
+    if qa_enabled:
+        qa_result = await _call_qa_agent(cluster, user_id, user_profile, db)
+        if not qa_result or not qa_result.get("should_show", True):
+            # Context7: Не блокируем показ кластера, только логируем
+            logger.debug(
+                "QA agent filtered cluster, but showing anyway",
+                cluster_id=str(cluster.id),
+                user_id=str(user_id) if user_id else None,
+                reason=qa_result.get("reasoning", "unknown") if qa_result else "no_result"
+            )
     
     metric = (
         db.query(TrendMetrics)
@@ -933,12 +1389,40 @@ async def get_trend_cluster(
     )
     base = _cluster_to_response(cluster, metric)
     card = _apply_personalization(db, cluster, base.card, user_id) if base.card else None
+    # Context7: Если персонализация дала пустой результат, показываем базовую карточку
     if user_id and card and card.stats.mentions <= 0:
-        # Возвращаем 404, если кластер пуст для пользователя
-        raise HTTPException(status_code=404, detail="Trend cluster not found for this user")
-    return TrendClusterResponse(
-        **{**base.model_dump(), "card": card or base.card}
-    )
+        card = base.card
+        logger.debug(
+            "Using base card for cluster (personalization empty)",
+            cluster_id=str(cluster.id),
+            user_id=str(user_id)
+        )
+    
+    response_data = {**base.model_dump(), "card": card or base.card}
+    
+    # Context7: Загружаем подтемы (sub-clusters), если запрошено
+    if include_subtopics:
+        subclusters = (
+            db.query(TrendCluster)
+            .filter(TrendCluster.parent_cluster_id == cluster.id)
+            .filter(TrendCluster.status == "active")
+            .order_by(TrendCluster.last_activity_at.desc())
+            .all()
+        )
+        if subclusters:
+            subcluster_responses = []
+            for subcluster in subclusters:
+                sub_metric = (
+                    db.query(TrendMetrics)
+                    .filter(TrendMetrics.cluster_id == subcluster.id)
+                    .order_by(TrendMetrics.metrics_at.desc())
+                    .first()
+                )
+                sub_base = _cluster_to_response(subcluster, sub_metric)
+                subcluster_responses.append(sub_base)
+            response_data["subclusters"] = subcluster_responses
+    
+    return TrendClusterResponse(**response_data)
 
 
 @router.get("/", response_model=TrendListResponse)
@@ -954,9 +1438,14 @@ async def get_trends(
     """Получить устойчивые тренды на основе кластеров."""
     try:
         cluster_status = status or "stable"
+        min_quality = float(os.getenv("TREND_MIN_QUALITY_SCORE", "0.5"))
         query = db.query(TrendCluster)
         if cluster_status:
             query = query.filter(TrendCluster.status == cluster_status)
+        # Quality filters
+        query = query.filter(TrendCluster.is_generic == False)
+        query = query.filter(TrendCluster.quality_score >= min_quality)
+        query = query.filter(TrendCluster.summary.isnot(None))
         if min_frequency:
             query = query.filter(TrendCluster.window_mentions >= min_frequency)
         if min_growth > 0:
@@ -973,7 +1462,13 @@ async def get_trends(
             .all()
         )
         if not clusters and cluster_status == "stable":
-            fallback_query = db.query(TrendCluster).filter(TrendCluster.status == "emerging")
+            fallback_query = (
+                db.query(TrendCluster)
+                .filter(TrendCluster.status == "emerging")
+                .filter(TrendCluster.is_generic == False)
+                .filter(TrendCluster.quality_score >= min_quality)
+                .filter(TrendCluster.summary.isnot(None))
+            )
             fallback_total = fallback_query.count()
             clusters = (
                 fallback_query.order_by(TrendCluster.last_activity_at.desc())
@@ -984,6 +1479,60 @@ async def get_trends(
             if clusters:
                 total = fallback_total
                 cluster_status = "emerging"
+        
+        # Context7: Fallback на TrendDetection, если кластеров нет
+        if not clusters:
+            logger.info("No clusters found, falling back to TrendDetection")
+            from datetime import datetime, timedelta, timezone
+            cutoff_7d = datetime.now(timezone.utc) - timedelta(days=7)
+            # Context7: Берем больше трендов для компенсации фильтрации generic
+            trend_detections = (
+                db.query(TrendDetection)
+                .filter(TrendDetection.status == "active")
+                .filter(TrendDetection.detected_at >= cutoff_7d)
+                .order_by(TrendDetection.detected_at.desc())
+                .limit(page_size * 3)  # Увеличиваем лимит для компенсации фильтрации
+                .all()
+            )
+            if trend_detections:
+                # Конвертируем TrendDetection в TrendResponse с фильтрацией generic-трендов
+                trends_response = []
+                for td in trend_detections:
+                    # Фильтруем generic-тренды
+                    if _is_generic_trend_keyword(td.trend_keyword):
+                        continue
+                    # Ограничиваем количество после фильтрации
+                    if len(trends_response) >= page_size:
+                        break
+                    trends_response.append(TrendResponse(
+                        id=td.id,
+                        trend_keyword=td.trend_keyword,
+                        frequency_count=td.frequency_count,
+                        growth_rate=td.growth_rate,
+                        engagement_score=td.engagement_score,
+                        first_mentioned_at=td.first_mentioned_at,
+                        last_mentioned_at=td.last_mentioned_at,
+                        channels_affected=td.channels_affected or [],
+                        posts_sample=td.posts_sample or [],
+                        detected_at=td.detected_at,
+                        status=td.status
+                    ))
+                # Context7: Подсчитываем total после фильтрации generic-трендов
+                all_trends = (
+                    db.query(TrendDetection)
+                    .filter(TrendDetection.status == "active")
+                    .filter(TrendDetection.detected_at >= cutoff_7d)
+                    .all()
+                )
+                total = sum(1 for td in all_trends if not _is_generic_trend_keyword(td.trend_keyword))
+                logger.info("Using TrendDetection fallback for trends", count=len(trends_response), total=total, filtered_from=len(all_trends))
+                return TrendListResponse(
+                    trends=trends_response,
+                    total=total,
+                    page=page,
+                    page_size=page_size,
+                )
+        
         trends_response = [_cluster_card_to_trend_response(cluster) for cluster in clusters]
         
         logger.info(

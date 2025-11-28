@@ -153,6 +153,7 @@ async def set_bot_commands() -> None:
             BotCommand(command="add_channel", description="Добавить канал"),
             BotCommand(command="my_channels", description="Мои каналы"),
             BotCommand(command="groups", description="Мои группы"),
+            BotCommand(command="add_group", description="Добавить группу"),
             BotCommand(command="group_discovery", description="Поиск групп"),
             BotCommand(command="group_digest", description="Дайджесты по группам"),
             BotCommand(command="ask", description="Задать вопрос"),

@@ -124,6 +124,13 @@
             visibility: visible;
         }
 
+        /* Context7: полностью скрываем QR контейнер когда показывается форма пароля */
+        .qr-container.hidden {
+            display: none !important;
+            min-height: 0 !important;
+            margin-bottom: 0 !important;
+        }
+
         .qr-code {
             background-color: var(--tg-section-bg-color);
             border-radius: 12px;
@@ -194,6 +201,66 @@
             transform: none;
         }
 
+        /* Context7: стили для формы ввода 2FA пароля */
+        .password-form {
+            margin-top: 16px;
+            padding: 16px;
+            background-color: var(--tg-section-bg-color);
+            border-radius: 12px;
+            text-align: left;
+            display: block;
+            width: 100%;
+            box-sizing: border-box;
+        }
+
+        .password-form h3 {
+            margin-top: 0;
+            margin-bottom: 16px;
+            color: var(--tg-text-color);
+            font-size: 18px;
+            font-weight: 600;
+        }
+
+        .password-form p {
+            color: var(--tg-hint-color);
+            font-size: 14px;
+            margin-bottom: 16px;
+            line-height: 1.5;
+        }
+
+        .password-form input {
+            width: 100%;
+            padding: 12px;
+            border-radius: 8px;
+            border: 1px solid var(--tg-section-bg-color);
+            margin-bottom: 12px;
+            font-size: 14px;
+            background-color: var(--tg-bg-color);
+            color: var(--tg-text-color);
+            box-sizing: border-box;
+        }
+
+        .password-form input:focus {
+            outline: none;
+            border-color: var(--tg-accent-color);
+        }
+
+        .password-form button {
+            width: 100%;
+            margin-top: 0;
+        }
+
+        .password-form #password-error {
+            margin-top: 12px;
+            color: var(--tg-destructive-color);
+            font-size: 14px;
+            display: none;
+        }
+
+        .hidden {
+            display: none !important;
+        }
+
         @media (max-width: 480px) {
             .container {
                 padding: 16px;
@@ -227,6 +294,25 @@
             <div class="qr-instructions">
                 Отсканируйте QR-код в Telegram
             </div>
+        </div>
+
+        <!-- Context7: Форма для ввода 2FA пароля -->
+        <div id="password-form" class="password-form hidden">
+            <h3 style="margin-top: 0; margin-bottom: 12px; color: var(--tg-text-color);">🔐 Требуется пароль 2FA</h3>
+            <p style="color: var(--tg-hint-color); font-size: 14px; margin-bottom: 16px; line-height: 1.4;">
+                Введите пароль двухфакторной аутентификации для завершения входа
+            </p>
+            <input 
+                type="password" 
+                id="password-input" 
+                placeholder="Пароль 2FA" 
+                style="width: 100%; padding: 12px; border: 1px solid var(--tg-section-bg-color); border-radius: 8px; font-size: 14px; margin-bottom: 12px; background-color: var(--tg-section-bg-color); color: var(--tg-text-color);"
+                autocomplete="current-password"
+            />
+            <button id="btn-submit-password" class="button show" style="margin-top: 0;">
+                Отправить пароль
+            </button>
+            <div id="password-error" style="margin-top: 12px; color: var(--tg-destructive-color); font-size: 14px; display: none;"></div>
         </div>
 
         <button id="cancel-btn" class="button" onclick="cancelAuth()">
@@ -289,13 +375,43 @@
 
             function initTelegramWebApp() {
                 if (window.Telegram && window.Telegram.WebApp) {
-                    window.Telegram.WebApp.ready();
-                    window.Telegram.WebApp.expand();
-                    window.Telegram.WebApp.setHeaderColor('bg_color');
-                    window.Telegram.WebApp.setBackgroundColor('bg_color');
+                    // Context7: безопасный вызов ready() - базовый метод, должен быть всегда
+                    if (typeof window.Telegram.WebApp.ready === 'function') {
+                        window.Telegram.WebApp.ready();
+                    }
+                    
+                    // Context7: безопасный вызов expand() - базовый метод
+                    if (typeof window.Telegram.WebApp.expand === 'function') {
+                        window.Telegram.WebApp.expand();
+                    }
+                    
+                    // Context7: setHeaderColor может не поддерживаться в старых версиях
+                    if (typeof window.Telegram.WebApp.setHeaderColor === 'function') {
+                        try {
+                            window.Telegram.WebApp.setHeaderColor('bg_color');
+                        } catch (e) {
+                            console.warn('[QR] setHeaderColor not supported:', e);
+                        }
+                    }
+                    
+                    // Context7: setBackgroundColor может не поддерживаться в старых версиях
+                    if (typeof window.Telegram.WebApp.setBackgroundColor === 'function') {
+                        try {
+                            window.Telegram.WebApp.setBackgroundColor('bg_color');
+                        } catch (e) {
+                            console.warn('[QR] setBackgroundColor not supported:', e);
+                        }
+                    }
+                    
                     applyTheme();
-                    if (window.Telegram.WebApp.onEvent) {
-                        window.Telegram.WebApp.onEvent('themeChanged', applyTheme);
+                    
+                    // Context7: onEvent может не поддерживаться в старых версиях
+                    if (typeof window.Telegram.WebApp.onEvent === 'function') {
+                        try {
+                            window.Telegram.WebApp.onEvent('themeChanged', applyTheme);
+                        } catch (e) {
+                            console.warn('[QR] onEvent not supported:', e);
+                        }
                     }
                 }
             }
@@ -564,13 +680,29 @@
             }
 
             function showQR() {
-                document.getElementById('qr-container').classList.add('show');
-                document.getElementById('cancel-btn').classList.add('show');
+                const qrContainer = document.getElementById('qr-container');
+                if (qrContainer) {
+                    // Context7: убираем hidden класс и показываем QR
+                    qrContainer.classList.remove('hidden');
+                    qrContainer.classList.add('show');
+                }
+                const cancelBtn = document.getElementById('cancel-btn');
+                if (cancelBtn) {
+                    cancelBtn.classList.add('show');
+                }
             }
 
             function hideQR() {
-                document.getElementById('qr-container').classList.remove('show');
-                document.getElementById('cancel-btn').classList.remove('show');
+                const qrContainer = document.getElementById('qr-container');
+                if (qrContainer) {
+                    qrContainer.classList.remove('show');
+                    // Context7: полностью скрываем QR контейнер чтобы он не занимал место
+                    qrContainer.classList.add('hidden');
+                }
+                const cancelBtn = document.getElementById('cancel-btn');
+                if (cancelBtn) {
+                    cancelBtn.classList.remove('show');
+                }
             }
 
             async function createSession() {
@@ -678,23 +810,109 @@
 
                     const data = await response.json();
 
+                    // Context7: ВАЖНО! Обрабатываем password_required ПЕРВЫМ
+                    if (data.status === 'password_required') {
+                        console.log('[QR] Password required detected, showing form');
+                        // Context7: не обновляем статус, так как заголовок уже есть в форме
+                        hideQR();
+                        
+                        const passwordForm = document.getElementById('password-form');
+                        const passwordInput = document.getElementById('password-input');
+                        const passwordError = document.getElementById('password-error');
+                        const cancelBtn = document.getElementById('cancel-btn');
+                        
+                        if (passwordForm) {
+                            // Context7: логируем состояние ДО показа формы
+                            const rectBefore = passwordForm.getBoundingClientRect();
+                            console.log('[QR] Before showing form:', {
+                                display: window.getComputedStyle(passwordForm).display,
+                                visibility: window.getComputedStyle(passwordForm).visibility,
+                                height: rectBefore.height,
+                                width: rectBefore.width,
+                                top: rectBefore.top,
+                                left: rectBefore.left
+                            });
+                            
+                            // Context7: показываем форму - убираем hidden класс и устанавливаем display
+                            passwordForm.classList.remove('hidden');
+                            passwordForm.style.display = 'block';
+                            passwordForm.style.visibility = 'visible';
+                            passwordForm.style.opacity = '1';
+                            
+                            // Context7: скрываем кнопку отмены
+                            if (cancelBtn) {
+                                cancelBtn.classList.remove('show');
+                            }
+                            
+                            // Context7: логируем состояние ПОСЛЕ показа формы
+                            setTimeout(() => {
+                                const rectAfter = passwordForm.getBoundingClientRect();
+                                console.log('[QR] After showing form:', {
+                                    display: window.getComputedStyle(passwordForm).display,
+                                    visibility: window.getComputedStyle(passwordForm).visibility,
+                                    height: rectAfter.height,
+                                    width: rectAfter.width,
+                                    top: rectAfter.top,
+                                    left: rectAfter.left,
+                                    isVisible: rectAfter.height > 0 && rectAfter.width > 0
+                                });
+                                
+                                // Context7: если форма все еще не видна, принудительно устанавливаем стили
+                                if (rectAfter.height === 0 || rectAfter.width === 0) {
+                                    console.warn('[QR] Form has zero dimensions, forcing display');
+                                    passwordForm.style.display = 'block';
+                                    passwordForm.style.minHeight = '200px';
+                                    passwordForm.style.position = 'relative';
+                                }
+                            }, 100);
+                            
+                            // Фокус на поле ввода
+                            setTimeout(() => {
+                                if (passwordInput) {
+                                    passwordInput.focus();
+                                }
+                            }, 300);
+                            
+                            // Context7: безопасный вызов showAlert - может не поддерживаться
+                            if (window.Telegram?.WebApp && typeof window.Telegram.WebApp.showAlert === 'function') {
+                                try {
+                                    window.Telegram.WebApp.showAlert('Требуется пароль 2FA для завершения входа');
+                                } catch (e) {
+                                    console.warn('[QR] showAlert not supported:', e);
+                                }
+                            }
+                        } else {
+                            console.error('[QR] Password form not found!');
+                            updateStatus('❌ Ошибка: форма пароля не найдена', 'error');
+                        }
+                        return; // Не обрабатываем дальше
+                    }
+                    
                     if (data.status === 'authorized') {
                         updateStatus('✅ Авторизация успешна!', 'success');
                         hideQR();
+                        document.getElementById('password-form').style.display = 'none';
                         clearInterval(statusCheckInterval);
 
                         setTimeout(() => {
-                            if (window.Telegram && window.Telegram.WebApp) {
-                                window.Telegram.WebApp.close();
+                            // Context7: безопасный вызов close() - может не поддерживаться
+                            if (window.Telegram?.WebApp && typeof window.Telegram.WebApp.close === 'function') {
+                                try {
+                                    window.Telegram.WebApp.close();
+                                } catch (e) {
+                                    console.warn('[QR] close not supported:', e);
+                                }
                             }
                         }, 2000);
                     } else if (data.status === 'failed') {
                         updateStatus(`❌ Ошибка: ${data.reason || 'Неизвестная ошибка'}`, 'error');
                         hideQR();
+                        document.getElementById('password-form').style.display = 'none';
                         clearInterval(statusCheckInterval);
                     } else if (data.status === 'expired') {
                         updateStatus('⏰ Сессия истекла', 'error');
                         hideQR();
+                        document.getElementById('password-form').style.display = 'none';
                         clearInterval(statusCheckInterval);
                     } else if (data.qr_url) {
                         showQR();
@@ -719,6 +937,87 @@
                 }
             }
 
+            // Context7: функция для отправки 2FA пароля
+            async function submitPassword() {
+                const passwordInput = document.getElementById('password-input');
+                const passwordError = document.getElementById('password-error');
+                const btnSubmit = document.getElementById('btn-submit-password');
+                
+                const password = passwordInput.value.trim();
+                if (!password) {
+                    passwordError.textContent = 'Введите пароль';
+                    passwordError.style.display = 'block';
+                    return;
+                }
+                
+                if (!sessionToken) {
+                    passwordError.textContent = 'Ошибка: сессия не найдена';
+                    passwordError.style.display = 'block';
+                    return;
+                }
+                
+                try {
+                    passwordError.style.display = 'none';
+                    btnSubmit.disabled = true;
+                    btnSubmit.textContent = 'Отправка...';
+                    
+                    const response = await fetch(`${API_BASE || ''}/tg/qr/password`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            session_token: sessionToken,
+                            password: password
+                        })
+                    });
+                    
+                    if (!response.ok) {
+                        const errorData = await response.json().catch(() => ({ detail: 'Ошибка при отправке пароля' }));
+                        throw new Error(errorData.detail || 'Ошибка при отправке пароля');
+                    }
+                    
+                    const data = await response.json();
+                    console.log('[QR] Password submission response:', data);
+                    
+                    if (data.status === 'authorized') {
+                        updateStatus('✅ Пароль принят, завершение авторизации...', 'success');
+                        document.getElementById('password-form').style.display = 'none';
+                        
+                        // Продолжаем проверять статус
+                        if (!statusCheckInterval) {
+                            statusCheckInterval = setInterval(checkStatus, 2000);
+                        }
+                    } else {
+                        throw new Error(data.message || 'Неизвестная ошибка');
+                    }
+                } catch (error) {
+                    console.error('[QR] Password submission error:', error);
+                    
+                    // Context7: проверяем, не связана ли ошибка с WebAppMethodUnsupported
+                    let errorMessage = error.message || 'Ошибка при отправке пароля';
+                    
+                    // Context7: обрабатываем разные типы ошибок
+                    if (errorMessage.includes('WebAppMethodUnsupported') || errorMessage.includes('MethodUnsupported')) {
+                        console.warn('[QR] WebAppMethodUnsupported detected, this is a non-critical WebApp API error');
+                        errorMessage = 'Ошибка при отправке пароля. Попробуйте еще раз.';
+                    } else if (errorMessage.includes('internal error') || errorMessage.includes('server') || errorMessage.includes('500')) {
+                        // Context7: внутренние ошибки сервера - показываем понятное сообщение
+                        errorMessage = 'Временная ошибка сервера. Попробуйте еще раз через несколько секунд.';
+                    } else if (errorMessage.includes('Invalid password') || errorMessage.includes('неверный')) {
+                        errorMessage = 'Неверный пароль. Проверьте и попробуйте снова.';
+                    } else if (errorMessage.includes('expired') || errorMessage.includes('истек')) {
+                        errorMessage = 'Сессия истекла. Начните авторизацию заново.';
+                    }
+                    
+                    passwordError.textContent = errorMessage;
+                    passwordError.style.display = 'block';
+                    passwordInput.value = '';
+                    passwordInput.focus();
+                } finally {
+                    btnSubmit.disabled = false;
+                    btnSubmit.textContent = 'Отправить пароль';
+                }
+            }
+
             async function cancelAuth() {
                 if (sessionToken) {
                     try {
@@ -733,6 +1032,7 @@
                 }
 
                 hideQR();
+                document.getElementById('password-form').style.display = 'none';
                 updateStatus('Авторизация отменена', 'loading');
                 clearInterval(statusCheckInterval);
             }
@@ -740,13 +1040,38 @@
             document.addEventListener('DOMContentLoaded', async () => {
                 initTelegramWebApp();
 
+                // Context7: безопасная проверка isReady - может не поддерживаться
                 if (window.Telegram && window.Telegram.WebApp) {
                     await new Promise(resolve => {
-                        if (window.Telegram.WebApp.isReady) {
+                        // Context7: isReady может не существовать в старых версиях
+                        if (window.Telegram.WebApp.isReady !== undefined && window.Telegram.WebApp.isReady) {
                             resolve();
                         } else {
-                            window.Telegram.WebApp.ready();
+                            // Context7: безопасный вызов ready()
+                            if (typeof window.Telegram.WebApp.ready === 'function') {
+                                try {
+                                    window.Telegram.WebApp.ready();
+                                } catch (e) {
+                                    console.warn('[QR] ready() error:', e);
+                                }
+                            }
                             setTimeout(resolve, 100);
+                        }
+                    });
+                }
+
+                // Context7: добавляем обработчик для кнопки отправки пароля
+                const btnSubmitPassword = document.getElementById('btn-submit-password');
+                const passwordInput = document.getElementById('password-input');
+                
+                if (btnSubmitPassword) {
+                    btnSubmitPassword.addEventListener('click', submitPassword);
+                }
+                
+                if (passwordInput) {
+                    passwordInput.addEventListener('keypress', (e) => {
+                        if (e.key === 'Enter') {
+                            submitPassword();
                         }
                     });
                 }

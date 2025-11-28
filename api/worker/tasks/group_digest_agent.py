@@ -53,7 +53,25 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_gigachat import GigaChat
 from prometheus_client import Counter as PromCounter  # type: ignore
-from prometheus_client import Gauge, Histogram  # type: ignore
+from prometheus_client import Gauge, Histogram, REGISTRY  # type: ignore
+
+# Context7: Функция для безопасной регистрации метрик (защита от дублирования)
+def _safe_register_metric(metric_class, name, *args, **kwargs):
+    """Безопасная регистрация метрики с обработкой дублирования."""
+    try:
+        return metric_class(name, *args, **kwargs)
+    except ValueError as e:
+        if 'Duplicated timeseries' in str(e):
+            # Метрика уже зарегистрирована, пытаемся найти её в registry
+            for collector in list(REGISTRY._collector_to_names.keys()):
+                if hasattr(collector, '_name') and collector._name == name:
+                    logger.warning(f"{name} already registered, reusing existing")
+                    return collector
+            # Если не нашли, создаём с уникальным именем как fallback
+            logger.warning(f"{name} already registered but not found, creating with _v2 suffix")
+            return metric_class(f"{name}_v2", *args, **kwargs)
+        else:
+            raise
 
 try:  # pragma: no cover - langgraph необязателен для unit-тестов
     from langgraph.graph import END, START, StateGraph
@@ -75,11 +93,16 @@ from worker.common.digest_state_store import (
     DigestStateStoreFactory,
     SupportsDigestState,
 )
+from worker.services.episodic_memory_service import get_episodic_memory_service
+from worker.services.dlq_service import get_dlq_service
+from worker.common.self_improvement import SelfImprovementService, SelfVerificationResult
+from worker.agents.planning_agent import PlanningAgent, Plan
+from api.services.persona_service import PersonaService
 from worker.common.resilience import (
     CircuitBreaker,
     CircuitOpenError,
     RetryPolicy,
-    build_dlq_payload,
+    build_dlq_payload,  # Оставляем для обратной совместимости, если используется где-то еще
     guarded_call,
 )
 from worker.common.json_guard import (
@@ -693,85 +716,152 @@ class _FallbackWorkflow:
         }
 
 
-digest_generation_seconds = Histogram(
+# Context7: Защита от дублирования метрик при повторном импорте модуля
+digest_generation_seconds = _safe_register_metric(
+    Histogram,
     "digest_generation_seconds",
     "Время выполнения стадий пайплайна групповых дайджестов",
     ["stage"],
 )
 
-digest_tokens_total = PromCounter(
+digest_tokens_total = _safe_register_metric(
+    PromCounter,
     "digest_tokens_total",
     "Оценка количества токенов, переданных в LLM-агентов",
     ["agent", "model"],
 )
 
-digest_synthesis_fallback_total = PromCounter(
+digest_synthesis_fallback_total = _safe_register_metric(
+    PromCounter,
     "digest_synthesis_fallback_total",
     "Количество fallback'ов с Pro на Base модель",
     ["reason"],
 )
 
-digest_skipped_total = PromCounter(
+digest_skipped_total = _safe_register_metric(
+    PromCounter,
     "digest_skipped_total",
     "Пропущенные дайджесты и причины",
     ["reason", "tenant_id", "mode"],
 )
 
-digest_messages_processed_total = PromCounter(
+digest_messages_processed_total = _safe_register_metric(
+    PromCounter,
     "digest_messages_processed_total",
     "Количество обработанных сообщений по арендаторам (метрика нагрузки)",
     ["tenant"],
 )
 
-digest_topics_empty_total = PromCounter(
+digest_topics_empty_total = _safe_register_metric(
+    PromCounter,
     "digest_topics_empty_total",
     "Количество случаев, когда темы пустые или недостаточны",
     ["reason", "tenant_id", "mode"],
 )
 
-digest_pre_quality_failed_total = PromCounter(
+digest_pre_quality_failed_total = _safe_register_metric(
+    PromCounter,
     "digest_pre_quality_failed_total",
     "Rule-based проверки качества, которые не прошли",
     ["check", "tenant_id"],
 )
 
-digest_mode_total = PromCounter(
+digest_mode_total = _safe_register_metric(
+    PromCounter,
     "digest_mode_total",
     "Распределение дайджестов по режимам (micro/normal/large)",
     ["mode", "tenant_id", "window_size_hours"],
 )
 
-digest_pro_quota_exceeded_total = PromCounter(
+digest_pro_quota_exceeded_total = _safe_register_metric(
+    PromCounter,
     "digest_pro_quota_exceeded_total",
     "Срабатывания квот на Pro модель (вызовы/токены)",
     ["tenant"],
 )
 
-digest_quality_score = Gauge(
+digest_quality_score = _safe_register_metric(
+    Gauge,
     "digest_quality_score",
     "Последние значения метрик качества дайджестов",
     ["metric"],
 )
 
-digest_dlq_total = PromCounter(
+# Self-Improvement метрики
+self_improvement_verification_total = _safe_register_metric(
+    PromCounter,
+    "self_improvement_verification_total",
+    "Количество self-verification проверок",
+    ["result"],  # passed, failed
+)
+
+self_improvement_correction_total = _safe_register_metric(
+    PromCounter,
+    "self_improvement_correction_total",
+    "Количество self-correction попыток",
+    ["result"],  # applied, skipped, failed
+)
+
+self_improvement_gating_total = _safe_register_metric(
+    PromCounter,
+    "self_improvement_gating_total",
+    "Количество self-gating решений",
+    ["decision"],  # retry_allowed, retry_denied
+)
+
+# Planning метрики
+planning_plan_generated_total = _safe_register_metric(
+    PromCounter,
+    "planning_plan_generated_total",
+    "Количество сгенерированных планов",
+    ["path_type"],  # fast_path, smart_path
+)
+
+planning_plan_execution_check_total = _safe_register_metric(
+    PromCounter,
+    "planning_plan_execution_check_total",
+    "Количество проверок выполнения плана",
+    ["result"],  # success, failed
+)
+
+planning_replan_total = _safe_register_metric(
+    PromCounter,
+    "planning_replan_total",
+    "Количество перепланирований",
+    ["result"],  # generated, skipped
+)
+
+# Persona метрики
+persona_prompt_adapted_total = _safe_register_metric(
+    PromCounter,
+    "persona_prompt_adapted_total",
+    "Количество адаптаций промптов под персону",
+    ["result"],  # success, failed, skipped
+)
+
+digest_dlq_total = _safe_register_metric(
+    PromCounter,
     "digest_dlq_total",
     "Количество отправленных в DLQ событий мультиагентного дайджеста",
     ["stage", "error_code"],
 )
 
-digest_circuit_open_total = PromCounter(
+digest_circuit_open_total = _safe_register_metric(
+    PromCounter,
     "digest_circuit_open_total",
     "Срабатывания circuit breaker при генерации дайджеста",
     ["stage"],
 )
 
-digest_stage_latency_seconds = Histogram(
+digest_stage_latency_seconds = _safe_register_metric(
+    Histogram,
     "digest_stage_latency_seconds",
     "Длительность стадий мультиагентного пайплайна",
     ["stage", "status"],
 )
 
-digest_stage_status_total = PromCounter(
+digest_stage_status_total = _safe_register_metric(
+    PromCounter,
     "digest_stage_status_total",
     "Количество завершений стадий пайплайна по статусу",
     ["stage", "status"],
@@ -1169,6 +1259,12 @@ class GroupDigestOrchestrator:
         self._synthesis_retry_prompt: ChatPromptTemplate = digest_composer_retry_prompt_v1()
         self._json_schemas: Dict[str, Dict[str, Any]] = JSON_SCHEMAS
         self._max_repair_attempts = max(1, min(self.config.max_retries, 2))
+        # Self-Improvement Service для автоматического улучшения качества
+        self._self_improvement = SelfImprovementService(llm_router=self._llm_router)
+        # Planning Agent для динамического планирования (только для Smart Path - async пайплайны)
+        self._planning_agent = PlanningAgent(llm_router=self._llm_router)
+        # Persona Service для персонализации промптов
+        self._persona_service = PersonaService()
         self._context_service = GroupContextService(self.config.context)
         self._context_storage_client: Optional[Context7StorageClient] = None
         storage_cfg = self.config.context_storage
@@ -1358,24 +1454,80 @@ class GroupDigestOrchestrator:
             "trace_id": trace_id,
             "errors": (state.get("errors") or [])[-3:],
         }
+        digest_id = state.get("digest_id") or window.get("digest_id")
+        
+        payload = {
+            "window_id": window_id,
+            "group_id": group_id,
+            "tenant_id": tenant_id,
+            "stage": stage,
+            "trace_id": trace_id,
+            "errors": (state.get("errors", []))[-3:],
+        }
+        
         stack_trace = None
+        error_message = error_details[:1000]  # Ограничение длины для БД
         if exc is not None:
-            stack_trace = "".join(traceback.format_exception(exc.__class__, exc, exc.__traceback__))[-1024:]
-        tracker = state.setdefault("_dlq_first_seen", {})
-        if stage not in tracker:
-            tracker[stage] = datetime.utcnow()
-        event_payload = build_dlq_payload(
-            base_event_type="digests.generate",
-            payload_snippet=payload_snippet,
-            error_code=error_code,
-            error_details=error_details,
-            retry_count=retry_count or self.config.resilience.retry.max_attempts,
-            tenant_id=tenant_id,
-            stack_trace=stack_trace,
-            first_seen_at=tracker[stage],
-            next_retry_at=datetime.utcnow() + timedelta(minutes=10),
-        )
-        state.setdefault("dlq_events", []).append(event_payload)
+            stack_trace = "".join(traceback.format_exception(exc.__class__, exc, exc.__traceback__))[-5000:]
+            if not error_message:
+                error_message = str(exc)[:1000]
+        
+        try:
+            dlq_service = get_dlq_service()
+            max_attempts = retry_count or (self.config.resilience.retry.max_attempts if hasattr(self, 'config') else 3)
+            
+            dlq_event = dlq_service.add_event(
+                tenant_id=tenant_id or "",
+                entity_type="digest",
+                event_type="digests.generate",
+                payload=payload,
+                error_code=error_code,
+                error_message=error_message,
+                stack_trace=stack_trace,
+                entity_id=digest_id,
+                max_attempts=max_attempts,
+            )
+            
+            # Сохраняем обратную совместимость: добавляем в state для логирования
+            event_payload = {
+                "event_id": str(dlq_event.id),
+                "stage": stage,
+                "error_code": error_code,
+                "error_details": error_details,
+                "retry_count": dlq_event.retry_count,
+                "max_attempts": dlq_event.max_attempts,
+                "next_retry_at": dlq_event.next_retry_at.isoformat() if dlq_event.next_retry_at else None,
+                "status": dlq_event.status,
+            }
+            state.setdefault("dlq_events", []).append(event_payload)
+            
+            logger.info(
+                "dlq.event_recorded",
+                tenant_id=tenant_id,
+                entity_type="digest",
+                stage=stage,
+                error_code=error_code,
+                event_id=str(dlq_event.id),
+                next_retry_at=dlq_event.next_retry_at.isoformat() if dlq_event.next_retry_at else None
+            )
+        except Exception as dlq_exc:
+            # Если DLQ недоступен, логируем ошибку, но не прерываем workflow
+            logger.error(
+                "dlq.record_failed",
+                tenant_id=tenant_id,
+                stage=stage,
+                error_code=error_code,
+                dlq_error=str(dlq_exc),
+                error_type=type(dlq_exc).__name__,
+            )
+            # Fallback: сохраняем в state для последующей обработки
+            event_payload = {
+                "stage": stage,
+                "error_code": error_code,
+                "error_details": error_details,
+                "dlq_error": str(dlq_exc),
+            }
+            state.setdefault("dlq_events", []).append(event_payload)
         # Context7: Обработка ошибок метрик - не прерываем workflow при ошибках Prometheus
         try:
             digest_dlq_total.labels(
@@ -2499,6 +2651,57 @@ class GroupDigestOrchestrator:
             tenant_id = state.get("tenant_id", "")
             trace_id = state.get("trace_id", "")
             window = state.get("window", {}) or {}
+            
+            # Model Personalization: адаптация промпта под персону пользователя
+            # Performance: только summary профиля (до 100-200 токенов), не весь профиль
+            user_id = window.get("requested_by_user_id") or state.get("requested_by_user_id")
+            if user_id and tenant_id:
+                try:
+                    persona_summary = self._persona_service.get_persona_profile_summary(
+                        user_id=user_id,
+                        tenant_id=tenant_id,
+                    )
+                    if persona_summary and persona_summary != "User preferences: general topics":
+                        # Адаптируем промпт под персону
+                        prompt_template_str = prompt.messages[0].content if hasattr(prompt, 'messages') else str(prompt)
+                        adapted_prompt_str = self._persona_service.adapt_prompt(
+                            base_prompt=prompt_template_str,
+                            persona_summary=persona_summary,
+                        )
+                        # Создаем новый промпт с персонализацией
+                        from langchain_core.prompts import ChatPromptTemplate
+                        adapted_prompt = ChatPromptTemplate.from_template(adapted_prompt_str)
+                        prompt = adapted_prompt
+                        logger.debug(
+                            "persona.prompt_adapted",
+                            user_id=str(user_id),
+                            tenant_id=tenant_id,
+                            summary_length=len(persona_summary),
+                        )
+                        # Метрики
+                        try:
+                            persona_prompt_adapted_total.labels(result=_sanitize_prometheus_label("success")).inc()
+                        except Exception as e:
+                            logger.warning("Failed to record persona_prompt_adapted_total metric", error=str(e))
+                except Exception as persona_exc:
+                    # Не прерываем workflow при ошибке персонализации
+                    logger.warning(
+                        "persona.adaptation_failed",
+                        error=str(persona_exc),
+                        user_id=str(user_id) if user_id else None,
+                        tenant_id=tenant_id,
+                    )
+                    # Метрики
+                    try:
+                        persona_prompt_adapted_total.labels(result=_sanitize_prometheus_label("failed")).inc()
+                    except Exception as e:
+                        logger.warning("Failed to record persona_prompt_adapted_total metric", error=str(e))
+            else:
+                # Метрики: персонализация пропущена (нет user_id)
+                try:
+                    persona_prompt_adapted_total.labels(result=_sanitize_prometheus_label("skipped")).inc()
+                except Exception as e:
+                    logger.warning("Failed to record persona_prompt_adapted_total metric", error=str(e))
 
             baseline_dict: Dict[str, Any] = {}
             existing_baseline = state.get("baseline_snapshot")
@@ -2784,8 +2987,120 @@ class GroupDigestOrchestrator:
             quality_threshold = self.config.quality_checks.quality_threshold
             quality_pass = min_score >= quality_threshold
             errors = list(state.get("errors", []))
-
+            
+            # Self-Improvement: Self-verification через чеклист
+            # Performance: только для Smart Path (async пайплайны), максимум 300 токенов
+            try:
+                quality_checklist = [
+                    "Дайджест содержит основные темы",
+                    "Структура дайджеста логична",
+                    "Отсутствуют галлюцинации",
+                    "Есть заголовок и разделы",
+                ]
+                verification_result = self._self_improvement.self_verify(
+                    content=digest_html,
+                    quality_checklist=quality_checklist,
+                    max_tokens=300,
+                )
+                if not verification_result.passed and verification_result.issues:
+                    logger.info(
+                        "self_improvement.verification_failed",
+                        quality_score=quality_score,
+                        issues=verification_result.issues,
+                        tenant_id=tenant_id,
+                    )
+                    # Метрики
+                    try:
+                        self_improvement_verification_total.labels(result=_sanitize_prometheus_label("failed")).inc()
+                    except Exception as e:
+                        logger.warning("Failed to record self_improvement_verification_total metric", error=str(e))
+                    # Добавляем issues в notes для контекста
+                    if verification_result.issues:
+                        metrics["notes"] = f"{metrics.get('notes', '')} [Self-verify issues: {', '.join(verification_result.issues[:3])}]"
+                else:
+                    # Метрики
+                    try:
+                        self_improvement_verification_total.labels(result=_sanitize_prometheus_label("passed")).inc()
+                    except Exception as e:
+                        logger.warning("Failed to record self_improvement_verification_total metric", error=str(e))
+            except Exception as verify_exc:
+                # Не прерываем workflow при ошибке self-verification
+                logger.warning(
+                    "self_improvement.verification_error",
+                    error=str(verify_exc),
+                    tenant_id=tenant_id,
+                )
+            
+            # Self-Improvement: Self-correction при низком качестве (quality_score < 0.6)
+            # Performance: только 1 попытка исправления, не цикл
+            if quality_score < 0.6 and not state.get("synthesis_retry_used"):
+                try:
+                    verification_result = self._self_improvement.self_verify(
+                        content=digest_html,
+                        quality_checklist=["Основные проблемы качества"],
+                        max_tokens=200,
+                    )
+                    if verification_result.issues:
+                        corrected_content = self._self_improvement.self_correct(
+                            content=digest_html,
+                            issues=verification_result.issues,
+                            max_attempts=1,
+                        )
+                        if corrected_content and corrected_content != digest_html:
+                            logger.info(
+                                "self_improvement.correction_applied",
+                                quality_score=quality_score,
+                                tenant_id=tenant_id,
+                            )
+                            # Переоцениваем исправленный контент
+                            try:
+                                data, model_id = evaluate_digest(corrected_content)
+                                corrected_quality_score = clamp(float(data.get("quality_score", quality_score)))
+                                if corrected_quality_score > quality_score:
+                                    digest_html = corrected_content
+                                    state["summary_html"] = corrected_content
+                                    state["summary"] = corrected_content
+                                    quality_score = corrected_quality_score
+                                    metrics.update({
+                                        "faithfulness": clamp(float(data.get("faithfulness", 0.0))),
+                                        "coherence": clamp(float(data.get("coherence", 0.0))),
+                                        "coverage": clamp(float(data.get("coverage", 0.0))),
+                                        "focus": clamp(float(data.get("focus", 0.0))),
+                                        "notes": f"{data.get('notes', '')} [Self-corrected]",
+                                    })
+                                    min_score = min(metrics["faithfulness"], metrics["coherence"], metrics["coverage"], metrics["focus"], quality_score)
+                                    quality_pass = min_score >= quality_threshold
+                                    # Метрики
+                                    try:
+                                        self_improvement_correction_total.labels(result=_sanitize_prometheus_label("applied")).inc()
+                                    except Exception as e:
+                                        logger.warning("Failed to record self_improvement_correction_total metric", error=str(e))
+                                else:
+                                    try:
+                                        self_improvement_correction_total.labels(result=_sanitize_prometheus_label("skipped")).inc()
+                                    except Exception as e:
+                                        logger.warning("Failed to record self_improvement_correction_total metric", error=str(e))
+                            except Exception as re_eval_exc:
+                                logger.warning("self_improvement.re_evaluation_failed", error=str(re_eval_exc))
+                except Exception as correct_exc:
+                    logger.warning("self_improvement.correction_error", error=str(correct_exc))
+            
+            # Self-Improvement: Self-gating для определения нужен ли retry
+            # Performance: дает право на один retry с альтернативным промптом/моделью
+            needs_retry = False
             if not quality_pass and not state.get("synthesis_retry_used"):
+                needs_retry = self._self_improvement.self_gate(
+                    quality_score=quality_score,
+                    threshold=quality_threshold,
+                )
+                # Метрики
+                try:
+                    decision = "retry_allowed" if needs_retry else "retry_denied"
+                    self_improvement_gating_total.labels(decision=_sanitize_prometheus_label(decision)).inc()
+                except Exception as e:
+                    logger.warning("Failed to record self_improvement_gating_total metric", error=str(e))
+
+            if not quality_pass and needs_retry and not state.get("synthesis_retry_used"):
                 baseline_snapshot = self._get_baseline_snapshot(state)
                 baseline_digest = baseline_snapshot.summary_html if baseline_snapshot else (state.get("baseline_snapshot", {}) or {}).get("summary_html", "")
                 corrective = self._attempt_corrective_synthesis(state, baseline_digest=baseline_digest or "Нет предыдущего дайджеста.")
@@ -2947,6 +3262,24 @@ class GroupDigestOrchestrator:
         trace_id = payload.get("trace_id") or window.get("trace_id") or uuid.uuid4().hex
         window["trace_id"] = trace_id
 
+        # Episodic Memory: запись события run_started
+        episodic_memory = get_episodic_memory_service()
+        digest_id = None
+        try:
+            episodic_memory.record_event(
+                tenant_id=tenant_id,
+                entity_type="digest",
+                event_type="run_started",
+                metadata={
+                    "group_id": group_id,
+                    "window_id": window_id,
+                    "trace_id": trace_id,
+                    "message_count": len(payload.get("messages", [])),
+                },
+            )
+        except Exception as exc:
+            logger.warning("episodic_memory.record_start_failed", error=str(exc), tenant_id=tenant_id)
+
         store = self._state_store_factory.create(
             tenant_id=tenant_id,
             group_id=group_id,
@@ -2958,6 +3291,11 @@ class GroupDigestOrchestrator:
 
         metadata_snapshot = store.load_metadata()
         artifact_metadata = dict(metadata_snapshot.get("stages", {}))
+        
+        # Получаем user_id из payload для персонализации
+        requested_by_user_id = payload.get("requested_by_user_id") or window.get("requested_by_user_id")
+        if requested_by_user_id:
+            window["requested_by_user_id"] = str(requested_by_user_id)
 
         initial_state: GroupDigestState = {
             "window": window,
@@ -2971,11 +3309,52 @@ class GroupDigestOrchestrator:
             "trace_id": trace_id,
             "tenant_id": tenant_id,
             "group_id": group_id,
+            "requested_by_user_id": str(requested_by_user_id) if requested_by_user_id else None,
             "dlq_events": [],
             "synthesis_retry_used": False,
             "baseline_snapshot": {},
             "_dlq_first_seen": {},
         }
+
+        # Plan-first архитектура: генерируем план перед выполнением
+        # Performance: только для Smart Path (async пайплайны), не для Fast Path
+        plan: Optional[Plan] = None
+        try:
+            planning_context = {
+                "tenant_id": tenant_id,
+                "group_id": group_id,
+                "window_id": window_id,
+                "message_count": len(payload.get("messages", [])),
+                "trace_id": trace_id,
+            }
+            plan = self._planning_agent.generate_plan(
+                context=planning_context,
+                is_fast_path=False,  # Digest pipeline - это Smart Path (async)
+            )
+            logger.info(
+                "planning.plan_generated",
+                tenant_id=tenant_id,
+                trace_id=trace_id,
+                plan_steps=len(plan.steps) if plan else 0,
+            )
+            # Метрики
+            try:
+                planning_plan_generated_total.labels(path_type=_sanitize_prometheus_label("smart_path")).inc()
+            except Exception as e:
+                logger.warning("Failed to record planning_plan_generated_total metric", error=str(e))
+            # Сохраняем план в state для последующей проверки
+            initial_state["_plan"] = {
+                "steps": plan.steps if plan else [],
+                "max_steps": plan.max_steps if plan else 0,
+            }
+        except Exception as plan_exc:
+            # Не прерываем workflow при ошибке планирования
+            logger.warning(
+                "planning.plan_generation_failed",
+                error=str(plan_exc),
+                tenant_id=tenant_id,
+                trace_id=trace_id,
+            )
 
         try:
             result = self.workflow.invoke(initial_state)
@@ -2985,6 +3364,80 @@ class GroupDigestOrchestrator:
             result.setdefault("artifact_metadata", initial_state.get("artifact_metadata", {}))
             result.pop("state_store", None)
             result.setdefault("dlq_events", initial_state.get("dlq_events", []))
+            
+            # Plan-first архитектура: проверка выполнения плана
+            # Performance: только для Smart Path, не для Fast Path
+            if plan:
+                try:
+                    execution_results = [
+                        {"stage": "ingest_validator", "status": "completed"},
+                        {"stage": "thread_builder", "status": "completed"},
+                        {"stage": "segmenter_agent", "status": "completed"},
+                        {"stage": "emotion_agent", "status": "completed"},
+                        {"stage": "roles_agent", "status": "completed"},
+                        {"stage": "topic_agent", "status": "completed"},
+                        {"stage": "synthesis_agent", "status": "completed"},
+                        {"stage": "evaluation_agent", "status": "completed"},
+                        {"stage": "delivery_manager", "status": "completed"},
+                    ]
+                    plan_executed = self._planning_agent.check_plan_execution(
+                        plan=plan,
+                        results=execution_results,
+                    )
+                    if not plan_executed:
+                        logger.warning(
+                            "planning.plan_execution_failed",
+                            tenant_id=tenant_id,
+                            trace_id=trace_id,
+                            plan_steps=len(plan.steps),
+                            results_count=len(execution_results),
+                        )
+                        # Метрики
+                        try:
+                            planning_plan_execution_check_total.labels(result=_sanitize_prometheus_label("failed")).inc()
+                        except Exception as e:
+                            logger.warning("Failed to record planning_plan_execution_check_total metric", error=str(e))
+                    else:
+                        try:
+                            planning_plan_execution_check_total.labels(result=_sanitize_prometheus_label("success")).inc()
+                        except Exception as e:
+                            logger.warning("Failed to record planning_plan_execution_check_total metric", error=str(e))
+                        # Перепланирование при необходимости (только для Smart Path)
+                        updated_context = {
+                            **planning_context,
+                            "execution_results": execution_results,
+                            "errors": result.get("errors", []),
+                        }
+                        new_plan = self._planning_agent.replan(
+                            original_plan=plan,
+                            execution_results=execution_results,
+                            context=updated_context,
+                        )
+                        if new_plan:
+                            logger.info(
+                                "planning.replan_generated",
+                                tenant_id=tenant_id,
+                                trace_id=trace_id,
+                                new_plan_steps=len(new_plan.steps),
+                            )
+                            # Метрики
+                            try:
+                                planning_replan_total.labels(result=_sanitize_prometheus_label("generated")).inc()
+                            except Exception as e:
+                                logger.warning("Failed to record planning_replan_total metric", error=str(e))
+                        else:
+                            try:
+                                planning_replan_total.labels(result=_sanitize_prometheus_label("skipped")).inc()
+                            except Exception as e:
+                                logger.warning("Failed to record planning_replan_total metric", error=str(e))
+                except Exception as check_exc:
+                    # Не прерываем workflow при ошибке проверки плана
+                    logger.warning(
+                        "planning.plan_check_failed",
+                        error=str(check_exc),
+                        tenant_id=tenant_id,
+                        trace_id=trace_id,
+                    )
 
             store.update_metadata(
                 stages=result.get("artifact_metadata", {}),
@@ -3002,6 +3455,32 @@ class GroupDigestOrchestrator:
                 delivery=result.get("delivery"),
                 baseline_delta=result.get("baseline_delta"),
             )
+            
+            # Episodic Memory: запись события run_completed
+            try:
+                digest_id = result.get("digest_id") or window.get("digest_id")
+                event_type = "run_completed"
+                if not result.get("quality_pass", False):
+                    event_type = "quality_low"
+                
+                episodic_memory.record_event(
+                    tenant_id=tenant_id,
+                    entity_type="digest",
+                    event_type=event_type,
+                    entity_id=digest_id,
+                    metadata={
+                        "group_id": group_id,
+                        "window_id": window_id,
+                        "trace_id": trace_id,
+                        "quality_score": result.get("quality_score"),
+                        "quality_pass": result.get("quality_pass", False),
+                        "topics_count": len(result.get("topics", [])),
+                        "synthesis_retry_used": result.get("synthesis_retry_used", False),
+                    },
+                )
+            except Exception as exc:
+                logger.warning("episodic_memory.record_complete_failed", error=str(exc), tenant_id=tenant_id)
+            
             return result
         except Exception as exc:
             # Context7: Детальное логирование ошибки с traceback для диагностики "Incorrect label names"
@@ -3013,6 +3492,25 @@ class GroupDigestOrchestrator:
                 tenant_id=tenant_id,
                 trace_id=trace_id,
             )
+            
+            # Episodic Memory: запись события error
+            try:
+                episodic_memory.record_event(
+                    tenant_id=tenant_id,
+                    entity_type="digest",
+                    event_type="error",
+                    entity_id=digest_id,
+                    metadata={
+                        "group_id": group_id,
+                        "window_id": window_id,
+                        "trace_id": trace_id,
+                        "error_type": type(exc).__name__,
+                        "error_message": str(exc)[:500],  # Ограничение длины
+                    },
+                )
+            except Exception as mem_exc:
+                logger.warning("episodic_memory.record_error_failed", error=str(mem_exc), tenant_id=tenant_id)
+            
             failure_result = self._handle_stage_failure(
                 initial_state,
                 stage="workflow",

@@ -282,7 +282,7 @@ async def cmd_help(msg: Message):
 
 <b>📺 Управление каналами</b>
 /add_channel @channel_name — Добавить канал для отслеживания
-Пример: <code>/add_channel @durov</code>
+Пример: <code>/add_channel @durov</code> или <code>/add_channel https://t.me/durov</code>
 
 /my_channels — Показать список ваших подписанных каналов
 
@@ -290,15 +290,14 @@ async def cmd_help(msg: Message):
 /ask <i>ваш вопрос</i> — Задать вопрос ассистенту
 Пример: <code>/ask Что нового в AI?</code>
 
-/search <i>запрос</i> — Поиск по содержимому каналов
-Пример: <code>/search машинное обучение</code>
+<b>📈 Тренды</b>
+/trends — Показать тренды в каналах
 
 <b>👥 Группы</b>
 /groups — Показать подключённые группы
+/add_group @group_name — Добавить группу по username или ссылке
+Пример: <code>/add_group @SergeXXI</code> или <code>/add_group https://t.me/SergeXXI</code>
 /group_discovery — Найти доступные чаты и подключить новые
-
-/recommend <i>запрос</i> — Получить рекомендации
-Пример: <code>/recommend интересные новости про AI</code>
 
 <b>💬 Текстовые и голосовые сообщения</b>
 Вы можете просто написать вопрос текстом — бот автоматически обработает запрос через RAG.
@@ -1090,9 +1089,55 @@ async def _show_subscription_callback(cb: CallbackQuery):
 # НОВЫЕ КОМАНДЫ ДЛЯ УПРАВЛЕНИЯ КАНАЛАМИ
 # ============================================================================
 
+def _extract_username_from_telegram_url(text: str) -> Optional[str]:
+    """
+    Извлекает username из Telegram URL или username.
+    
+    Context7: Поддерживает различные форматы:
+    - https://t.me/username
+    - http://t.me/username
+    - t.me/username
+    - @username
+    - username
+    """
+    if not text:
+        return None
+    
+    text = text.strip()
+    
+    # Убираем @ если есть
+    if text.startswith('@'):
+        username = text[1:]
+        # Валидация username (только буквы, цифры, подчёркивания, 5-32 символа)
+        if re.match(r'^[a-zA-Z0-9_]{5,32}$', username):
+            return username
+        return None
+    
+    # Парсинг URL
+    # Паттерн для https://t.me/username или http://t.me/username
+    url_pattern = r'(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/([a-zA-Z0-9_]{5,32})'
+    match = re.search(url_pattern, text)
+    if match:
+        username = match.group(1)
+        return username
+    
+    # Если это просто username без @
+    if re.match(r'^[a-zA-Z0-9_]{5,32}$', text):
+        return text
+    
+    return None
+
+
 @router.message(Command("add_channel"))
 async def cmd_add_channel(msg: Message):
-    """Команда добавления канала."""
+    """
+    Команда добавления канала.
+    
+    Context7: Поддерживает прямой ввод username или ссылки:
+    - /add_channel @channel_name
+    - /add_channel https://t.me/channel_name
+    - /add_channel channel_name
+    """
     try:
         # Извлекаем аргументы из текста сообщения
         command_text = msg.text or ""
@@ -1101,20 +1146,24 @@ async def cmd_add_channel(msg: Message):
         if not args:
             await msg.answer(
                 "Использование: /add_channel @channel_name\n\n"
-                "Пример: /add_channel @durov"
+                "Пример: /add_channel @durov\n"
+                "Или: /add_channel https://t.me/durov"
             )
             return
         
-        username = args
+        # Извлекаем username из аргументов (может быть ссылка или username)
+        username = _extract_username_from_telegram_url(args)
         
-        # Валидация username
-        if not re.match(r'^@?[a-zA-Z0-9_]{5,32}$', username):
-            await msg.answer("❌ Неверный формат канала. Используйте @channel_name")
+        if not username:
+            await msg.answer(
+                "❌ Неверный формат канала!\n\n"
+                "Используйте один из форматов:\n"
+                "• <code>/add_channel @channel_name</code>\n"
+                "• <code>/add_channel https://t.me/channel_name</code>\n"
+                "• <code>/add_channel channel_name</code>",
+                parse_mode="HTML"
+            )
             return
-        
-        # Добавление @ если отсутствует
-        if not username.startswith('@'):
-            username = '@' + username
         
         try:
             async with httpx.AsyncClient(timeout=10) as client:

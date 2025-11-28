@@ -156,13 +156,90 @@ api_client = ChannelAPIClient()
 
 @router.message(Command("add_channel"))
 async def cmd_add_channel(msg: Message, state: FSMContext):
-    """Команда добавления канала."""
+    """
+    Команда добавления канала.
+    
+    Context7: Поддерживает прямой ввод username или ссылки:
+    - /add_channel @channel_name
+    - /add_channel https://t.me/channel_name
+    - /add_channel channel_name
+    
+    Если аргументы не указаны, показывает интерактивное меню.
+    """
     try:
         # Проверка прав доступа
         if not await _check_user_permissions(msg.from_user.id):
             await msg.answer("❌ У вас нет прав для добавления каналов")
             return
         
+        # Извлекаем аргументы из команды
+        command_text = msg.text or ""
+        args = command_text.replace("/add_channel", "").strip()
+        
+        # Если есть аргументы, обрабатываем напрямую
+        if args:
+            username = _extract_username_from_telegram_url(args)
+            
+            if not username:
+                await msg.answer(
+                    "❌ Неверный формат!\n\n"
+                    "Используйте один из форматов:\n"
+                    "• <code>/add_channel @channel_name</code>\n"
+                    "• <code>/add_channel https://t.me/channel_name</code>\n"
+                    "• <code>/add_channel channel_name</code>\n\n"
+                    "Username должен содержать только буквы, цифры и подчёркивания (5-32 символа).",
+                    parse_mode="HTML"
+                )
+                return
+            
+            # Проверка лимитов перед добавлением
+            stats_result = await api_client.get_subscription_stats(str(msg.from_user.id))
+            if stats_result["success"]:
+                stats = stats_result["data"]
+                if not stats.get("can_add_more", True):
+                    await msg.answer(
+                        f"❌ Достигнут лимит подписок!\n"
+                        f"Текущих каналов: {stats.get('total_channels', 0)}\n"
+                        f"Лимит: {stats.get('subscription_limit', 0)}\n\n"
+                        f"💡 Обновите подписку для увеличения лимита"
+                    )
+                    return
+            
+            # Показываем, что обрабатываем запрос
+            processing_msg = await msg.answer(
+                f"⏳ Обрабатываю запрос на добавление канала <code>@{username}</code>...",
+                parse_mode="HTML"
+            )
+            
+            # Подписка на канал
+            result = await api_client.subscribe_to_channel(
+                user_id=str(msg.from_user.id),
+                username=username
+            )
+            
+            if result["success"]:
+                channel_data = result["data"]
+                await processing_msg.edit_text(
+                    f"✅ <b>Канал успешно добавлен!</b>\n\n"
+                    f"📢 Канал: @{username}\n"
+                    f"📝 Название: {channel_data.get('title', 'N/A')}\n\n"
+                    f"🔄 Начинаю парсинг последних постов...",
+                    parse_mode="HTML"
+                )
+                
+                # Триггер парсинга в фоне
+                asyncio.create_task(_trigger_background_parsing(msg.from_user.id, channel_data["id"]))
+            else:
+                error_msg = result.get("error", "Неизвестная ошибка")
+                await processing_msg.edit_text(
+                    f"❌ <b>Ошибка добавления канала</b>\n\n"
+                    f"Не удалось добавить канал <code>@{username}</code>.\n"
+                    f"Ошибка: {error_msg[:200]}",
+                    parse_mode="HTML"
+                )
+            return
+        
+        # Если аргументов нет, показываем интерактивное меню
         # Получение статистики подписок
         stats_result = await api_client.get_subscription_stats(str(msg.from_user.id))
         
@@ -185,7 +262,7 @@ async def cmd_add_channel(msg: Message, state: FSMContext):
         # Создание клавиатуры с вариантами добавления
         keyboard = InlineKeyboardBuilder()
         keyboard.add(InlineKeyboardButton(
-            text="📝 По username (@channel_name)",
+            text="📝 По username (@channel_name или ссылка)",
             callback_data="add_by_username"
         ))
         keyboard.add(InlineKeyboardButton(
@@ -203,6 +280,9 @@ async def cmd_add_channel(msg: Message, state: FSMContext):
             f"• Каналов: {stats.get('total_channels', 0)}/{stats.get('subscription_limit', 0)}\n"
             f"• Постов сегодня: {stats.get('posts_today', 0)}\n"
             f"• Всего постов: {stats.get('total_posts', 0)}\n\n"
+            f"💡 <i>Или просто отправьте:</i>\n"
+            f"• <code>/add_channel @channel_name</code>\n"
+            f"• <code>/add_channel https://t.me/channel_name</code>\n\n"
             f"Выберите способ добавления:",
             reply_markup=keyboard.as_markup(),
             parse_mode="HTML"
@@ -309,10 +389,13 @@ async def cmd_channel_stats(msg: Message):
 
 @router.callback_query(F.data == "add_by_username")
 async def cb_add_by_username(callback: CallbackQuery, state: FSMContext):
-    """Обработка добавления канала по username."""
+    """Обработка добавления канала по username или ссылке."""
     await callback.message.edit_text(
         "📝 <b>Добавление по username</b>\n\n"
-        "Отправьте username канала (например: @channel_name или channel_name)",
+        "Отправьте username канала или ссылку:\n"
+        "• <code>@channel_name</code>\n"
+        "• <code>channel_name</code>\n"
+        "• <code>https://t.me/channel_name</code>",
         parse_mode="HTML"
     )
     await state.set_state(ChannelStates.waiting_username)
@@ -354,15 +437,27 @@ async def cb_add_channel(callback: CallbackQuery, state: FSMContext):
 
 @router.message(ChannelStates.waiting_username)
 async def process_username(msg: Message, state: FSMContext):
-    """Обработка username канала."""
+    """
+    Обработка username канала или ссылки.
+    
+    Context7: Поддерживает различные форматы:
+    - @channel_name
+    - channel_name
+    - https://t.me/channel_name
+    """
     try:
-        username = msg.text.strip().lstrip('@')
+        # Извлекаем username из текста (может быть ссылка или username)
+        username = _extract_username_from_telegram_url(msg.text)
         
-        # Валидация username
-        if not _is_valid_username(username):
+        if not username:
             await msg.answer(
-                "❌ Неверный формат username!\n\n"
-                "Используйте формат: @channel_name или channel_name"
+                "❌ Неверный формат!\n\n"
+                "Используйте один из форматов:\n"
+                "• <code>@channel_name</code>\n"
+                "• <code>channel_name</code>\n"
+                "• <code>https://t.me/channel_name</code>\n\n"
+                "Username должен содержать только буквы, цифры и подчёркивания (5-32 символа).",
+                parse_mode="HTML"
             )
             return
         
@@ -449,6 +544,51 @@ async def _check_user_permissions(user_id: int) -> bool:
     # Здесь можно добавить логику проверки прав
     # Например, проверка в БД или кеше
     return True
+
+def _extract_username_from_telegram_url(text: str) -> Optional[str]:
+    """
+    Извлекает username из Telegram URL или username.
+    
+    Context7: Поддерживает различные форматы:
+    - https://t.me/username
+    - http://t.me/username
+    - t.me/username
+    - @username
+    - username
+    
+    Args:
+        text: Текст, содержащий URL или username
+        
+    Returns:
+        Username без @ или None, если не удалось извлечь
+    """
+    if not text:
+        return None
+    
+    text = text.strip()
+    
+    # Убираем @ если есть
+    if text.startswith('@'):
+        username = text[1:]
+        # Валидация username (только буквы, цифры, подчёркивания, 5-32 символа)
+        if re.match(r'^[a-zA-Z0-9_]{5,32}$', username):
+            return username
+        return None
+    
+    # Парсинг URL
+    # Паттерн для https://t.me/username или http://t.me/username
+    url_pattern = r'(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/([a-zA-Z0-9_]{5,32})'
+    match = re.search(url_pattern, text)
+    if match:
+        username = match.group(1)
+        return username
+    
+    # Если это просто username без @
+    if re.match(r'^[a-zA-Z0-9_]{5,32}$', text):
+        return text
+    
+    return None
+
 
 def _is_valid_username(username: str) -> bool:
     """Валидация username канала."""

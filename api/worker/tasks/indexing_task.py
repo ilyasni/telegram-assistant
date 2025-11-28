@@ -688,6 +688,7 @@ class IndexingTask:
             # Context7: tenant_id получаем из users через user_channel (приоритет 1), затем из tags_data (приоритет 2), затем из channels.settings (приоритет 3)
             # Context7: Явное приведение типа для tenant_id через CAST для избежания ошибки "COALESCE types text[] and jsonb cannot be matched"
             # Context7: users.tenant_id имеет тип UUID, приводим к text для COALESCE
+            # Context7: Добавляем channel_title для Neo4j индексации
             cursor.execute("""
                    SELECT 
                        p.id,
@@ -695,6 +696,7 @@ class IndexingTask:
                        p.content as text,
                        p.telegram_message_id,
                        p.created_at,
+                       c.title as channel_title,
                        COALESCE(
                            (SELECT u.tenant_id::text FROM users u 
                             JOIN user_channel uc ON uc.user_id = u.id 
@@ -1401,6 +1403,7 @@ class IndexingTask:
             # Context7: Вызов метода create_post_node с enrichment данными
             # Context7 P2: Добавляем telegram_message_id и tg_channel_id для reply связей
             # Context7: Добавляем posted_at для обогащения графа временными данными
+            # Context7: Добавляем channel_title для удобства запросов в Neo4j
             success = await self.neo4j_client.create_post_node(
                 post_id=node_data['post_id'],
                 user_id=post_data.get('user_id', 'system'),  # Fallback для совместимости
@@ -1412,7 +1415,8 @@ class IndexingTask:
                 content=node_data.get('content'),
                 telegram_message_id=post_data.get('telegram_message_id'),
                 tg_channel_id=post_data.get('tg_channel_id'),
-                posted_at=node_data.get('posted_at')
+                posted_at=node_data.get('posted_at'),
+                channel_title=post_data.get('channel_title')
             )
             
             # Context7: Создаём узел альбома и связи если пост из альбома

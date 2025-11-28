@@ -68,21 +68,55 @@ class TelegramIngestionService:
             logger.info("Database connected")
             
             # Context7: Получаем клиент через TelegramClientManager
-            # Сначала получаем telegram_id из БД
+            # Сначала получаем telegram_id авторизованного пользователя с сессией из БД
             cursor = self.db_connection.cursor()
-            cursor.execute("SELECT telegram_id FROM users WHERE telegram_id IS NOT NULL LIMIT 1")
+            cursor.execute("""
+                SELECT telegram_id 
+                FROM users 
+                WHERE telegram_auth_status = 'authorized' 
+                  AND telegram_session_enc IS NOT NULL
+                ORDER BY telegram_auth_created_at DESC
+                LIMIT 1
+            """)
             result = cursor.fetchone()
             cursor.close()
             
             if not result:
-                logger.error("No telegram_id found in users table")
+                logger.error(
+                    "No authorized user with session found in users table",
+                    available_users_count=0
+                )
+                # Context7: Дополнительная диагностика - проверяем, сколько пользователей есть
+                cursor = self.db_connection.cursor()
+                cursor.execute("""
+                    SELECT 
+                        COUNT(*) FILTER (WHERE telegram_auth_status = 'authorized') as authorized_count,
+                        COUNT(*) FILTER (WHERE telegram_auth_status = 'pending') as pending_count,
+                        COUNT(*) FILTER (WHERE telegram_session_enc IS NOT NULL) as with_session_count
+                    FROM users
+                    WHERE telegram_id IS NOT NULL
+                """)
+                stats = cursor.fetchone()
+                cursor.close()
+                if stats:
+                    logger.warning(
+                        "User session statistics",
+                        authorized_count=stats[0] or 0,
+                        pending_count=stats[1] or 0,
+                        with_session_count=stats[2] or 0,
+                    )
                 return
                 
             telegram_id = result[0]
             self.telegram_id = telegram_id  # Context7: Сохраняем для использования в других методах
+            logger.info("Selected authorized user for Telegram client", telegram_id=telegram_id)
             self.client = await self.client_manager.get_client(telegram_id)
             if not self.client:
-                logger.error("No available Telegram client from manager")
+                logger.error(
+                    "No available Telegram client from manager",
+                    telegram_id=telegram_id,
+                    reason="Session may be invalid or expired"
+                )
                 return
                 
             logger.info("Telegram client obtained from manager", telegram_id=telegram_id)
@@ -205,9 +239,11 @@ class TelegramIngestionService:
                     """)
                     self._active_group_ids = {int(row['tg_chat_id']) for row in cursor.fetchall() if row['tg_chat_id']}
                     
-                    logger.debug("Active chats cache refreshed",
+                    logger.info("Active chats cache refreshed",
                                channels_count=len(self._active_channel_ids),
-                               groups_count=len(self._active_group_ids))
+                               groups_count=len(self._active_group_ids),
+                               active_channel_ids=list(self._active_channel_ids)[:10],  # Первые 10 для диагностики
+                               active_group_ids=list(self._active_group_ids)[:10])  # Первые 10 для диагностики
             except Exception as e:
                 logger.warning("Failed to refresh active chats cache", error=str(e))
         
@@ -230,13 +266,33 @@ class TelegramIngestionService:
                 chat_id = getattr(event.message.peer_id, 'channel_id', None) or getattr(event.message.peer_id, 'chat_id', None)
                 if chat_id:
                     chat_id_int = int(chat_id)
-                    if chat_id_int not in self._active_channel_ids and chat_id_int not in self._active_group_ids:
-                        # Не активный канал/группа - пропускаем
+                    is_channel = chat_id_int in self._active_channel_ids
+                    is_group = chat_id_int in self._active_group_ids
+                    
+                    if not is_channel and not is_group:
+                        # Context7: Детальное логирование для диагностики пропущенных сообщений
+                        logger.debug(
+                            "Message skipped - not in active chats",
+                            chat_id=chat_id_int,
+                            active_channels_count=len(self._active_channel_ids),
+                            active_groups_count=len(self._active_group_ids),
+                            is_channel=is_channel,
+                            is_group=is_group,
+                        )
                         return
+                    
+                    # Context7: Логирование успешной обработки для диагностики
+                    logger.info(
+                        "Processing new message",
+                        chat_id=chat_id_int,
+                        message_id=event.message.id,
+                        is_channel=is_channel,
+                        is_group=is_group,
+                    )
                 
                 await self._process_message(event)
             except Exception as e:
-                logger.error("Error processing message", error=str(e), message_id=event.message.id)
+                logger.error("Error processing message", error=str(e), message_id=event.message.id, exc_info=True)
         
         @self.client.on(events.MessageEdited)
         async def handle_message_edited(event):
@@ -302,64 +358,127 @@ class TelegramIngestionService:
             logger.error("Failed to load channels", error=str(e))
 
     async def _load_active_groups(self):
-        """Загрузка активных групп из БД для подписки на события."""
+        """Загрузка активных групп из БД для подписки на события.
+        
+        Context7: Использует клиент пользователя, подписанного на группу.
+        Только группы с активными подписками в user_group загружаются.
+        """
         try:
+            # Context7: Получаем группы с информацией о подписанных пользователях
             with self.db_connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                # Получаем только группы с активными подписками в user_group
                 cursor.execute("""
-                    SELECT id, tenant_id, tg_chat_id, username, title
-                    FROM groups
-                    WHERE is_active = true
+                    SELECT 
+                        g.id, 
+                        g.tenant_id, 
+                        g.tg_chat_id, 
+                        g.username, 
+                        g.title,
+                        u.telegram_id as subscriber_telegram_id
+                    FROM groups g
+                    INNER JOIN user_group ug ON g.id = ug.group_id
+                    INNER JOIN users u ON ug.user_id = u.id
+                    WHERE g.is_active = true
+                      AND ug.is_active = true
+                      AND u.telegram_auth_status = 'authorized'
+                      AND u.telegram_session_enc IS NOT NULL
+                    ORDER BY ug.subscribed_at DESC
                 """)
-                groups = cursor.fetchall() or []
+                groups_with_users = cursor.fetchall() or []
 
-            for group in groups:
+            if not groups_with_users:
+                logger.warning(
+                    "No groups with authorized users found",
+                    total_groups=0
+                )
+                return
+
+            for group_data in groups_with_users:
                 try:
+                    subscriber_telegram_id = group_data.get("subscriber_telegram_id")
+                    if not subscriber_telegram_id or not self.client_manager:
+                        logger.warning(
+                            "Group has no subscriber or client manager unavailable",
+                            group_id=group_data.get("id"),
+                            subscriber_telegram_id=subscriber_telegram_id,
+                        )
+                        continue
+
+                    # Context7: Получаем клиент пользователя, подписанного на группу
+                    subscriber_telegram_id_int = int(subscriber_telegram_id)
+                    group_client = await self.client_manager.get_client(subscriber_telegram_id_int)
+                    if not group_client:
+                        logger.warning(
+                            "No client available for group subscriber",
+                            group_id=group_data.get("id"),
+                            subscriber_telegram_id=subscriber_telegram_id_int,
+                        )
+                        continue
+
                     entity = None
-                    if group.get("username"):
-                        clean_username = group["username"].lstrip("@")
-                        entity = await self.client.get_entity(clean_username)
-                    elif group.get("tg_chat_id"):
-                        entity = await self.client.get_entity(int(group["tg_chat_id"]))
+                    if group_data.get("username"):
+                        clean_username = group_data["username"].lstrip("@")
+                        entity = await group_client.get_entity(clean_username)
+                    elif group_data.get("tg_chat_id"):
+                        entity = await group_client.get_entity(int(group_data["tg_chat_id"]))
 
                     logger.info(
                         "Loaded group for real-time ingest",
-                        group_id=group["id"],
-                        tg_chat_id=group.get("tg_chat_id"),
-                        username=group.get("username"),
-                        title=group.get("title"),
+                        group_id=group_data["id"],
+                        tg_chat_id=group_data.get("tg_chat_id"),
+                        username=group_data.get("username"),
+                        title=group_data.get("title"),
+                        subscriber_telegram_id=subscriber_telegram_id_int,
                         entity_type=type(entity).__name__ if entity else None,
                     )
                 except Exception as e:
                     logger.warning(
                         "Failed to load group entity",
-                        group_id=group.get("id"),
-                        tg_chat_id=group.get("tg_chat_id"),
+                        group_id=group_data.get("id"),
+                        tg_chat_id=group_data.get("tg_chat_id"),
+                        subscriber_telegram_id=group_data.get("subscriber_telegram_id"),
                         error=str(e),
                     )
         except Exception as e:
             logger.error("Failed to load groups", error=str(e))
 
     async def _group_sync_worker(self):
-        """Периодическая синхронизация истории сообщений групп."""
+        """Периодическая синхронизация истории сообщений групп.
+        
+        Context7: Использует сессию пользователя, подписанного на группу.
+        """
         poll_interval = int(os.getenv("GROUP_SYNC_INTERVAL_SEC", "180"))
         max_messages = int(os.getenv("GROUP_SYNC_LIMIT", "200"))
         lookback_hours = int(os.getenv("GROUP_SYNC_LOOKBACK_HOURS", "24"))
 
         while True:
-            if not self.is_running or not self.client or not self.db_connection:
+            if not self.is_running or not self.client_manager or not self.db_connection:
                 await asyncio.sleep(poll_interval)
                 continue
 
             try:
+                # Context7: Получаем группы с информацией о подписанных пользователях
                 with self.db_connection.cursor(cursor_factory=RealDictCursor) as cursor:
                     cursor.execute(
                         """
-                        SELECT id, tenant_id, tg_chat_id, username, title
-                        FROM groups
-                        WHERE is_active = true
+                        SELECT 
+                            g.id, 
+                            g.tenant_id, 
+                            g.tg_chat_id, 
+                            g.username, 
+                            g.title,
+                            u.telegram_id as subscriber_telegram_id
+                        FROM groups g
+                        INNER JOIN user_group ug ON g.id = ug.group_id
+                        INNER JOIN users u ON ug.user_id = u.id
+                        WHERE g.is_active = true
+                          AND ug.is_active = true
+                          AND u.telegram_auth_status = 'authorized'
+                          AND u.telegram_session_enc IS NOT NULL
+                        ORDER BY ug.subscribed_at DESC
                         """
                     )
-                    groups = cursor.fetchall() or []
+                    groups_with_users = cursor.fetchall() or []
             except Exception as fetch_err:
                 logger.error("Failed to load groups for sync", error=str(fetch_err))
                 try:
@@ -371,25 +490,47 @@ class TelegramIngestionService:
 
             lookback_threshold = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
 
-            for group in groups:
-                tg_chat_id = group.get("tg_chat_id")
-                if tg_chat_id is None:
+            for group_data in groups_with_users:
+                tg_chat_id = group_data.get("tg_chat_id")
+                subscriber_telegram_id = group_data.get("subscriber_telegram_id")
+                if tg_chat_id is None or subscriber_telegram_id is None:
+                    continue
+
+                # Context7: Получаем клиент пользователя, подписанного на группу
+                try:
+                    subscriber_telegram_id_int = int(subscriber_telegram_id)
+                    group_client = await self.client_manager.get_client(subscriber_telegram_id_int)
+                    if not group_client:
+                        logger.warning(
+                            "No client available for group subscriber",
+                            group_id=group_data.get("id"),
+                            subscriber_telegram_id=subscriber_telegram_id_int,
+                        )
+                        continue
+                except Exception as client_err:
+                    logger.warning(
+                        "Failed to get client for group subscriber",
+                        error=str(client_err),
+                        group_id=group_data.get("id"),
+                        subscriber_telegram_id=subscriber_telegram_id,
+                    )
                     continue
 
                 try:
-                    entity = await self.client.get_entity(int(tg_chat_id))
+                    entity = await group_client.get_entity(int(tg_chat_id))
                 except Exception as entity_err:
                     logger.warning(
                         "Failed to resolve group entity for sync",
                         error=str(entity_err),
-                        group_id=group.get("id"),
+                        group_id=group_data.get("id"),
                         tg_chat_id=tg_chat_id,
+                        subscriber_telegram_id=subscriber_telegram_id_int,
                     )
                     continue
 
                 processed = 0
                 try:
-                    async for message in self.client.iter_messages(entity, limit=max_messages):
+                    async for message in group_client.iter_messages(entity, limit=max_messages):
                         message_date = getattr(message, "date", None)
                         if isinstance(message_date, datetime):
                             msg_dt = (
@@ -400,22 +541,24 @@ class TelegramIngestionService:
                             if msg_dt < lookback_threshold:
                                 break
 
-                        await self._process_group_message(message, group)
+                        await self._process_group_message(message, dict(group_data))
                         processed += 1
                 except Exception as sync_err:
                     logger.warning(
                         "Group sync iteration failed",
                         error=str(sync_err),
-                        group_id=group.get("id"),
+                        group_id=group_data.get("id"),
                         tg_chat_id=tg_chat_id,
+                        subscriber_telegram_id=subscriber_telegram_id_int,
                     )
                     continue
 
                 if processed:
                     logger.info(
                         "Group history synced",
-                        group_id=group.get("id"),
+                        group_id=group_data.get("id"),
                         tg_chat_id=tg_chat_id,
+                        subscriber_telegram_id=subscriber_telegram_id_int,
                         processed=processed,
                         lookback_hours=lookback_hours,
                     )
@@ -1098,7 +1241,10 @@ class TelegramIngestionService:
             raise
     
     async def _process_message(self, event):
-        """Обработка нового сообщения."""
+        """Обработка нового сообщения.
+        
+        Context7: Для групп использует клиент пользователя, подписанного на группу.
+        """
         try:
             message = event.message
             channel = await event.get_chat()
@@ -1109,7 +1255,40 @@ class TelegramIngestionService:
                 # Попытка найти группу
                 group_info = await self._get_group_info(channel.id)
                 if group_info:
-                    await self._process_group_message(message, group_info)
+                    # Context7: Для групп используем клиент подписанного пользователя
+                    subscriber_telegram_id = group_info.get("subscriber_telegram_id")
+                    if subscriber_telegram_id and self.client_manager:
+                        try:
+                            subscriber_telegram_id_int = int(subscriber_telegram_id)
+                            group_client = await self.client_manager.get_client(subscriber_telegram_id_int)
+                            if group_client:
+                                # Сохраняем оригинальный клиент и временно используем клиент подписчика
+                                original_client = self.client
+                                self.client = group_client
+                                try:
+                                    await self._process_group_message(message, group_info)
+                                finally:
+                                    self.client = original_client
+                            else:
+                                logger.warning(
+                                    "No client available for group subscriber",
+                                    group_id=group_info.get("id"),
+                                    subscriber_telegram_id=subscriber_telegram_id_int,
+                                )
+                        except Exception as client_err:
+                            logger.warning(
+                                "Failed to get client for group subscriber",
+                                error=str(client_err),
+                                group_id=group_info.get("id"),
+                                subscriber_telegram_id=subscriber_telegram_id,
+                            )
+                    else:
+                        # Context7: Пропускаем сообщение, если нет подписчика в user_group
+                        logger.warning(
+                            "Group message skipped - no subscriber in user_group",
+                            group_id=group_info.get("id"),
+                            tg_chat_id=channel.id,
+                        )
                 else:
                     logger.warning(
                         "Chat not registered as channel or group",
@@ -1396,15 +1575,36 @@ class TelegramIngestionService:
             return None
 
     async def _get_group_info(self, telegram_id: int) -> Optional[dict]:
-        """Получение информации о группе из БД."""
+        """Получение информации о группе из БД с информацией о подписанном пользователе.
+        
+        Context7: Возвращает группу и telegram_id пользователя, подписанного на неё.
+        Если подписки нет, использует пользователя из того же tenant с авторизованной сессией.
+        """
         try:
             with self.db_connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                # Context7: Сначала ищем группу с подписанным пользователем
                 cursor.execute("""
-                    SELECT id, tenant_id, tg_chat_id, username, title, settings
-                    FROM groups
-                    WHERE tg_chat_id = %s AND is_active = true
+                    SELECT 
+                        g.id, 
+                        g.tenant_id, 
+                        g.tg_chat_id, 
+                        g.username, 
+                        g.title, 
+                        g.settings,
+                        u.telegram_id as subscriber_telegram_id
+                    FROM groups g
+                    INNER JOIN user_group ug ON g.id = ug.group_id
+                    INNER JOIN users u ON ug.user_id = u.id
+                    WHERE g.tg_chat_id = %s 
+                      AND g.is_active = true
+                      AND ug.is_active = true
+                      AND u.telegram_auth_status = 'authorized'
+                      AND u.telegram_session_enc IS NOT NULL
+                    ORDER BY ug.subscribed_at DESC
+                    LIMIT 1
                 """, (telegram_id,))
                 row = cursor.fetchone()
+                
                 return row
         except Exception as e:
             logger.error("Failed to get group info", error=str(e))

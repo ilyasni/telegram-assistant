@@ -104,7 +104,8 @@ class Neo4jClient:
         content: Optional[str] = None,
         telegram_message_id: Optional[int] = None,
         tg_channel_id: Optional[int] = None,
-        posted_at: Optional[str] = None
+        posted_at: Optional[str] = None,
+        channel_title: Optional[str] = None
     ) -> bool:
         """
         Создание узла поста с expires_at property.
@@ -141,7 +142,8 @@ class Neo4jClient:
                     p.content = coalesce($content, p.content),
                     p.telegram_message_id = coalesce($telegram_message_id, p.telegram_message_id),
                     p.tg_channel_id = coalesce($tg_channel_id, p.tg_channel_id),
-                    p.posted_at = coalesce($posted_at, p.posted_at)
+                    p.posted_at = coalesce($posted_at, p.posted_at),
+                    p.channel_title = coalesce($channel_title, p.channel_title, '')
                 MERGE (u:User {user_id: $effective_user_id})
                 SET u.tenant_id = $tenant_id
                 MERGE (c:Channel {channel_id: $channel_id})
@@ -167,7 +169,8 @@ class Neo4jClient:
                     content=trimmed_content,
                     telegram_message_id=telegram_message_id,
                     tg_channel_id=tg_channel_id,
-                    posted_at=posted_at
+                    posted_at=posted_at,
+                    channel_title=channel_title
                 )
                 
                 record = await result.single()

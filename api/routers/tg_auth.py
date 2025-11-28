@@ -34,7 +34,7 @@ AUTH_QR_FAIL = Counter("auth_qr_fail_total", "QR failures", ["tenant_id", "reaso
 AUTH_QR_DURATION = Histogram("auth_qr_duration_seconds", "QR auth duration", ["tenant_id"], namespace="api")
 AUTH_QR_EXPIRED = Counter("auth_qr_expired_total", "QR sessions expired", ["tenant_id"], namespace="api")
 AUTH_QR_OWNERSHIP_FAIL = Counter("auth_qr_ownership_fail_total", "Ownership check failures", namespace="api")
-AUTH_QR_2FA_REQUIRED = Counter("auth_qr_2fa_required_total", "2FA required count", namespace="api")
+AUTH_QR_2FA_REQUIRED = Counter("auth_qr_2fa_required_total", "2FA required count", ["tenant_id"], namespace="api")
 
 # Context7 best practice: async Redis client для неблокирующих операций
 redis_client = redis.from_url(settings.redis_url, decode_responses=True)
@@ -55,6 +55,11 @@ class QrStart(BaseModel):
     invite_code: str | None = None
     init_data: str | None = None  # Telegram MiniApp initData для извлечения telegram_user_id
     token: str | None = None  # Fallback JWT от бота
+
+
+class QrPassword(BaseModel):
+    session_token: str
+    password: str
 
 
 def verify_telegram_init_data(init_data: str, bot_token: str) -> bool:
@@ -150,6 +155,11 @@ def resolve_tenant_from_token(token: str, db: Session) -> tuple[str, str | None]
     if not token:
         raise HTTPException(status_code=400, detail="token is required to resolve tenant_id")
     try:
+        # Context7: детальное логирование для диагностики проблем с токеном
+        logger.debug("Decoding fallback token", 
+                    token_length=len(token),
+                    token_preview=token[:50] if len(token) > 50 else token)
+        
         payload = jwt.decode(
             token,
             settings.jwt_secret.get_secret_value(),
@@ -157,10 +167,31 @@ def resolve_tenant_from_token(token: str, db: Session) -> tuple[str, str | None]
             audience="qr_webapp",
             options={"require": ["tenant_id", "session_id"], "verify_aud": True}
         )
-    except jwt.ExpiredSignatureError:
+        
+        logger.debug("Token decoded successfully", 
+                    has_tenant_id="tenant_id" in payload,
+                    has_session_id="session_id" in payload,
+                    has_telegram_id="telegram_id" in payload,
+                    purpose=payload.get("purpose"),
+                    audience=payload.get("aud"))
+    except jwt.ExpiredSignatureError as e:
+        logger.warning("Fallback token expired", error=str(e))
         raise HTTPException(status_code=401, detail="token expired")
+    except jwt.InvalidAudienceError as e:
+        logger.warning("Invalid token audience", 
+                      error=str(e),
+                      expected_audience="qr_webapp",
+                      token_audience=getattr(e, 'audience', None))
+        raise HTTPException(status_code=401, detail="invalid token audience")
+    except jwt.MissingRequiredClaimError as e:
+        logger.warning("Missing required claim in token", 
+                      error=str(e),
+                      claim=getattr(e, 'claim', None))
+        raise HTTPException(status_code=401, detail=f"missing required claim: {getattr(e, 'claim', 'unknown')}")
     except jwt.InvalidTokenError as exc:
-        logger.warning("Invalid fallback token", error=str(exc))
+        logger.warning("Invalid fallback token", 
+                      error=str(exc),
+                      error_type=type(exc).__name__)
         raise HTTPException(status_code=401, detail="invalid token")
 
     tenant_id = payload.get("tenant_id")
@@ -462,7 +493,7 @@ async def qr_status_post(body: dict):
     if "qr_url" in data:
         resp["qr_url"] = data["qr_url"]
     # Context7 best practice: прокидываем причину ошибки из Redis, чтобы фронт не показывал "Неизвестная ошибка"
-    if resp["status"] == "failed" and "reason" in data:
+    if resp["status"] in ["failed", "password_required"] and "reason" in data:
         resp["reason"] = data["reason"]
     return resp
 
@@ -471,8 +502,17 @@ async def qr_status_post(body: dict):
 async def qr_sse(token: str):
     """SSE endpoint для статуса QR-авторизации (async генератор)."""
     
+    # Context7: логируем открытие SSE соединения
+    try:
+        payload = decode_session_token(token)
+        tenant_id = _extract_tenant_id(payload)
+        logger.info("SSE connection opened", tenant_id=tenant_id)
+    except Exception as e:
+        logger.error("SSE: failed to decode token", error=str(e))
+    
     async def gen():
         import time as _t
+        iteration = 0
         while True:
             try:
                 payload = decode_session_token(token)
@@ -483,16 +523,44 @@ async def qr_sse(token: str):
                 data = await redis_client.hgetall(key)
                 status = "pending"
                 qr_url = None
+                reason = None
                 if data:
                     status = data.get("status", "pending")
                     qr_url = data.get("qr_url")
+                    if status in ["failed", "password_required"] and "reason" in data:
+                        reason = data.get("reason")
+                
+                # Context7: ВАЖНО! При статусе password_required НЕ отправляем qr_url
+                # Это гарантирует, что фронтенд обработает password_required, а не qr_url
                 line = {
                     "status": status,
-                    "qr_url": qr_url,
                 }
+                # Context7: отправляем qr_url только если статус НЕ password_required
+                if qr_url and status != "password_required":
+                    line["qr_url"] = qr_url
+                if reason:
+                    line["reason"] = reason
+                
+                # Context7: логируем статус password_required для отладки
+                if status == "password_required":
+                    logger.info("SSE: sending password_required status", 
+                              tenant_id=tenant_id, 
+                              has_reason=bool(reason),
+                              has_qr_url=bool(qr_url),
+                              line=line,
+                              redis_key=key,
+                              iteration=iteration)  # Добавляем итерацию для отладки
+                elif iteration % 10 == 0:  # Логируем каждые 10 итераций для других статусов
+                    logger.debug("SSE: sending status", 
+                               tenant_id=tenant_id,
+                               status=status,
+                               iteration=iteration)
+                
                 yield f"data: {json.dumps(line)}\n\n"
+                iteration += 1
                 await asyncio.sleep(1.5)
-            except Exception:
+            except Exception as e:
+                logger.error("SSE: error in generator", error=str(e), tenant_id=tenant_id if 'tenant_id' in locals() else "unknown")
                 yield "data: {\"status\": \"error\"}\n\n"
                 await asyncio.sleep(2)
     
@@ -568,3 +636,244 @@ async def qr_png(session_id: str):
     )
 
 
+@router.post("/qr/password")
+async def qr_password(body: QrPassword):
+    """Context7 best practice: endpoint для отправки 2FA пароля при QR-авторизации.
+    
+    [C7-ID: telethon-2fa-handling-002]
+    """
+    # Декодируем JWT чтобы получить tenant_id
+    try:
+        payload = decode_session_token(body.session_token)
+        tenant_id = _extract_tenant_id(payload)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to decode session token", error=str(e))
+        raise HTTPException(status_code=400, detail="invalid token")
+    
+    # Rate limiting для пароля
+    ip = "qr_password"  # Можно улучшить, добавив IP из request
+    if not await ratelimit_strict(f"qr:password:{tenant_id}"):
+        raise HTTPException(status_code=429, detail="Too many password attempts. Try again in 1 minute.")
+    
+    # Context7: Единый префикс t:{tenant}:qr:session
+    key = f"t:{tenant_id}:qr:session"
+    data = await redis_client.hgetall(key)
+    if not data:
+        raise HTTPException(status_code=404, detail="QR session not found or expired")
+    
+    status = data.get("status")
+    if status != "password_required":
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Password not required. Current status: {status}"
+        )
+    
+    session_string = data.get("session_string")
+    if not session_string:
+        logger.error("Session string missing for password_required status", tenant_id=tenant_id)
+        raise HTTPException(status_code=500, detail="Session data corrupted")
+    
+    # Context7 best practice: проверка пароля через Telethon
+    # [C7-ID: telethon-2fa-handling-003]
+    # Context7: согласно best practices, после SessionPasswordNeededError нужно:
+    # 1. Создать клиент с сохраненным session_string
+    # 2. Подключиться
+    # 3. Проверить состояние авторизации
+    # 4. Вызвать sign_in(password=...) только если клиент не авторизован
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+    from telethon.errors import PasswordHashInvalidError, SessionPasswordNeededError
+    
+    # Context7: получаем API credentials из переменных окружения
+    # Поддерживаем оба варианта: MASTER_API_* (для telethon-ingest) и TELEGRAM_API_* (для совместимости)
+    # Context7: логируем для диагностики
+    master_api_id_env = os.getenv("MASTER_API_ID")
+    telegram_api_id_env = os.getenv("TELEGRAM_API_ID")
+    master_api_hash_env = os.getenv("MASTER_API_HASH")
+    telegram_api_hash_env = os.getenv("TELEGRAM_API_HASH")
+    
+    logger.debug("Checking Telegram API credentials", 
+                has_master_api_id=bool(master_api_id_env),
+                has_master_api_hash=bool(master_api_hash_env),
+                has_telegram_api_id=bool(telegram_api_id_env),
+                has_telegram_api_hash=bool(telegram_api_hash_env),
+                tenant_id=tenant_id)
+    
+    master_api_id = int(master_api_id_env or telegram_api_id_env or "0")
+    master_api_hash = master_api_hash_env or telegram_api_hash_env or ""
+    
+    if not master_api_id or not master_api_hash or master_api_id == 0:
+        logger.error("Telegram API credentials not configured", 
+                    master_api_id_value=master_api_id,
+                    master_api_hash_length=len(master_api_hash) if master_api_hash else 0,
+                    has_master_api_id=bool(master_api_id_env),
+                    has_master_api_hash=bool(master_api_hash_env),
+                    has_telegram_api_id=bool(telegram_api_id_env),
+                    has_telegram_api_hash=bool(telegram_api_hash_env),
+                    tenant_id=tenant_id)
+        raise HTTPException(
+            status_code=500, 
+            detail="Telegram API credentials not configured. Please set MASTER_API_ID and MASTER_API_HASH (or TELEGRAM_API_ID and TELEGRAM_API_HASH) in environment variables."
+        )
+    
+    client = TelegramClient(
+        StringSession(session_string),
+        master_api_id,
+        master_api_hash,
+        device_model="TelegramAssistant",
+        system_version="Linux",
+        app_version="1.0"
+    )
+    
+    try:
+        logger.debug("Connecting client for 2FA password verification", tenant_id=tenant_id)
+        await client.connect()
+        
+        # Context7 best practice: проверяем состояние авторизации перед sign_in
+        # После открепления бота сессия может быть в неполном состоянии
+        is_authorized = await client.is_user_authorized()
+        logger.debug("Client authorization status", tenant_id=tenant_id, is_authorized=is_authorized)
+        
+        # Context7: если клиент уже авторизован, проверяем что это правильный пользователь
+        if is_authorized:
+            try:
+                me = await client.get_me()
+                if me and me.id:
+                    logger.info("Client already authorized, verifying session", 
+                              tenant_id=tenant_id, telegram_user_id=me.id)
+                    # Сохраняем обновленную сессию
+                    updated_session_string = client.session.save()
+                    
+                    # Обновляем Redis
+                    await redis_client.hset(key, mapping={
+                        "status": "authorized",
+                        "session_string": updated_session_string,
+                        "telegram_user_id": str(me.id),
+                        "password_verified": "true",
+                        "created_at": str(int(time.time()))
+                    })
+                    await redis_client.expire(key, 3600)
+                    
+                    # Публикуем StringSession для ingest
+                    session_key = f"t:{tenant_id}:session"
+                    await redis_client.set(session_key, updated_session_string, ex=86400)
+                    
+                    logger.info("Session already authorized, verified successfully", 
+                              tenant_id=tenant_id, telegram_user_id=me.id)
+                    AUTH_QR_SUCCESS.labels(tenant_id=tenant_id).inc()
+                    # Context7: Counter не поддерживает .dec(), только .inc()
+                    # Уменьшение счетчика не требуется - Counter отслеживает общее количество событий
+                    
+                    return {
+                        "status": "authorized",
+                        "message": "Session already authorized",
+                        "telegram_user_id": me.id
+                    }
+            except Exception as e:
+                logger.warning("Failed to verify authorized session, will try sign_in", 
+                             error=str(e), tenant_id=tenant_id)
+                # Продолжаем с sign_in
+        
+        # Context7 best practice: вызываем sign_in только если клиент не авторизован
+        # Это правильный способ завершить 2FA после SessionPasswordNeededError
+        logger.debug("Calling sign_in with password", tenant_id=tenant_id)
+        try:
+            # Context7: sign_in(password=...) завершает процесс авторизации с 2FA
+            # После успешного sign_in клиент будет авторизован
+            await client.sign_in(password=body.password)
+            
+            # Context7: проверяем что авторизация прошла успешно
+            if not await client.is_user_authorized():
+                logger.error("Client not authorized after sign_in", tenant_id=tenant_id)
+                raise HTTPException(status_code=500, detail="Authorization failed after password verification")
+            
+            # Успешная авторизация
+            me = await client.get_me()
+            
+            if not me or not me.id:
+                logger.error("Invalid Telegram user data after password", tenant_id=tenant_id)
+                raise HTTPException(status_code=500, detail="Invalid user data")
+            
+            # Сохраняем обновленную сессию
+            updated_session_string = client.session.save()
+            
+            # Context7 best practice: обновляем Redis с authorized статусом
+            # Telethon-ingest автоматически обработает authorized сессию и сохранит в БД
+            await redis_client.hset(key, mapping={
+                "status": "authorized",
+                "session_string": updated_session_string,
+                "telegram_user_id": str(me.id),
+                "password_verified": "true",
+                "created_at": str(int(time.time()))  # Обновляем timestamp для валидации
+            })
+            await redis_client.expire(key, 3600)  # Продлеваем TTL для обработки telethon-ingest
+            
+            # Context7: публикуем StringSession в единый ключ для ingest с префиксом t:{tenant}:session
+            session_key = f"t:{tenant_id}:session"
+            await redis_client.set(session_key, updated_session_string, ex=86400)
+            
+            logger.info("2FA password verified successfully", 
+                       tenant_id=tenant_id, 
+                       telegram_user_id=me.id,
+                       session_string_length=len(updated_session_string),
+                       note="Session saved to Redis, user authenticated")
+            AUTH_QR_SUCCESS.labels(tenant_id=tenant_id).inc()
+            # Context7: Counter не поддерживает .dec(), только .inc()
+            # Counter отслеживает общее количество событий "2FA required", не текущее состояние
+            
+            return {
+                "status": "authorized",
+                "message": "Password verified successfully",
+                "telegram_user_id": me.id
+            }
+            
+        except PasswordHashInvalidError:
+            logger.warning("Invalid 2FA password", tenant_id=tenant_id)
+            AUTH_QR_FAIL.labels(tenant_id=tenant_id, reason="invalid_password").inc()
+            raise HTTPException(status_code=400, detail="Invalid password")
+        except SessionPasswordNeededError:
+            # Context7: если все еще требуется пароль, значит что-то пошло не так
+            logger.error("Password still required after sign_in attempt", tenant_id=tenant_id)
+            AUTH_QR_FAIL.labels(tenant_id=tenant_id, reason="password_still_required").inc()
+            raise HTTPException(status_code=500, detail="Password verification failed: session still requires password")
+        except Exception as e:
+            # Context7: логируем ошибку с деталями для диагностики
+            error_msg = str(e)
+            error_type = type(e).__name__
+            logger.error("Error during password verification", 
+                        error=error_msg, 
+                        tenant_id=tenant_id, 
+                        error_type=error_type,
+                        exc_info=True)
+            
+            # Context7: безопасное использование метрики с проверкой
+            try:
+                AUTH_QR_FAIL.labels(tenant_id=tenant_id, reason="password_verification_error").inc()
+            except Exception as metric_error:
+                logger.warning("Failed to update metric", 
+                             metric_error=str(metric_error), 
+                             tenant_id=tenant_id)
+            
+            # Context7: не раскрываем внутренние детали ошибки в ответе пользователю
+            if "No label names" in error_msg or "counter" in error_msg.lower():
+                # Внутренняя ошибка метрики - не показываем пользователю
+                raise HTTPException(status_code=500, detail="Password verification failed: internal error")
+            raise HTTPException(status_code=500, detail=f"Password verification failed: {error_msg}")
+            
+    finally:
+        try:
+            # Context7: Безопасная проверка состояния клиента перед отключением
+            # Проверяем, что клиент был успешно создан и находится в безопасном состоянии
+            if client and hasattr(client, 'is_connected'):
+                try:
+                    if client.is_connected():
+                        await client.disconnect()
+                        logger.debug("Client disconnected after 2FA verification", tenant_id=tenant_id)
+                except Exception as disconnect_error:
+                    # Игнорируем ошибки при проверке состояния или отключении
+                    logger.debug("Client disconnect error (expected if connection failed)", 
+                               error=str(disconnect_error), tenant_id=tenant_id)
+        except Exception as e:
+            logger.warning("Error disconnecting client", error=str(e), tenant_id=tenant_id)

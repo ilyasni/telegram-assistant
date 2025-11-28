@@ -4,7 +4,7 @@ Context7 best practice: Атомарное сохранение в БД без F
 Порядок операций:
 1. UPSERT users (ON CONFLICT telegram_id)
 2. UPSERT channels (ON CONFLICT telegram_id) 
-3. INSERT posts (ON CONFLICT DO NOTHING)
+3. INSERT posts (ON CONFLICT DO UPDATE) - обновляем существующие посты для актуализации данных
 
 HWM обновляется ТОЛЬКО после успешного commit.
 """
@@ -45,6 +45,13 @@ db_transaction_rollbacks_total = Counter(
     'db_transaction_rollbacks_total',
     'Transaction rollbacks',
     ['reason']
+)
+
+# Context7: Метрика для отслеживания проблем с подписками
+db_subscription_check_failures_total = Counter(
+    'db_subscription_check_failures_total',
+    'Total subscription check failures',
+    ['reason']  # 'no_subscription', 'subscription_inactive'
 )
 
 # Context7: Метрики для отслеживания проблем с парсингом
@@ -199,18 +206,81 @@ class AtomicDBSaver:
                                 channel_id=channel_id_uuid,
                                 telegram_id=channel_data.get('telegram_id'))
                 
-                # 2.5. Context7 best practice: Создаём user_channel связь если её нет
-                # Это необходимо для корректной работы сохранения альбомов
-                # Context7: Не прерываем транзакцию при ошибке - это дополнительная операция
-                try:
-                    await self._ensure_user_channel(db_session, user_data, channel_data, channel_id_uuid)
-                except Exception as e:
-                    # Логируем, но не прерываем транзакцию
-                    self.logger.warning("_ensure_user_channel failed but continuing transaction",
-                                      error=str(e),
-                                      error_type=type(e).__name__)
+                # 2.5. Context7: Проверка подписки с поддержкой системного парсинга
+                # Для системного парсинга (scheduler) автоматически создаем/активируем подписку для активных каналов
+                telegram_id = user_data.get('telegram_id')
+                if isinstance(telegram_id, str):
+                    telegram_id = int(telegram_id)
                 
-                # 3. BULK INSERT posts (ON CONFLICT DO NOTHING)
+                # Context7: Получаем user_id для проверки подписки
+                user_result = await db_session.execute(
+                    text("SELECT id FROM users WHERE telegram_id = :telegram_id LIMIT 1"),
+                    {"telegram_id": telegram_id}
+                )
+                user_row = user_result.fetchone()
+                if not user_row:
+                    self.logger.error("User not found", telegram_id=telegram_id)
+                    return False, "user_not_found", 0
+                
+                user_id_uuid = user_row[0]
+                
+                # Context7: Проверка активной подписки
+                check_subscription = await db_session.execute(
+                    text("""
+                        SELECT user_id, is_active FROM user_channel 
+                        WHERE user_id = :user_id AND channel_id = :channel_id
+                        LIMIT 1
+                    """),
+                    {"user_id": user_id_uuid, "channel_id": channel_id_uuid}
+                )
+                
+                subscription_row = check_subscription.fetchone()
+                
+                # Context7: Если подписки нет или она неактивна - проверяем, можно ли создать/активировать
+                if not subscription_row or not subscription_row.is_active:
+                    # Проверяем, активен ли канал (для системного парсинга)
+                    channel_check = await db_session.execute(
+                        text("SELECT is_active FROM channels WHERE id = :channel_id LIMIT 1"),
+                        {"channel_id": channel_id_uuid}
+                    )
+                    channel_row = channel_check.fetchone()
+                    
+                    if channel_row and channel_row.is_active:
+                        # Context7: Канал активен - создаем/активируем подписку для системного парсинга
+                        # Это позволяет scheduler парсить активные каналы без явной подписки пользователя
+                        await db_session.execute(
+                            text("""
+                                INSERT INTO user_channel (user_id, channel_id, is_active, subscribed_at, settings)
+                                VALUES (:user_id, :channel_id, true, NOW(), '{}'::jsonb)
+                                ON CONFLICT (user_id, channel_id) 
+                                DO UPDATE SET is_active = true, subscribed_at = COALESCE(user_channel.subscribed_at, NOW())
+                            """),
+                            {"user_id": user_id_uuid, "channel_id": channel_id_uuid}
+                        )
+                        self.logger.info("Created/activated subscription for system parsing",
+                                       channel_id=channel_id_uuid,
+                                       telegram_id=telegram_id)
+                    else:
+                        # Канал неактивен или не найден - не сохраняем посты
+                        pass
+                
+                # Перепроверяем subscription_row после возможного создания подписки
+                if not subscription_row:
+                    self.logger.warning("User not subscribed to channel, skipping post save",
+                                      channel_id=channel_id_uuid,
+                                      telegram_id=telegram_id,
+                                      reason="no_subscription")
+                    db_subscription_check_failures_total.labels(reason="no_subscription").inc()
+                    return False, "user_not_subscribed", 0
+                elif not subscription_row.is_active:
+                    self.logger.warning("User subscription is inactive, skipping post save",
+                                      channel_id=channel_id_uuid,
+                                      telegram_id=telegram_id,
+                                      reason="subscription_inactive")
+                    db_subscription_check_failures_total.labels(reason="subscription_inactive").inc()
+                    return False, "subscription_inactive", 0
+                
+                # 3. BULK INSERT posts (ON CONFLICT DO UPDATE) - обновляем существующие посты
                 self.logger.debug("Bulk inserting posts", posts_count=len(posts_data))
                 inserted_count = await self._bulk_insert_posts(
                     db_session, 
@@ -274,6 +344,7 @@ class AtomicDBSaver:
         try:
             # Context7 P1.1: Сохранение forwards с расширенными полями MessageFwdHeader
             if forwards_data:
+                # Context7: Исправление синтаксиса SQL - используем CAST для jsonb вместо :param::jsonb
                 forwards_sql = text("""
                     INSERT INTO post_forwards (
                         post_id, from_chat_id, from_message_id,
@@ -283,8 +354,8 @@ class AtomicDBSaver:
                     ) VALUES (
                         :post_id, :from_chat_id, :from_message_id,
                         :from_chat_title, :from_chat_username, :forwarded_at,
-                        :from_id::jsonb, :from_name, :post_author_signature,
-                        :saved_from_peer::jsonb, :saved_from_msg_id, :psa_type
+                        CAST(:from_id AS jsonb), :from_name, :post_author_signature,
+                        CAST(:saved_from_peer AS jsonb), :saved_from_msg_id, :psa_type
                     )
                     ON CONFLICT DO NOTHING
                 """)
@@ -852,7 +923,7 @@ class AtomicDBSaver:
                 }
                 prepared_posts.append(prepared_post)
             
-            # Context7: Bulk insert с ON CONFLICT DO NOTHING
+            # Context7: Bulk insert с ON CONFLICT DO UPDATE - обновляем существующие посты для актуализации данных
             # Используем правильный подход: передаем список словарей в execute()
             # SQLAlchemy автоматически использует executemany для списка параметров
             # Для PostgreSQL ON CONFLICT используем text() с правильным синтаксисом

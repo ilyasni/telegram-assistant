@@ -436,6 +436,9 @@ services:
       NEO4J_PASSWORD: ${NEO4J_PASSWORD}
       # Context7 best practice: timezone для корректной работы с временем
       TZ: Europe/Moscow
+      # Context7: Telegram API credentials для проверки 2FA пароля в QR-авторизации
+      MASTER_API_ID: ${MASTER_API_ID}
+      MASTER_API_HASH: ${MASTER_API_HASH}
       # S3 Storage Configuration (Cloud.ru) - Context7: для Vision + S3 Integration
       S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-https://s3.cloud.ru}
       S3_BUCKET_NAME: ${S3_BUCKET_NAME}
@@ -461,6 +464,11 @@ services:
       TREND_QA_MIN_SCORE: ${TREND_QA_MIN_SCORE:-0.6}
       TREND_QA_LLM_MODEL: ${TREND_QA_LLM_MODEL:-GigaChat}
       TREND_PERSONALIZER_ENABLED: ${TREND_PERSONALIZER_ENABLED:-true}
+      # Context7: GigaChat API Credentials (для Self-Improvement, Context Router и других LLM вызовов)
+      GIGACHAT_CREDENTIALS: ${GIGACHAT_CREDENTIALS}
+      GIGACHAT_SCOPE: ${GIGACHAT_SCOPE:-GIGACHAT_API_PERS}
+      GIGACHAT_BASE_URL: ${GIGACHAT_BASE_URL:-}
+      GIGACHAT_PROXY_URL: ${GIGACHAT_PROXY_URL:-http://gpt2giga-proxy:8090}
     volumes:
       - ./webapp:/app/webapp:ro
       - ./api:/app:ro  # Context7: монтируем код для разработки (read-only для безопасности)
@@ -514,8 +522,10 @@ services:
       # Убираем GIGACHAT_ACCESS_TOKEN - используем только прокси
       # GIGACHAT_ACCESS_TOKEN: ${GIGACHAT_ACCESS_TOKEN}
       # Context7: GigaChat Vision API Credentials (для VisionAnalysisTask)
+      # Context7: GigaChat API Credentials (для Self-Improvement, Context Router и других LLM вызовов)
       GIGACHAT_CREDENTIALS: ${GIGACHAT_CREDENTIALS}
       GIGACHAT_SCOPE: ${GIGACHAT_SCOPE:-GIGACHAT_API_PERS}
+      GIGACHAT_BASE_URL: ${GIGACHAT_BASE_URL:-}
       # Context7: Модель для embeddings (EmbeddingsGigaR возвращает 2560 измерений)
       GIGACHAT_EMBEDDINGS_MODEL: ${GIGACHAT_EMBEDDINGS_MODEL:-EmbeddingsGigaR}
       # Fallback: OpenRouter

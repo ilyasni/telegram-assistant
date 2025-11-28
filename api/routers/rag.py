@@ -5,12 +5,39 @@ from pydantic import BaseModel
 from typing import List, Optional
 from uuid import UUID
 import structlog
+import time
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from models.database import get_db, User
 from api.services.rag_service import get_rag_service, RAGResult, RAGSource
 from api.services.enrichment_trigger_service import update_triggers_from_dialog
 from fastapi import Request
+
+# Импорт Performance Metrics для регистрации метрик в Prometheus
+try:
+    from api.worker.common.performance_metrics import (
+        fast_path_latency_seconds,
+        llm_calls_per_request,
+        tokens_per_request,
+        agent_steps_per_request,
+    )
+except Exception as e:
+    # Если модуль недоступен, создаём заглушки для метрик
+    # Это предотвращает падение приложения при отсутствии модуля
+    _temp_logger = structlog.get_logger()
+    _temp_logger.warning("Failed to import performance metrics, using no-op metrics", error=str(e))
+    
+    # Создаём заглушки-метрики, которые ничего не делают
+    class NoOpMetric:
+        def labels(self, **kwargs):
+            return self
+        def observe(self, value):
+            pass
+    
+    fast_path_latency_seconds = NoOpMetric()
+    llm_calls_per_request = NoOpMetric()
+    tokens_per_request = NoOpMetric()
+    agent_steps_per_request = NoOpMetric()
 
 logger = structlog.get_logger()
 router = APIRouter(prefix="/rag", tags=["rag"])
@@ -119,6 +146,11 @@ async def rag_query(query_data: RAGQuery, request: Request, db: Session = Depend
             error=str(e)
         )
     
+    # Performance metrics: Fast Path tracking
+    start_time = time.time()
+    path_type = "fast_path"
+    endpoint = "/rag/query"
+    
     # Выполняем RAG запрос
     result = await rag_service.query(
         query=query_data.query,
@@ -131,6 +163,34 @@ async def rag_query(query_data: RAGQuery, request: Request, db: Session = Depend
         transcription_text=query_data.transcription_text,
         intent_override=query_data.intent_override
     )
+    
+    # Performance metrics: записываем метрики
+    latency = time.time() - start_time
+    fast_path_latency_seconds.labels(endpoint=endpoint, tenant_id=tenant_id).observe(latency)
+    
+    # Получаем метрики из результата (если они есть)
+    llm_calls = getattr(result, 'llm_calls', 1)  # По умолчанию 1 вызов
+    tokens = getattr(result, 'tokens_used', 0)
+    agent_steps = getattr(result, 'agent_steps', 1)  # По умолчанию 1 шаг
+    
+    llm_calls_per_request.labels(
+        path_type=path_type,
+        endpoint=endpoint,
+        tenant_id=tenant_id
+    ).observe(llm_calls)
+    
+    if tokens > 0:
+        tokens_per_request.labels(
+            path_type=path_type,
+            endpoint=endpoint,
+            tenant_id=tenant_id
+        ).observe(tokens)
+    
+    agent_steps_per_request.labels(
+        path_type=path_type,
+        endpoint=endpoint,
+        tenant_id=tenant_id
+    ).observe(agent_steps)
     
     # Преобразуем источники в dict для ответа
     sources_dict = [

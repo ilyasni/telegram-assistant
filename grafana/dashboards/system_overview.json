@@ -27,6 +27,82 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
+      "description": "Current error rate across all worker tasks",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "yellow",
+                "value": 0.01
+              },
+              {
+                "color": "red",
+                "value": 0.1
+              }
+            ]
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 0,
+        "y": 0
+      },
+      "id": 4,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "12.2.1",
+      "targets": [
+        {
+          "datasource": {
+            "name": "Prometheus",
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(worker_errors_total[5m]))",
+          "legendFormat": "Errors (5m)",
+          "refId": "A"
+        }
+      ],
+      "title": "❗ Errors Rate",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "name": "Prometheus",
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Number of services currently available (up=1)",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -48,8 +124,8 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 6,
-        "x": 0,
+        "w": 3,
+        "x": 3,
         "y": 0
       },
       "id": 1,
@@ -84,7 +160,6 @@
           "refId": "A"
         }
       ],
-      "description": "Number of services currently available (up=1)",
       "title": "✅ Services Available",
       "type": "stat"
     },
@@ -94,12 +169,16 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
+      "description": "Current rate of posts being processed across all stages",
       "fieldConfig": {
         "defaults": {
           "color": {
             "mode": "thresholds"
           },
+          "decimals": 4,
           "mappings": [],
+          "min": 0,
+          "noValue": "0 ops",
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -109,12 +188,7 @@
               }
             ]
           },
-          "unit": "ops",
-          "decimals": 4,
-          "min": 0,
-          "max": null,
-          "nullValueMode": "null",
-          "noValue": "0 ops"
+          "unit": "ops"
         },
         "overrides": []
       },
@@ -151,18 +225,17 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(rate(posts_processed_total[5m]))",
-          "legendFormat": "Posts Processing Rate",
-          "refId": "A",
-          "interval": "",
-          "intervalMs": 1000,
           "exemplar": false,
+          "expr": "sum(rate(posts_processed_total[5m]))",
           "format": "table",
           "instant": false,
-          "range": true
+          "interval": "",
+          "intervalMs": 1000,
+          "legendFormat": "Posts Processing Rate",
+          "range": true,
+          "refId": "A"
         }
       ],
-      "description": "Current rate of posts being processed across all stages",
       "title": "📦 Posts Processing Rate",
       "type": "stat"
     },
@@ -172,6 +245,86 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
+      "description": "Time since last scheduler tick (should be < 600s for 5min interval)",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "yellow",
+                "value": 300
+              },
+              {
+                "color": "orange",
+                "value": 600
+              },
+              {
+                "color": "red",
+                "value": 900
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 0
+      },
+      "id": 13,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "12.2.1",
+      "targets": [
+        {
+          "datasource": {
+            "name": "Prometheus",
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "time() - scheduler_last_tick_ts_seconds",
+          "legendFormat": "Scheduler Freshness",
+          "refId": "A"
+        }
+      ],
+      "title": "⏰ Scheduler Freshness",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "name": "Prometheus",
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Total number of posts processed in the last 24 hours",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -194,7 +347,7 @@
       "gridPos": {
         "h": 4,
         "w": 6,
-        "x": 12,
+        "x": 18,
         "y": 0
       },
       "id": 3,
@@ -225,14 +378,13 @@
           },
           "editorMode": "code",
           "expr": "sum(increase(posts_processed_total[24h]))",
-          "legendFormat": "Posts Processed (24h)",
-          "refId": "A",
-          "maxDataPoints": 100,
           "interval": "",
-          "intervalMs": 30000
+          "intervalMs": 30000,
+          "legendFormat": "Posts Processed (24h)",
+          "maxDataPoints": 100,
+          "refId": "A"
         }
       ],
-      "description": "Total number of posts processed in the last 24 hours",
       "title": "📊 Posts Processed (24h)",
       "type": "stat"
     },
@@ -242,81 +394,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              },
-              {
-                "color": "yellow",
-                "value": 0.01
-              },
-              {
-                "color": "red",
-                "value": 0.1
-              }
-            ]
-          },
-          "unit": "reqps"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 6,
-        "x": 18,
-        "y": 0
-      },
-      "id": 4,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "percentChangeColorMode": "standard",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "showPercentChange": false,
-        "textMode": "auto",
-        "wideLayout": true
-      },
-      "pluginVersion": "12.2.1",
-      "targets": [
-        {
-          "datasource": {
-            "name": "Prometheus",
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "sum(rate(worker_errors_total[5m]))",
-          "legendFormat": "Errors (5m)",
-          "refId": "A"
-        }
-      ],
-      "description": "Current error rate across all worker tasks",
-      "title": "❗ Errors Rate",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "name": "Prometheus",
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
+      "description": "HTTP request rate by method and endpoint",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -416,7 +494,6 @@
           "refId": "A"
         }
       ],
-      "description": "HTTP request rate by method and endpoint",
       "title": "HTTP Request Rate",
       "type": "timeseries"
     },
@@ -426,6 +503,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
+      "description": "HTTP response time percentiles (p50, p95)",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -536,7 +614,6 @@
           "refId": "B"
         }
       ],
-      "description": "HTTP response time percentiles (p50, p95)",
       "title": "HTTP Response Time",
       "type": "timeseries"
     },
@@ -546,6 +623,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
+      "description": "Posts processing rate by stage and success status (filtered by stage variable)",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -637,7 +715,6 @@
           "refId": "A"
         }
       ],
-      "description": "Posts processing rate by stage and success status (filtered by stage variable)",
       "title": "Posts Processing Rate",
       "type": "timeseries"
     },
@@ -647,6 +724,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
+      "description": "Current queue depth for pending and new messages across all queues",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -746,7 +824,6 @@
           "refId": "A"
         }
       ],
-      "description": "Current queue depth for pending and new messages across all queues",
       "title": "Queue Depth: Pending & New Messages",
       "type": "timeseries"
     },
@@ -756,6 +833,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
+      "description": "Parser runs rate by status (ok, error, skipped, failed)",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -765,7 +843,7 @@
             "axisBorderShow": false,
             "axisCenteredZero": false,
             "axisColorMode": "text",
-            "axisLabel": "Count",
+            "axisLabel": "Runs/min",
             "axisPlacement": "auto",
             "barAlignment": 0,
             "barWidthFactor": 0.6,
@@ -780,7 +858,7 @@
             },
             "insertNulls": false,
             "lineInterpolation": "linear",
-            "lineWidth": 2,
+            "lineWidth": 1,
             "pointSize": 5,
             "scaleDistribution": {
               "type": "linear"
@@ -790,10 +868,10 @@
             "spanNulls": false,
             "stacking": {
               "group": "A",
-              "mode": "none"
+              "mode": "normal"
             },
             "thresholdsStyle": {
-              "mode": "line"
+              "mode": "off"
             }
           },
           "mappings": [],
@@ -803,18 +881,10 @@
               {
                 "color": "green",
                 "value": 0
-              },
-              {
-                "color": "yellow",
-                "value": 50
-              },
-              {
-                "color": "red",
-                "value": 200
               }
             ]
           },
-          "unit": "short"
+          "unit": "reqps"
         },
         "overrides": []
       },
@@ -824,13 +894,12 @@
         "x": 0,
         "y": 20
       },
-      "id": 9,
+      "id": 14,
       "options": {
         "legend": {
           "calcs": [
             "lastNotNull",
-            "max",
-            "mean"
+            "sum"
           ],
           "displayMode": "table",
           "placement": "bottom",
@@ -851,38 +920,12 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "posts_in_queue_total{queue=\"posts.enriched\", status=\"total\"}",
-          "legendFormat": "Queue Size (posts.enriched)",
+          "expr": "sum(rate(parser_runs_total[5m])) by (status)",
+          "legendFormat": "{{status}}",
           "refId": "A"
-        },
-        {
-          "datasource": {
-            "name": "Prometheus",
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "sum(increase(posts_processed_total{stage=\"enrichment\", success=\"true\"}[24h]))",
-          "legendFormat": "Total Enriched Processed (24h)",
-          "refId": "B",
-          "maxDataPoints": 100,
-          "interval": "",
-          "intervalMs": 30000
-        },
-        {
-          "datasource": {
-            "name": "Prometheus",
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "posts_in_queue_total{queue=\"posts.enriched\", status=\"pending\"}",
-          "legendFormat": "Pending (posts.enriched)",
-          "refId": "C"
         }
       ],
-      "description": "Comparison of enriched posts queue size vs total processed (24h window)",
-      "title": "📊 Enriched Posts: Queue vs Processed",
+      "title": "📊 Parser Runs Rate",
       "type": "timeseries"
     },
     {
@@ -891,6 +934,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
+      "description": "Enrichment processing rate by success status",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -982,7 +1026,6 @@
           "refId": "A"
         }
       ],
-      "description": "Enrichment processing rate by success status",
       "title": "📈 Enrichment Processing Rate",
       "type": "timeseries"
     },
@@ -992,6 +1035,274 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
+      "description": "Comparison of enriched posts queue size vs total processed (24h window)",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Count",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "vis": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "yellow",
+                "value": 50
+              },
+              {
+                "color": "red",
+                "value": 200
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 28
+      },
+      "id": 9,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max",
+            "mean"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.2.1",
+      "targets": [
+        {
+          "datasource": {
+            "name": "Prometheus",
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "posts_in_queue_total{queue=\"posts.enriched\", status=\"total\"}",
+          "legendFormat": "Queue Size (posts.enriched)",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "name": "Prometheus",
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(posts_processed_total{stage=\"enrichment\", success=\"true\"}[24h]))",
+          "interval": "",
+          "intervalMs": 30000,
+          "legendFormat": "Total Enriched Processed (24h)",
+          "maxDataPoints": 100,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "name": "Prometheus",
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "posts_in_queue_total{queue=\"posts.enriched\", status=\"pending\"}",
+          "legendFormat": "Pending (posts.enriched)",
+          "refId": "C"
+        }
+      ],
+      "title": "📊 Enriched Posts: Queue vs Processed",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "name": "Prometheus",
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Channel processing time percentiles (p50, p95, p99) by mode and status",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Seconds",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "vis": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "yellow",
+                "value": 10
+              },
+              {
+                "color": "red",
+                "value": 60
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 28
+      },
+      "id": 12,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max",
+            "mean"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.2.1",
+      "targets": [
+        {
+          "datasource": {
+            "name": "Prometheus",
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum(rate(parser_channel_processing_seconds_bucket[5m])) by (le, mode, status))",
+          "legendFormat": "p95 - {{mode}}/{{status}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "name": "Prometheus",
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum(rate(parser_channel_processing_seconds_bucket[5m])) by (le, mode, status))",
+          "legendFormat": "p50 - {{mode}}/{{status}}",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "name": "Prometheus",
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum(rate(parser_channel_processing_seconds_bucket[5m])) by (le, mode, status))",
+          "legendFormat": "p99 - {{mode}}/{{status}}",
+          "refId": "C"
+        }
+      ],
+      "title": "⏱️ Channel Processing Time",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "name": "Prometheus",
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Total queue size across all queues (with color thresholds)",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1027,7 +1338,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 28
+        "y": 36
       },
       "id": 11,
       "options": {
@@ -1061,7 +1372,6 @@
           "refId": "A"
         }
       ],
-      "description": "Total queue size across all queues (with color thresholds)",
       "title": "📦 Total Queue Size",
       "type": "stat"
     }
@@ -1077,9 +1387,7 @@
   "templating": {
     "list": [
       {
-        "allValue": null,
         "current": {
-          "selected": false,
           "text": "All",
           "value": "$__all"
         },
@@ -1089,8 +1397,6 @@
         },
         "definition": "label_values(posts_processed_total, stage)",
         "description": "Filter by processing stage",
-        "error": null,
-        "hide": 0,
         "includeAll": true,
         "label": "Stage",
         "multi": true,
@@ -1102,7 +1408,6 @@
         },
         "refresh": 2,
         "regex": "",
-        "skipUrlSync": false,
         "sort": 1,
         "type": "query"
       }
@@ -1131,5 +1436,5 @@
   "timezone": "browser",
   "title": "System Overview",
   "uid": "system-overview",
-  "version": 12
+  "version": 28
 }

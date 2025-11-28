@@ -38,14 +38,21 @@ grep -i "floodwait" logs/telethon-ingest.log
 ## Проблема: 2FA required
 
 **Симптомы:**
-- QR отсканирован, но статус `failed` с `reason: password_required`
+- QR отсканирован, но статус `password_required` с `reason: password_required`
 
 **Причина:**
 - У пользователя включена двухфакторная аутентификация
 
 **Решение:**
-- Пользователь должен отключить 2FA или использовать другой метод входа
-- В будущем: добавить поддержку 2FA через Mini App
+- Отправить 2FA пароль через `POST /tg/qr/password` с телом:
+  ```json
+  {
+    "session_token": "JWT_TOKEN",
+    "password": "2FA_PASSWORD"
+  }
+  ```
+- После успешной проверки пароля статус изменится на `authorized`
+- Если пароль неверный, вернётся ошибка `400 Invalid password`
 
 ## Проблема: FloodWait
 
