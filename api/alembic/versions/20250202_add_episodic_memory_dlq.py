@@ -1,13 +1,18 @@
 """Add episodic_memory and dlq_events tables
 
 Revision ID: 20250202_episodic_memory_dlq
-Revises: 20250131_add_digest_trends_tables
+Revises: 20251119_merge_branches
 Create Date: 2025-02-02
 
+Context7: Исправлено несоответствие между docstring и down_revision.
+Context7: Эта миграция создает только таблицы episodic_memory и dlq_events.
+Колонки для trend_clusters (is_generic, parent_cluster_id, cluster_level) добавляются
+в последующих миграциях: 20251120_add_is_generic и 20251122_hierarchical_indexes.
 """
 from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
+from sqlalchemy import text
 
 # revision identifiers, used by Alembic.
 revision = '20250202_episodic_memory_dlq'
@@ -25,7 +30,7 @@ def upgrade():
         sa.Column('entity_type', sa.String(50), nullable=False),
         sa.Column('entity_id', postgresql.UUID(as_uuid=True), nullable=True),
         sa.Column('event_type', sa.String(50), nullable=False),
-        sa.Column('event_metadata', postgresql.JSONB, nullable=False, server_default='{}'),
+        sa.Column('event_metadata', postgresql.JSONB, nullable=False, server_default=text("'{}'::jsonb")),
         sa.Column('created_at', sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
         sa.ForeignKeyConstraint(['tenant_id'], ['tenants.id'], ondelete='CASCADE'),
     )
@@ -63,16 +68,16 @@ def upgrade():
         sa.Column('entity_type', sa.String(50), nullable=False),
         sa.Column('entity_id', postgresql.UUID(as_uuid=True), nullable=True),
         sa.Column('event_type', sa.String(100), nullable=False),
-        sa.Column('payload', postgresql.JSONB, nullable=False, server_default='{}'),
+        sa.Column('payload', postgresql.JSONB, nullable=False, server_default=text("'{}'::jsonb")),
         sa.Column('error_code', sa.String(100), nullable=True),
         sa.Column('error_message', sa.Text, nullable=True),
         sa.Column('stack_trace', sa.Text, nullable=True),
-        sa.Column('retry_count', sa.Integer, nullable=False, server_default='0'),
-        sa.Column('max_attempts', sa.Integer, nullable=False, server_default='3'),
+        sa.Column('retry_count', sa.Integer, nullable=False, server_default=text('0')),
+        sa.Column('max_attempts', sa.Integer, nullable=False, server_default=text('3')),
         sa.Column('next_retry_at', sa.DateTime(timezone=True), nullable=True),
         sa.Column('first_seen_at', sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
         sa.Column('last_attempt_at', sa.DateTime(timezone=True), nullable=True),
-        sa.Column('status', sa.String(32), nullable=False, server_default='pending'),
+        sa.Column('status', sa.String(32), nullable=False, server_default=text("'pending'")),
         sa.Column('created_at', sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
         sa.ForeignKeyConstraint(['tenant_id'], ['tenants.id'], ondelete='CASCADE'),
     )

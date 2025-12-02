@@ -1360,7 +1360,7 @@ class TrendThresholdSuggestion(Base):
     analysis_period_start = Column(DateTime(timezone=True), nullable=False)  # Начало периода анализа
     analysis_period_end = Column(DateTime(timezone=True), nullable=False)  # Конец периода анализа
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())  # Время создания предложения
-    status = Column(String(32), nullable=False, default="pending")  # 'pending', 'accepted', 'rejected'
+    status = Column(String(32), nullable=False, server_default=text("'pending'"))  # Context7: 'pending', 'accepted', 'rejected'
     
     __table_args__ = (
         Index('idx_trend_threshold_suggestions_status', 'status'),
@@ -1417,12 +1417,12 @@ class DLQEvent(Base):
     error_code = Column(String(100), nullable=True)
     error_message = Column(Text, nullable=True)
     stack_trace = Column(Text, nullable=True)
-    retry_count = Column(Integer, nullable=False, default=0)
-    max_attempts = Column(Integer, nullable=False, default=3)
+    retry_count = Column(Integer, nullable=False, server_default=text('0'))
+    max_attempts = Column(Integer, nullable=False, server_default=text('3'))
     next_retry_at = Column(DateTime(timezone=True), nullable=True)
     first_seen_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     last_attempt_at = Column(DateTime(timezone=True), nullable=True)
-    status = Column(String(32), nullable=False, default="pending")  # 'pending', 'reprocessed', 'permanent_failure'
+    status = Column(String(32), nullable=False, server_default=text("'pending'"))  # 'pending', 'reprocessed', 'permanent_failure'
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     
     # Relationships

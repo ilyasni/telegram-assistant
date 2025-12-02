@@ -126,6 +126,7 @@ from worker.services.group_context_service import (
     extract_reply_to,
     format_timestamp,
     mask_pii,
+    _tokenize,
     parse_timestamp,
     text_vector,
     TOKEN_REGEX,
@@ -1680,7 +1681,14 @@ class GroupDigestOrchestrator:
         return repaired
 
     def _normalize_summary_html(self, raw: str) -> str:
-        """Нормализация HTML дайджеста с проверкой на пустые формулировки."""
+        """
+        Нормализация HTML дайджеста с проверкой на пустые формулировки и исправлением структуры списков.
+        
+        Context7 best practice: нормализация HTML структуры для Telegram.
+        - Заменяет символы списков (▸, •, -) на правильные HTML теги <ul><li>
+        - Добавляет обёртки <ul> для одиночных <li> элементов
+        - Исправляет незакрытые теги списков
+        """
         summary_html = (raw or "").strip()
         
         # Первый грубый фильтр: regexp-проверка на пустые формулировки (не единственный критерий)
@@ -1699,6 +1707,13 @@ class GroupDigestOrchestrator:
                 )
                 # Не отклоняем сразу, это только первый фильтр - дополняется структурными проверками
         
+        # Нормализация структуры списков
+        summary_html = self._normalize_html_lists(summary_html)
+        
+        # Context7: Проверка и исправление двойного экранирования HTML
+        # Если HTML экранирован (например, &lt;b&gt; вместо <b>), раскомментируем его
+        summary_html = self._fix_html_escaping(summary_html)
+        
         if len(summary_html) > 4096:
             summary_html = summary_html[:4093] + "..."
         if summary_html and not summary_html.startswith("📊"):
@@ -1706,6 +1721,110 @@ class GroupDigestOrchestrator:
         if not summary_html:
             summary_html = "<b>Дайджест пуст</b>"
         return summary_html
+    
+    def _fix_html_escaping(self, html: str) -> str:
+        """
+        Исправляет двойное экранирование HTML.
+        
+        Context7 best practice: проверка и исправление экранирования HTML для Telegram.
+        Если HTML экранирован (например, &lt;b&gt; вместо <b>), раскомментируем его.
+        """
+        if not html:
+            return html
+        
+        # Проверяем, экранирован ли HTML
+        # Если есть экранированные теги (например, &lt;b&gt;), но нет обычных тегов <b>
+        # значит HTML был экранирован и нужно его раскомментировать
+        has_escaped_tags = bool(re.search(r'&lt;[a-z/]', html, re.IGNORECASE))
+        has_normal_tags = bool(re.search(r'<[a-z/]', html, re.IGNORECASE))
+        
+        if has_escaped_tags and not has_normal_tags:
+            # HTML экранирован, нужно раскомментировать
+            import html as html_module
+            html = html_module.unescape(html)
+            logger.debug("digest_html_unescaped", snippet=html[:200])
+        
+        return html
+    
+    def _normalize_html_lists(self, html: str) -> str:
+        """
+        Нормализация HTML структуры списков.
+        
+        Context7 best practice: исправление неправильной HTML структуры списков.
+        Исправляет:
+        - Заменяет символы списков (▸, •, -) на <ul><li>
+        - Добавляет <ul> обёртки для <li> элементов без обёртки
+        - Исправляет незакрытые теги списков
+        """
+        if not html:
+            return html
+        
+        # Шаг 1: Заменяем символы списков (▸, •, -) на <li> теги
+        # Паттерн: символ списка в начале строки, за которым следует пробел и содержимое
+        def replace_list_marker(match: re.Match) -> str:
+            """Заменяет маркер списка на <li> тег."""
+            content = match.group(1)  # Содержимое после маркера
+            return f'<li>{content}</li>'
+        
+        html = re.sub(
+            r'^([▸•\-])\s+(.+)$',
+            replace_list_marker,
+            html,
+            flags=re.MULTILINE
+        )
+        
+        # Шаг 2: Оборачиваем последовательности <li>...</li> в <ul>, если они не обёрнуты
+        # Находим последовательности <li>...</li> (минимум 1) без обёртки <ul> или <ol>
+        def wrap_li_in_ul(match: re.Match) -> str:
+            """Оборачивает последовательность <li> в <ul>."""
+            sequence = match.group(1)
+            # Проверяем, не обёрнута ли уже в <ul> или <ol> (смотрим контекст до и после)
+            start_pos = match.start()
+            end_pos = match.end()
+            context_before = html[max(0, start_pos - 100):start_pos]
+            context_after = html[end_pos:min(len(html), end_pos + 100)]
+            
+            # Если перед последовательностью нет открывающего <ul> или <ol>
+            if not re.search(r'<[uo]l[>\s]', context_before, re.IGNORECASE):
+                # И после нет закрывающего </ul> или </ol>
+                if not re.search(r'</[uo]l>', context_after, re.IGNORECASE):
+                    # Оборачиваем в <ul>
+                    return f'<ul>{sequence}</ul>'
+            
+            return sequence
+        
+        # Находим последовательности <li>...</li> (может быть один или несколько)
+        # Паттерн: <li>...</li> с возможными пробелами и переносами строк между ними
+        html = re.sub(
+            r'((?:<li[^>]*>.*?</li>(?:\s*<br\s*/?>)?\s*)+)',
+            wrap_li_in_ul,
+            html,
+            flags=re.DOTALL | re.IGNORECASE
+        )
+        
+        # Шаг 3: Исправляем случаи, когда <li> находится внутри текста без обёртки
+        # Находим одиночные <li>...</li>, которые не внутри <ul> или <ol>
+        html = re.sub(
+            r'(?<!<[uo]l[>\s])(<li[^>]*>.*?</li>)(?!\s*</[uo]l>)',
+            r'<ul>\1</ul>',
+            html,
+            flags=re.DOTALL | re.IGNORECASE
+        )
+        
+        # Шаг 4: Удаляем дублирующиеся <ul> обёртки
+        html = re.sub(r'<ul>\s*<ul>', '<ul>', html, flags=re.IGNORECASE)
+        html = re.sub(r'</ul>\s*</ul>', '</ul>', html, flags=re.IGNORECASE)
+        
+        # Шаг 5: Исправляем случаи, когда <li> находится внутри блока с <br>
+        # Например: <b>🎯 Что обсуждали</b>:<br><li>...</li> → должно быть <ul><li>...</li></ul>
+        html = re.sub(
+            r'(<br\s*/?>)\s*(<li[^>]*>.*?</li>)',
+            r'\1<ul>\2</ul>',
+            html,
+            flags=re.DOTALL | re.IGNORECASE
+        )
+        
+        return html
 
     def _resolve_group_title(self, window: Dict[str, Any]) -> str:
         for key in ("group_title", "group_name", "title", "name"):
@@ -1714,6 +1833,129 @@ class GroupDigestOrchestrator:
                 return str(value)
         group_id = window.get("group_id")
         return f"Группа {group_id}" if group_id else "Группа"
+
+    def _build_message_links(
+        self,
+        message_ids: List[str],
+        sanitized_messages: List[Dict[str, Any]],
+        raw_messages: List[Dict[str, Any]],
+        window: Dict[str, Any],
+    ) -> List[str]:
+        """
+        Формирует правильные Telegram ссылки на сообщения.
+        
+        Context7 best practice: правильный формат ссылок Telegram.
+        Формат: https://t.me/c/{tg_chat_id}/{tg_message_id}
+        где tg_chat_id - числовой ID чата (без -100 префикса для групп)
+        и tg_message_id - числовой ID сообщения.
+        """
+        if not message_ids:
+            return []
+        
+        # Получаем tg_chat_id из window или group
+        tg_chat_id = None
+        # Пробуем разные варианты получения tg_chat_id
+        for key in ("tg_chat_id", "chat_id", "group_tg_chat_id"):
+            value = window.get(key)
+            if value:
+                try:
+                    tg_chat_id = int(value)
+                    break
+                except (ValueError, TypeError):
+                    continue
+        
+        # Если не нашли в window, пробуем из raw_messages
+        if not tg_chat_id and raw_messages:
+            for msg in raw_messages:
+                for key in ("tg_chat_id", "chat_id", "group_tg_chat_id"):
+                    value = msg.get(key)
+                    if value:
+                        try:
+                            tg_chat_id = int(value)
+                            break
+                        except (ValueError, TypeError):
+                            continue
+                if tg_chat_id:
+                    break
+        
+        if not tg_chat_id:
+            logger.warning("digest_message_links_no_chat_id", window_keys=list(window.keys()))
+            return []
+        
+        # Создаём индекс сообщений по message_id для быстрого поиска
+        message_index: Dict[str, Dict[str, Any]] = {}
+        for msg in sanitized_messages:
+            msg_id = msg.get("message_id")
+            if msg_id:
+                message_index[msg_id] = msg
+        
+        # Также индексируем raw_messages по id и tg_message_id
+        raw_index: Dict[str, Dict[str, Any]] = {}
+        for msg in raw_messages:
+            msg_id = str(msg.get("id") or msg.get("message_id") or "")
+            if msg_id:
+                raw_index[msg_id] = msg
+            tg_msg_id = msg.get("tg_message_id")
+            if tg_msg_id:
+                raw_index[str(tg_msg_id)] = msg
+        
+        links: List[str] = []
+        for idx, msg_id in enumerate(message_ids[:5], 1):  # Ограничиваем до 5 ссылок
+            tg_message_id = None
+            
+            # Пробуем найти tg_message_id в sanitized_messages (приоритет)
+            sanitized_msg = message_index.get(msg_id)
+            if sanitized_msg:
+                # В sanitized_messages теперь есть поле tg_message_id
+                tg_message_id = sanitized_msg.get("tg_message_id")
+            
+            # Если не нашли, пробуем в raw_messages
+            if not tg_message_id:
+                raw_msg = raw_index.get(msg_id)
+                if raw_msg:
+                    tg_message_id = raw_msg.get("tg_message_id") or raw_msg.get("telegram_message_id")
+            
+            # Если всё ещё не нашли, пробуем использовать message_id как числовой (если это число)
+            if not tg_message_id:
+                try:
+                    # Пробуем интерпретировать message_id как число
+                    tg_message_id = int(msg_id)
+                except (ValueError, TypeError):
+                    # Если это UUID, пропускаем
+                    continue
+            
+            if tg_message_id:
+                # Формируем ссылку: https://t.me/c/{tg_chat_id}/{tg_message_id}
+                # Для групп Telegram использует отрицательные ID, но в ссылках используется abs()
+                link = f"https://t.me/c/{abs(tg_chat_id)}/{tg_message_id}"
+                links.append(f'<a href="{link}">#{idx}</a>')
+        
+        return links
+    
+    def _enrich_topics_with_links(
+        self,
+        topics: List[Dict[str, Any]],
+        sanitized_messages: List[Dict[str, Any]],
+        raw_messages: List[Dict[str, Any]],
+        window: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """
+        Обогащает темы правильными ссылками на сообщения.
+        """
+        enriched_topics = []
+        for topic in topics:
+            enriched_topic = topic.copy()
+            message_ids = topic.get("message_ids", [])
+            if message_ids:
+                links = self._build_message_links(
+                    message_ids,
+                    sanitized_messages,
+                    raw_messages,
+                    window,
+                )
+                enriched_topic["message_links"] = links
+            enriched_topics.append(enriched_topic)
+        return enriched_topics
 
     def _resolve_period(self, window: Dict[str, Any]) -> str:
         start = window.get("window_start")
@@ -2415,22 +2657,85 @@ class GroupDigestOrchestrator:
                 for stat in state.get("participant_stats", [])
                 if isinstance(stat, dict)
             }
+            
+            # Извлекаем решения для обогащения участников
+            sanitized_messages = state.get("sanitized_messages", [])
+            all_decisions = self._context_service._extract_decisions_from_messages(sanitized_messages)
+            
+            # Создаём индекс решений по участникам
+            decisions_by_username: Dict[str, List[Dict[str, Any]]] = {}
+            for decision in all_decisions:
+                owners = decision.get("owners", [])
+                for owner in owners:
+                    if owner not in decisions_by_username:
+                        decisions_by_username[owner] = []
+                    decisions_by_username[owner].append(decision)
+            
+            # Создаём индекс сообщений по username для извлечения цитат
+            messages_by_username: Dict[str, List[Dict[str, Any]]] = {}
+            for msg in sanitized_messages:
+                username = msg.get("username")
+                if username:
+                    if username not in messages_by_username:
+                        messages_by_username[username] = []
+                    messages_by_username[username].append(msg)
+            
             participants_payload: List[Dict[str, Any]] = []
             for item in role_profile:
                 username = item.get("username")
                 stat_info = stats_index.get(username, {})
+                
+                # Собираем цитаты из сообщений участника
+                quotes: List[str] = []
+                user_messages = messages_by_username.get(username, [])
+                for msg in user_messages[:5]:  # Берём первые 5 сообщений
+                    content = msg.get("content", "").strip()
+                    if content and len(content) > 20 and len(content) < 200:
+                        quotes.append(content[:150])
+                
+                # Считаем решения, инициированные участником
+                user_decisions = decisions_by_username.get(username, [])
+                decisions_initiated = len(user_decisions)
+                
+                # Формируем summary с цитатами
+                summary = item.get("comment") or ""
+                if quotes and not summary:
+                    # Если нет комментария от LLM, используем первую цитату
+                    summary = quotes[0]
+                elif quotes and len(quotes) > 1:
+                    # Добавляем вторую цитату, если есть
+                    summary = f"{summary} Пример: {quotes[1][:100]}"
+                
                 participants_payload.append(
                     {
                         "telegram_id": stat_info.get("telegram_id"),
                         "username": username,
                         "role": item.get("dominant_role") or "observer",
                         "message_count": stat_info.get("message_count", len(item.get("message_ids", []))),
-                        "summary": item.get("comment") or "",
+                        "summary": summary,
+                        "decisions_initiated": decisions_initiated,
+                        "quotes": quotes[:2],  # Сохраняем до 2 цитат
                     }
                 )
             if not participants_payload:
                 participants_payload = self._build_fallback_participants(state)
                 role_profile = []
+            else:
+                # Обогащаем fallback-участников тоже
+                for participant in participants_payload:
+                    username = participant.get("username")
+                    if not participant.get("quotes"):
+                        user_messages = messages_by_username.get(username, [])
+                        quotes = []
+                        for msg in user_messages[:3]:
+                            content = msg.get("content", "").strip()
+                            if content and len(content) > 20 and len(content) < 200:
+                                quotes.append(content[:150])
+                        participant["quotes"] = quotes[:2]
+                    
+                    if "decisions_initiated" not in participant:
+                        user_decisions = decisions_by_username.get(username, [])
+                        participant["decisions_initiated"] = len(user_decisions)
 
             result = {"role_profile": role_profile, "participants": participants_payload}
             state["role_profile"] = role_profile
@@ -2482,49 +2787,43 @@ class GroupDigestOrchestrator:
             if cached:
                 return cached
             
+            sanitized_messages = state.get("sanitized_messages") or []
+            media_highlights = state.get("media_highlights") or []
+            message_count = state.get("message_total", 0)
+            fallback_used = False
+            
             # Для micro-режима используем упрощённую keyword-based тему
             digest_mode = state.get("digest_mode", "normal")
             if digest_mode == "micro":
-                # Простая keyword-based тема
                 keyword_topics = self._context_service.build_keyword_topics(
-                    state.get("sanitized_messages") or [],
-                    state.get("media_highlights") or [],
-                    limit=1,  # Только одна тема для micro
+                    sanitized_messages,
+                    media_highlights,
+                    limit=1,
                 )
                 if keyword_topics:
                     topics = keyword_topics
                 else:
-                    # Fallback: одна общая тема
-                    message_count = state.get("message_total", 0)
-                    topics = [
-                        {
-                            "title": "Короткое обсуждение",
-                            "priority": "medium",
-                            "msg_count": message_count,
-                            "threads": [],
-                            "summary": f"Обсуждение из {message_count} сообщений.",
-                            "signals": {"source": "micro_mode"},
-                            "decision": "Требуется зафиксировать итоговое решение.",
-                            "status": "watch",
-                            "owners": "Активные участники группы",
-                            "blockers": [],
-                            "actions": [],
-                        }
-                    ]
+                    fallback_topics = self._context_service._build_fallback_topic_from_messages(
+                        sanitized_messages, media_highlights
+                    )
+                    topics = fallback_topics
+                    fallback_used = True
                 
-                result = {"topics": topics}
+                result = {"topics": topics, "fallback_used": fallback_used}
                 state["topics"] = topics
                 self._store_stage_payload(state, "topic_agent", result, model_id="heuristic")
                 return result
             
-            prompt = self._prompts["topic_agent"]
-            variables = {
-                "semantic_units": json.dumps(state.get("semantic_units", []), ensure_ascii=False),
-                "emotion_profile": json.dumps(state.get("emotion_profile", {}), ensure_ascii=False),
-                "media_highlights_json": json.dumps(state.get("media_highlights", []), ensure_ascii=False),
-            }
+            # Шаг 1: LLM-извлечение тем
+            topics: List[Dict[str, Any]] = []
             model_id = "unknown"
             try:
+                prompt = self._prompts["topic_agent"]
+                variables = {
+                    "semantic_units": json.dumps(state.get("semantic_units", []), ensure_ascii=False),
+                    "emotion_profile": json.dumps(state.get("emotion_profile", {}), ensure_ascii=False),
+                    "media_highlights_json": json.dumps(media_highlights, ensure_ascii=False),
+                }
                 response = self._llm_router.invoke(
                     "topic_agent",
                     prompt,
@@ -2544,62 +2843,109 @@ class GroupDigestOrchestrator:
                     tenant_id=state.get("tenant_id", ""),
                     trace_id=state.get("trace_id", ""),
                 )
-                if data is None:
-                    raise ValueError("invalid_topics_json")
+                if data is not None:
+                    topics_raw = data.get("topics") if isinstance(data, dict) else None
+                    if isinstance(topics_raw, list):
+                        for topic in topics_raw:
+                            topics.append({
+                                "title": topic.get("title") or "Без названия",
+                                "priority": topic.get("priority") or "medium",
+                                "msg_count": int(topic.get("msg_count") or len(topic.get("threads") or [])),
+                                "threads": topic.get("threads") or [],
+                                "message_ids": topic.get("message_ids", []),
+                                "summary": topic.get("summary") or "",
+                                "decision": topic.get("decision", "Явных решений не найдено"),
+                                "status": topic.get("status", "unclear"),
+                                "owners": topic.get("owners", []),
+                                "blockers": topic.get("blockers", []),
+                                "actions": topic.get("actions", []),
+                                "signals": topic.get("signals", {}),
+                            })
             except Exception as exc:  # noqa: BLE001
                 logger.warning("topic_agent_failed", error=str(exc))
-                fallback = {"topics": [], "errors": list(state.get("errors", [])) + [f"topic_agent:{exc}"]}
-                self._store_stage_payload(state, "topic_agent", fallback, model_id="unknown")
-                return fallback
-
-            topics_raw = data.get("topics") if isinstance(data, dict) else None
-            topics: List[Dict[str, Any]] = []
-            if isinstance(topics_raw, list):
-                for topic in topics_raw:
-                    topics.append(
-                        {
-                            "title": topic.get("title") or "Без названия",
-                            "priority": topic.get("priority") or "medium",
-                            "msg_count": int(topic.get("msg_count") or len(topic.get("threads") or [])),
-                            "threads": topic.get("threads") or [],
-                            "summary": topic.get("summary") or "",
-                            "signals": topic.get("signals") or {},
-                        }
-                    )
+                state.setdefault("errors", []).append(f"topic_agent:{exc}")
+            
+            # Шаг 2: Нормализация тем
+            topics = self._context_service._normalize_topics(topics)
+            
+            # Шаг 3: Fallback на keyword_topics если тем нет
             if not topics:
-                fallback_topics = self._context_service.build_keyword_topics(
-                    state.get("sanitized_messages") or [],
-                    state.get("media_highlights") or [],
+                keyword_topics = self._context_service.build_keyword_topics(
+                    sanitized_messages,
+                    media_highlights,
+                )
+                if keyword_topics:
+                    topics = keyword_topics
+                    fallback_used = True
+            
+            # Шаг 4: Fallback на создание темы из сообщений
+            if not topics:
+                fallback_topics = self._context_service._build_fallback_topic_from_messages(
+                    sanitized_messages, media_highlights
                 )
                 if fallback_topics:
                     topics = fallback_topics
-                else:
-                    topics.append(
-                        {
-                            "title": "Общее обсуждение",
-                            "priority": "medium",
-                            "msg_count": state.get("message_total", 0),
-                            "threads": [],
-                            "summary": "Темы не были выделены автоматически.",
-                            "signals": {"source": "fallback"},
-                        }
-                    )
-            elif all(topic.get("title") in {"Общее обсуждение", "Разное", "Без темы"} for topic in topics):
-                # Rule-based guard: если все темы общие, принудительно запускаем fallback
-                heuristic_topics = self._context_service.build_keyword_topics(
-                    state.get("sanitized_messages") or [],
-                    state.get("media_highlights") or [],
-                )
-                if heuristic_topics:
-                    topics = heuristic_topics
+                    fallback_used = True
             
-            # Rule-based guard: проверка на минимальное количество тем
-            message_count = state.get("message_total", 0)
+            # Шаг 5: Обогащение тем решениями и владельцами
+            if topics and sanitized_messages:
+                # Извлекаем все решения из сообщений
+                all_decisions = self._context_service._extract_decisions_from_messages(sanitized_messages)
+                
+                # Матчим решения к темам по message_ids
+                for topic in topics:
+                    topic_message_ids = set(topic.get("message_ids", []))
+                    if not topic_message_ids:
+                        # Если нет message_ids, пытаемся найти по ключевым словам
+                        topic_title_lower = topic.get("title", "").lower()
+                        topic_tokens = set(topic_title_lower.split())
+                        for msg in sanitized_messages:
+                            msg_content = (msg.get("content", "") or "").lower()
+                            msg_tokens = set(_tokenize(msg_content))
+                            if topic_tokens & msg_tokens:  # Есть пересечение
+                                msg_id = msg.get("message_id")
+                                if msg_id:
+                                    topic_message_ids.add(msg_id)
+                    
+                    # Находим решения, связанные с темой
+                    matched_decisions = [
+                        d for d in all_decisions
+                        if set(d.get("message_ids", [])) & topic_message_ids
+                    ]
+                    
+                    # Обогащаем тему решениями
+                    if matched_decisions:
+                        first_decision = matched_decisions[0]
+                        if not topic.get("decision") or topic.get("decision") == "Явных решений не найдено":
+                            topic["decision"] = first_decision.get("summary", topic.get("decision", "Явных решений не найдено"))
+                        
+                        # Обновляем owners из решений
+                        decision_owners = set(topic.get("owners", []))
+                        for dec in matched_decisions:
+                            decision_owners.update(dec.get("owners", []))
+                        topic["owners"] = list(decision_owners)
+                        
+                        # Обновляем actions
+                        if not topic.get("actions"):
+                            topic["actions"] = []
+                        for dec in matched_decisions[:3]:
+                            dec_owners = dec.get("owners", [])
+                            if dec_owners:
+                                action_text = f"{', '.join(dec_owners)} — {dec.get('summary', '')}"
+                                if action_text not in topic["actions"]:
+                                    topic["actions"].append(action_text)
+                        
+                        # Обновляем status на основе решений
+                        if any(d.get("status") == "agreed" for d in matched_decisions):
+                            topic["status"] = "agreed"
+                        elif any(d.get("status") == "proposed" for d in matched_decisions):
+                            topic["status"] = "in_progress"
+            
+            # Шаг 6: Принудительное расширение тем если их мало
             min_messages_for_topics = self.config.quality_checks.min_messages_for_topics
             min_topics_required = self.config.quality_checks.min_topics_required
             
             if message_count >= min_messages_for_topics and len(topics) < min_topics_required:
-                # Считаем ошибкой, принудительно запускаем fallback
                 reason = f"topics_too_few:got_{len(topics)}_required_{min_topics_required}"
                 logger.warning(
                     "digest_topics_too_few",
@@ -2609,7 +2955,6 @@ class GroupDigestOrchestrator:
                 )
                 tenant_id = state.get("tenant_id", "unknown")
                 mode = state.get("digest_mode", "normal")
-                # Context7: Обработка ошибок метрик - не прерываем workflow при ошибках Prometheus
                 try:
                     digest_topics_empty_total.labels(
                         reason=_sanitize_prometheus_label(reason), 
@@ -2619,17 +2964,54 @@ class GroupDigestOrchestrator:
                 except Exception as metric_error:
                     logger.warning("Failed to record digest_topics_empty_total metric", reason=reason, tenant_id=tenant_id, error=str(metric_error))
                 
-                fallback_topics = self._context_service.build_keyword_topics(
-                    state.get("sanitized_messages") or [],
-                    state.get("media_highlights") or [],
+                # Пытаемся расширить через keyword_topics
+                keyword_topics = self._context_service.build_keyword_topics(
+                    sanitized_messages,
+                    media_highlights,
+                    limit=min_topics_required,
                 )
-                if fallback_topics:
-                    topics = fallback_topics
-                else:
-                    # Если fallback не помог, всё равно добавляем ошибку
-                    state.setdefault("errors", []).append(reason)
+                if keyword_topics and len(keyword_topics) > len(topics):
+                    topics = keyword_topics
+                    fallback_used = True
+                elif not topics:
+                    # Последний fallback
+                    fallback_topics = self._context_service._build_fallback_topic_from_messages(
+                        sanitized_messages, media_highlights
+                    )
+                    if fallback_topics:
+                        topics = fallback_topics
+                        fallback_used = True
+                    else:
+                        state.setdefault("errors", []).append(reason)
             
-            result = {"topics": topics}
+            # Гарантия: всегда минимум одна тема
+            if not topics:
+                logger.warning("digest_topics_empty_final_fallback", message_count=message_count)
+                topics = self._context_service._build_fallback_topic_from_messages(
+                    sanitized_messages, media_highlights
+                )
+                fallback_used = True
+                
+                # Если и fallback не помог (крайне маловероятно), создаём минимальную тему
+                if not topics:
+                    logger.error("digest_topics_completely_empty", message_count=message_count)
+                    topics = [{
+                        "title": "Обсуждение",
+                        "priority": "medium",
+                        "msg_count": message_count,
+                        "threads": [],
+                        "message_ids": [msg.get("message_id") for msg in sanitized_messages[:10] if msg.get("message_id")],
+                        "summary": f"Обсуждение из {message_count} сообщений. Темы не удалось выделить автоматически.",
+                        "signals": {"source": "emergency_fallback"},
+                        "decision": "Явных решений не найдено в явной форме",
+                        "status": "unclear",
+                        "owners": [],
+                        "blockers": [],
+                        "actions": [],
+                    }]
+                    fallback_used = True
+            
+            result = {"topics": topics, "fallback_used": fallback_used}
             state["topics"] = topics
             self._store_stage_payload(state, "topic_agent", result, model_id=model_id)
             self._log_sample(
@@ -2720,10 +3102,69 @@ class GroupDigestOrchestrator:
             period = self._resolve_period(window)
             message_count = self._resolve_message_count(state, window)
 
+            # Проверка пустоты тем перед вызовом LLM
+            current_topics = state.get("topics", [])
+            topics_generated_from_messages = False
+            fallback_used_flag = state.get("fallback_used", False)
+            
+            # Если тем нет, запускаем fallback-генерацию
+            if not current_topics:
+                sanitized_messages = state.get("sanitized_messages", [])
+                media_highlights = state.get("media_highlights", [])
+                
+                # Пытаемся создать темы через keyword_topics
+                keyword_topics = self._context_service.build_keyword_topics(
+                    sanitized_messages,
+                    media_highlights,
+                    limit=3,
+                )
+                if keyword_topics:
+                    current_topics = keyword_topics
+                    topics_generated_from_messages = True
+                    fallback_used_flag = True
+                else:
+                    # Последний fallback
+                    fallback_topics = self._context_service._build_fallback_topic_from_messages(
+                        sanitized_messages, media_highlights
+                    )
+                    if fallback_topics:
+                        current_topics = fallback_topics
+                        topics_generated_from_messages = True
+                        fallback_used_flag = True
+            
+            # Логирование для диагностики
+            total_decisions = sum(len(topic.get("actions", [])) for topic in current_topics)
+            window_id = window.get("window_id", "")
+            logger.info(
+                "GroupDigestTopics",
+                extra={
+                    "window_id": window_id,
+                    "topics_count": len(current_topics),
+                    "decisions_count": total_decisions,
+                    "fallback_used": fallback_used_flag,
+                    "topics_generated_from_messages": topics_generated_from_messages,
+                },
+            )
+            
+            # Мягкий quality gate: если тем 0 и fallback не помог
+            if not current_topics:
+                degraded_summary = (
+                    "<b>Дайджест не сформирован</b>: Обсуждение носило хаотичный характер, "
+                    "явных тем и решений не выделено. Возможно, окно слишком короткое или в нём только оффтоп."
+                )
+                result = {
+                    "summary_html": degraded_summary,
+                    "summary": degraded_summary,
+                    "baseline_snapshot": baseline_dict,
+                    "prompt_version": "digest_composer_prompt_v2",
+                    "degraded": True,
+                }
+                self._store_stage_payload(state, "synthesis_agent", result, model_id="system")
+                return result
+            
             # Вычисляем baseline_delta для v2 промпта (используем текущие темы и метрики)
             baseline_snapshot_obj = self._get_baseline_snapshot(state)
             current_metrics = state.get("metrics", {})
-            current_topics = state.get("topics", [])
             baseline_delta = compute_delta(
                 baseline_snapshot_obj,
                 current_topics,
@@ -2739,9 +3180,19 @@ class GroupDigestOrchestrator:
                 reverse=True
             )[:3]
 
+            # Обогащаем темы правильными ссылками на сообщения
+            sanitized_messages = state.get("sanitized_messages", [])
+            raw_messages = state.get("messages", [])
+            enriched_topics = self._enrich_topics_with_links(
+                current_topics,
+                sanitized_messages,
+                raw_messages,
+                window,
+            )
+
             variables = {
                 "window_json": json.dumps(window, ensure_ascii=False),
-                "topics_json": json.dumps(state.get("topics", []), ensure_ascii=False),
+                "topics_json": json.dumps(enriched_topics, ensure_ascii=False),
                 "participants_json": json.dumps(participants_top3, ensure_ascii=False),  # Только top-3
                 "role_profile_json": json.dumps(state.get("role_profile", []), ensure_ascii=False),
                 "metrics_json": json.dumps(state.get("metrics", {}), ensure_ascii=False),

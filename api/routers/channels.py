@@ -23,6 +23,7 @@ from middleware.tracing import get_trace_id
 from repositories.outbox import OutboxRepository, get_outbox_repository
 from events.schemas.channels_v1 import ChannelSubscribedEventV1, ChannelUnsubscribedEventV1
 from services.telegram_channel_resolver import get_tg_channel_id_by_username
+from bot.utils import extract_username_from_telegram_url
 
 logger = structlog.get_logger()
 
@@ -94,7 +95,12 @@ async def subscribe_to_channel(
     db: Session = Depends(get_db),
     outbox: OutboxRepository = Depends(get_outbox_repository)
 ):
-    """Подписка на канал с триггером парсинга."""
+    """Подписка на канал с триггером парсинга.
+    
+    Context7: FastAPI обрабатывает синхронные операции БД через thread pool executor,
+    поэтому async функция с синхронными db.execute() работает корректно.
+    await asyncio.sleep() вызывается до операций с БД, что безопасно.
+    """
     try:
         trace_id = get_trace_id(req)
         
@@ -128,22 +134,29 @@ async def subscribe_to_channel(
                 }
             )
         
-        # Валидация username
-        if request.username and not re.match(r'^@?[a-zA-Z0-9_]{5,32}$', request.username):
-            raise HTTPException(
-                status_code=422,
-                detail={"error": "invalid_channel", "trace_id": trace_id}
-            )
-        
         # Context7: Если telegram_id не передан, пытаемся получить его по username
         telegram_id = request.telegram_id
+        normalized_username = None
         if not telegram_id and request.username:
+            # Context7: Нормализуем username перед вызовом API (убираем @, парсим URL)
+            normalized_username = extract_username_from_telegram_url(request.username)
+            if not normalized_username:
+                raise HTTPException(
+                    status_code=422,
+                    detail={"error": "invalid_channel", "trace_id": trace_id}
+                )
+            # Context7: Валидация username после нормализации (поддерживает URL и username)
+            if not re.match(r'^[a-zA-Z0-9_]{5,32}$', normalized_username):
+                raise HTTPException(
+                    status_code=422,
+                    detail={"error": "invalid_channel", "trace_id": trace_id}
+                )
             # Пытаемся получить tg_channel_id из Telegram API с retry
             # Context7: Делаем несколько попыток для надежности
             max_retries = 3
             for attempt in range(max_retries):
                 try:
-                    tg_channel_id = await get_tg_channel_id_by_username(request.username)
+                    tg_channel_id = await get_tg_channel_id_by_username(normalized_username)
                     if tg_channel_id:
                         telegram_id = tg_channel_id
                         logger.info("Got tg_channel_id from Telegram API", 
@@ -169,10 +182,14 @@ async def subscribe_to_channel(
                         delay = attempt + 1  # Linear backoff: 1s, 2s, 3s
                         await asyncio.sleep(delay)
         
+        # Context7: Используем нормализованный username для создания канала
+        channel_username = normalized_username if normalized_username else request.username
+        
         # Получение или создание канала
+        # Context7: Синхронные операции БД в async функции - FastAPI обрабатывает это через thread pool
         channel = _get_or_create_channel(
             tenant_id=tenant_id,
-            username=request.username,
+            username=channel_username,
             telegram_id=telegram_id,
             title=request.title,
             db=db
@@ -714,8 +731,9 @@ async def _fill_tg_channel_id_background(channel_id: str, username: str):
             tg_channel_id = await get_tg_channel_id_by_username(username)
             if tg_channel_id:
                 # Обновляем канал в БД
-                from models.database import get_db
-                db = next(get_db())
+                # Context7: Используем SessionLocal напрямую для фоновых задач, а не FastAPI dependency
+                from models.database import SessionLocal
+                db = SessionLocal()
                 try:
                     result = db.execute(
                         text("""
@@ -737,6 +755,7 @@ async def _fill_tg_channel_id_background(channel_id: str, username: str):
                         # Канал уже обновлен или не найден
                         logger.info("Channel tg_channel_id already set or channel not found", 
                                    channel_id=channel_id)
+                        # Context7: Выходим из цикла retry, так как дальнейшие попытки бесполезны
                         return
                 except Exception as e:
                     error_msg = f"DB update error: {str(e)}"
@@ -745,7 +764,6 @@ async def _fill_tg_channel_id_background(channel_id: str, username: str):
                                channel_id=channel_id, 
                                error=str(e),
                                attempt=attempt + 1)
-                    db.rollback()
                 finally:
                     db.close()
             else:

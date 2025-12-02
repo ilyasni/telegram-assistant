@@ -236,6 +236,11 @@ async def process_topics(msg: Message, state: FSMContext):
         await state.clear()
         return
     
+    # Context7: Проверка на None перед использованием msg.text
+    if not msg.text:
+        await msg.answer("❌ Сообщение не содержит текста. Попробуйте еще раз:")
+        return
+    
     # Парсим темы (разделяем по запятой, очищаем от пробелов)
     topics = [t.strip() for t in msg.text.split(",") if t.strip()]
     
@@ -297,6 +302,11 @@ async def process_schedule_time(msg: Message, state: FSMContext):
     if not user_id:
         await msg.answer("❌ Пользователь не найден")
         await state.clear()
+        return
+    
+    # Context7: Проверка на None перед использованием msg.text
+    if not msg.text:
+        await msg.answer("❌ Сообщение не содержит текста. Попробуйте еще раз:")
         return
     
     # Валидация формата времени
@@ -444,8 +454,10 @@ async def callback_digest_generate(callback: CallbackQuery):
     redis_client = None
     lock_key = f"digest:lock:{user_id}"
     lock_acquired = False
+    redis_client_closed = False  # Context7: Флаг для отслеживания закрытия клиента
     
     try:
+        # Context7: Инициализируем redis_client в начале try блока для корректной обработки ошибок
         redis_client = await redis.from_url(redis_url, decode_responses=True)
         
         # Пытаемся получить lock (TTL 5 минут)
@@ -453,13 +465,16 @@ async def callback_digest_generate(callback: CallbackQuery):
         if not lock_acquired:
             await callback.answer("⏳ Дайджест уже генерируется, подождите...", show_alert=True)
             # Context7: Закрываем клиент перед ранним возвратом
-            if redis_client:
+            if redis_client and not redis_client_closed:
                 try:
                     await redis_client.close()
+                    redis_client_closed = True  # Context7: Отмечаем, что клиент закрыт
                 except Exception as e:
                     logger.warning("Failed to close Redis client on early return", error=str(e))
+                    redis_client_closed = True  # Context7: Отмечаем как закрытый даже при ошибке
             return
         
+        # Context7: Код генерации дайджеста перемещен в основной try блок для корректной работы
         # Показываем индикатор загрузки
         await callback.answer("⏳ Генерирую дайджест...")
         
@@ -487,6 +502,7 @@ async def callback_digest_generate(callback: CallbackQuery):
                     queued_message += "\nМы пришлём готовый дайджест отдельным сообщением."
                     await callback.message.answer(queued_message, parse_mode="HTML")
                     await callback.answer("✅ Дайджест поставлен в очередь")
+                    # Context7: Не освобождаем lock здесь - finally блок освободит его автоматически
                     return
                 
                 from utils.telegram_formatter import markdown_to_telegram_chunks
@@ -532,11 +548,21 @@ async def callback_digest_generate(callback: CallbackQuery):
                     await redis_client.delete(lock_key)
                 except Exception as e:
                     logger.warning("Failed to release digest lock", error=str(e), lock_key=lock_key)
+    except Exception as redis_init_error:
+        # Context7: Обрабатываем ошибки инициализации Redis клиента
+        logger.error("Failed to initialize Redis client", error=str(redis_init_error))
+        await callback.answer("❌ Ошибка подключения к Redis. Попробуйте позже.", show_alert=True)
+        # Context7: redis_client может быть None, если инициализация не удалась
+        redis_client = None
+        redis_client_closed = True
+        return
     finally:
-        # Закрываем Redis client в любом случае
-        if redis_client:
+        # Закрываем Redis client в любом случае, если он еще не закрыт
+        if redis_client and not redis_client_closed:
             try:
                 await redis_client.close()
+                redis_client_closed = True
             except Exception as e:
                 logger.warning("Failed to close Redis client", error=str(e))
+                redis_client_closed = True
 

@@ -456,27 +456,85 @@ class GroupContextService:
         if not messages:
             return []
 
+        message_count = len(messages)
+        # Динамический порог частоты
+        if message_count <= 10:
+            min_freq = 1
+        elif message_count <= 30:
+            min_freq = 2
+        else:
+            min_freq = 3
+
+        # Собираем униграммы и биграммы
         tokens_by_msg: List[Tuple[Dict[str, Any], List[str]]] = []
-        counter: Counter[str] = Counter()
+        unigram_counter: Counter[str] = Counter()
+        bigram_counter: Counter[str] = Counter()
+        
         for msg in messages:
-            tokens = _tokenize(f"{msg.get('content', '')} {' '.join(msg.get('media_summary', []))}")
+            media_summary = msg.get('media_summary', [])
+            if not isinstance(media_summary, list):
+                media_summary = []
+            content = f"{msg.get('content', '')} {' '.join(media_summary)}"
+            tokens = _tokenize(content)
             if not tokens:
                 continue
             tokens_by_msg.append((msg, tokens))
-            counter.update(tokens)
+            unigram_counter.update(tokens)
+            
+            # Собираем биграммы
+            for i in range(len(tokens) - 1):
+                bigram = f"{tokens[i]} {tokens[i+1]}"
+                bigram_counter[bigram] += 1
 
-        if not counter:
+        if not unigram_counter and not bigram_counter:
             return []
 
-        top_tokens = [token for token, freq in counter.most_common(10) if freq >= 2][:limit]
-        if not top_tokens:
-            top_tokens = [counter.most_common(1)[0][0]]
+        # Объединяем униграммы и биграммы, приоритет биграммам
+        combined_items: List[Tuple[str, int]] = []
+        for bigram, freq in bigram_counter.most_common(20):
+            if freq >= min_freq:
+                combined_items.append((bigram, freq * 2))  # Увеличиваем вес биграмм
+        
+        for unigram, freq in unigram_counter.most_common(20):
+            if freq >= min_freq:
+                # Проверяем, что униграмма не входит в уже выбранные биграммы
+                if not any(unigram in item[0] for item in combined_items[:limit]):
+                    combined_items.append((unigram, freq))
+        
+        # Сортируем по частоте и берём top-N
+        combined_items.sort(key=lambda x: x[1], reverse=True)
+        top_phrases = [phrase for phrase, _ in combined_items[:limit]]
+        
+        if not top_phrases:
+            # Если ничего не нашлось, берём хотя бы самые частые
+            if bigram_counter:
+                top_phrases = [bigram_counter.most_common(1)[0][0]]
+            elif unigram_counter:
+                top_phrases = [unigram_counter.most_common(1)[0][0]]
+            else:
+                return []
 
         topics: List[Dict[str, Any]] = []
-        for idx, keyword in enumerate(top_tokens):
-            matched_messages = [
-                msg for msg, tokens in tokens_by_msg if keyword in tokens
-            ][:10]
+        for idx, phrase in enumerate(top_phrases):
+            # Ищем сообщения, содержащие эту фразу (или её части для биграмм)
+            phrase_tokens = phrase.split()
+            matched_messages = []
+            for msg, tokens in tokens_by_msg:
+                # Для биграмм проверяем наличие обоих токенов рядом
+                if len(phrase_tokens) == 2:
+                    found = False
+                    for i in range(len(tokens) - 1):
+                        if tokens[i] == phrase_tokens[0] and tokens[i+1] == phrase_tokens[1]:
+                            found = True
+                            break
+                    if found:
+                        matched_messages.append(msg)
+                else:
+                    # Для униграмм просто проверяем наличие
+                    if phrase in tokens:
+                        matched_messages.append(msg)
+            
+            matched_messages = matched_messages[:10]
             msg_count = max(1, len(matched_messages))
             priority = "high" if idx == 0 else "medium"
 
@@ -485,7 +543,7 @@ class GroupContextService:
                 summary_lines.append(candidate.get("content", "")[:160])
             summary = " ".join(line for line in summary_lines if line).strip()
             if not summary:
-                summary = f"Обсуждение ключевой темы «{keyword}»."
+                summary = f"Обсуждение ключевой темы «{phrase}»."
 
             owners_counter: Counter[str] = Counter(
                 mask_pii(msg.get("username") or "") for msg in matched_messages if msg.get("username")
@@ -495,34 +553,362 @@ class GroupContextService:
             ]
             owners_text = ", ".join(owners_list) if owners_list else "Активные участники группы"
 
+            # Ищем решения в сообщениях темы
+            decisions = self._extract_decisions_from_messages(matched_messages)
+            decision_text = "Требуется зафиксировать итоговое решение."
+            actions_list: List[str] = []
+            if decisions:
+                # Берём первое решение для decision
+                first_decision = decisions[0]
+                decision_text = first_decision.get("summary", decision_text)
+                # Формируем actions из решений
+                for dec in decisions[:3]:
+                    owners_dec = dec.get("owners", [])
+                    if owners_dec:
+                        actions_list.append(f"{', '.join(owners_dec)} — {dec.get('summary', '')}")
+
             topic_highlights = [
                 h
                 for h in highlights
-                if keyword in (h.get("description", "").lower() + " " + " ".join(h.get("labels", []))).lower()
+                if any(token in (h.get("description", "").lower() + " " + " ".join(h.get("labels", []))).lower() 
+                       for token in phrase_tokens)
             ]
             signals = {
                 "source": "heuristic",
-                "keyword": keyword,
+                "keyword": phrase,
                 "media_refs": len(topic_highlights),
             }
 
+            # Собираем message_ids
+            message_ids = [msg.get("message_id") for msg in matched_messages if msg.get("message_id")]
+
             topics.append(
                 {
-                    "title": keyword.capitalize(),
+                    "title": phrase.capitalize() if len(phrase.split()) == 1 else phrase,
                     "priority": priority,
                     "msg_count": msg_count,
                     "threads": [],
+                    "message_ids": message_ids,
                     "summary": summary,
                     "signals": signals,
-                    "decision": "Требуется зафиксировать итоговое решение.",
-                    "status": "в процессе обсуждения",
-                    "owners": owners_text,
-                    "blockers": "Не обозначены.",
-                    "actions": f"Сформулировать и согласовать следующие шаги по теме «{keyword}».",
+                    "decision": decision_text,
+                    "status": "ongoing" if not decisions else ("agreed" if any(d.get("status") == "agreed" for d in decisions) else "unclear"),
+                    "owners": owners_list if owners_list else [],
+                    "blockers": [],
+                    "actions": actions_list if actions_list else [],
                 }
             )
 
         return topics
+
+    def _extract_decisions_from_messages(
+        self, messages: Sequence[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Извлечение решений из сообщений через эвристики (независимо от тем)."""
+        if not messages:
+            return []
+
+        # Паттерны маркеров решений
+        decision_markers = [
+            r"решили",
+            r"договорились",
+            r"договорились\s+что",
+            r"окей",
+            r"ок\s*[,\.]",
+            r"по\s+рукам",
+            r"давайте\s+так",
+            r"давай\s+сделаем",
+            r"будем\s+делать",
+            r"надо\s+сделать",
+            r"я\s+беру",
+            r"я\s+сделаю",
+            r"беру\s+на\s+себя",
+            r"могу\s+сделать",
+            r"предлагаю",
+            r"закрепляем",
+        ]
+        
+        rejection_markers = [
+            r"нет\s*[,\.]",
+            r"не\s+будем",
+            r"это\s+плохая\s+идея",
+            r"не\s+надо",
+            r"отказываемся",
+        ]
+        
+        confirmation_markers = [
+            r"ок\s*[,\.]",
+            r"давайте\s+так",
+            r"по\s+рукам",
+            r"согласен",
+            r"поддерживаю",
+        ]
+
+        decisions: List[Dict[str, Any]] = []
+        messages_list = list(messages)
+        
+        for i, msg in enumerate(messages_list):
+            content = msg.get("content", "").lower()
+            if not content:
+                continue
+            
+            # Проверяем маркеры решений
+            found_marker = None
+            for marker in decision_markers:
+                if re.search(marker, content, re.IGNORECASE):
+                    found_marker = marker
+                    break
+            
+            if not found_marker:
+                continue
+            
+            # Определяем статус
+            status = "unclear"
+            # Проверяем на отклонение
+            if any(re.search(rm, content, re.IGNORECASE) for rm in rejection_markers):
+                status = "rejected"
+            # Проверяем на подтверждение в следующих сообщениях
+            elif any(re.search(cm, content, re.IGNORECASE) for cm in confirmation_markers):
+                status = "agreed"
+            else:
+                # Проверяем следующие 1-2 сообщения на подтверждение
+                for j in range(i + 1, min(i + 3, len(messages_list))):
+                    next_content = messages_list[j].get("content", "").lower()
+                    if any(re.search(cm, next_content, re.IGNORECASE) for cm in confirmation_markers):
+                        status = "agreed"
+                        break
+                    if any(re.search(rm, next_content, re.IGNORECASE) for rm in rejection_markers):
+                        status = "rejected"
+                        break
+                if status == "unclear":
+                    # Если только предложение без подтверждений
+                    if "предлагаю" in content or "давай" in content:
+                        status = "proposed"
+            
+            # Извлекаем owners: автор + @упоминания
+            owners: List[str] = []
+            username = msg.get("username")
+            if username and username not in ("user-unknown", "без никнейма"):
+                owners.append(username)
+            
+            # Ищем @упоминания
+            mentions = re.findall(r"@(\w+)", msg.get("content", ""), re.IGNORECASE)
+            owners.extend([m for m in mentions if m not in owners])
+            
+            # Ищем прямые обращения типа "Аня, сделай"
+            direct_mentions = re.findall(r"([А-ЯЁа-яё]+)\s*[,\.]\s*(?:сделай|сделай\s+пожалуйста|возьми|можешь)", content, re.IGNORECASE)
+            for mention in direct_mentions:
+                if mention and mention not in owners:
+                    owners.append(mention)
+            
+            # Формируем summary из контекста
+            context_start = max(0, i - 1)
+            context_end = min(len(messages_list), i + 2)
+            context_messages = messages_list[context_start:context_end]
+            summary_parts = []
+            for ctx_msg in context_messages:
+                ctx_content = ctx_msg.get("content", "").strip()
+                if ctx_content and len(ctx_content) < 200:
+                    summary_parts.append(ctx_content)
+            
+            summary = " ".join(summary_parts[:2])[:300]
+            if not summary:
+                summary = msg.get("content", "")[:200]
+            
+            # Собираем message_ids
+            message_ids = [m.get("message_id") for m in context_messages if m.get("message_id")]
+            if not message_ids:
+                message_ids = [msg.get("message_id")] if msg.get("message_id") else []
+            
+            decisions.append({
+                "summary": summary.strip(),
+                "owners": owners,
+                "message_ids": message_ids,
+                "status": status,
+            })
+        
+        return decisions
+
+    def _build_fallback_topic_from_messages(
+        self, messages: Sequence[Dict[str, Any]], highlights: Sequence[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
+        """Создание fallback-темы из сообщений с использованием биграмм."""
+        if not messages:
+            return []
+        
+        highlights = highlights or []
+        message_count = len(messages)
+        
+        # Собираем биграммы из всех сообщений
+        bigram_counter: Counter[str] = Counter()
+        tokens_by_msg: List[Tuple[Dict[str, Any], List[str]]] = []
+        
+        for msg in messages:
+            media_summary = msg.get('media_summary', [])
+            if not isinstance(media_summary, list):
+                media_summary = []
+            content = f"{msg.get('content', '')} {' '.join(media_summary)}"
+            tokens = _tokenize(content)
+            if not tokens:
+                continue
+            tokens_by_msg.append((msg, tokens))
+            
+            # Собираем биграммы
+            for i in range(len(tokens) - 1):
+                bigram = f"{tokens[i]} {tokens[i+1]}"
+                bigram_counter[bigram] += 1
+        
+        if not bigram_counter:
+            # Если биграмм нет, используем униграммы
+            unigram_counter: Counter[str] = Counter()
+            for msg, tokens in tokens_by_msg:
+                unigram_counter.update(tokens)
+            if not unigram_counter:
+                # Если нет токенов вообще, создаём тему из первых слов сообщений
+                title_parts = []
+                for msg in messages[:5]:
+                    content = (msg.get('content', '') or '').strip()
+                    if content:
+                        # Берём первые 2-3 слова
+                        words = content.split()[:3]
+                        if words:
+                            title_parts.extend([w for w in words if len(w) > 2])
+                            if len(title_parts) >= 2:
+                                break
+                if not title_parts:
+                    # Последний fallback: просто "Обсуждение"
+                    title = "Обсуждение"
+                else:
+                    title = f"Обсуждение: {' '.join(title_parts[:2])}"
+            else:
+                # Берём 2-3 самые частые униграммы
+                top_tokens = [token for token, _ in unigram_counter.most_common(3)]
+                title_parts = top_tokens[:3]
+                # Формируем заголовок
+                if len(title_parts) >= 2:
+                    title = f"Обсуждение: {title_parts[0]} и {title_parts[1]}"
+                else:
+                    title = f"Обсуждение: {title_parts[0]}"
+        else:
+            # Берём 2-3 самые частые биграммы
+            top_bigrams = [bigram for bigram, _ in bigram_counter.most_common(3)]
+            title_parts = top_bigrams[:3]
+            # Формируем заголовок
+            if len(title_parts) >= 2:
+                title = f"Обсуждение: {title_parts[0]} и {title_parts[1]}"
+            else:
+                title = f"Обсуждение: {title_parts[0]}"
+        
+        # Собираем все message_ids
+        all_message_ids = [msg.get("message_id") for msg in messages if msg.get("message_id")]
+        
+        # Формируем summary из первых сообщений
+        summary_parts = []
+        for msg in messages[:5]:
+            content = msg.get("content", "").strip()
+            if content and len(content) < 200:
+                summary_parts.append(content[:150])
+        summary = " ".join(summary_parts[:3])[:400]
+        if not summary:
+            summary = f"Обсуждение из {message_count} сообщений."
+        
+        # Ищем решения
+        decisions = self._extract_decisions_from_messages(messages)
+        decision_text = "Явных решений не найдено в явной форме."
+        if decisions:
+            first_decision = decisions[0]
+            decision_text = first_decision.get("summary", decision_text)
+        
+        # Собираем owners
+        owners_counter: Counter[str] = Counter(
+            mask_pii(msg.get("username") or "") for msg in messages if msg.get("username")
+        )
+        owners_list = [owner for owner, _ in owners_counter.most_common(3) if owner]
+        
+        # Формируем actions из решений
+        actions_list: List[str] = []
+        for dec in decisions[:3]:
+            owners_dec = dec.get("owners", [])
+            if owners_dec:
+                actions_list.append(f"{', '.join(owners_dec)} — {dec.get('summary', '')}")
+        
+        return [{
+            "title": title,
+            "priority": "medium",
+            "msg_count": message_count,
+            "threads": [],
+            "message_ids": all_message_ids,
+            "summary": summary,
+            "signals": {"source": "fallback"},
+            "decision": decision_text,
+            "status": "ongoing" if not decisions else ("agreed" if any(d.get("status") == "agreed" for d in decisions) else "unclear"),
+            "owners": owners_list,
+            "blockers": [],
+            "actions": actions_list,
+        }]
+
+    def _normalize_topics(self, topics: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Нормализация тем: убрать пустые, дубли, обрезать воду."""
+        if not topics:
+            return []
+        
+        normalized: List[Dict[str, Any]] = []
+        seen_titles: set[str] = set()
+        generic_titles = {"Общее обсуждение", "Разное", "Без темы", "Без названия"}
+        
+        for topic in topics:
+            title = (topic.get("title") or "").strip()
+            if not title or title in generic_titles:
+                continue
+            
+            # Проверяем на дубли (нормализуем для сравнения)
+            title_lower = title.lower()
+            if title_lower in seen_titles:
+                continue
+            seen_titles.add(title_lower)
+            
+            # Обрезаем слишком длинные summary
+            summary = topic.get("summary", "").strip()
+            if len(summary) > 500:
+                summary = summary[:497] + "..."
+            
+            # Убеждаемся, что есть обязательные поля
+            # Нормализуем owners: может быть строкой или списком
+            owners_raw = topic.get("owners", [])
+            if isinstance(owners_raw, str):
+                owners = [owners_raw] if owners_raw else []
+            elif isinstance(owners_raw, list):
+                owners = owners_raw
+            else:
+                owners = []
+            
+            # Нормализуем actions: должен быть списком
+            actions_raw = topic.get("actions", [])
+            if isinstance(actions_raw, str):
+                actions = [actions_raw] if actions_raw else []
+            elif isinstance(actions_raw, list):
+                actions = actions_raw
+            else:
+                actions = []
+            
+            normalized_topic = {
+                "title": title,
+                "priority": topic.get("priority", "medium"),
+                "msg_count": int(topic.get("msg_count", 0)),
+                "threads": topic.get("threads", []),
+                "message_ids": topic.get("message_ids", []),
+                "summary": summary,
+                "signals": topic.get("signals", {}),
+                "decision": topic.get("decision", "Явных решений не найдено"),
+                "status": topic.get("status", "unclear"),
+                "owners": owners,
+                "blockers": topic.get("blockers", []),
+                "actions": actions,
+            }
+            
+            normalized.append(normalized_topic)
+        
+        return normalized
 
     def _sanitize_messages(self, raw_messages: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
         sanitized: List[Dict[str, Any]] = []
@@ -539,9 +925,12 @@ class GroupContextService:
                 else:
                     enriched_content = f"Вложения: {attachments}"
             reaction_count = int(raw.get("reaction_count") or 0)
+            # Сохраняем tg_message_id для формирования ссылок
+            tg_message_id = raw.get("tg_message_id") or raw.get("telegram_message_id")
             sanitized.append(
                 {
                     "message_id": str(raw.get("id") or raw.get("tg_message_id") or uuid.uuid4().hex),
+                    "tg_message_id": tg_message_id,  # Сохраняем для формирования ссылок
                     "timestamp_iso": timestamp_iso,
                     "timestamp_unix": posted_at.timestamp(),
                     "username": mask_pii(raw.get("sender_username") or f"user-{raw.get('sender_tg_id') or 'unknown'}"),

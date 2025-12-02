@@ -59,11 +59,36 @@ def init_bot() -> None:
         _bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
         _dp = Dispatcher()
         # Регистрация хендлеров
+        # Context7: Регистрируем все routers из handler файлов для поддержки всех команд
         try:
-            from bot.handlers.base import router as handlers_router  # local import to avoid cycles
-            _dp.include_router(handlers_router)
+            from bot.handlers.base import router as base_router
+            _dp.include_router(base_router)
         except Exception as e:
-            logger.error("Failed to register bot handlers", error=str(e))
+            logger.error("Failed to register base handlers", error=str(e))
+        
+        try:
+            from bot.handlers.channel_handlers import router as channel_router
+            _dp.include_router(channel_router)
+        except Exception as e:
+            logger.error("Failed to register channel handlers", error=str(e))
+        
+        try:
+            from bot.handlers.digest_handlers import router as digest_router
+            _dp.include_router(digest_router)
+        except Exception as e:
+            logger.error("Failed to register digest handlers", error=str(e))
+        
+        try:
+            from bot.handlers.group_handlers import router as group_router
+            _dp.include_router(group_router)
+        except Exception as e:
+            logger.error("Failed to register group handlers", error=str(e))
+        
+        try:
+            from bot.handlers.trends_handlers import router as trends_router
+            _dp.include_router(trends_router)
+        except Exception as e:
+            logger.error("Failed to register trends handlers", error=str(e))
         # Context7: Устанавливаем глобальные переменные напрямую, а не через globals()
         # Это гарантирует, что переменные будут доступны в модуле
         import bot.webhook as webhook_module

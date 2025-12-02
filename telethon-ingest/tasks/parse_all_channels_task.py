@@ -790,6 +790,13 @@ class ParseAllChannelsTask:
         """
         if not await self._acquire_lock():
             logger.info("Lock held by another instance, skipping tick")
+            # Context7: Обновляем метрику freshness даже при отсутствии lock,
+            # чтобы показать, что scheduler активен, но не может выполнить тик
+            try:
+                now_ts = datetime.now(timezone.utc).timestamp()
+                scheduler_last_tick_ts_seconds.set(now_ts)
+            except Exception:
+                pass  # Игнорируем ошибки обновления метрики
             return
         
         tick_start_time = datetime.now(timezone.utc)
@@ -1265,7 +1272,7 @@ class ParseAllChannelsTask:
                   AND (c.blocked_until IS NULL OR c.blocked_until < NOW())
                 ORDER BY
                   (c.last_parsed_at IS NULL) DESC,  -- Явный приоритет NULL (TRUE идет первым)
-                  c.last_parsed_at NULLS FIRST,     -- Дополнительная гарантия приоритета NULL
+                  c.last_parsed_at ASC NULLS FIRST,  -- Context7: Старые каналы в приоритете (ASC = старые первыми)
                   COALESCE(u.tenant_id::text, '00000000-0000-0000-0000-000000000000'),  -- Fairness между tenant'ами
                   COALESCE(uc.user_id::text, '0'),  -- Fairness между пользователями
                   c.created_at DESC

@@ -576,7 +576,15 @@ class DigestWorker:
         if not bot:
             raise NonRetryableDigestError("Telegram bot is not initialized")
 
-        digest_chunks = markdown_to_telegram_chunks(content)
+        # Context7: Для групповых дайджестов content уже содержит HTML (summary_html),
+        # не нужно конвертировать из Markdown. Используем split_for_telegram напрямую.
+        if group_digest_id:
+            # Групповой дайджест: content уже HTML, используем split_for_telegram
+            from utils.telegram_formatter import split_for_telegram
+            digest_chunks = split_for_telegram(content, limit=4096)
+        else:
+            # Обычный дайджест: content в Markdown, конвертируем в HTML
+            digest_chunks = markdown_to_telegram_chunks(content)
 
         async def _do_send():
             for idx, chunk in enumerate(digest_chunks):

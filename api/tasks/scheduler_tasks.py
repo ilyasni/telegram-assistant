@@ -52,7 +52,7 @@ logger = structlog.get_logger()
 # Используем префикс "trends_stable_" чтобы избежать конфликтов
 # Проверяем существование метрик перед созданием, чтобы избежать дублирования при повторном импорте
 def _get_or_create_metric(metric_type, name, *args, **kwargs):
-    """Создает метрику только если она еще не существует в REGISTRY."""
+    """Context7: Создает метрику только если она еще не существует в REGISTRY."""
     try:
         # Пытаемся получить существующую метрику
         existing = REGISTRY._names_to_collectors.get(name)
@@ -61,8 +61,33 @@ def _get_or_create_metric(metric_type, name, *args, **kwargs):
     except (AttributeError, KeyError):
         pass
     
-    # Создаем новую метрику
-    return metric_type(name, *args, **kwargs)
+    # Создаем новую метрику с обработкой дублирования
+    try:
+        return metric_type(name, *args, **kwargs)
+    except ValueError as e:
+        if 'Duplicated timeseries' in str(e) or 'already registered' in str(e).lower():
+            # Метрика уже зарегистрирована, пытаемся найти её в registry
+            try:
+                existing = REGISTRY._names_to_collectors.get(name)
+                if existing:
+                    logger.debug(f"Metric {name} already registered, reusing existing", metric=name)
+                    return existing
+            except (AttributeError, KeyError, TypeError):
+                pass
+            # Если не нашли, логируем предупреждение и возвращаем заглушку
+            logger.warning(f"Metric {name} exists but could not retrieve from REGISTRY", metric=name)
+            # Создаём заглушку для избежания падения
+            class MockMetric:
+                def labels(self, **kwargs):
+                    return self
+                def inc(self, value=1):
+                    pass
+                def observe(self, value):
+                    pass
+                def set(self, value):
+                    pass
+            return MockMetric()
+        raise
 
 trends_stable_task_runs_total = _get_or_create_metric(
     Counter,
@@ -152,10 +177,15 @@ def _is_group_digest_enabled_for_tenant(tenant_id: str) -> bool:
     return normalized in allow_list
 
 def _register_digest_retry_counter() -> Counter:
+    """Context7: Регистрация метрики digest_retry_total с защитой от дублирования."""
     metric_name = 'api_digest_retry_total'
-    existing = REGISTRY._names_to_collectors.get(metric_name)
-    if existing is not None:
-        return existing  # type: ignore[return-value]
+    try:
+        existing = REGISTRY._names_to_collectors.get(metric_name)
+        if existing is not None:
+            return existing  # type: ignore[return-value]
+    except (AttributeError, KeyError):
+        pass
+    
     try:
         return Counter(
             'digest_retry_total',
@@ -1430,7 +1460,11 @@ async def calculate_tenant_storage_usage_task():
     """
     try:
         import os
-        import asyncpg
+        try:
+            import asyncpg
+        except ImportError:
+            logger.warning("asyncpg not available, skipping tenant storage usage calculation")
+            return
         
         # Context7: Импорт worker версии StorageQuotaService для async методов
         # Добавляем путь к worker для импорта

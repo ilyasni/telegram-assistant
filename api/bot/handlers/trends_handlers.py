@@ -782,7 +782,11 @@ async def callback_trends_list(callback: CallbackQuery):
             if cluster_id:
                 builder.button(text=f"ℹ️ {label[:26]}", callback_data=f"trend:cluster:{cluster_id}")
         
-        # Context7: Кнопки навигации добавляем один раз после цикла, а не для каждого кластера
+        # Context7: Применяем adjust(1) один раз после цикла для всех кнопок кластеров
+        # Это гарантирует, что каждая кнопка кластера отображается на отдельной строке
+        builder.adjust(1)
+        
+        # Context7: Кнопки навигации добавляем один раз после цикла
         builder.button(text="🔍 Обнаружить", callback_data="trends:detect")
         builder.button(text="🔙 Назад", callback_data="trends:menu")
         builder.adjust(1)

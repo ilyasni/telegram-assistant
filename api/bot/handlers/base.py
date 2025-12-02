@@ -20,6 +20,7 @@ from datetime import datetime
 from urllib.parse import urljoin, urlencode, urlparse, parse_qsl, urlunparse
 from config import settings
 from utils.telegram_formatter import markdown_to_telegram_chunks
+from bot.utils import extract_username_from_telegram_url
 
 logger = structlog.get_logger()
 router = Router()
@@ -1089,43 +1090,9 @@ async def _show_subscription_callback(cb: CallbackQuery):
 # НОВЫЕ КОМАНДЫ ДЛЯ УПРАВЛЕНИЯ КАНАЛАМИ
 # ============================================================================
 
-def _extract_username_from_telegram_url(text: str) -> Optional[str]:
-    """
-    Извлекает username из Telegram URL или username.
-    
-    Context7: Поддерживает различные форматы:
-    - https://t.me/username
-    - http://t.me/username
-    - t.me/username
-    - @username
-    - username
-    """
-    if not text:
-        return None
-    
-    text = text.strip()
-    
-    # Убираем @ если есть
-    if text.startswith('@'):
-        username = text[1:]
-        # Валидация username (только буквы, цифры, подчёркивания, 5-32 символа)
-        if re.match(r'^[a-zA-Z0-9_]{5,32}$', username):
-            return username
-        return None
-    
-    # Парсинг URL
-    # Паттерн для https://t.me/username или http://t.me/username
-    url_pattern = r'(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/([a-zA-Z0-9_]{5,32})'
-    match = re.search(url_pattern, text)
-    if match:
-        username = match.group(1)
-        return username
-    
-    # Если это просто username без @
-    if re.match(r'^[a-zA-Z0-9_]{5,32}$', text):
-        return text
-    
-    return None
+# Context7: Функция _extract_username_from_telegram_url перенесена в bot.utils
+# для избежания дублирования кода
+_extract_username_from_telegram_url = extract_username_from_telegram_url
 
 
 @router.message(Command("add_channel"))

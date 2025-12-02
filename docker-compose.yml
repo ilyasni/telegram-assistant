@@ -169,7 +169,8 @@ services:
   grafana:
     image: grafana/grafana:latest
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: ${GF_SECURITY_ADMIN_PASSWORD}
+      # Используем GRAFANA_PASSWORD как основной источник, с fallback на GF_SECURITY_ADMIN_PASSWORD
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-${GF_SECURITY_ADMIN_PASSWORD:-admin}}
       GF_SERVER_ROOT_URL: https://grafana.${DOMAIN}/
       GF_SERVER_DOMAIN: grafana.${DOMAIN}
       GF_SERVER_ENFORCE_DOMAIN: "true"
@@ -749,6 +750,7 @@ services:
       CRAWL_GROUP: crawl4ai_workers
     volumes:
       - ./worker/config:/app/config:ro
+      - ./shared/python:/app/shared/python:ro  # Context7: Монтируем shared/python для доступа к CircuitBreaker и другим утилитам
       - /tmp/playwright:/tmp/playwright
     shm_size: "1gb"
     ulimits:

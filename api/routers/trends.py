@@ -261,6 +261,9 @@ def _is_generic_trend_keyword(keyword: str) -> bool:
     """
     Проверяет, является ли keyword generic-трендом.
     Использует ту же логику, что и TrendDetectionWorker._is_generic_label.
+    
+    Context7: Не помечаем валидные однословные тренды (например, "AI", "Python", "Kubernetes")
+    как generic, если они не являются стоп-словами и имеют достаточную длину.
     """
     if not keyword:
         return True
@@ -269,9 +272,9 @@ def _is_generic_trend_keyword(keyword: str) -> bool:
         return True
     if len(lower) < 4:
         return True
-    # одиночное слово без хэштега/сущности
-    if " " not in lower and not lower.startswith("#"):
-        return True
+    # Context7: Убрана проверка на однословные тренды без хештега, так как валидные
+    # однословные тренды (например, "AI", "Python", "Kubernetes") не должны фильтроваться.
+    # Если слово прошло проверку на стоп-слова и длину, оно валидно.
     return False
 
 
@@ -311,8 +314,9 @@ def _build_trend_card(cluster: TrendCluster) -> Optional[TrendCard]:
                 # Проверяем, не являются ли оба слова стоп-словами или generic
                 if all(w.lower() in TREND_STOPWORDS or len(w) < 4 for w in words):
                     return True
-        if " " not in s and not s.startswith("#"):
-            return True
+        # Context7: Убрана проверка на однословные заголовки без хештега, так как валидные
+        # однословные тренды (например, "AI", "Python", "Kubernetes") не должны фильтроваться.
+        # Если слово прошло проверку на стоп-слова и длину, оно валидно.
         return False
 
     def _derive_better_title(raw_payload: Dict[str, Any]) -> Optional[str]:
@@ -851,7 +855,8 @@ async def get_emerging_trends(
     base_query = (
         db.query(TrendCluster)
         .filter(TrendCluster.status == "emerging")
-        .filter(TrendCluster.is_generic == False)
+        # Context7: Включаем NULL значения для обратной совместимости с данными, созданными до добавления колонки
+        .filter((TrendCluster.is_generic == False) | (TrendCluster.is_generic.is_(None)))
         .filter(
             # Quality score может быть NULL или >= min_quality (NULL считается валидным для emerging)
             (TrendCluster.quality_score.is_(None)) | (TrendCluster.quality_score >= min_quality)
@@ -970,10 +975,31 @@ async def get_emerging_trends(
                 ))
                 if len(responses) >= page_size:
                     break  # Ограничиваем количество после фильтрации
-            logger.info("Using TrendDetection fallback for emerging trends", count=len(responses), filtered=len(trend_detections) - len(responses))
+            
+            # Context7: Подсчитываем total после фильтрации - берем все тренды без лимита для точного подсчета
+            all_trend_detections = (
+                db.query(TrendDetection)
+                .filter(TrendDetection.status == "active")
+                .filter(TrendDetection.detected_at >= cutoff)
+                .all()
+            )
+            # Применяем те же фильтры, что и выше
+            total = 0
+            for td in all_trend_detections:
+                if _is_generic_trend_keyword(td.trend_keyword):
+                    continue
+                source_count = len(td.channels_affected or [])
+                if source_count < min_sources:
+                    continue
+                burst = td.growth_rate or 0.0
+                if min_burst > 0 and burst > 0 and burst < min_burst:
+                    continue
+                total += 1
+            
+            logger.info("Using TrendDetection fallback for emerging trends", count=len(responses), total=total, filtered_from=len(all_trend_detections))
             return TrendClusterListResponse(
                 clusters=responses,
-                total=len(responses),
+                total=total,
                 page=page,
                 page_size=page_size,
                 window=window,
@@ -1058,7 +1084,8 @@ async def list_trend_clusters(
     if status:
         query = query.filter(TrendCluster.status == status)
     # Quality filters
-    query = query.filter(TrendCluster.is_generic == False)
+    # Context7: Включаем NULL значения для обратной совместимости с данными, созданными до добавления колонки
+    query = query.filter((TrendCluster.is_generic == False) | (TrendCluster.is_generic.is_(None)))
     # Context7: Для stable трендов ослабляем фильтр quality_score - если нет stable, fallback на emerging
     if status == "stable":
         query = query.filter(TrendCluster.quality_score >= min_quality)
@@ -1092,7 +1119,8 @@ async def list_trend_clusters(
             # Переключаемся на emerging кластеры с ослабленными фильтрами
             fallback_query = db.query(TrendCluster)
             fallback_query = fallback_query.filter(TrendCluster.status == "emerging")
-            fallback_query = fallback_query.filter(TrendCluster.is_generic == False)
+            # Context7: Включаем NULL значения для обратной совместимости с данными, созданными до добавления колонки
+            fallback_query = fallback_query.filter((TrendCluster.is_generic == False) | (TrendCluster.is_generic.is_(None)))
             # Ослабляем фильтр quality_score для emerging
             min_quality_emerging = float(os.getenv("TREND_EMERGING_MIN_QUALITY_SCORE", "0.3"))
             fallback_query = fallback_query.filter(
@@ -1138,6 +1166,8 @@ async def list_trend_clusters(
     
     # Context7: Fallback на TrendDetection, если кластеров нет ДО фильтрации
     if total == 0:
+        # Context7: Сохраняем исходный статус для fallback ответа
+        fallback_status = status or "emerging"  # По умолчанию emerging для TrendDetection
         logger.info("No clusters found, falling back to TrendDetection", status=status, window=requested_window)
         from datetime import datetime, timedelta, timezone
         cutoff = datetime.now(timezone.utc) - timedelta(days=7)  # По умолчанию 7 дней
@@ -1197,7 +1227,7 @@ async def list_trend_clusters(
                 responses.append(TrendClusterResponse(
                     id=td.id,
                     cluster_key=cluster_key,
-                    status=status or "stable",
+                    status=fallback_status,
                     label=td.trend_keyword,
                     summary=f"Тренд обнаружен: {td.trend_keyword}",
                     primary_topic=td.trend_keyword,
@@ -1443,7 +1473,8 @@ async def get_trends(
         if cluster_status:
             query = query.filter(TrendCluster.status == cluster_status)
         # Quality filters
-        query = query.filter(TrendCluster.is_generic == False)
+        # Context7: Включаем NULL значения для обратной совместимости с данными, созданными до добавления колонки
+        query = query.filter((TrendCluster.is_generic == False) | (TrendCluster.is_generic.is_(None)))
         query = query.filter(TrendCluster.quality_score >= min_quality)
         query = query.filter(TrendCluster.summary.isnot(None))
         if min_frequency:
@@ -1465,7 +1496,8 @@ async def get_trends(
             fallback_query = (
                 db.query(TrendCluster)
                 .filter(TrendCluster.status == "emerging")
-                .filter(TrendCluster.is_generic == False)
+                # Context7: Включаем NULL значения для обратной совместимости с данными, созданными до добавления колонки
+                .filter((TrendCluster.is_generic == False) | (TrendCluster.is_generic.is_(None)))
                 .filter(TrendCluster.quality_score >= min_quality)
                 .filter(TrendCluster.summary.isnot(None))
             )

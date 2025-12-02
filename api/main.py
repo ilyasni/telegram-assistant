@@ -26,6 +26,19 @@ try:
 except Exception as e:
     # logger еще не определен на этом этапе, используем print
     print(f"Warning: Failed to import performance metrics: {e}")
+    # Context7: Fallback NoOpMetric для избежания NameError при использовании метрик
+    class NoOpMetric:
+        def labels(self, **kwargs):
+            return self
+        def observe(self, value):
+            pass
+        def inc(self, value=1):
+            pass
+    
+    fast_path_latency_seconds = NoOpMetric()
+    llm_calls_per_request = NoOpMetric()
+    tokens_per_request = NoOpMetric()
+    agent_steps_per_request = NoOpMetric()
 
 # Middleware imports
 from middleware.tracing import TracingMiddleware
@@ -86,6 +99,7 @@ neo4j_connections_active = Gauge(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
+    # Context7: Явное логирование для диагностики
     logger.info("Application startup - lifespan started")
     # [C7-ID: dev-mode-002] Логируем окружение при старте
     logger.info(
@@ -96,9 +110,16 @@ async def lifespan(app: FastAPI):
     
     # Инициализация scheduler для периодических задач
     try:
+        logger.info("Attempting to start scheduler...")
         from tasks.scheduler_tasks import start_scheduler
         await start_scheduler()  # Context7: AsyncIOScheduler требует async контекст
         logger.info("Scheduler started for digest and trend tasks")
+        # Context7: Проверяем статус scheduler после запуска
+        from tasks.scheduler_tasks import scheduler
+        if scheduler:
+            logger.info("Scheduler status", running=scheduler.running, state=scheduler.state if hasattr(scheduler, 'state') else 'N/A')
+        else:
+            logger.warning("Scheduler is None after start_scheduler()")
     except Exception as e:
         logger.error("Failed to start scheduler", error=str(e), exc_info=True)
         # Продолжаем без scheduler

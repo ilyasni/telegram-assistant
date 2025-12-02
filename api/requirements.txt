@@ -51,3 +51,6 @@ pytest-asyncio>=0.21.0,<0.22.0
 
 # JSON validation (используется в worker/common/json_guard.py, который импортируется из api/)
 jsonschema>=4.21.1
+
+# Context7: asyncpg для calculate_tenant_storage_usage_task в scheduler
+asyncpg>=0.29.0

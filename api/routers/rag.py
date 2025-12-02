@@ -33,6 +33,8 @@ except Exception as e:
             return self
         def observe(self, value):
             pass
+        def inc(self, value=1):
+            pass
     
     fast_path_latency_seconds = NoOpMetric()
     llm_calls_per_request = NoOpMetric()

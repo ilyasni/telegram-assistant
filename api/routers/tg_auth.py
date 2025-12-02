@@ -19,7 +19,7 @@ import redis.asyncio as redis
 import structlog
 from sqlalchemy.orm import Session
 from urllib.parse import parse_qsl, unquote
-from prometheus_client import Counter, Histogram
+from prometheus_client import Counter, Histogram, REGISTRY
 from config import settings
 import qrcode
 import io
@@ -28,13 +28,49 @@ from models.database import get_db, Identity, User
 router = APIRouter(prefix="/tg", tags=["tg_auth"])
 logger = structlog.get_logger()
 
+
+def _safe_register_metric(metric_class, name, *args, **kwargs):
+    """Безопасная регистрация метрики с обработкой дублирования.
+    
+    Context7: Обрабатывает случай, когда метрика была ранее зарегистрирована
+    с другим набором labels, что вызывает ошибку "Duplicated timeseries".
+    """
+    try:
+        return metric_class(name, *args, **kwargs)
+    except ValueError as e:
+        if 'Duplicated timeseries' in str(e) or 'already registered' in str(e).lower():
+            # Метрика уже зарегистрирована, пытаемся найти её в registry
+            # Context7: Используем _names_to_collectors для поиска существующих метрик
+            try:
+                if hasattr(REGISTRY, '_names_to_collectors'):
+                    existing = REGISTRY._names_to_collectors.get(name)
+                    if existing:
+                        logger.warning(f"{name} already registered with different labels, reusing existing", metric=name)
+                        return existing
+            except (AttributeError, KeyError, TypeError):
+                pass
+            # Если не нашли, создаём с уникальным именем как fallback
+            logger.warning(f"{name} already registered but not found, creating with _v2 suffix", metric=name)
+            return metric_class(f"{name}_v2", *args, **kwargs)
+        else:
+            raise
+
+
 AUTH_QR_START = Counter("auth_qr_start_total", "QR start attempts", ["tenant_id"], namespace="api")
 AUTH_QR_SUCCESS = Counter("auth_qr_success_total", "QR success", ["tenant_id"], namespace="api")
 AUTH_QR_FAIL = Counter("auth_qr_fail_total", "QR failures", ["tenant_id", "reason"], namespace="api")
 AUTH_QR_DURATION = Histogram("auth_qr_duration_seconds", "QR auth duration", ["tenant_id"], namespace="api")
 AUTH_QR_EXPIRED = Counter("auth_qr_expired_total", "QR sessions expired", ["tenant_id"], namespace="api")
 AUTH_QR_OWNERSHIP_FAIL = Counter("auth_qr_ownership_fail_total", "Ownership check failures", namespace="api")
-AUTH_QR_2FA_REQUIRED = Counter("auth_qr_2fa_required_total", "2FA required count", ["tenant_id"], namespace="api")
+# Context7: Безопасная регистрация метрики с обработкой дублирования.
+# Если метрика была зарегистрирована ранее без labels, будет использована существующая.
+AUTH_QR_2FA_REQUIRED = _safe_register_metric(
+    Counter,
+    "auth_qr_2fa_required_total",
+    "2FA required count",
+    ["tenant_id"],
+    namespace="api"
+)
 
 # Context7 best practice: async Redis client для неблокирующих операций
 redis_client = redis.from_url(settings.redis_url, decode_responses=True)
@@ -653,7 +689,7 @@ async def qr_password(body: QrPassword):
         raise HTTPException(status_code=400, detail="invalid token")
     
     # Rate limiting для пароля
-    ip = "qr_password"  # Можно улучшить, добавив IP из request
+    # Context7: Используем tenant_id для multi-tenant изоляции rate limit
     if not await ratelimit_strict(f"qr:password:{tenant_id}"):
         raise HTTPException(status_code=429, detail="Too many password attempts. Try again in 1 minute.")
     

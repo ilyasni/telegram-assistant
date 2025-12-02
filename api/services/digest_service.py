@@ -46,6 +46,24 @@ digest_graph_hits_total = PromCounter(
     ['tenant_id']
 )
 
+digest_gigachat_filter_detected_total = PromCounter(
+    'digest_gigachat_filter_detected_total',
+    'Количество обнаруженных ответов с фильтром Gigachat',
+    ['tenant_id']
+)
+
+digest_openrouter_fallback_total = PromCounter(
+    'digest_openrouter_fallback_total',
+    'Количество успешных fallback на OpenRouter',
+    ['tenant_id']
+)
+
+digest_openrouter_fallback_failed_total = PromCounter(
+    'digest_openrouter_fallback_failed_total',
+    'Количество неудачных fallback на OpenRouter',
+    ['tenant_id']
+)
+
 # ============================================================================
 # PYDANTIC MODELS
 # ============================================================================
@@ -709,6 +727,45 @@ class DigestService:
             response = await self.llm.ainvoke(messages)
             content = response.content if hasattr(response, 'content') else str(response)
             
+            # Context7: Проверяем, не вернул ли Gigachat ответ с фильтром
+            if self._is_gigachat_filter_response(content):
+                logger.warning(
+                    "Gigachat filter detected, falling back to OpenRouter",
+                    user_id=str(user_id),
+                    tenant_id=tenant_id_str,
+                    content_preview=content[:200] if len(content) > 200 else content
+                )
+                digest_gigachat_filter_detected_total.labels(tenant_id=tenant_id_str).inc()
+                
+                try:
+                    # Генерируем дайджест через OpenRouter
+                    openrouter_content = await self._generate_with_openrouter(
+                        messages=messages,
+                        context=context,
+                        topics=", ".join(topics)
+                    )
+                    
+                    # Используем результат от OpenRouter
+                    content = openrouter_content
+                    digest_openrouter_fallback_total.labels(tenant_id=tenant_id_str).inc()
+                    
+                    logger.info(
+                        "Digest generated via OpenRouter fallback",
+                        user_id=str(user_id),
+                        tenant_id=tenant_id_str
+                    )
+                    
+                except Exception as fallback_error:
+                    # При ошибке fallback возвращаем оригинальный ответ Gigachat
+                    digest_openrouter_fallback_failed_total.labels(tenant_id=tenant_id_str).inc()
+                    logger.error(
+                        "OpenRouter fallback failed, using original Gigachat response",
+                        user_id=str(user_id),
+                        tenant_id=tenant_id_str,
+                        error=str(fallback_error)
+                    )
+                    # content остается от Gigachat (даже если с фильтром)
+            
             # Парсим секции из markdown (простой парсинг)
             sections = self._parse_sections(content, topics)
             
@@ -737,6 +794,148 @@ class DigestService:
         finally:
             duration = time.perf_counter() - start_time
             digest_generation_duration_seconds.labels(tenant_id=tenant_id_str).observe(duration)
+    
+    def _is_gigachat_filter_response(self, content: str) -> bool:
+        """
+        Детектирование ответов с фильтром Gigachat.
+        
+        Проверяет наличие ключевых фраз и паттернов, указывающих на то,
+        что Gigachat вернул сообщение о фильтрации контента.
+        
+        Args:
+            content: Текст ответа от Gigachat
+            
+        Returns:
+            True если обнаружен фильтр, False иначе
+        """
+        if not content:
+            return False
+        
+        content_lower = content.lower()
+        
+        # Ключевые фразы для детектирования фильтра
+        key_phrases = [
+            "некорректных ответов",
+            "некорректные ответы",
+            "чувствительными темами",
+            "чувствительные темы",
+            "ограничены",
+            "временно ограничены",
+            "генеративные языковые модели",
+            "не обладают собственным мнением",
+            "не транслирует мнение своих разработчиков",
+            "обученной на открытых данных, в которых может содержаться неточная или ошибочная информация",
+            "во избежание неправильного толкования",
+            "как и любая языковая модель, gigachat",
+        ]
+        
+        # Подсчитываем количество найденных ключевых фраз
+        found_phrases = sum(1 for phrase in key_phrases if phrase in content_lower)
+        
+        # Паттерны для детектирования
+        patterns = [
+            ("к сожалению", "ограничены"),
+            ("как и любая языковая модель", "ограничены"),
+        ]
+        
+        # Проверяем паттерны
+        pattern_found = False
+        for pattern_start, pattern_end in patterns:
+            if pattern_start in content_lower and pattern_end in content_lower:
+                pattern_found = True
+                break
+        
+        # Детектируем фильтр, если найдено 2+ ключевых фразы или один из паттернов
+        return found_phrases >= 2 or pattern_found
+    
+    async def _generate_with_openrouter(
+        self,
+        messages: List[Any],
+        context: str,
+        topics: str
+    ) -> str:
+        """
+        Генерация дайджеста через OpenRouter API (fallback).
+        
+        Args:
+            messages: Список сообщений в формате LangChain
+            context: Контекст с постами
+            topics: Темы для дайджеста
+            
+        Returns:
+            Сгенерированный контент дайджеста
+        """
+        import os
+        import httpx
+        
+        api_key = os.getenv('OPENROUTER_API_KEY')
+        api_base = os.getenv('OPENROUTER_API_BASE', 'https://openrouter.ai/api/v1')
+        model = os.getenv('OPENROUTER_MODEL', 'qwen/qwen-2.5-72b-instruct:free')
+        
+        if not api_key:
+            raise ValueError("OPENROUTER_API_KEY not configured")
+        
+        # Преобразуем LangChain messages в формат OpenRouter API
+        openrouter_messages = []
+        for msg in messages:
+            if hasattr(msg, 'content') and hasattr(msg, 'type'):
+                # LangChain message (BaseMessage)
+                # Типы: system, human, ai, tool
+                msg_type = getattr(msg, 'type', 'human')
+                if msg_type == "system":
+                    role = "system"
+                elif msg_type == "ai" or msg_type == "assistant":
+                    role = "assistant"
+                else:
+                    role = "user"
+                openrouter_messages.append({
+                    "role": role,
+                    "content": str(msg.content) if msg.content else ""
+                })
+            elif isinstance(msg, dict):
+                # Уже в формате dict
+                openrouter_messages.append(msg)
+            else:
+                # Fallback: пытаемся извлечь content как строку
+                logger.warning("Unknown message format in OpenRouter fallback", msg_type=type(msg).__name__)
+                if hasattr(msg, 'content'):
+                    openrouter_messages.append({
+                        "role": "user",
+                        "content": str(msg.content) if msg.content else ""
+                    })
+        
+        headers = {
+            'Authorization': f'Bearer {api_key}',
+            'Content-Type': 'application/json',
+            'HTTP-Referer': os.getenv('OPENROUTER_HTTP_REFERER', 'https://github.com/telegram-assistant'),
+            'X-Title': 'Telegram Assistant Digest'
+        }
+        
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                response = await client.post(
+                    f'{api_base}/chat/completions',
+                    headers=headers,
+                    json={
+                        'model': model,
+                        'messages': openrouter_messages,
+                        'temperature': 0.7,
+                        'max_tokens': 4000,
+                    }
+                )
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    content = result['choices'][0]['message']['content'].strip()
+                    return content
+                else:
+                    error_msg = f"OpenRouter API error: {response.status_code} - {response.text}"
+                    logger.error("OpenRouter API request failed", status_code=response.status_code, error=response.text)
+                    raise Exception(error_msg)
+                    
+        except httpx.RequestError as e:
+            logger.error("OpenRouter API request exception", error=str(e))
+            raise
     
     def _parse_sections(self, content: str, topics: List[str]) -> List[Dict[str, Any]]:
         """Парсинг секций из markdown контента."""
