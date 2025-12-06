@@ -9,6 +9,7 @@ Context7 best practices:
 - Оптимизация повторных вызовов GetFullChannel
 """
 import asyncio
+import os
 import structlog
 import json
 import time
@@ -26,7 +27,7 @@ CACHE_KEY_PREFIX = "channel:has_comments:"
 CACHE_TTL = 86400  # 24 часа
 
 # Context7 P1: Rate limiting для GetDiscussionMessage (запросов в секунду)
-DISCUSSION_RATE_LIMIT = 10  # Максимум 10 запросов в секунду
+DISCUSSION_RATE_LIMIT = int(os.getenv("DISCUSSION_RATE_LIMIT", "10"))  # Максимум N запросов в секунду
 _last_discussion_request_time = {}  # {channel_id: timestamp}
 
 

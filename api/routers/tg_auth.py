@@ -673,10 +673,11 @@ async def qr_png(session_id: str):
 
 
 @router.post("/qr/password")
-async def qr_password(body: QrPassword):
+async def qr_password(body: QrPassword, db: Session = Depends(get_db)):
     """Context7 best practice: endpoint для отправки 2FA пароля при QR-авторизации.
     
     [C7-ID: telethon-2fa-handling-002]
+    Context7: Добавлен db dependency для немедленного сохранения сессии в БД.
     """
     # Декодируем JWT чтобы получить tenant_id
     try:
@@ -782,6 +783,46 @@ async def qr_password(body: QrPassword):
                     # Сохраняем обновленную сессию
                     updated_session_string = client.session.save()
                     
+                    # Context7 best practice: НЕМЕДЛЕННОЕ сохранение сессии в БД
+                    from utils.identity_membership import save_telegram_session_sync
+                    import uuid as uuid_lib
+                    
+                    try:
+                        tenant_uuid = uuid_lib.UUID(tenant_id)
+                        success, session_id, error_msg = save_telegram_session_sync(
+                            db=db,
+                            tenant_id=tenant_uuid,
+                            session_string=updated_session_string,
+                            telegram_user_id=me.id,
+                            first_name=getattr(me, 'first_name', None),
+                            last_name=getattr(me, 'last_name', None),
+                            username=getattr(me, 'username', None),
+                            dc_id=getattr(client.session, 'dc_id', None) or 2
+                        )
+                        
+                        if success:
+                            logger.info(
+                                "Session saved to database (already authorized)",
+                                tenant_id=tenant_id,
+                                telegram_user_id=me.id,
+                                session_id=str(session_id)
+                            )
+                        else:
+                            logger.warning(
+                                "Failed to save session to database (already authorized)",
+                                tenant_id=tenant_id,
+                                telegram_user_id=me.id,
+                                error=error_msg
+                            )
+                    except Exception as e:
+                        logger.error(
+                            "Exception while saving session to database (already authorized)",
+                            tenant_id=tenant_id,
+                            telegram_user_id=me.id,
+                            error=str(e),
+                            exc_info=True
+                        )
+                    
                     # Обновляем Redis
                     await redis_client.hset(key, mapping={
                         "status": "authorized",
@@ -835,8 +876,52 @@ async def qr_password(body: QrPassword):
             # Сохраняем обновленную сессию
             updated_session_string = client.session.save()
             
+            # Context7 best practice: НЕМЕДЛЕННОЕ сохранение сессии в БД после успешной авторизации
+            # Это гарантирует, что telegram_auth_status обновится сразу, а не ждёт обработки telethon-ingest
+            from utils.identity_membership import save_telegram_session_sync
+            import uuid as uuid_lib
+            
+            try:
+                tenant_uuid = uuid_lib.UUID(tenant_id)
+                success, session_id, error_msg = save_telegram_session_sync(
+                    db=db,
+                    tenant_id=tenant_uuid,
+                    session_string=updated_session_string,
+                    telegram_user_id=me.id,
+                    first_name=getattr(me, 'first_name', None),
+                    last_name=getattr(me, 'last_name', None),
+                    username=getattr(me, 'username', None),
+                    dc_id=getattr(client.session, 'dc_id', None) or 2
+                )
+                
+                if success:
+                    logger.info(
+                        "Session saved to database after password verification",
+                        tenant_id=tenant_id,
+                        telegram_user_id=me.id,
+                        session_id=str(session_id),
+                        note="telegram_auth_status updated to authorized"
+                    )
+                else:
+                    logger.error(
+                        "Failed to save session to database after password verification",
+                        tenant_id=tenant_id,
+                        telegram_user_id=me.id,
+                        error=error_msg,
+                        note="Session saved to Redis only, will be processed by telethon-ingest"
+                    )
+            except Exception as e:
+                logger.error(
+                    "Exception while saving session to database",
+                    tenant_id=tenant_id,
+                    telegram_user_id=me.id,
+                    error=str(e),
+                    note="Session saved to Redis only, will be processed by telethon-ingest",
+                    exc_info=True
+                )
+            
             # Context7 best practice: обновляем Redis с authorized статусом
-            # Telethon-ingest автоматически обработает authorized сессию и сохранит в БД
+            # Telethon-ingest также обработает authorized сессию как fallback
             await redis_client.hset(key, mapping={
                 "status": "authorized",
                 "session_string": updated_session_string,
@@ -854,7 +939,7 @@ async def qr_password(body: QrPassword):
                        tenant_id=tenant_id, 
                        telegram_user_id=me.id,
                        session_string_length=len(updated_session_string),
-                       note="Session saved to Redis, user authenticated")
+                       note="Session saved to Redis and database, user authenticated")
             AUTH_QR_SUCCESS.labels(tenant_id=tenant_id).inc()
             # Context7: Counter не поддерживает .dec(), только .inc()
             # Counter отслеживает общее количество событий "2FA required", не текущее состояние

@@ -5,13 +5,14 @@ Context7: Используем APScheduler для планирования за�
 
 import asyncio
 import os
+import time as time_module
 from datetime import datetime, date, time, timezone, timedelta
 from typing import List, Optional, Dict, Any
 import json
 import structlog
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from prometheus_client import Counter, Histogram, REGISTRY
+from prometheus_client import Counter, Histogram, Gauge, REGISTRY
 from sqlalchemy.orm import Session
 
 from models.database import (
@@ -26,6 +27,8 @@ from models.database import (
     Group,
     GroupConversationWindow,
     GroupMessage,
+    GroupDigest,  # Context7: Для проверки готовых дайджестов при переиспользовании окон
+    UserGroup,  # Context7: Для проверки подписки пользователя на группу
     ChatTrendSubscription,
     UserTrendProfile,
     Tenant,
@@ -202,6 +205,26 @@ def _register_digest_retry_counter() -> Counter:
 
 
 digest_retry_counter = _register_digest_retry_counter()
+
+# Context7: Метрики для scheduler
+scheduler_running = _get_or_create_metric(
+    Gauge,
+    "scheduler_running",
+    "Scheduler running status (1=running, 0=stopped)",
+)
+
+scheduler_startup_duration_seconds = _get_or_create_metric(
+    Histogram,
+    "scheduler_startup_duration_seconds",
+    "Duration of scheduler startup in seconds",
+    buckets=(0.1, 0.5, 1.0, 2.0, 5.0, 10.0),
+)
+
+scheduler_jobs_total = _get_or_create_metric(
+    Gauge,
+    "scheduler_jobs_total",
+    "Total number of scheduled jobs",
+)
 
 # Глобальный scheduler
 scheduler: AsyncIOScheduler = None
@@ -426,13 +449,75 @@ async def enqueue_group_digest(
         user_uuid = UUID(user_id)
         requested_by_uuid = UUID(requested_by) if requested_by else user_uuid
 
+        # Context7: Группы глобальные (без tenant_id), проверяем только существование группы
+        # Изоляция происходит через user_group - проверяем, что пользователь подписан на группу
         group: Optional[Group] = (
             db.query(Group)
-            .filter(Group.id == group_uuid, Group.tenant_id == tenant_uuid)
+            .filter(Group.id == group_uuid)
             .first()
         )
         if not group:
-            raise ValueError("Группа не найдена или принадлежит другому арендатору")
+            logger.warning(
+                "Group not found in enqueue_group_digest",
+                group_id=group_id,
+                tenant_id=tenant_id,
+                user_id=user_id,
+            )
+            raise ValueError("Группа не найдена")
+        
+        # Context7: КРИТИЧНО - проверяем, что пользователь подписан на группу через user_group
+        # Context7: Используем .is_(True) вместо == True для правильной работы с NULL значениями
+        logger.debug(
+            "Checking user subscription to group",
+            group_id=group_id,
+            group_title=group.title,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            user_uuid=str(user_uuid),
+            group_uuid=str(group_uuid),
+        )
+        
+        user_group_subscription = (
+            db.query(UserGroup)
+            .filter(
+                UserGroup.user_id == user_uuid,
+                UserGroup.group_id == group_uuid,
+                UserGroup.is_active.is_(True)
+            )
+            .first()
+        )
+        
+        # Context7: Детальная диагностика - проверяем все подписки пользователя на эту группу
+        if not user_group_subscription:
+            # Проверяем, есть ли вообще подписка (даже неактивная)
+            any_subscription = (
+                db.query(UserGroup)
+                .filter(
+                    UserGroup.user_id == user_uuid,
+                    UserGroup.group_id == group_uuid
+                )
+                .first()
+            )
+            
+            if any_subscription:
+                logger.warning(
+                    "User subscription exists but is not active in enqueue_group_digest",
+                    group_id=group_id,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    subscription_is_active=any_subscription.is_active,
+                    subscription_subscribed_at=any_subscription.subscribed_at.isoformat() if any_subscription.subscribed_at else None,
+                )
+                raise ValueError("Подписка пользователя на группу неактивна")
+            else:
+                logger.warning(
+                    "User not subscribed to group in enqueue_group_digest",
+                    group_id=group_id,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    group_title=group.title if group else None,
+                )
+                raise ValueError("Пользователь не подписан на эту группу")
 
         now_utc = datetime.now(timezone.utc)
         window_start = now_utc - timedelta(hours=window_size_hours)
@@ -514,19 +599,110 @@ async def enqueue_group_digest(
                     suggestion=f"Last message is {round(last_message_age_hours, 1)} hours old. Try increasing window_size_hours or check if new messages are being ingested.",
                 )
 
-        window = GroupConversationWindow(
-            group_id=group_uuid,
-            tenant_id=tenant_uuid,
-            window_size_hours=window_size_hours,
-            window_start=window_start,
-            window_end=window_end,
-            message_count=message_count,
-            participant_count=participant_count,
-            status="queued",
+        # Context7: Дедупликация окон - проверяем существующие окна с перекрывающимся временным диапазоном
+        # Перекрытие определяется как: (window1_start <= window2_end) AND (window1_end >= window2_start)
+        # Для одинакового размера окна допустимый порог перекрытия - 30 минут
+        window_overlap_threshold_minutes = int(os.getenv("GROUP_DIGEST_WINDOW_OVERLAP_THRESHOLD_MINUTES", "30"))
+        window_overlap_threshold = timedelta(minutes=window_overlap_threshold_minutes)
+        
+        existing_window = (
+            db.query(GroupConversationWindow)
+            .filter(
+                GroupConversationWindow.group_id == group_uuid,
+                GroupConversationWindow.tenant_id == tenant_uuid,
+                GroupConversationWindow.window_size_hours == window_size_hours,
+                # Проверка перекрытия временных диапазонов:
+                # существующее окно перекрывается с новым, если:
+                # (existing_start <= new_end) AND (existing_end >= new_start)
+                GroupConversationWindow.window_start <= window_end,
+                GroupConversationWindow.window_end >= window_start,
+            )
+            .order_by(GroupConversationWindow.window_end.desc())
+            .first()
         )
-        db.add(window)
-        db.commit()
-        db.refresh(window)
+        
+        if existing_window:
+            # Проверяем, насколько близко временные окна (для одинакового размера окна)
+            time_diff_start = abs((existing_window.window_start - window_start).total_seconds() / 60)
+            time_diff_end = abs((existing_window.window_end - window_end).total_seconds() / 60)
+            
+            if time_diff_start <= window_overlap_threshold_minutes and time_diff_end <= window_overlap_threshold_minutes:
+                # Переиспользуем существующее окно
+                window = existing_window
+                
+                # Context7: Проверяем, есть ли уже готовый дайджест для этого окна
+                # Если есть - он будет использован как baseline для сравнения при генерации нового дайджеста
+                existing_digest = (
+                    db.query(GroupDigest)
+                    .filter(
+                        GroupDigest.window_id == window.id,
+                        GroupDigest.delivery_status == "sent",
+                    )
+                    .order_by(GroupDigest.generated_at.desc())
+                    .first()
+                )
+                
+                logger.info(
+                    "Reusing existing conversation window for group digest",
+                    tenant_id=tenant_id,
+                    group_id=group_id,
+                    window_id=str(window.id),
+                    existing_window_start=window.window_start.isoformat(),
+                    existing_window_end=window.window_end.isoformat(),
+                    requested_window_start=window_start.isoformat(),
+                    requested_window_end=window_end.isoformat(),
+                    time_diff_start_minutes=round(time_diff_start, 1),
+                    time_diff_end_minutes=round(time_diff_end, 1),
+                    window_status=window.status,
+                    has_existing_digest=existing_digest is not None,
+                    will_use_as_baseline=existing_digest is not None,
+                )
+                
+                # Окно существует, но дайджест еще не готов или не завершен
+                # Используем существующее окно, но создадим новую запись DigestHistory
+            else:
+                # Окна перекрываются, но различаются слишком сильно - создаем новое
+                logger.info(
+                    "Overlapping windows found but time difference too large, creating new window",
+                    tenant_id=tenant_id,
+                    group_id=group_id,
+                    existing_window_id=str(existing_window.id),
+                    existing_window_start=existing_window.window_start.isoformat(),
+                    existing_window_end=existing_window.window_end.isoformat(),
+                    requested_window_start=window_start.isoformat(),
+                    requested_window_end=window_end.isoformat(),
+                    time_diff_start_minutes=round(time_diff_start, 1),
+                    time_diff_end_minutes=round(time_diff_end, 1),
+                    threshold_minutes=window_overlap_threshold_minutes,
+                )
+                window = GroupConversationWindow(
+                    group_id=group_uuid,
+                    tenant_id=tenant_uuid,
+                    window_size_hours=window_size_hours,
+                    window_start=window_start,
+                    window_end=window_end,
+                    message_count=message_count,
+                    participant_count=participant_count,
+                    status="queued",
+                )
+                db.add(window)
+                db.commit()
+                db.refresh(window)
+        else:
+            # Окно не найдено - создаем новое
+            window = GroupConversationWindow(
+                group_id=group_uuid,
+                tenant_id=tenant_uuid,
+                window_size_hours=window_size_hours,
+                window_start=window_start,
+                window_end=window_end,
+                message_count=message_count,
+                participant_count=participant_count,
+                status="queued",
+            )
+            db.add(window)
+            db.commit()
+            db.refresh(window)
 
         digest_history = DigestHistory(
             user_id=user_uuid,
@@ -577,8 +753,36 @@ async def enqueue_group_digest(
             "participant_count": participant_count,
         }
 
+    except Exception as exc:
+        # Context7: Rollback при ошибках для предотвращения утечек транзакций
+        try:
+            db.rollback()
+            logger.warning(
+                "Rolled back transaction due to error in enqueue_group_digest",
+                group_id=group_id,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+        except Exception as rollback_exc:
+            logger.error(
+                "Failed to rollback transaction",
+                group_id=group_id,
+                tenant_id=tenant_id,
+                error=str(rollback_exc),
+            )
+        # Пробрасываем исключение дальше для обработки в эндпоинте
+        raise
     finally:
-        db.close()
+        # Context7: Всегда закрываем сессию БД
+        try:
+            db.close()
+        except Exception as close_exc:
+            logger.error(
+                "Error closing database session",
+                error=str(close_exc),
+            )
 
 
 async def process_digests_task():
@@ -766,7 +970,7 @@ async def trends_stable_task():
     emerging кластеры в таблицу TrendDetection.
     """
     import time
-    task_start = time.time()
+    task_start = time_module.time()
     db = None
     try:
         db = next(get_db())
@@ -884,7 +1088,7 @@ async def trends_stable_task():
         else:
             db.rollback()
 
-        task_duration = time.time() - task_start
+        task_duration = time_module.time() - task_start
         trends_stable_task_duration_seconds.observe(task_duration)
         trends_stable_task_runs_total.labels(outcome="success").inc()
 
@@ -909,7 +1113,7 @@ async def trends_stable_task():
         )
     except Exception as e:
         trends_stable_task_runs_total.labels(outcome="error").inc()
-        task_duration = time.time() - task_start
+        task_duration = time_module.time() - task_start
         trends_stable_task_duration_seconds.observe(task_duration)
         if db:
             db.rollback()
@@ -1739,27 +1943,108 @@ def setup_scheduled_tasks():
 
 
 async def start_scheduler():
-    """Запуск scheduler (async для работы с AsyncIOScheduler)."""
+    """
+    Запуск scheduler (async для работы с AsyncIOScheduler).
+    
+    Context7: Добавлено подробное логирование и метрики для observability.
+    """
     global scheduler
     
-    if scheduler is None:
-        scheduler = init_scheduler()
+    start_time = time_module.time()
+    logger.info("Starting scheduler initialization...")
     
-    if not scheduler.running:
-        # Context7: AsyncIOScheduler требует запущенного event loop
-        # Запускаем scheduler в фоне через asyncio.create_task
-        scheduler.start()
-        setup_scheduled_tasks()
-        logger.info("Scheduler started")
-    else:
-        logger.warning("Scheduler already running")
+    try:
+        if scheduler is None:
+            logger.info("Initializing scheduler instance...")
+            scheduler = init_scheduler()
+            logger.info("Scheduler instance created", scheduler_id=id(scheduler))
+        else:
+            logger.info("Using existing scheduler instance", scheduler_id=id(scheduler))
+        
+        if not scheduler.running:
+            # Context7: AsyncIOScheduler требует запущенного event loop
+            # Запускаем scheduler в фоне через asyncio.create_task
+            logger.info("Starting scheduler...")
+            scheduler.start()
+            logger.info("Scheduler started, setting up scheduled tasks...")
+            
+            setup_scheduled_tasks()
+            
+            # Context7: Обновляем метрики
+            scheduler_running.set(1)
+            jobs = scheduler.get_jobs()
+            scheduler_jobs_total.set(len(jobs))
+            
+            duration = time_module.time() - start_time
+            scheduler_startup_duration_seconds.observe(duration)
+            
+            logger.info(
+                "Scheduler started successfully",
+                jobs_count=len(jobs),
+                startup_duration_seconds=round(duration, 3),
+                job_ids=[job.id for job in jobs]
+            )
+        else:
+            logger.warning("Scheduler already running, skipping startup")
+            scheduler_running.set(1)
+            jobs = scheduler.get_jobs()
+            scheduler_jobs_total.set(len(jobs))
+            
+    except Exception as e:
+        scheduler_running.set(0)
+        duration = time.time() - start_time
+        scheduler_startup_duration_seconds.observe(duration)
+        logger.error(
+            "Failed to start scheduler",
+            error=str(e),
+            error_type=type(e).__name__,
+            startup_duration_seconds=round(duration, 3),
+            exc_info=True
+        )
+        raise
 
 
 def stop_scheduler():
-    """Остановка scheduler."""
+    """
+    Остановка scheduler.
+    
+    Context7: Graceful shutdown с таймаутом и обновлением метрик.
+    """
     global scheduler
     
-    if scheduler and scheduler.running:
-        scheduler.shutdown()
-        logger.info("Scheduler stopped")
+    if scheduler is None:
+        logger.warning("Scheduler is None, nothing to stop")
+        scheduler_running.set(0)
+        return
+    
+    if not scheduler.running:
+        logger.info("Scheduler is not running, nothing to stop")
+        scheduler_running.set(0)
+        return
+    
+    try:
+        logger.info("Stopping scheduler...")
+        
+        # Context7: Graceful shutdown - сохраняем список jobs перед остановкой
+        jobs_before = scheduler.get_jobs()
+        logger.info("Jobs before shutdown", jobs_count=len(jobs_before), job_ids=[job.id for job in jobs_before])
+        
+        # Останавливаем scheduler
+        scheduler.shutdown(wait=False)  # Не ждем завершения задач
+        
+        # Context7: Обновляем метрики
+        scheduler_running.set(0)
+        scheduler_jobs_total.set(0)
+        
+        logger.info("Scheduler stopped successfully")
+        
+    except Exception as e:
+        scheduler_running.set(0)
+        logger.error(
+            "Error stopping scheduler",
+            error=str(e),
+            error_type=type(e).__name__,
+            exc_info=True
+        )
+        # Не пробрасываем исключение, чтобы не блокировать shutdown
 

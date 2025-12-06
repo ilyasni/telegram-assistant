@@ -206,79 +206,22 @@ class AtomicDBSaver:
                                 channel_id=channel_id_uuid,
                                 telegram_id=channel_data.get('telegram_id'))
                 
-                # 2.5. Context7: Проверка подписки с поддержкой системного парсинга
-                # Для системного парсинга (scheduler) автоматически создаем/активируем подписку для активных каналов
-                telegram_id = user_data.get('telegram_id')
-                if isinstance(telegram_id, str):
-                    telegram_id = int(telegram_id)
-                
-                # Context7: Получаем user_id для проверки подписки
-                user_result = await db_session.execute(
-                    text("SELECT id FROM users WHERE telegram_id = :telegram_id LIMIT 1"),
-                    {"telegram_id": telegram_id}
+                # Context7: Парсинг каналов - глобальный процесс, не привязан к конкретному пользователю
+                # Посты сохраняются глобально, изоляция происходит через user_channel при запросах пользователя
+                # Проверяем только активность канала, не проверяем подписку пользователя
+                channel_check = await db_session.execute(
+                    text("SELECT is_active FROM channels WHERE id = :channel_id LIMIT 1"),
+                    {"channel_id": channel_id_uuid}
                 )
-                user_row = user_result.fetchone()
-                if not user_row:
-                    self.logger.error("User not found", telegram_id=telegram_id)
-                    return False, "user_not_found", 0
+                channel_row = channel_check.fetchone()
                 
-                user_id_uuid = user_row[0]
-                
-                # Context7: Проверка активной подписки
-                check_subscription = await db_session.execute(
-                    text("""
-                        SELECT user_id, is_active FROM user_channel 
-                        WHERE user_id = :user_id AND channel_id = :channel_id
-                        LIMIT 1
-                    """),
-                    {"user_id": user_id_uuid, "channel_id": channel_id_uuid}
-                )
-                
-                subscription_row = check_subscription.fetchone()
-                
-                # Context7: Если подписки нет или она неактивна - проверяем, можно ли создать/активировать
-                if not subscription_row or not subscription_row.is_active:
-                    # Проверяем, активен ли канал (для системного парсинга)
-                    channel_check = await db_session.execute(
-                        text("SELECT is_active FROM channels WHERE id = :channel_id LIMIT 1"),
-                        {"channel_id": channel_id_uuid}
-                    )
-                    channel_row = channel_check.fetchone()
-                    
-                    if channel_row and channel_row.is_active:
-                        # Context7: Канал активен - создаем/активируем подписку для системного парсинга
-                        # Это позволяет scheduler парсить активные каналы без явной подписки пользователя
-                        await db_session.execute(
-                            text("""
-                                INSERT INTO user_channel (user_id, channel_id, is_active, subscribed_at, settings)
-                                VALUES (:user_id, :channel_id, true, NOW(), '{}'::jsonb)
-                                ON CONFLICT (user_id, channel_id) 
-                                DO UPDATE SET is_active = true, subscribed_at = COALESCE(user_channel.subscribed_at, NOW())
-                            """),
-                            {"user_id": user_id_uuid, "channel_id": channel_id_uuid}
-                        )
-                        self.logger.info("Created/activated subscription for system parsing",
-                                       channel_id=channel_id_uuid,
-                                       telegram_id=telegram_id)
-                    else:
-                        # Канал неактивен или не найден - не сохраняем посты
-                        pass
-                
-                # Перепроверяем subscription_row после возможного создания подписки
-                if not subscription_row:
-                    self.logger.warning("User not subscribed to channel, skipping post save",
+                if not channel_row or not channel_row.is_active:
+                    self.logger.warning("Channel is inactive, skipping post save",
                                       channel_id=channel_id_uuid,
-                                      telegram_id=telegram_id,
-                                      reason="no_subscription")
-                    db_subscription_check_failures_total.labels(reason="no_subscription").inc()
-                    return False, "user_not_subscribed", 0
-                elif not subscription_row.is_active:
-                    self.logger.warning("User subscription is inactive, skipping post save",
-                                      channel_id=channel_id_uuid,
-                                      telegram_id=telegram_id,
-                                      reason="subscription_inactive")
-                    db_subscription_check_failures_total.labels(reason="subscription_inactive").inc()
-                    return False, "subscription_inactive", 0
+                                      reason="channel_inactive",
+                                      posts_count=len(posts_data))
+                    db_subscription_check_failures_total.labels(reason="channel_inactive").inc()
+                    return False, "channel_inactive", 0
                 
                 # 3. BULK INSERT posts (ON CONFLICT DO UPDATE) - обновляем существующие посты
                 self.logger.debug("Bulk inserting posts", posts_count=len(posts_data))
@@ -788,20 +731,36 @@ class AtomicDBSaver:
             channel_id: UUID канала (из _upsert_channel)
         """
         try:
-            # Получаем user_id по telegram_id
+            # Context7: КРИТИЧНО - проверяем tenant_id для предотвращения утечки данных
+            # В multi-tenant системе один telegram_id может быть в нескольких tenant
+            tenant_id = user_data.get('tenant_id')
+            if not tenant_id:
+                self.logger.error("tenant_id is required for user_channel creation",
+                                user_data=user_data)
+                return
+            
+            # Получаем user_id по telegram_id И tenant_id
             telegram_id = user_data.get('telegram_id')
             if isinstance(telegram_id, str):
                 telegram_id = int(telegram_id)
             
+            # Context7: КРИТИЧНО - фильтруем по tenant_id для предотвращения утечки данных
             get_user_sql = text("""
-                SELECT id FROM users WHERE telegram_id = :telegram_id LIMIT 1
+                SELECT id FROM users 
+                WHERE telegram_id = :telegram_id 
+                  AND tenant_id = :tenant_id
+                LIMIT 1
             """)
-            result = await db_session.execute(get_user_sql, {"telegram_id": telegram_id})
+            result = await db_session.execute(
+                get_user_sql, 
+                {"telegram_id": telegram_id, "tenant_id": tenant_id}
+            )
             user_row = result.fetchone()
             
             if not user_row:
                 self.logger.warning("User not found for user_channel creation",
-                                  telegram_id=telegram_id)
+                                  telegram_id=telegram_id,
+                                  tenant_id=tenant_id)
                 return
             
             user_id = str(user_row.id)

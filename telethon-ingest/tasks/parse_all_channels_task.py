@@ -73,6 +73,12 @@ scheduler_last_tick_ts_seconds = Gauge(
     'Unix timestamp of last scheduler tick'
 )
 
+# Context7: Heartbeat метрика для отслеживания активности scheduler'а в реальном времени
+scheduler_heartbeat_seconds = Gauge(
+    'scheduler_heartbeat_seconds',
+    'Scheduler heartbeat timestamp (updated every 30s to track scheduler activity)'
+)
+
 parser_retries_total = Counter(
     'parser_retries_total',
     'Total parser retry attempts',
@@ -226,6 +232,29 @@ class ParseAllChannelsTask:
         
         logger.info("Starting parse_all_channels scheduler loop (active parsing mode)")
         
+        # Context7: Запускаем heartbeat задачу для мониторинга активности scheduler'а
+        async def heartbeat_task():
+            """Context7: Обновляем heartbeat метрику каждые 30 секунд для отслеживания активности."""
+            # Инициализируем heartbeat сразу при запуске
+            try:
+                now_ts = datetime.now(timezone.utc).timestamp()
+                scheduler_heartbeat_seconds.set(now_ts)
+            except Exception:
+                pass
+            
+            while True:
+                try:
+                    now_ts = datetime.now(timezone.utc).timestamp()
+                    scheduler_heartbeat_seconds.set(now_ts)
+                    await asyncio.sleep(30)  # Обновляем каждые 30 секунд
+                except Exception as e:
+                    logger.error("Heartbeat task error", error=str(e))
+                    await asyncio.sleep(30)  # Продолжаем даже при ошибке
+        
+        # Запускаем heartbeat в фоне
+        asyncio.create_task(heartbeat_task())
+        logger.info("Scheduler heartbeat task started")
+        
         # Context7: Реальный парсинг с мониторингом
         while True:
             try:
@@ -236,7 +265,12 @@ class ParseAllChannelsTask:
             await asyncio.sleep(self.interval_sec)
     
     async def _acquire_lock(self) -> bool:
-        """Try to acquire scheduler lock"""
+        """Try to acquire scheduler lock
+        
+        Context7: Улучшенная логика получения lock:
+        - Если lock принадлежит тому же instance_id (после перезапуска контейнера), перезаписываем его
+        - Это предотвращает ситуацию, когда старый lock блокирует новый экземпляр после перезапуска
+        """
         instance_id = os.getenv("HOSTNAME", "default")
         lock_key = "parse_all_channels:lock"
         ttl = self.interval_sec * 2
@@ -261,6 +295,24 @@ class ParseAllChannelsTask:
                            lock_key=lock_key,
                            existing_value=existing_lock,
                            instance_id=instance_id)
+                
+                # Context7: Если lock принадлежит тому же instance_id, это означает,
+                # что контейнер перезапустился, и старый lock "мертвый"
+                # Перезаписываем lock, чтобы новый экземпляр мог работать
+                if existing_lock == instance_id:
+                    logger.warning("Lock held by same instance_id (container restarted), reclaiming lock",
+                                 lock_key=lock_key,
+                                 instance_id=instance_id)
+                    # Перезаписываем lock с новым TTL
+                    await self.redis.set(lock_key, instance_id, ex=ttl)
+                    scheduler_lock_acquired_total.labels(status="reclaimed").inc()
+                    logger.info("Lock reclaimed successfully after container restart",
+                               lock_key=lock_key,
+                               instance_id=instance_id,
+                               ttl=ttl)
+                    if self.app_state:
+                        self.app_state["scheduler"]["lock_owner"] = instance_id
+                    return True
             
             # Context7: async Redis - используем await для set()
             acquired = await self.redis.set(
@@ -630,19 +682,19 @@ class ParseAllChannelsTask:
             # Определение режима
             mode = self._decide_mode(channel)
             
-            # Context7: Все блокирующие операции внутри этого метода (внутри wait_for)
-            # Получение telegram_id и tenant_id
-            # Context7: Используем async версию, которая обертывает синхронный вызов в run_in_executor
-            logger.debug("Getting system user/tenant",
+            # Context7: Парсинг каналов - глобальный процесс, не привязан к конкретному tenant_id
+            # Посты сохраняются глобально, изоляция происходит через user_channel при запросах пользователя
+            # Используем системный telegram_id и tenant_id для парсинга
+            logger.debug("Getting system user/tenant for global channel parsing",
                         channel_id=channel['id'])
             telegram_id, tenant_id = await self._get_system_user_and_tenant()
-            logger.debug("Got system user/tenant",
+            logger.debug("Got system user/tenant for channel parsing",
                         channel_id=channel['id'],
                         telegram_id=telegram_id,
                         has_tenant_id=bool(tenant_id))
             
             if not telegram_id or telegram_id == 0:
-                logger.warning("No telegram_id found in database, skipping parsing",
+                logger.warning("No telegram_id found, skipping parsing",
                              channel_id=channel['id'])
                 status = "skipped"
                 return {"status": "skipped", "reason": "no_telegram_id", "parsed": 0, "max_message_date": None}
@@ -865,7 +917,7 @@ class ParseAllChannelsTask:
             # Увеличено до 180 секунд, так как парсинг канала может занимать время
             # (получение клиента, создание parser'а, сам парсинг, обработка медиа)
             # Особенно важно для больших каналов с большим количеством постов
-            individual_task_timeout = 180.0  # 180 секунд на обработку одного канала
+            individual_task_timeout = float(os.getenv("PARSER_INDIVIDUAL_TASK_TIMEOUT", "180.0"))  # секунд на обработку одного канала
             
             async def process_channel_with_timeout(channel, tick_start_time, max_tick_duration):
                 """Wrapper с индивидуальным таймаутом для каждого канала"""
@@ -1253,9 +1305,33 @@ class ParseAllChannelsTask:
             conn = psycopg2.connect(self.db_url)
             cursor = conn.cursor(cursor_factory=RealDictCursor)
             
-            # Context7: Выбираем только N каналов с учетом blocked_until и fairness
-            # Получаем tenant_id через JOIN с users через user_channel
+            # Context7: Weighted Round-Robin с анти-starvation механизмом
+            # Гарантируем минимальную частоту парсинга для всех каналов
+            # Используем комбинированный подход: гарантия + приоритизация + fairness
+            # 
+            # Приоритеты:
+            # 1. Критические голодающие (> 24 часа) - гарантированный слот
+            # 2. Голодающие (> 6 часов) - гарантированный слот
+            # 3. Каналы с новыми постами - приоритетный слот
+            # 4. Остальные каналы - fairness слот
+            
             cursor.execute("""
+                WITH channel_activity AS (
+                    SELECT 
+                        c.id as channel_id,
+                        COUNT(p.id) FILTER (
+                            WHERE p.posted_at > COALESCE(c.last_parsed_at, '1970-01-01'::timestamp)
+                        ) as new_posts_count,
+                        MAX(p.posted_at) as last_post_time,
+                        COUNT(p.id) FILTER (
+                            WHERE p.posted_at > NOW() - INTERVAL '24 hours'
+                        ) as posts_24h
+                    FROM channels c
+                    LEFT JOIN posts p ON p.channel_id = c.id
+                    WHERE c.is_active = true
+                      AND (c.blocked_until IS NULL OR c.blocked_until < NOW())
+                    GROUP BY c.id
+                )
                 SELECT c.id,
                        c.tg_channel_id,
                        c.username,
@@ -1264,17 +1340,32 @@ class ParseAllChannelsTask:
                        c.is_active,
                        c.blocked_until,
                        COALESCE(u.tenant_id::text, '00000000-0000-0000-0000-000000000000') as tenant_id,
-                       COALESCE(uc.user_id::text, '0') as user_id
+                       COALESCE(uc.user_id::text, '0') as user_id,
+                       COALESCE(ca.new_posts_count, 0) as new_posts_count,
+                       ca.last_post_time,
+                       COALESCE(ca.posts_24h, 0) as posts_24h
                 FROM channels c
                 LEFT JOIN user_channel uc ON c.id = uc.channel_id AND uc.is_active = true
                 LEFT JOIN users u ON uc.user_id = u.id
+                LEFT JOIN channel_activity ca ON c.id = ca.channel_id
                 WHERE c.is_active = true
                   AND (c.blocked_until IS NULL OR c.blocked_until < NOW())
                 ORDER BY
-                  (c.last_parsed_at IS NULL) DESC,  -- Явный приоритет NULL (TRUE идет первым)
-                  c.last_parsed_at ASC NULLS FIRST,  -- Context7: Старые каналы в приоритете (ASC = старые первыми)
-                  COALESCE(u.tenant_id::text, '00000000-0000-0000-0000-000000000000'),  -- Fairness между tenant'ами
-                  COALESCE(uc.user_id::text, '0'),  -- Fairness между пользователями
+                  -- Приоритет 1: Критически голодающие каналы (> 24 часа или NULL)
+                  (c.last_parsed_at IS NULL OR c.last_parsed_at < NOW() - INTERVAL '24 hours') DESC,
+                  -- Приоритет 2: Голодающие каналы (> 6 часов) - анти-starvation
+                  (c.last_parsed_at < NOW() - INTERVAL '6 hours') DESC,
+                  -- Приоритет 3: Каналы с новыми постами (posted_at > last_parsed_at)
+                  (COALESCE(ca.new_posts_count, 0) > 0) DESC,
+                  COALESCE(ca.new_posts_count, 0) DESC NULLS LAST,
+                  -- Приоритет 4: Активные каналы (много постов за 24 часа)
+                  COALESCE(ca.posts_24h, 0) DESC NULLS LAST,
+                  ca.last_post_time DESC NULLS LAST,
+                  -- Приоритет 5: Давно не парсились (старые last_parsed_at) - fairness
+                  c.last_parsed_at ASC NULLS FIRST,
+                  -- Приоритет 6: Fairness между tenant'ами и пользователями
+                  COALESCE(u.tenant_id::text, '00000000-0000-0000-0000-000000000000'),
+                  COALESCE(uc.user_id::text, '0'),
                   c.created_at DESC
                 LIMIT %s
             """, (channels_per_tick,))
@@ -1282,12 +1373,16 @@ class ParseAllChannelsTask:
             channels = cursor.fetchall()
             channels_list = [dict(ch) for ch in channels]
             
-            # Context7: Логируем статистику для диагностики
+            # Context7: Логируем статистику для диагностики с информацией о новых постах
             new_channels_count = sum(1 for ch in channels_list if ch.get('last_parsed_at') is None)
+            channels_with_new_posts = sum(1 for ch in channels_list if ch.get('new_posts_count', 0) > 0)
+            total_new_posts = sum(ch.get('new_posts_count', 0) for ch in channels_list)
             logger.info(
                 "Active channels retrieved (limited per tick)",
                 total=len(channels_list),
                 new_channels=new_channels_count,
+                channels_with_new_posts=channels_with_new_posts,
+                total_new_posts=total_new_posts,
                 channels_per_tick_limit=channels_per_tick
             )
             

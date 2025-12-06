@@ -68,13 +68,16 @@ async def _get_user_context(telegram_id: int) -> Optional[Dict[str, Any]]:
     return None
 
 
-async def _fetch_groups(tenant_id: str) -> Optional[Dict[str, Any]]:
-    """Загружает группы арендатора."""
+async def _fetch_groups(tenant_id: str, user_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Загружает группы арендатора. Если указан user_id, возвращает только группы с подписками пользователя."""
     try:
+        params = {"tenant_id": tenant_id, "limit": 50, "offset": 0}
+        if user_id:
+            params["user_id"] = user_id
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(
                 f"{API_BASE}/api/groups/",
-                params={"tenant_id": tenant_id, "limit": 50, "offset": 0},
+                params=params,
             )
             if resp.status_code == 200:
                 return resp.json()
@@ -89,9 +92,10 @@ async def _fetch_groups(tenant_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-async def _fetch_all_groups(tenant_id: str, page_size: int = 50) -> List[Dict[str, Any]]:
+async def _fetch_all_groups(tenant_id: str, user_id: Optional[str] = None, page_size: int = 50) -> List[Dict[str, Any]]:
     """
     Возвращает все группы арендатора без ограничения пагинацией.
+    Если указан user_id, возвращает только группы с подписками пользователя.
     Context7: мягкий backoff между запросами, чтобы не перегружать API.
     """
     collected: List[Dict[str, Any]] = []
@@ -99,13 +103,16 @@ async def _fetch_all_groups(tenant_id: str, page_size: int = 50) -> List[Dict[st
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             while True:
+                params = {
+                    "tenant_id": tenant_id,
+                    "limit": page_size,
+                    "offset": offset,
+                }
+                if user_id:
+                    params["user_id"] = user_id
                 resp = await client.get(
                     f"{API_BASE}/api/groups/",
-                    params={
-                        "tenant_id": tenant_id,
-                        "limit": page_size,
-                        "offset": offset,
-                    },
+                    params=params,
                 )
                 if resp.status_code != 200:
                     logger.warning(
@@ -151,10 +158,12 @@ async def _load_group_digest_groups(
     state: FSMContext,
     tenant_id: str,
     force_refresh: bool = False,
+    user_id: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
     """
     Возвращает список групп и карту по id из FSM-состояния,
     при необходимости перезапрашивает из API.
+    Если указан user_id, возвращает только группы с подписками пользователя.
     """
     data = await state.get_data()
     groups: Optional[List[Dict[str, Any]]] = None
@@ -165,7 +174,10 @@ async def _load_group_digest_groups(
         groups_map = data.get("group_digest_groups_map")
 
     if groups is None or groups_map is None or force_refresh:
-        groups = await _fetch_all_groups(tenant_id)
+        # Получаем user_id из параметра или из состояния
+        if not user_id:
+            user_id = data.get("group_digest_user_id")
+        groups = await _fetch_all_groups(tenant_id, user_id=user_id)
         groups_map = {str(group.get("id")): group for group in groups}
         await state.update_data(
             group_digest_groups=groups,
@@ -605,7 +617,8 @@ async def cmd_groups(msg: Message, state: FSMContext):
         return
 
     tenant_id = str(user_ctx["tenant_id"])
-    groups_payload = await _fetch_groups(tenant_id)
+    user_id = str(user_ctx["id"])
+    groups_payload = await _fetch_groups(tenant_id, user_id=user_id)
     groups = groups_payload.get("groups", []) if groups_payload else []
 
     await msg.answer(
@@ -900,7 +913,8 @@ async def cb_menu_groups(callback: CallbackQuery, state: FSMContext):
         return
 
     tenant_id = str(user_ctx["tenant_id"])
-    groups_payload = await _fetch_groups(tenant_id)
+    user_id = str(user_ctx["id"])
+    groups_payload = await _fetch_groups(tenant_id, user_id=user_id)
     groups = groups_payload.get("groups", []) if groups_payload else []
 
     await callback.message.edit_text(

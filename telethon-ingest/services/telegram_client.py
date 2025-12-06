@@ -1716,6 +1716,35 @@ class TelegramIngestionService:
         except Exception:
             reply_to_info = None
 
+        # Context7: Извлечение информации о пересылках (forwarded messages)
+        forward_info = None
+        is_forwarded = False
+        try:
+            if hasattr(message, "fwd_from") and message.fwd_from:
+                fwd_from = message.fwd_from
+                forward_peer_id_data = None
+                
+                if hasattr(fwd_from, "from_id") and fwd_from.from_id:
+                    from_id = fwd_from.from_id
+                    if hasattr(from_id, "user_id"):
+                        forward_peer_id_data = {"user_id": from_id.user_id}
+                    elif hasattr(from_id, "channel_id"):
+                        forward_peer_id_data = {"channel_id": from_id.channel_id}
+                    elif hasattr(from_id, "chat_id"):
+                        forward_peer_id_data = {"chat_id": from_id.chat_id}
+                
+                forward_info = {
+                    "from_peer_id": forward_peer_id_data,
+                    "from_chat_id": forward_peer_id_data.get("channel_id") or forward_peer_id_data.get("chat_id") if forward_peer_id_data else None,
+                    "from_message_id": getattr(fwd_from, "channel_post", None) or getattr(fwd_from, "saved_from_msg_id", None),
+                    "from_name": getattr(fwd_from, "from_name", None),
+                    "forward_date": fwd_from.date.isoformat() if hasattr(fwd_from, "date") and fwd_from.date else None,
+                }
+                is_forwarded = True
+        except Exception as e:
+            logger.debug("Failed to extract forward info from group message", error=str(e))
+            forward_info = None
+
         mentions = self._extract_mentions(message)
         indicators_stub = {
             "tone": "unknown",
@@ -1730,6 +1759,12 @@ class TelegramIngestionService:
             posted_at = datetime.now(timezone.utc)
         created_at = datetime.now(timezone.utc)
 
+        # Context7: Сохраняем информацию о пересылке в reply_to JSON для совместимости с существующей схемой БД
+        # В будущем можно добавить отдельное поле forward в GroupMessage
+        reply_to_final = reply_to_info or {}
+        if forward_info:
+            reply_to_final["forward"] = forward_info
+
         message_data = {
             "group_id": group_id,
             "tenant_id": tenant_id,
@@ -1738,11 +1773,12 @@ class TelegramIngestionService:
             "sender_username": sender_username,
             "content": message.message or message.text or "",
             "media_urls": media_urls,
-            "reply_to": reply_to_info,
+            "reply_to": reply_to_final,  # Context7: Содержит reply_to_info и forward_info
             "mentions": mentions,
             "has_media": bool(media_urls),
             "is_service": bool(getattr(message, "action", None)),
             "action_type": getattr(getattr(message, "action", None), "__class__", type(None)).__name__,
+            "is_forwarded": is_forwarded,  # Context7: Флаг пересылки для быстрой проверки
             "posted_at": posted_at,
             "created_at": created_at,
             "indicators": indicators_stub,
@@ -1774,13 +1810,21 @@ class TelegramIngestionService:
         return mentions
 
     async def _save_group_message(self, message_data: dict) -> str:
-        """Сохранение сообщения группы и связанных записей."""
+        """
+        Context7: Сохранение сообщения группы и связанных записей.
+        Сообщения сохраняются глобально (без tenant_id), изоляция происходит через user_group при запросах пользователя.
+        """
         try:
             with self.db_connection.cursor() as cursor:
-                # Context7: Устанавливаем tenant_id для RLS перед INSERT
-                tenant_id = message_data.get("tenant_id")
-                if tenant_id:
-                    cursor.execute("SET LOCAL app.tenant_id = %s", (str(tenant_id),))
+                # Context7: Получаем системный tenant_id для совместимости с существующей схемой БД
+                # TODO: В будущем миграции нужно убрать tenant_id из group_messages
+                from utils.tenant_utils import get_system_tenant_id_sync
+                import os
+                db_url = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@supabase-db:5432/postgres")
+                system_tenant_id = get_system_tenant_id_sync(db_url)
+                
+                # Context7: Устанавливаем системный tenant_id для RLS перед INSERT
+                cursor.execute("SET LOCAL app.tenant_id = %s", (system_tenant_id,))
                 
                 cursor.execute(
                     """
@@ -1822,7 +1866,7 @@ class TelegramIngestionService:
                     (
                         message_data.get("id"),
                         message_data["group_id"],
-                        message_data["tenant_id"],
+                        system_tenant_id,  # Context7: Системный tenant_id для совместимости
                         message_data["tg_message_id"],
                         message_data["sender_tg_id"],
                         message_data["sender_username"],

@@ -6,6 +6,14 @@ rule_files:
   - "alerts.yml"
   - "alerts/storage_quota_alerts.yml"
   - "alerts/performance_metrics_alerts.yml"
+  - "alerts/vision_s3_alerts.yml"
+
+# Настройка AlertManager для отправки уведомлений
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          - 'alertmanager:9093'
 
 scrape_configs:
   - job_name: 'worker'
@@ -25,6 +33,6 @@ scrape_configs:
 
   - job_name: 'telethon-ingest'
     static_configs:
-      - targets: ['telegram-assistant-telethon-ingest-1:8011']
+      - targets: ['telethon-ingest:8011']
     metrics_path: /metrics
     scrape_interval: 15s

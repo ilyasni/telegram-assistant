@@ -31,7 +31,7 @@ from .discussion_extractor import (
     check_channel_has_comments
 )
 from utils.time_utils import ensure_dt_utc
-from prometheus_client import Counter
+from prometheus_client import Counter, Gauge
 
 # WORKER IMPORT DISABLED - will be restored when worker module is available
 # from worker.event_bus import EventPublisher, PostParsedEvent
@@ -56,6 +56,17 @@ def _get_or_create_counter(name, description, labels):
     # Создаём новую метрику
     return Counter(name, description, labels)
 
+def _get_or_create_gauge(name, description, labels):
+    """Получить существующую метрику Gauge или создать новую."""
+    try:
+        existing = REGISTRY._names_to_collectors.get(name)
+        if existing:
+            return existing
+    except (AttributeError, KeyError):
+        pass
+    
+    return Gauge(name, description, labels)
+
 channel_not_found_total = _get_or_create_counter(
     'channel_not_found_total',
     'Total channel not found errors',
@@ -74,6 +85,34 @@ session_rollback_failures_total = _get_or_create_counter(
     ['operation']  # operation: 'before_parsing', 'before_entity', 'before_albums'
 )
 
+# Context7: Метрики для отслеживания потерь постов и покрытия каналов
+posts_lost_total = _get_or_create_counter(
+    'posts_lost_total',
+    'Total posts lost (not saved)',
+    ['reason']  # duplicate, subscription, filter, error
+)
+
+posts_skipped_duplicate_total = _get_or_create_counter(
+    'posts_skipped_duplicate_total',
+    'Total posts skipped as duplicates',
+    []  # Без labels для контроля кардинальности
+)
+
+posts_skipped_subscription_total = _get_or_create_counter(
+    'posts_skipped_subscription_total',
+    'Total posts skipped due to subscription issues',
+    []  # Без labels для контроля кардинальности
+)
+
+# Context7: Метрика покрытия каналов (процент сохраненных постов)
+# Используем Gauge для текущего значения покрытия
+# Кардинальность контролируется: метрика обновляется периодически, не на каждое событие
+channel_coverage_percent = _get_or_create_gauge(
+    'channel_coverage_percent',
+    'Channel posts coverage percentage (actual/expected * 100)',
+    ['channel_username']  # Используем username вместо channel_id для контроля кардинальности
+)
+
 # ============================================================================
 # КОНФИГУРАЦИЯ
 # ============================================================================
@@ -88,7 +127,7 @@ class ParserConfig:
     lpa_max_age_hours: int = int(os.getenv("PARSER_LPA_MAX_AGE_HOURS", "48"))
     
     # Батчинг
-    max_messages_per_batch: int = 50
+    max_messages_per_batch: int = int(os.getenv("PARSER_MAX_MESSAGES_PER_BATCH", "50"))
     batch_delay_ms: int = 1000
     
     # FloodWait handling
@@ -601,6 +640,17 @@ class ChannelParser:
                 'max_message_date': max_message_date.isoformat() if max_message_date else None,  # For HWM
                 'stats': self.stats.copy()
             }
+            
+            # Context7: Специальное логирование для проблемных каналов
+            await self._log_problematic_channel_stats(
+                channel_id=channel_id,
+                channel_entity=channel_entity,
+                messages_processed=messages_processed,
+                messages_skipped=self.stats.get('messages_skipped', 0),
+                batch_count=batch_count,
+                processing_time=processing_time,
+                mode=mode
+            )
             
             logger.info("Channel parsing completed", **result)
             return result
@@ -1233,32 +1283,62 @@ class ChannelParser:
         redis_hwm = ensure_dt_utc(hwm_raw) if hwm_raw else None
         
         if mode == "incremental":
-            # Context7: [C7-ID: incremental-since-date-fix-003] КРИТИЧНО - для incremental режима используем ТОЛЬКО MAX(posted_at) из БД
-            # last_parsed_at может быть намного больше реального последнего поста, если парсинг не нашел новых постов
-            # Это приводит к неправильному расчету since_date и пропуску постов
+            # Context7: [C7-ID: incremental-since-date-fix-004] КРИТИЧНО - приоритетная логика для since_date
+            # Приоритет 1: last_parsed_at (точка последнего парсинга) - самый актуальный источник истины
+            # Приоритет 2: last_post_date (последний пост в БД) - fallback для проверки gap
+            # Приоритет 3: Redis HWM - временное хранилище
+            # 
+            # Проблема предыдущей логики: использование last_post_date приводило к пропуску постов,
+            # так как last_parsed_at мог быть обновлен даже без новых постов, а since_date
+            # вычислялся от старого last_post_date.
+            
+            last_parsed_at_raw = channel.get('last_parsed_at')
+            last_parsed_utc = ensure_dt_utc(last_parsed_at_raw) if last_parsed_at_raw else None
             last_post_date = await self._get_last_post_date(channel_id)
             
-            if last_post_date:
-                # Context7: Используем ТОЛЬКО last_post_date (реальный последний пост в БД)
-                # НЕ используем last_parsed_at, так как он может быть неточным
+            # Приоритет 1: Используем last_parsed_at если он есть и не слишком старый (< 48 часов)
+            if last_parsed_utc:
+                age_hours = (now - last_parsed_utc).total_seconds() / 3600
+                if age_hours < self.config.lpa_max_age_hours:
+                    base_utc = last_parsed_utc
+                    logger.debug("Using last_parsed_at as base for incremental mode",
+                               channel_id=channel_id,
+                               last_parsed_at=last_parsed_utc.isoformat(),
+                               age_hours=age_hours)
+                else:
+                    # last_parsed_at слишком старый - используем last_post_date или min(last_parsed_at, last_post_date)
+                    if last_post_date:
+                        # Используем максимум из last_parsed_at и last_post_date для безопасности
+                        base_utc = max(last_parsed_utc, last_post_date)
+                        logger.debug("last_parsed_at too old, using max(last_parsed_at, last_post_date)",
+                                   channel_id=channel_id,
+                                   last_parsed_at=last_parsed_utc.isoformat(),
+                                   last_post_date=last_post_date.isoformat(),
+                                   base_date=base_utc.isoformat(),
+                                   age_hours=age_hours)
+                    else:
+                        base_utc = last_parsed_utc
+                        logger.debug("Using last_parsed_at as base (no posts in DB)",
+                                   channel_id=channel_id,
+                                   last_parsed_at=last_parsed_utc.isoformat(),
+                                   age_hours=age_hours)
+            elif last_post_date:
+                # Приоритет 2: Используем last_post_date если нет last_parsed_at
                 base_utc = last_post_date
-                logger.debug("Using last_post_date as base for incremental mode",
+                logger.debug("Using last_post_date as base for incremental mode (no last_parsed_at)",
                            channel_id=channel_id,
                            last_post_date=last_post_date.isoformat())
+            elif redis_hwm:
+                # Приоритет 3: Используем Redis HWM как fallback
+                base_utc = redis_hwm
+                logger.debug("Using Redis HWM as base for incremental mode",
+                           channel_id=channel_id,
+                           hwm=redis_hwm.isoformat())
             else:
-                # Fallback: если нет постов в БД, используем last_parsed_at или Redis HWM
-                base = channel.get('last_parsed_at') or redis_hwm
-                if base:
-                    base_utc = ensure_dt_utc(base)
-                    if not base_utc:
-                        # Если не удалось нормализовать, используем incremental окно
-                        return now - timedelta(minutes=self.config.incremental_minutes)
-                    logger.debug("Using last_parsed_at/HWM as fallback (no posts in DB)",
-                               channel_id=channel_id,
-                               base_date=base_utc.isoformat())
-                else:
-                    # Fallback: если нет данных, берём incremental окно
-                    return now - timedelta(minutes=self.config.incremental_minutes)
+                # Fallback: если нет данных, используем incremental окно
+                logger.debug("No base date available, using incremental window fallback",
+                           channel_id=channel_id)
+                return now - timedelta(minutes=self.config.incremental_minutes)
             
             # Проверка валидности
             if not base_utc:
@@ -1599,6 +1679,8 @@ class ChannelParser:
                 is_duplicate = await self._is_duplicate_message(message, channel_id, tenant_id)
                 if is_duplicate:
                     skipped += 1
+                    # Context7: Метрика для потерь постов (дубликаты)
+                    posts_lost_total.labels(reason='duplicate').inc()
                     logger.debug(f"Message {message.id} skipped as duplicate", 
                                channel_id=channel_id,
                                message_id=message.id)
@@ -1810,13 +1892,9 @@ class ChannelParser:
                     'username': channel_username
                 }
                 
-                # Context7: Проверка подписки с поддержкой системного парсинга
-                # Для системного парсинга (scheduler) разрешаем парсинг активных каналов,
-                # так как AtomicDBSaver автоматически создаст/активирует подписку при сохранении постов
-                # Context7: Преобразуем user_id в int для SQL запроса (telegram_id в БД - bigint)
-                telegram_id_int = int(user_id) if isinstance(user_id, str) else user_id
-                
-                # Проверяем активность канала
+                # Context7: Парсинг каналов - глобальный процесс, не привязан к конкретному пользователю
+                # Посты сохраняются глобально, изоляция происходит через user_channel при запросах пользователя
+                # Проверяем только активность канала
                 channel_active_check = await self.db_session.execute(
                     text("SELECT is_active FROM channels WHERE id = :channel_id LIMIT 1"),
                     {"channel_id": channel_id}
@@ -1824,38 +1902,17 @@ class ChannelParser:
                 channel_active_row = channel_active_check.fetchone()
                 is_channel_active = channel_active_row and channel_active_row.is_active
                 
-                # Проверяем подписку
-                check_subscription = await self.db_session.execute(
-                    text("""
-                        SELECT user_id FROM user_channel 
-                        WHERE user_id = (SELECT id FROM users WHERE telegram_id = :telegram_id LIMIT 1)
-                          AND channel_id = :channel_id
-                          AND is_active = true
-                        LIMIT 1
-                    """),
-                    {"telegram_id": telegram_id_int, "channel_id": channel_id}
-                )
-                
-                subscription_exists = check_subscription.fetchone() is not None
-                
-                if not subscription_exists:
-                    if is_channel_active:
-                        # Context7: Канал активен - разрешаем парсинг для системного парсинга
-                        # AtomicDBSaver автоматически создаст/активирует подписку при сохранении постов
-                        logger.info("Channel is active, allowing parsing for system parsing (subscription will be created by AtomicDBSaver)",
-                                  channel_id=channel_id,
-                                  telegram_id=user_id)
-                    else:
-                        # Канал неактивен - блокируем парсинг
-                        logger.warning("User not subscribed to inactive channel, skipping parsing",
-                                      channel_id=channel_id,
-                                      telegram_id=user_id)
-                        return {"status": "skipped", "reason": "not_subscribed_inactive_channel", "parsed": 0, "max_message_date": None}
-                else:
-                    # Пользователь подписан - продолжаем парсинг
-                    logger.info("User subscribed to channel, continuing parsing",
-                           channel_id=channel_id,
-                           telegram_id=user_id)
+                if not is_channel_active:
+                    # Канал неактивен - пропускаем парсинг
+                    logger.warning("Channel is inactive, skipping parsing",
+                                 channel_id=channel_id)
+                    return {
+                        "status": "skipped",
+                        "reason": "channel_inactive",
+                        "processed": 0,
+                        "skipped": 0,
+                        "max_message_date": None
+                    }
             except Exception as e:
                 logger.warning("Failed to ensure user_channel when no new posts",
                              channel_id=channel_id,
@@ -2083,16 +2140,18 @@ class ChannelParser:
                             # Context7: Получаем UUID пользователя один раз (для всех альбомов канала)
                             user_uuid = None
                             try:
-                                # Сначала пытаемся получить через user_channel (приоритет 1)
+                                # Context7: КРИТИЧНО - получаем через user_channel с проверкой tenant_id (приоритет 1)
                                 result = await self.db_session.execute(
                                     text("""
                                         SELECT u.id::text
                                         FROM users u
                                         JOIN user_channel uc ON uc.user_id = u.id
                                         WHERE uc.channel_id = :channel_id
+                                          AND u.telegram_id = :telegram_id
+                                          AND u.tenant_id = :tenant_id
                                         LIMIT 1
                                     """),
-                                    {"channel_id": channel_id}
+                                    {"channel_id": channel_id, "telegram_id": int(user_id), "tenant_id": tenant_id}
                                 )
                                 row = result.fetchone()
                                 if row:
@@ -2104,10 +2163,15 @@ class ChannelParser:
                                     logger.debug("No user_channel found, trying direct telegram_id lookup",
                                                channel_id=channel_id,
                                                telegram_id=user_id)
-                                    # Fallback: пытаемся получить по telegram_id (приоритет 2)
+                                    # Context7: КРИТИЧНО - Fallback с проверкой tenant_id для предотвращения утечки данных
                                     result2 = await self.db_session.execute(
-                                        text("SELECT id::text FROM users WHERE telegram_id = :telegram_id LIMIT 1"),
-                                        {"telegram_id": int(user_id)}
+                                        text("""
+                                            SELECT id::text FROM users 
+                                            WHERE telegram_id = :telegram_id 
+                                              AND tenant_id = :tenant_id
+                                            LIMIT 1
+                                        """),
+                                        {"telegram_id": int(user_id), "tenant_id": tenant_id}
                                     )
                                     row2 = result2.fetchone()
                                     if row2:
@@ -2115,7 +2179,8 @@ class ChannelParser:
                                         logger.debug("Found user_uuid via direct telegram_id lookup",
                                                    channel_id=channel_id,
                                                    user_uuid=user_uuid,
-                                                   telegram_id=user_id)
+                                                   telegram_id=user_id,
+                                                   tenant_id=tenant_id)
                             except Exception as e:
                                 logger.warning(
                                     "Failed to get user UUID for albums",
@@ -2133,17 +2198,24 @@ class ChannelParser:
                                     telegram_id=user_id,
                                     grouped_ids=list(grouped_ids_in_batch)[:3]
                                 )
-                                # Context7: Пробуем найти user_id по telegram_id напрямую
+                                # Context7: КРИТИЧНО - пробуем найти user_id по telegram_id с проверкой tenant_id
                                 try:
                                     result3 = await self.db_session.execute(
-                                        text("SELECT id::text FROM users WHERE telegram_id = :telegram_id LIMIT 1"),
-                                        {"telegram_id": int(user_id) if user_id else None}
+                                        text("""
+                                            SELECT id::text FROM users 
+                                            WHERE telegram_id = :telegram_id 
+                                              AND tenant_id = :tenant_id
+                                            LIMIT 1
+                                        """),
+                                        {"telegram_id": int(user_id) if user_id else None, "tenant_id": tenant_id}
                                     )
                                     row3 = result3.fetchone()
                                     if row3:
                                         user_uuid = str(row3[0])
                                         logger.info("Found user UUID via direct telegram_id lookup",
-                                                  user_uuid=user_uuid, telegram_id=user_id)
+                                                  user_uuid=user_uuid, 
+                                                  telegram_id=user_id,
+                                                  tenant_id=tenant_id)
                                 except Exception as e:
                                     logger.warning("Failed direct telegram_id lookup", error=str(e))
                             
@@ -2217,18 +2289,22 @@ class ChannelParser:
                                         'username': channel_username
                                     }
                                     
-                                    # Context7: НЕ создаем user_channel автоматически при парсинге!
+                                    # Context7: КРИТИЧНО - НЕ создаем user_channel автоматически при парсинге!
                                     # Подписки должны создаваться только при явном запросе пользователя через API
-                                    # Проверяем, подписан ли пользователь на канал
+                                    # Проверяем, подписан ли пользователь на канал с фильтрацией по tenant_id
                                     check_subscription = await self.db_session.execute(
                                         text("""
-                                            SELECT user_id FROM user_channel 
-                                            WHERE user_id = (SELECT id FROM users WHERE telegram_id = :telegram_id LIMIT 1)
-                                              AND channel_id = :channel_id
-                                              AND is_active = true
+                                            SELECT uc.user_id FROM user_channel uc
+                                            JOIN users u ON uc.user_id = u.id
+                                            WHERE u.telegram_id = :telegram_id
+                                              AND u.tenant_id = :tenant_id
+                                              AND uc.channel_id = :channel_id
+                                              AND uc.is_active = true
                                             LIMIT 1
                                         """),
-                                        {"telegram_id": int(user_id) if isinstance(user_id, str) else user_id, "channel_id": channel_id}
+                                        {"telegram_id": int(user_id) if isinstance(user_id, str) else user_id, 
+                                         "tenant_id": tenant_id,
+                                         "channel_id": channel_id}
                                     )
                                     
                                     if not check_subscription.fetchone():
@@ -2242,17 +2318,23 @@ class ChannelParser:
                                         await self.atomic_saver._upsert_user(self.db_session, user_data)
                                         channel_id_uuid = await self.atomic_saver._upsert_channel(self.db_session, channel_data)
                                         
-                                        # Повторно пытаемся получить user_uuid
+                                        # Context7: КРИТИЧНО - повторно пытаемся получить user_uuid с проверкой tenant_id
                                     result3 = await self.db_session.execute(
-                                        text("SELECT id::text FROM users WHERE telegram_id = :telegram_id LIMIT 1"),
-                                        {"telegram_id": int(user_id) if user_id else None}
+                                        text("""
+                                            SELECT id::text FROM users 
+                                            WHERE telegram_id = :telegram_id 
+                                              AND tenant_id = :tenant_id
+                                            LIMIT 1
+                                        """),
+                                        {"telegram_id": int(user_id) if user_id else None, "tenant_id": tenant_id}
                                     )
                                     row3 = result3.fetchone()
                                     if row3:
                                         user_uuid = str(row3[0])
                                         logger.info("Created user_channel and found user UUID",
                                                   user_uuid=user_uuid,
-                                                  telegram_id=user_id)
+                                                  telegram_id=user_id,
+                                                  tenant_id=tenant_id)
                                 except Exception as e:
                                     logger.error("Failed to create user_channel for albums",
                                                channel_id=channel_id,
@@ -2831,9 +2913,12 @@ class ChannelParser:
         # Проверка в Redis (быстрая проверка)
         # Context7: exists() - асинхронная функция в redis.asyncio
         if await self.redis_client.exists(cache_key):
+            # Context7: Метрика для пропусков дубликатов
+            posts_skipped_duplicate_total.inc()
             return True
         
         # Проверка в БД (Context7: используем существующий уникальный индекс)
+        # Context7: Проверяем БД в первую очередь для надежности
         result = await self.db_session.execute(
             text("""
                 SELECT 1 FROM posts 
@@ -2846,7 +2931,11 @@ class ChannelParser:
         if result.fetchone():
             # Кеширование результата
             # Context7: setex() - асинхронная функция в redis.asyncio
-            await self.redis_client.setex(cache_key, 3600, "1")  # TTL 1 час
+            # Context7: Уменьшен TTL до 15 минут для лучшей синхронизации с БД
+            await self.redis_client.setex(cache_key, 900, "1")  # TTL 15 минут (было 3600 = 1 час)
+            
+            # Context7: Метрика для пропусков дубликатов
+            posts_skipped_duplicate_total.inc()
             return True
         
         return False
@@ -3157,7 +3246,8 @@ class ChannelParser:
                             event_payload[key] = value.isoformat()
                         else:
                             event_payload[key] = str(value)
-                    await self.redis_client.xadd(stream_key, event_payload, maxlen=10000)  # Context7: ограничиваем размер stream
+                    redis_stream_maxlen = int(os.getenv("REDIS_STREAM_MAXLEN", "10000"))
+                    await self.redis_client.xadd(stream_key, event_payload, maxlen=redis_stream_maxlen)  # Context7: ограничиваем размер stream
                 logger.info(f"Published {len(events_data)} post.parsed events to Redis Streams")
             else:
                 # Используем event_publisher, если он доступен
@@ -3334,6 +3424,154 @@ class ChannelParser:
         except Exception as e:
             # Не критичная ошибка, логируем и продолжаем
             logger.warning("Failed to monitor missing posts",
+                         channel_id=channel_id,
+                         error=str(e))
+    
+    async def _log_problematic_channel_stats(
+        self,
+        channel_id: str,
+        channel_entity: Any,
+        messages_processed: int,
+        messages_skipped: int,
+        batch_count: int,
+        processing_time: float,
+        mode: str
+    ):
+        """
+        Context7: Специальное логирование для проблемных каналов.
+        
+        Логирует детальную статистику для каналов с:
+        - Низким покрытием (< 10%)
+        - Высоким процентом пропусков
+        - Большими диапазонами message_id
+        - Критическими потерями постов
+        """
+        try:
+            # Получаем информацию о канале из БД
+            result = await self.db_session.execute(
+                text("""
+                    SELECT 
+                        c.username,
+                        c.title,
+                        c.tg_channel_id,
+                        COUNT(p.id) as posts_count,
+                        MIN(p.telegram_message_id) as min_message_id,
+                        MAX(p.telegram_message_id) as max_message_id,
+                        COUNT(DISTINCT DATE_TRUNC('day', p.posted_at)) as days_with_posts
+                    FROM channels c
+                    LEFT JOIN posts p ON p.channel_id = c.id
+                    WHERE c.id = :channel_id
+                    GROUP BY c.id, c.username, c.title, c.tg_channel_id
+                """),
+                {"channel_id": channel_id}
+            )
+            channel_row = result.fetchone()
+            
+            if not channel_row:
+                return
+            
+            username = channel_row.username or "unknown"
+            title = channel_row.title or "Unknown"
+            posts_count = channel_row.posts_count or 0
+            min_message_id = channel_row.min_message_id
+            max_message_id = channel_row.max_message_id
+            days_with_posts = channel_row.days_with_posts or 0
+            
+            # Вычисляем статистику
+            message_id_range = None
+            expected_posts = None
+            coverage_percent = None
+            gap_size = None
+            
+            if min_message_id and max_message_id:
+                message_id_range = max_message_id - min_message_id + 1
+                gap_size = message_id_range - posts_count if message_id_range > posts_count else 0
+                
+                # Ожидаемое количество постов = диапазон message_id
+                expected_posts = message_id_range
+                
+                # Вычисляем покрытие (процент сохраненных постов от ожидаемого диапазона)
+                if expected_posts > 0:
+                    coverage_percent = (posts_count / expected_posts) * 100
+            
+            # Определяем, является ли канал проблемным
+            is_problematic = False
+            problem_reasons = []
+            
+            # Критерии проблемного канала
+            if coverage_percent is not None and coverage_percent < 10:
+                is_problematic = True
+                problem_reasons.append(f"low_coverage_{coverage_percent:.2f}%")
+            
+            if gap_size and gap_size > 1000:
+                is_problematic = True
+                problem_reasons.append(f"large_gap_{gap_size}")
+            
+            if messages_processed == 0 and batch_count > 0:
+                is_problematic = True
+                problem_reasons.append("no_messages_processed")
+            
+            if messages_skipped > messages_processed * 2:
+                is_problematic = True
+                problem_reasons.append(f"high_skip_ratio_{messages_skipped}/{messages_processed}")
+            
+            # Специальное логирование для проблемных каналов
+            if is_problematic:
+                logger.warning(
+                    "PROBLEMATIC_CHANNEL_DETECTED",
+                    channel_id=channel_id,
+                    channel_username=username,
+                    channel_title=title,
+                    tg_channel_id=channel_row.tg_channel_id,
+                    messages_processed=messages_processed,
+                    messages_skipped=messages_skipped,
+                    batch_count=batch_count,
+                    processing_time_seconds=processing_time,
+                    mode=mode,
+                    posts_count_in_db=posts_count,
+                    min_message_id=min_message_id,
+                    max_message_id=max_message_id,
+                    message_id_range=message_id_range,
+                    expected_posts=expected_posts,
+                    gap_size=gap_size,
+                    coverage_percent=coverage_percent,
+                    days_with_posts=days_with_posts,
+                    problem_reasons=problem_reasons,
+                    stats=self.stats.copy()
+                )
+                
+                # Обновляем метрику покрытия для проблемных каналов
+                if coverage_percent is not None:
+                    try:
+                        channel_coverage_percent.labels(channel_username=username).set(coverage_percent)
+                    except Exception as e:
+                        logger.debug("Failed to update channel_coverage_percent metric",
+                                   channel_id=channel_id,
+                                   error=str(e))
+            else:
+                # Обычное логирование для нормальных каналов (менее детальное)
+                logger.debug(
+                    "Channel parsing stats",
+                    channel_id=channel_id,
+                    channel_username=username,
+                    messages_processed=messages_processed,
+                    messages_skipped=messages_skipped,
+                    posts_count_in_db=posts_count,
+                    coverage_percent=coverage_percent
+                )
+                
+                # Обновляем метрику покрытия для всех каналов
+                if coverage_percent is not None:
+                    try:
+                        channel_coverage_percent.labels(channel_username=username).set(coverage_percent)
+                    except Exception as e:
+                        logger.debug("Failed to update channel_coverage_percent metric",
+                                   channel_id=channel_id,
+                                   error=str(e))
+        
+        except Exception as e:
+            # Не критичная ошибка, логируем и продолжаем
+            logger.warning("Failed to log problematic channel stats",
                          channel_id=channel_id,
                          error=str(e))
     

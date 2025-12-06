@@ -1,0 +1,46 @@
+global:
+  # Время ожидания перед отправкой повторного уведомления
+  resolve_timeout: 5m
+
+# Маршрутизация алертов
+route:
+  # Группировка по alertname и severity
+  group_by: ['alertname', 'severity']
+  
+  # Группировать алерты в течение 5 минут
+  group_wait: 30s
+  group_interval: 5m
+  
+  # Повторять уведомления не чаще раза в час
+  repeat_interval: 1h
+  
+  # Получатель по умолчанию (для всех алертов)
+  receiver: 'telegram-webhook'
+  
+  # Дочерние маршруты: отправлять только critical алерты
+  routes:
+    - match:
+        severity: critical
+      receiver: 'telegram-webhook'
+      continue: false
+
+# Получатели уведомлений
+receivers:
+  - name: 'telegram-webhook'
+    webhook_configs:
+      - url: 'http://api:8000/api/monitoring/alertmanager/webhook'
+        send_resolved: true
+        http_config:
+          follow_redirects: true
+        # Таймаут для webhook запроса
+        timeout: 10s
+
+# Подавление дубликатов
+inhibit_rules:
+  # Если критический алерт активен, подавить warning алерты с тем же alertname
+  - source_match:
+      severity: 'critical'
+    target_match:
+      severity: 'warning'
+    equal: ['alertname']
+

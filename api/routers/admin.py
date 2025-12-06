@@ -13,6 +13,7 @@ from fastapi import APIRouter, HTTPException, Depends, Query, Request
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from uuid import UUID
+from datetime import datetime, timezone
 import uuid
 import structlog
 import time
@@ -822,48 +823,127 @@ async def get_user_subscriptions(
     tenant_id = str(admin_user.tenant_id)
     
     try:
-        user_uuid = uuid.UUID(user_id)
-        user = db.query(User).filter(User.id == user_uuid).first()
+        # Context7: Устанавливаем tenant_id для RLS политик
+        from middleware.rls_middleware import set_tenant_id_in_session
+        set_tenant_id_in_session(db, tenant_id)
+        
+        # Context7: Поддержка поиска по telegram_id или UUID
+        # Определяем, является ли user_id UUID или telegram_id
+        user = None
+        user_uuid = None
+        
+        try:
+            # Пытаемся преобразовать в int - если получилось, это telegram_id
+            telegram_id = int(user_id)
+            user = db.query(User).filter(User.telegram_id == telegram_id).first()
+            if user:
+                user_uuid = user.id
+        except ValueError:
+            # Если не получилось преобразовать в int, считаем что это UUID
+            try:
+                user_uuid = uuid.UUID(user_id)
+                user = db.query(User).filter(User.id == user_uuid).first()
+            except ValueError:
+                # Невалидный формат
+                ADMIN_OPERATIONS_TOTAL.labels(operation="get_user_subscriptions", status="error", tenant_id=tenant_id).inc()
+                raise HTTPException(status_code=400, detail="Invalid user_id format. Expected UUID or telegram_id")
         
         if not user:
             ADMIN_OPERATIONS_TOTAL.labels(operation="get_user_subscriptions", status="not_found", tenant_id=tenant_id).inc()
             raise HTTPException(status_code=404, detail="User not found")
         
+        # Context7: Админ может видеть подписки всех пользователей, независимо от tenant
+        # Устанавливаем tenant_id пользователя для RLS политик, чтобы получить доступ к его данным
+        user_tenant_id = str(user.tenant_id)
+        if user_tenant_id != tenant_id:
+            logger.info(
+                "Admin accessing user from different tenant",
+                admin_id=str(admin_user.id),
+                admin_tenant_id=tenant_id,
+                user_id=user_id,
+                user_tenant_id=user_tenant_id,
+                trace_id=trace_id
+            )
+            # Устанавливаем tenant_id пользователя для RLS
+            set_tenant_id_in_session(db, user_tenant_id)
+        
         # Подписки на каналы
-        channel_subs = db.query(UserChannel, Channel).join(
+        # Context7: Используем outerjoin для обработки случаев, когда канал может быть удален
+        channel_subs = db.query(UserChannel, Channel).outerjoin(
             Channel, UserChannel.channel_id == Channel.id
         ).filter(UserChannel.user_id == user_uuid).all()
         
+        logger.debug(
+            "Found channel subscriptions",
+            user_id=user_id,
+            user_uuid=str(user_uuid),
+            channel_subs_count=len(channel_subs),
+            tenant_id=tenant_id,
+            trace_id=trace_id
+        )
+        
         # Подписки на группы
-        group_subs = db.query(UserGroup, Group).join(
+        # Context7: Используем outerjoin для обработки случаев, когда группа может быть удалена
+        group_subs = db.query(UserGroup, Group).outerjoin(
             Group, UserGroup.group_id == Group.id
         ).filter(UserGroup.user_id == user_uuid).all()
+        
+        logger.debug(
+            "Found group subscriptions",
+            user_id=user_id,
+            user_uuid=str(user_uuid),
+            group_subs_count=len(group_subs),
+            tenant_id=tenant_id,
+            trace_id=trace_id
+        )
         
         subscriptions = []
         
         # Обработка подписок на каналы
         for user_channel, channel in channel_subs:
+            # Context7: Обрабатываем случаи, когда канал может быть None (удален)
+            if channel is None:
+                logger.warning(
+                    "Channel not found for subscription",
+                    user_id=user_id,
+                    channel_id=str(user_channel.channel_id),
+                    tenant_id=tenant_id,
+                    trace_id=trace_id
+                )
+                continue
+            
             subscriptions.append(SubscriptionResponse(
                 id=f"channel_{user_channel.channel_id}",
                 channel_id=str(channel.id),
                 group_id=None,
-                channel_title=channel.title,
+                channel_title=channel.title or "Без названия",
                 group_title=None,
-                subscribed_at=user_channel.subscribed_at.isoformat(),
-                is_active=user_channel.is_active,
+                subscribed_at=user_channel.subscribed_at.isoformat() if user_channel.subscribed_at else datetime.now(timezone.utc).isoformat(),
+                is_active=user_channel.is_active if user_channel.is_active is not None else True,
                 type="channel"
             ))
         
         # Обработка подписок на группы
         for user_group, group in group_subs:
+            # Context7: Обрабатываем случаи, когда группа может быть None (удалена)
+            if group is None:
+                logger.warning(
+                    "Group not found for subscription",
+                    user_id=user_id,
+                    group_id=str(user_group.group_id),
+                    tenant_id=tenant_id,
+                    trace_id=trace_id
+                )
+                continue
+            
             subscriptions.append(SubscriptionResponse(
                 id=f"group_{user_group.group_id}",
                 channel_id=None,
                 group_id=str(group.id),
                 channel_title=None,
-                group_title=group.title,
-                subscribed_at=user_group.subscribed_at.isoformat(),
-                is_active=user_group.is_active,
+                group_title=group.title or "Без названия",
+                subscribed_at=user_group.subscribed_at.isoformat() if user_group.subscribed_at else datetime.now(timezone.utc).isoformat(),
+                is_active=user_group.is_active if user_group.is_active is not None else True,
                 type="group"
             ))
         
@@ -888,6 +968,21 @@ async def get_user_subscriptions(
         
     except HTTPException:
         raise
+    except ValueError as e:
+        # Ошибка парсинга UUID
+        duration = time.time() - start_time
+        ADMIN_OPERATION_DURATION.labels(operation="get_user_subscriptions", tenant_id=tenant_id).observe(duration)
+        ADMIN_OPERATIONS_TOTAL.labels(operation="get_user_subscriptions", status="error", tenant_id=tenant_id).inc()
+        
+        logger.error(
+            "Invalid user_id format",
+            error=str(e),
+            admin_id=str(admin_user.id),
+            user_id=user_id,
+            tenant_id=tenant_id,
+            trace_id=trace_id
+        )
+        raise HTTPException(status_code=400, detail="Invalid user_id format")
     except Exception as e:
         duration = time.time() - start_time
         ADMIN_OPERATION_DURATION.labels(operation="get_user_subscriptions", tenant_id=tenant_id).observe(duration)
@@ -896,10 +991,12 @@ async def get_user_subscriptions(
         logger.error(
             "Failed to get user subscriptions",
             error=str(e),
+            error_type=type(e).__name__,
             admin_id=str(admin_user.id),
             user_id=user_id,
             tenant_id=tenant_id,
-            trace_id=trace_id
+            trace_id=trace_id,
+            exc_info=True
         )
         raise HTTPException(status_code=500, detail="Failed to get user subscriptions")
 

@@ -15,39 +15,25 @@ logger = structlog.get_logger(__name__)
 PHONE_PATTERN = re.compile(r"(\+?\d[\d\s\-().]{6,})")
 EMAIL_PATTERN = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 TOKEN_REGEX = re.compile(r"[a-zA-Zа-яА-ЯёЁ0-9]{2,}", re.UNICODE)
+# Context7: Расширенный список стоп-слов для фильтрации тем и ключевых слов
+# Best Practice: Включаем служебные слова, которые не несут смысловой нагрузки
 STOPWORDS = {
-    "это",
-    "или",
-    "как",
-    "что",
-    "так",
-    "если",
-    "где",
-    "нет",
-    "для",
-    "про",
-    "при",
-    "когда",
-    "через",
-    "уже",
-    "после",
-    "будет",
-    "вас",
-    "они",
-    "все",
-    "еще",
-    "есть",
-    "эта",
-    "этот",
-    "эти",
-    "with",
-    "from",
-    "have",
-    "just",
-    "also",
-    "about",
-    "http",
-    "https",
+    # Русские служебные слова
+    "это", "или", "как", "что", "так", "если", "где", "нет", "для", "про",
+    "при", "когда", "через", "уже", "после", "будет", "вас", "они", "все",
+    "еще", "есть", "эта", "этот", "эти", "было", "были", "был", "была",
+    "может", "можно", "нужно", "надо", "должен", "должны", "должна",
+    "знаю", "знает", "знают", "знать", "только", "лишь", "просто",
+    "очень", "самый", "сама", "сами", "само", "самим", "самих",
+    "какой", "какая", "какие", "каким", "каких", "какого", "какой",
+    "который", "которая", "которые", "которого", "которых", "которым",
+    "вопрос", "ответ", "решение", "проблема", "тема", "обсуждение",
+    # Английские служебные слова
+    "with", "from", "have", "just", "also", "about", "http", "https",
+    "the", "a", "an", "and", "or", "of", "in", "on", "to", "is", "are",
+    "was", "were", "been", "being", "do", "does", "did", "will", "would",
+    "could", "should", "may", "might", "must", "this", "that", "these",
+    "those", "it", "its", "they", "them", "their", "there", "here",
 }
 
 
@@ -129,32 +115,51 @@ def text_similarity(left: str, right: str) -> float:
 
 
 def build_participant_stats(messages: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Context7: Подсчет статистики участников с учетом пересылок.
+    
+    Оригинальные сообщения и пересылки считаются отдельно для корректной оценки активности участников.
+    """
     stats: Dict[str, Dict[str, Any]] = {}
     for msg in messages:
-        username = msg.get("username") or f"user-{msg.get('telegram_id') or 'unknown'}"
+        username = msg.get("username") or msg.get("sender_username") or f"user-{msg.get('telegram_id') or msg.get('sender_tg_id') or 'unknown'}"
+        telegram_id = msg.get("telegram_id") or msg.get("sender_tg_id")
+        
         entry = stats.setdefault(
             username,
             {
                 "username": username,
-                "telegram_id": msg.get("telegram_id"),
-                "message_count": 0,
+                "telegram_id": telegram_id,
+                "message_count": 0,  # Context7: Только оригинальные сообщения
+                "forwarded_count": 0,  # Context7: Количество пересылок
                 "media_count": 0,
                 "media_types": {},
                 "media_samples": [],
             },
         )
-        entry["message_count"] += 1
-        media_items = msg.get("media") or []
-        if media_items:
-            entry["media_count"] += len(media_items)
-            media_types = entry.setdefault("media_types", {})
-            for media in media_items:
-                kind = media.get("kind") or "unknown"
-                media_types[kind] = media_types.get(kind, 0) + 1
-                if len(entry["media_samples"]) < 5:
-                    sample = media.get("description") or media.get("ocr_excerpt")
-                    if sample:
-                        entry["media_samples"].append(sample[:160])
+        
+        # Context7: Проверяем, является ли сообщение пересылкой
+        is_forwarded = msg.get("is_forwarded") or bool(msg.get("forward"))
+        
+        if is_forwarded:
+            entry["forwarded_count"] += 1
+            # Context7: Пересылки не учитываются в message_count для оценки активности
+        else:
+            entry["message_count"] += 1
+            
+            # Context7: Медиа из оригинальных сообщений учитываются в статистике
+            media_items = msg.get("media") or []
+            if media_items:
+                entry["media_count"] += len(media_items)
+                media_types = entry.setdefault("media_types", {})
+                for media in media_items:
+                    kind = media.get("kind") or "unknown"
+                    media_types[kind] = media_types.get(kind, 0) + 1
+                    if len(entry["media_samples"]) < 5:
+                        sample = media.get("description") or media.get("ocr_excerpt")
+                        if sample:
+                            entry["media_samples"].append(sample[:160])
+    
+    # Context7: Сортировка по оригинальным сообщениям (message_count), не по пересылкам
     return sorted(stats.values(), key=lambda item: item["message_count"], reverse=True)
 
 
@@ -516,6 +521,26 @@ class GroupContextService:
 
         topics: List[Dict[str, Any]] = []
         for idx, phrase in enumerate(top_phrases):
+            # Context7: Фильтруем фразы, которые являются стоп-словами
+            phrase_lower = phrase.lower().strip()
+            phrase_words = phrase_lower.split()
+            
+            # Пропускаем однословные фразы, если это стоп-слово
+            if len(phrase_words) == 1 and phrase_words[0] in STOPWORDS:
+                logger.debug(
+                    "Skipping stopword phrase in keyword topics",
+                    phrase=phrase,
+                )
+                continue
+            
+            # Пропускаем фразы, где все слова - стоп-слова
+            if all(word in STOPWORDS for word in phrase_words):
+                logger.debug(
+                    "Skipping phrase with all stopwords",
+                    phrase=phrase,
+                )
+                continue
+            
             # Ищем сообщения, содержащие эту фразу (или её части для биграмм)
             phrase_tokens = phrase.split()
             matched_messages = []
@@ -847,8 +872,238 @@ class GroupContextService:
             "actions": actions_list,
         }]
 
+    def _cluster_similar_topics(self, topics: List[Dict[str, Any]], similarity_threshold: float = 0.4) -> List[Dict[str, Any]]:
+        """Context7: Кластеризация семантически похожих тем в одну тему.
+        
+        Best Practice: Используем TF-based cosine similarity + проверку ключевых слов
+        для группировки похожих тем, как в тренд-детекции.
+        
+        Args:
+            topics: Список тем для кластеризации
+            similarity_threshold: Порог сходства для объединения (понижен до 0.4 для лучшей группировки)
+        
+        Returns:
+            Список объединенных тем
+        """
+        if len(topics) <= 1:
+            return topics
+        
+        # Создаем текстовые представления тем для сравнения
+        topic_texts: List[str] = []
+        topic_keywords_sets: List[set] = []  # Множества ключевых слов для каждой темы
+        
+        for topic in topics:
+            # Комбинируем title, summary, keywords для лучшего сходства
+            title = (topic.get("title") or "").strip()
+            summary = (topic.get("summary") or "").strip()
+            keywords = topic.get("keywords", []) or []
+            keywords_str = " ".join(keywords)
+            combined = f"{title} {summary} {keywords_str}".strip()
+            topic_texts.append(combined)
+            
+            # Создаем множество ключевых слов для проверки пересечений
+            # Извлекаем значимые слова из title, summary, keywords
+            all_text = f"{title} {summary} {keywords_str}".lower()
+            tokens = TOKEN_REGEX.findall(all_text)
+            # Фильтруем стоп-слова и короткие токены
+            significant_tokens = {
+                t for t in tokens 
+                if len(t) >= 3 and t not in STOPWORDS and t not in {"вопрос", "решение", "проблема", "тема"}
+            }
+            topic_keywords_sets.append(significant_tokens)
+        
+        # Группируем похожие темы
+        clusters: List[List[int]] = []
+        used = set()
+        
+        for i, text_i in enumerate(topic_texts):
+            if i in used:
+                continue
+            
+            # Создаем новый кластер с текущей темой
+            cluster = [i]
+            used.add(i)
+            keywords_i = topic_keywords_sets[i]
+            
+            # Ищем похожие темы
+            for j, text_j in enumerate(topic_texts):
+                if i == j or j in used:
+                    continue
+                
+                keywords_j = topic_keywords_sets[j]
+                
+                # Метод 1: TF-based cosine similarity
+                similarity = text_similarity(text_i, text_j)
+                
+                # Метод 2: Проверка пересечения ключевых слов
+                # Если есть значимое пересечение ключевых слов (>= 2 общих слова), считаем темы похожими
+                keyword_intersection = keywords_i & keywords_j
+                keyword_overlap = len(keyword_intersection)
+                
+                # Если пересечение >= 2 значимых слов, считаем темы похожими
+                # Или если similarity достаточно высокий
+                should_merge = False
+                
+                if keyword_overlap >= 2:
+                    should_merge = True
+                    logger.debug(
+                        "Merging topics by keyword overlap",
+                        topic_i=topics[i].get("title"),
+                        topic_j=topics[j].get("title"),
+                        overlap_count=keyword_overlap,
+                        common_keywords=list(keyword_intersection)[:5],
+                    )
+                elif similarity >= similarity_threshold:
+                    should_merge = True
+                    logger.debug(
+                        "Merging topics by similarity",
+                        topic_i=topics[i].get("title"),
+                        topic_j=topics[j].get("title"),
+                        similarity=similarity,
+                    )
+                elif keyword_overlap >= 1 and similarity >= 0.25:
+                    # Если есть хотя бы одно общее слово и минимальное сходство
+                    should_merge = True
+                    logger.debug(
+                        "Merging topics by keyword + similarity",
+                        topic_i=topics[i].get("title"),
+                        topic_j=topics[j].get("title"),
+                        overlap_count=keyword_overlap,
+                        similarity=similarity,
+                    )
+                
+                if should_merge:
+                    cluster.append(j)
+                    used.add(j)
+                    # Обновляем ключевые слова кластера (объединение)
+                    keywords_i = keywords_i | keywords_j
+            
+            clusters.append(cluster)
+        
+        # Объединяем темы в каждом кластере
+        merged_topics: List[Dict[str, Any]] = []
+        for cluster_indices in clusters:
+            if len(cluster_indices) == 1:
+                # Одна тема - просто добавляем
+                merged_topics.append(topics[cluster_indices[0]])
+            else:
+                # Объединяем несколько тем
+                cluster_topics = [topics[idx] for idx in cluster_indices]
+                
+                # Выбираем лучшее название (самое информативное, не стоп-слово)
+                best_title = None
+                for topic in cluster_topics:
+                    title = (topic.get("title") or "").strip()
+                    title_lower = title.lower()
+                    # Пропускаем стоп-слова и общие названия
+                    if (title_lower not in STOPWORDS and 
+                        title_lower not in {"вопрос", "решение", "проблема", "тема"} and
+                        len(title) > 3):
+                        if not best_title or len(title) > len(best_title):
+                            best_title = title
+                
+                # Если не нашли хорошее название, используем самое длинное
+                if not best_title:
+                    best_title = max((t.get("title", "") for t in cluster_topics), key=len)
+                
+                # Объединяем summaries
+                summaries = [t.get("summary", "").strip() for t in cluster_topics if t.get("summary")]
+                combined_summary = " ".join(summaries[:3])[:400]  # Ограничиваем длину
+                
+                # Объединяем message_ids
+                all_message_ids = []
+                for topic in cluster_topics:
+                    all_message_ids.extend(topic.get("message_ids", []) or [])
+                unique_message_ids = list(dict.fromkeys(all_message_ids))  # Сохраняем порядок, убираем дубли
+                
+                # Объединяем owners
+                all_owners = []
+                for topic in cluster_topics:
+                    owners = topic.get("owners", []) or []
+                    if isinstance(owners, list):
+                        all_owners.extend(owners)
+                    elif isinstance(owners, str):
+                        all_owners.append(owners)
+                unique_owners = list(dict.fromkeys(all_owners))[:5]  # Top-5
+                
+                # Объединяем keywords
+                all_keywords = []
+                for topic in cluster_topics:
+                    keywords = topic.get("keywords", []) or []
+                    if isinstance(keywords, list):
+                        all_keywords.extend(keywords)
+                    elif isinstance(keywords, str):
+                        all_keywords.append(keywords)
+                unique_keywords = list(dict.fromkeys([kw.lower() for kw in all_keywords if kw]))[:10]
+                
+                # Объединяем decisions - берем первое непустое
+                decision = None
+                for topic in cluster_topics:
+                    topic_decision = topic.get("decision", "").strip()
+                    if topic_decision and topic_decision not in {"Явных решений не найдено", "Требуется зафиксировать итоговое решение"}:
+                        decision = topic_decision
+                        break
+                if not decision:
+                    decision = cluster_topics[0].get("decision", "Явных решений не найдено")
+                
+                # Объединяем actions
+                all_actions = []
+                for topic in cluster_topics:
+                    actions = topic.get("actions", []) or []
+                    if isinstance(actions, list):
+                        all_actions.extend(actions)
+                    elif isinstance(actions, str):
+                        all_actions.append(actions)
+                unique_actions = list(dict.fromkeys(all_actions))[:5]
+                
+                # Вычисляем суммарный msg_count и приоритет
+                total_msg_count = sum(t.get("msg_count", 0) for t in cluster_topics)
+                priorities = [t.get("priority", "medium") for t in cluster_topics]
+                # Приоритет: critical > high > medium > low
+                priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+                best_priority = min(priorities, key=lambda p: priority_order.get(p, 2))
+                
+                # Определяем статус (если хотя бы один agreed, то agreed)
+                statuses = [t.get("status", "unclear") for t in cluster_topics]
+                final_status = "agreed" if "agreed" in statuses else (statuses[0] if statuses else "unclear")
+                
+                # Создаем объединенную тему
+                merged_topic = {
+                    "title": best_title,
+                    "priority": best_priority,
+                    "msg_count": total_msg_count,
+                    "threads": cluster_topics[0].get("threads", []),  # Берем из первой темы
+                    "message_ids": unique_message_ids,
+                    "summary": combined_summary or f"Обсуждение по теме {best_title}",
+                    "decision": decision,
+                    "status": final_status,
+                    "owners": unique_owners,
+                    "blockers": cluster_topics[0].get("blockers", []),
+                    "actions": unique_actions,
+                    "signals": {
+                        "source": "clustered",
+                        "original_topics_count": len(cluster_indices),
+                        "original_titles": [t.get("title") for t in cluster_topics],
+                    },
+                    "keywords": unique_keywords,
+                }
+                
+                merged_topics.append(merged_topic)
+        
+        logger.info(
+            "Clustered similar topics",
+            original_count=len(topics),
+            merged_count=len(merged_topics),
+            similarity_threshold=similarity_threshold,
+        )
+        
+        return merged_topics
+
     def _normalize_topics(self, topics: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Нормализация тем: убрать пустые, дубли, обрезать воду."""
+        """Context7: Нормализация тем - убрать пустые, дубли, стоп-слова, обрезать воду.
+        
+        Best Practice: Фильтруем темы, которые являются стоп-словами или слишком общими.
+        """
         if not topics:
             return []
         
@@ -861,8 +1116,35 @@ class GroupContextService:
             if not title or title in generic_titles:
                 continue
             
+            # Context7: Проверяем, не является ли название стоп-словом
+            title_lower = title.lower().strip()
+            
+            # Проверяем однословные названия - они не должны быть стоп-словами
+            title_words = title_lower.split()
+            if len(title_words) == 1 and title_words[0] in STOPWORDS:
+                logger.debug(
+                    "Filtering topic with stopword title",
+                    title=title,
+                    stopword=title_words[0],
+                )
+                continue
+            
+            # Проверяем, начинается ли название со стоп-слова (кроме многословных фраз)
+            if len(title_words) > 1 and title_words[0] in STOPWORDS:
+                # Если первое слово - стоп-слово, пробуем убрать его
+                filtered_words = [w for w in title_words if w not in STOPWORDS]
+                if filtered_words:
+                    title = " ".join(filtered_words).capitalize()
+                    title_lower = title.lower().strip()
+                else:
+                    # Если все слова - стоп-слова, пропускаем тему
+                    logger.debug(
+                        "Filtering topic with all stopwords in title",
+                        original_title=topic.get("title"),
+                    )
+                    continue
+            
             # Проверяем на дубли (нормализуем для сравнения)
-            title_lower = title.lower()
             if title_lower in seen_titles:
                 continue
             seen_titles.add(title_lower)
@@ -911,6 +1193,7 @@ class GroupContextService:
         return normalized
 
     def _sanitize_messages(self, raw_messages: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Context7: Санитизация сообщений с сохранением информации о пересылках."""
         sanitized: List[Dict[str, Any]] = []
         for raw in sorted(raw_messages, key=lambda m: m.get("posted_at") or ""):
             posted_at = parse_timestamp(raw.get("posted_at"))
@@ -927,6 +1210,18 @@ class GroupContextService:
             reaction_count = int(raw.get("reaction_count") or 0)
             # Сохраняем tg_message_id для формирования ссылок
             tg_message_id = raw.get("tg_message_id") or raw.get("telegram_message_id")
+            
+            # Context7: Извлекаем информацию о пересылке
+            is_forwarded = raw.get("is_forwarded") or False
+            forward_info = raw.get("forward")
+            if not forward_info:
+                # Проверяем reply_to JSON на наличие forward
+                reply_to_data = raw.get("reply_to")
+                if isinstance(reply_to_data, dict):
+                    forward_info = reply_to_data.get("forward")
+                    if forward_info:
+                        is_forwarded = True
+            
             sanitized.append(
                 {
                     "message_id": str(raw.get("id") or raw.get("tg_message_id") or uuid.uuid4().hex),
@@ -939,6 +1234,8 @@ class GroupContextService:
                     "raw_content": base_content,
                     "reply_to_id": extract_reply_to(raw),
                     "is_service": bool(raw.get("is_service")),
+                    "is_forwarded": is_forwarded,  # Context7: Флаг пересылки
+                    "forward": forward_info,  # Context7: Информация о пересылке
                     "reaction_count": reaction_count,
                     "media": media_entries,
                     "media_summary": media_summary,

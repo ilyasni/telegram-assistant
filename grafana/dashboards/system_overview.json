@@ -93,7 +93,7 @@
           "refId": "A"
         }
       ],
-      "title": "❗ Errors Rate",
+      "title": "\u2757 Errors Rate",
       "type": "stat"
     },
     {
@@ -160,7 +160,7 @@
           "refId": "A"
         }
       ],
-      "title": "✅ Services Available",
+      "title": "\u2705 Services Available",
       "type": "stat"
     },
     {
@@ -236,7 +236,7 @@
           "refId": "A"
         }
       ],
-      "title": "📦 Posts Processing Rate",
+      "title": "\ud83d\udce6 Posts Processing Rate",
       "type": "stat"
     },
     {
@@ -245,16 +245,21 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "Time since last scheduler tick (should be < 600s for 5min interval)",
+      "description": "Time since last scheduler tick (should be < 600s for 5min interval). Values > 24h are clamped.",
       "fieldConfig": {
         "defaults": {
           "color": {
             "mode": "thresholds"
           },
           "mappings": [],
+          "noValue": "N/A",
           "thresholds": {
             "mode": "absolute",
             "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
               {
                 "color": "green",
                 "value": 0
@@ -310,13 +315,128 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "time() - scheduler_last_tick_ts_seconds",
+          "expr": "clamp_max(time() - scheduler_last_tick_ts_seconds, 86400)",
           "legendFormat": "Scheduler Freshness",
           "refId": "A"
         }
       ],
-      "title": "⏰ Scheduler Freshness",
+      "title": "\u23f0 Scheduler Freshness",
       "type": "stat"
+    },
+    {
+      "datasource": {
+        "name": "Prometheus",
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "History of scheduler freshness over time (time since last tick)",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "vis": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 300
+              },
+              {
+                "color": "orange",
+                "value": 600
+              },
+              {
+                "color": "red",
+                "value": 900
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 4
+      },
+      "id": 14,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max",
+            "mean"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "name": "Prometheus",
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "clamp_max(time() - scheduler_last_tick_ts_seconds, 86400)",
+          "legendFormat": "Scheduler Freshness (Last Tick)",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "name": "Prometheus",
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "clamp_max(time() - scheduler_heartbeat_seconds, 86400)",
+          "legendFormat": "Scheduler Heartbeat",
+          "refId": "B"
+        }
+      ],
+      "title": "\ud83d\udcca Scheduler Freshness History",
+      "type": "timeseries"
     },
     {
       "datasource": {
@@ -377,7 +497,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(increase(posts_processed_total[24h]))",
+          "expr": "sum(increase(posts_processed_total{stage=~\"tagging|enrichment|indexing\"}[24h])) + sum(increase(posts_parsed_total[24h]))",
           "interval": "",
           "intervalMs": 30000,
           "legendFormat": "Posts Processed (24h)",
@@ -385,7 +505,7 @@
           "refId": "A"
         }
       ],
-      "title": "📊 Posts Processed (24h)",
+      "title": "\ud83d\udcca Posts Processed (24h)",
       "type": "stat"
     },
     {
@@ -925,7 +1045,7 @@
           "refId": "A"
         }
       ],
-      "title": "📊 Parser Runs Rate",
+      "title": "\ud83d\udcca Parser Runs Rate",
       "type": "timeseries"
     },
     {
@@ -1026,7 +1146,7 @@
           "refId": "A"
         }
       ],
-      "title": "📈 Enrichment Processing Rate",
+      "title": "\ud83d\udcc8 Enrichment Processing Rate",
       "type": "timeseries"
     },
     {
@@ -1161,7 +1281,7 @@
           "refId": "C"
         }
       ],
-      "title": "📊 Enriched Posts: Queue vs Processed",
+      "title": "\ud83d\udcca Enriched Posts: Queue vs Processed",
       "type": "timeseries"
     },
     {
@@ -1293,7 +1413,7 @@
           "refId": "C"
         }
       ],
-      "title": "⏱️ Channel Processing Time",
+      "title": "\u23f1\ufe0f Channel Processing Time",
       "type": "timeseries"
     },
     {
@@ -1302,7 +1422,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "Total queue size across all queues (with color thresholds)",
+      "description": "Maximum queue size across all queues over the last 24 hours (with color thresholds)",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1367,13 +1487,363 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(posts_in_queue_total{status=\"total\"}) by (queue)",
-          "legendFormat": "{{queue}}",
+          "expr": "max by (queue) (max_over_time(posts_in_queue_total{status=\"total\"}[24h]))",
+          "legendFormat": "{{queue}} (max 24h)",
           "refId": "A"
         }
       ],
-      "title": "📦 Total Queue Size",
+      "title": "\ud83d\udce6 Total Queue Size (24h max)",
       "type": "stat"
+    },
+    {
+      "id": 15,
+      "title": "PostgreSQL Operations Rate",
+      "type": "stat",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 44
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(postgres_operations_total[5m])) by (operation, status)",
+          "refId": "A",
+          "legendFormat": "{{operation}} ({{status}})"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "decimals": 2
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 16,
+      "title": "PostgreSQL Latency (p95)",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 6,
+        "y": 44
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, rate(postgres_operation_duration_seconds_bucket[5m]))",
+          "refId": "A",
+          "legendFormat": "{{operation}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 3
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 17,
+      "title": "PostgreSQL Connections",
+      "type": "stat",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 44
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "postgres_connections_active / postgres_connections_max",
+          "refId": "A",
+          "legendFormat": "Usage"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1,
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 18,
+      "title": "Qdrant Operations Rate",
+      "type": "stat",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 48
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(qdrant_operations_total[5m])) by (operation, status)",
+          "refId": "A",
+          "legendFormat": "{{operation}} ({{status}})"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "decimals": 2
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 19,
+      "title": "Qdrant Latency (p95)",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 6,
+        "y": 48
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, rate(qdrant_operation_duration_seconds_bucket[5m]))",
+          "refId": "A",
+          "legendFormat": "{{operation}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 3
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 20,
+      "title": "Qdrant Collection Size",
+      "type": "stat",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 48
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(qdrant_collection_size) by (collection)",
+          "refId": "A",
+          "legendFormat": "{{collection}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 21,
+      "title": "Post Persistence Processed",
+      "type": "stat",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 52
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(post_persistence_processed_total[5m])) by (status)",
+          "refId": "A",
+          "legendFormat": "{{status}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "decimals": 2
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 22,
+      "title": "Post Persistence PEL Size",
+      "type": "stat",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 52
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(post_persistence_pel_size) by (consumer_group)",
+          "refId": "A",
+          "legendFormat": "{{consumer_group}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 23,
+      "title": "Graph Writer Processed",
+      "type": "stat",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 52
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(graph_writer_processed_total[5m])) by (operation_type, status)",
+          "refId": "A",
+          "legendFormat": "{{operation_type}} ({{status}})"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "decimals": 2
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 24,
+      "title": "Graph Writer PEL Size",
+      "type": "stat",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 56
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(graph_writer_pel_size) by (stream, consumer_group)",
+          "refId": "A",
+          "legendFormat": "{{stream}}/{{consumer_group}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 25,
+      "title": "API Endpoint Requests",
+      "type": "stat",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 56
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(api_endpoint_requests_total[5m])) by (endpoint, status_code)",
+          "refId": "A",
+          "legendFormat": "{{endpoint}} ({{status_code}})"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "decimals": 2
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 26,
+      "title": "API Endpoint Latency (p95)",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 60
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, rate(api_endpoint_latency_seconds_bucket{endpoint=~'/api/.*'}[5m]))",
+          "refId": "A",
+          "legendFormat": "{{endpoint}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 3
+        },
+        "overrides": []
+      }
     }
   ],
   "preload": false,
@@ -1436,5 +1906,5 @@
   "timezone": "browser",
   "title": "System Overview",
   "uid": "system-overview",
-  "version": 28
+  "version": 29
 }

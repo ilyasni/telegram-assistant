@@ -170,7 +170,11 @@ class MediaProcessor:
         self.s3_service = s3_service
         self.storage_quota = storage_quota
         self.redis_client = redis_client
-        self.tenant_id = tenant_id or os.getenv("S3_DEFAULT_TENANT_ID", "877193ef-be80-4977-aaeb-8009c3d772ee")
+        # Context7: Убираем хардкод UUID - используем только env переменную
+        s3_default_tenant_id = os.getenv("S3_DEFAULT_TENANT_ID")
+        if not s3_default_tenant_id:
+            raise ValueError("S3_DEFAULT_TENANT_ID must be set in environment variables")
+        self.tenant_id = tenant_id or s3_default_tenant_id
         
         logger.info(
             "MediaProcessor initialized",

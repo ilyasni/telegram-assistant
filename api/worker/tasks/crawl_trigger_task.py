@@ -125,6 +125,8 @@ class CrawlTriggerTask:
         # Context7: Бесконечный цикл с обработкой всех исключений для предотвращения завершения задачи
         # Context7: Добавлено логирование для диагностики завершения задачи
         iteration = 0
+        pending_check_interval = 60  # Проверять pending каждые 60 секунд
+        last_pending_check = time.time()
         logger.info("CrawlTriggerTask entering main loop")
         try:
             while True:
@@ -138,6 +140,15 @@ class CrawlTriggerTask:
                         crawl_trigger_queue_depth_current.set(queue_length)
                     except Exception as e:
                         logger.warning("Failed to get queue length", error=str(e))
+                    
+                    # Context7: Периодическая проверка pending сообщений
+                    current_time = time.time()
+                    if current_time - last_pending_check >= pending_check_interval:
+                        try:
+                            await self._process_pending_messages()
+                            last_pending_check = current_time
+                        except Exception as e:
+                            logger.error("Error processing pending messages", error=str(e))
                     
                     # Читаем сообщения (сначала с начала, потом только новые)
                     logger.debug("Reading from stream", stream=self.stream_in, group=self.consumer_group)
@@ -206,6 +217,59 @@ class CrawlTriggerTask:
             logger.warning("CrawlTriggerTask.start() exiting - this should not happen!")
             # Context7: Если мы дошли сюда, значит цикл завершился - это ошибка
             # Не возвращаемся, чтобы supervisor мог перезапустить задачу
+    
+    async def _process_pending_messages(self) -> int:
+        """
+        Context7: Обработка pending сообщений через XAUTOCLAIM.
+        Возвращает количество обработанных сообщений.
+        """
+        try:
+            # Используем xautoclaim для получения pending сообщений
+            # min_idle_time: 5000ms (5 секунд) - сообщения, которые не обрабатывались 5+ секунд
+            result = await self.redis.xautoclaim(
+                name=self.stream_in,
+                groupname=self.consumer_group,
+                consumername=self.consumer_name,
+                min_idle_time=5000,  # 5 секунд
+                start_id="0-0",
+                count=50,
+                justid=False
+            )
+            
+            # xautoclaim возвращает [next_id, messages]
+            if isinstance(result, (list, tuple)) and len(result) >= 2:
+                next_id, messages = result[0], result[1]
+            else:
+                messages = result if result else []
+                next_id = None
+            
+            if not messages:
+                return 0
+            
+            processed = 0
+            for msg_id, fields in messages:
+                try:
+                    start_time = time.time()
+                    await self._process_tagged_event(msg_id, fields)
+                    processing_time = time.time() - start_time
+                    crawl_trigger_processing_latency_seconds.observe(processing_time)
+                    
+                    await self.redis.xack(self.stream_in, self.consumer_group, msg_id)
+                    processed += 1
+                    logger.debug("Processed pending message", msg_id=msg_id)
+                except Exception as e:
+                    logger.error("Error processing pending message",
+                               msg_id=msg_id, error=str(e), exc_info=True)
+                    # Не ACK - оставляем в PEL для повторной обработки
+            
+            if processed > 0:
+                logger.info("Processed pending messages", count=processed)
+            
+            return processed
+            
+        except Exception as e:
+            logger.error("Error in _process_pending_messages", error=str(e), exc_info=True)
+            return 0
     
     async def _process_tagged_event(self, msg_id: str, fields: Dict[str, Any]):
         """Проверка триггеров и публикация в posts.crawl."""

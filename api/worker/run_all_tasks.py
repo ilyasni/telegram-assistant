@@ -427,6 +427,39 @@ async def main():
     except ImportError:
         logger.debug("AlbumAssemblerTask metrics not available (module may not be loaded)")
     
+    # Context7: Импорт метрик post persistence для регистрации
+    try:
+        from tasks.post_persistence_task import (
+            post_persistence_processed_total,
+            post_persistence_latency_seconds,
+            post_persistence_db_operations_total,
+            post_persistence_pel_size
+        )
+    except ImportError:
+        logger.debug("PostPersistenceTask metrics not available (module may not be loaded)")
+    
+    # Context7: Импорт метрик PostgreSQL для регистрации
+    try:
+        from api.utils.postgres_metrics import (
+            postgres_operations_total,
+            postgres_operation_duration_seconds,
+            postgres_connections_active,
+            postgres_connections_max
+        )
+    except ImportError:
+        logger.debug("PostgreSQL metrics not available (module may not be loaded)")
+    
+    # Context7: Импорт метрик Qdrant для регистрации
+    try:
+        from worker.integrations.qdrant_client import (
+            qdrant_operations_total,
+            qdrant_operation_duration_seconds,
+            qdrant_collection_size,
+            qdrant_collection_indexed
+        )
+    except ImportError:
+        logger.debug("Qdrant metrics not available (module may not be loaded)")
+    
     # Context7: Метрики refinement автоматически регистрируются при импорте модуля
     # Импорт здесь не нужен, чтобы избежать дублирования регистрации
     try:

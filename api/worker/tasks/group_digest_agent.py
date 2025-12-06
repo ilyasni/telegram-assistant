@@ -2868,7 +2868,84 @@ class GroupDigestOrchestrator:
             # Шаг 2: Нормализация тем
             topics = self._context_service._normalize_topics(topics)
             
-            # Шаг 3: Fallback на keyword_topics если тем нет
+            # Шаг 3: Context7 Best Practice - Post-processing валидация: сравнение LLM-тем со статистическим baseline
+            # Используем keyword-based topic extraction как baseline для обнаружения пропущенных тем
+            # Это универсальный подход без хардкода ключевых слов
+            keyword_topics_baseline = self._context_service.build_keyword_topics(
+                sanitized_messages,
+                media_highlights,
+                limit=10,  # Берем больше, чтобы не пропустить значимые темы
+            )
+            
+            if keyword_topics_baseline:
+                # Извлекаем ключевые фразы из baseline тем
+                baseline_keywords = set()
+                for kw_topic in keyword_topics_baseline:
+                    title = (kw_topic.get("title", "") or "").lower().strip()
+                    if title and len(title) > 2:  # Игнорируем слишком короткие
+                        baseline_keywords.add(title)
+                    # Также извлекаем keywords из темы, если есть
+                    for kw in kw_topic.get("keywords", []):
+                        if kw and isinstance(kw, str) and len(kw) > 2:
+                            baseline_keywords.add(kw.lower().strip())
+                
+                # Проверяем, какие baseline темы не покрыты LLM-темами
+                llm_covered_keywords = set()
+                for llm_topic in topics:
+                    title = (llm_topic.get("title", "") or "").lower().strip()
+                    if title:
+                        llm_covered_keywords.add(title)
+                        # Проверяем частичное совпадение (если baseline keyword содержится в LLM теме)
+                        for baseline_kw in baseline_keywords:
+                            if baseline_kw in title or title in baseline_kw:
+                                llm_covered_keywords.add(baseline_kw)
+                    for kw in llm_topic.get("keywords", []):
+                        if kw and isinstance(kw, str):
+                            kw_lower = kw.lower().strip()
+                            llm_covered_keywords.add(kw_lower)
+                            # Проверяем частичное совпадение
+                            for baseline_kw in baseline_keywords:
+                                if baseline_kw in kw_lower or kw_lower in baseline_kw:
+                                    llm_covered_keywords.add(baseline_kw)
+                
+                # Находим пропущенные значимые темы
+                missing_keywords = baseline_keywords - llm_covered_keywords
+                
+                # Добавляем темы из baseline, которые не были покрыты LLM
+                # Используем только те baseline темы, которые соответствуют пропущенным keywords
+                for kw_topic in keyword_topics_baseline:
+                    title_lower = (kw_topic.get("title", "") or "").lower().strip()
+                    # Проверяем, является ли эта тема пропущенной
+                    is_missing = title_lower in missing_keywords or any(
+                        kw.lower().strip() in missing_keywords 
+                        for kw in kw_topic.get("keywords", [])
+                        if isinstance(kw, str)
+                    )
+                    
+                    if is_missing and kw_topic.get("msg_count", 0) >= 2:
+                        # Добавляем тему из baseline, если она достаточно значима
+                        topics.append(kw_topic)
+                        logger.info(
+                            "Added missing topic from statistical baseline validation",
+                            topic_title=kw_topic.get("title"),
+                            msg_count=kw_topic.get("msg_count"),
+                            source="keyword_statistical_validation",
+                        )
+            
+            # Context7: Повторная нормализация после добавления тем из baseline
+            # Это гарантирует, что стоп-слова будут отфильтрованы
+            topics = self._context_service._normalize_topics(topics)
+            
+            # Шаг 3.5: Context7 Best Practice - Кластеризация семантически похожих тем
+            # Объединяем темы с высоким семантическим сходством (например, "Вопрос", "Улицы", "Лизюкова" 
+            # про памятник котенка объединяются в одну тему)
+            if len(topics) > 1:
+                topics = self._context_service._cluster_similar_topics(
+                    topics,
+                    similarity_threshold=0.55,  # Порог как в тренд-детекции (TREND_COHERENCE_THRESHOLD)
+                )
+            
+            # Шаг 4: Fallback на keyword_topics если тем нет
             if not topics:
                 keyword_topics = self._context_service.build_keyword_topics(
                     sanitized_messages,
@@ -2878,7 +2955,7 @@ class GroupDigestOrchestrator:
                     topics = keyword_topics
                     fallback_used = True
             
-            # Шаг 4: Fallback на создание темы из сообщений
+            # Шаг 5: Fallback на создание темы из сообщений
             if not topics:
                 fallback_topics = self._context_service._build_fallback_topic_from_messages(
                     sanitized_messages, media_highlights
@@ -3026,9 +3103,12 @@ class GroupDigestOrchestrator:
         if state.get("skip"):
             return {}
         with self._stage_span("synthesis_agent", state):
-            cached = self._load_cached_stage(state, "synthesis_agent")
-            if cached:
-                return cached
+            # Context7: Пропускаем кэш для synthesis_agent, чтобы всегда генерировать новый дайджест
+            # Это позволяет использовать baseline для сравнения и получать актуальный контент
+            # Даже если для окна уже был сгенерирован дайджест, мы перегенерируем его с учетом baseline
+            # cached = self._load_cached_stage(state, "synthesis_agent")
+            # if cached:
+            #     return cached
             prompt = self._prompts["synthesis_agent"]
             tenant_id = state.get("tenant_id", "")
             trace_id = state.get("trace_id", "")
@@ -3748,12 +3828,28 @@ class GroupDigestOrchestrator:
         if requested_by_user_id:
             window["requested_by_user_id"] = str(requested_by_user_id)
 
+        # Context7: Используем baseline_snapshot из payload, если он передан
+        # Это позволяет использовать существующий дайджест для сравнения при генерации нового
+        baseline_from_payload = payload.get("baseline_snapshot")
+        initial_baseline: Dict[str, Any] = {}
+        if isinstance(baseline_from_payload, dict) and baseline_from_payload:
+            initial_baseline = baseline_from_payload
+            logger.info(
+                "Using baseline snapshot from payload",
+                window_id=baseline_from_payload.get("window_id"),
+                has_topics=bool(baseline_from_payload.get("topics")),
+                has_metrics=bool(baseline_from_payload.get("metrics")),
+            )
+        
+        # Context7: Игнорируем skip из metadata_snapshot - всегда генерируем новый дайджест
+        # Старое состояние может содержать skip=True, но мы хотим перегенерировать дайджест
+        # даже если он уже был сгенерирован ранее (для использования baseline сравнения)
         initial_state: GroupDigestState = {
             "window": window,
             "messages": payload.get("messages", []),
             "errors": list(metadata_snapshot.get("errors", [])) if isinstance(metadata_snapshot, dict) else [],
-            "skip": bool(metadata_snapshot.get("skip")) if isinstance(metadata_snapshot, dict) else False,
-            "skip_reason": metadata_snapshot.get("skip_reason"),
+            "skip": False,  # Context7: Всегда генерируем новый дайджест, игнорируем старое состояние
+            "skip_reason": None,  # Context7: Очищаем skip_reason, так как генерируем заново
             "state_store": store,
             "artifact_metadata": artifact_metadata,
             "schema_version": self.schema_version,
@@ -3763,7 +3859,7 @@ class GroupDigestOrchestrator:
             "requested_by_user_id": str(requested_by_user_id) if requested_by_user_id else None,
             "dlq_events": [],
             "synthesis_retry_used": False,
-            "baseline_snapshot": {},
+            "baseline_snapshot": initial_baseline,
             "_dlq_first_seen": {},
         }
 

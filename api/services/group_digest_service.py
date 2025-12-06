@@ -29,14 +29,18 @@ from models.database import (
     GroupMediaMap,
     GroupMessage,
     User,
+    PostEnrichment,
+    PostMediaMap,
 )
 # Context7: импортируем оркестратор и event publisher как из API-контекста, так и из worker-контейнера
 try:
     from worker.tasks.group_digest_agent import GroupDigestOrchestrator
     from worker.event_bus import EventPublisher, create_publisher
+    from worker.common.baseline_compare import BaselineSnapshot
 except ModuleNotFoundError:  # pragma: no cover - fallback для worker-контейнера
     from tasks.group_digest_agent import GroupDigestOrchestrator  # type: ignore
     from event_bus import EventPublisher, create_publisher  # type: ignore
+    from common.baseline_compare import BaselineSnapshot  # type: ignore
 from api.services.graph_service import get_graph_service
 
 logger = structlog.get_logger()
@@ -100,7 +104,7 @@ class GroupDigestService:
             return mapping.get(prefix, "unknown")
         return "unknown"
 
-    def _serialize_group_message(self, message: GroupMessage) -> Dict[str, Any]:
+    def _serialize_group_message(self, message: GroupMessage, db: Optional[Session] = None) -> Dict[str, Any]:
         """Подготовка структуры сообщения с обогащением медиа и аналитикой."""
         analytics_payload: Dict[str, Any] = {}
         media_analysis_map: Dict[str, Dict[str, Any]] = {}
@@ -134,6 +138,34 @@ class GroupDigestService:
         legacy_media = message.media_urls or []
         sorted_media = sorted(getattr(message, "media_map", []) or [], key=lambda link: link.position or 0)
 
+        # Context7: Получаем Vision данные из PostEnrichment для медиа файлов по file_sha256
+        vision_data_map: Dict[str, Dict[str, Any]] = {}
+        if db and sorted_media:
+            file_sha256_list = [str(media_link.file_sha256) for media_link in sorted_media if media_link.file_sha256]
+            if file_sha256_list:
+                # Ищем Vision данные через PostMediaMap -> PostEnrichment по file_sha256
+                vision_results = (
+                    db.query(PostEnrichment, PostMediaMap.file_sha256)
+                    .join(PostMediaMap, PostEnrichment.post_id == PostMediaMap.post_id)
+                    .filter(
+                        PostMediaMap.file_sha256.in_(file_sha256_list),
+                        PostEnrichment.kind == "vision",
+                    )
+                    .order_by(PostEnrichment.updated_at.desc())
+                    .all()
+                )
+                
+                # Создаем мапу file_sha256 -> vision_data (берем самый свежий для каждого файла)
+                for enrichment, file_sha256 in vision_results:
+                    sha256_str = str(file_sha256)
+                    if sha256_str not in vision_data_map:
+                        vision_data = enrichment.data or {}
+                        vision_data_map[sha256_str] = {
+                            "description": vision_data.get("description") or vision_data.get("summary"),
+                            "labels": vision_data.get("labels") or [],
+                            "ocr": vision_data.get("ocr") or {},
+                        }
+
         for idx, media_link in enumerate(sorted_media):
             meta = media_link.meta or {}
             media_object = getattr(media_link, "media_object", None)
@@ -141,18 +173,47 @@ class GroupDigestService:
             size_bytes = meta.get("size_bytes") or (media_object.size_bytes if media_object else None)
             size_int = int(size_bytes) if isinstance(size_bytes, (int, float)) else None
 
-            analysis = media_analysis_map.get(media_link.file_sha256, {})
+            file_sha256_str = str(media_link.file_sha256)
+            
+            # Context7: Приоритет источников данных:
+            # 1. metadata_payload.media (существующая логика)
+            # 2. PostEnrichment (Vision данные из каналов)
+            # 3. meta (локальные метаданные)
+            analysis = media_analysis_map.get(file_sha256_str, {})
+            vision_data = vision_data_map.get(file_sha256_str, {})
+            
+            # Извлекаем OCR текст
+            ocr_payload = vision_data.get("ocr") or {}
+            if isinstance(ocr_payload, dict):
+                ocr_text_from_vision = ocr_payload.get("text")
+            elif isinstance(ocr_payload, str):
+                ocr_text_from_vision = ocr_payload
+            else:
+                ocr_text_from_vision = None
+            
             description = (
                 analysis.get("summary")
                 or analysis.get("description")
                 or analysis.get("caption")
+                or vision_data.get("description")  # Context7: Vision данные из PostEnrichment
                 or meta.get("description")
             )
-            labels = analysis.get("labels") or analysis.get("keywords") or []
-            ocr_text = analysis.get("ocr_text") or analysis.get("transcript")
+            
+            labels = (
+                analysis.get("labels") 
+                or analysis.get("keywords") 
+                or vision_data.get("labels")  # Context7: Labels из Vision анализа
+                or []
+            )
+            
+            ocr_text = (
+                analysis.get("ocr_text") 
+                or analysis.get("transcript")
+                or ocr_text_from_vision  # Context7: OCR из PostEnrichment
+            )
 
             if not description and isinstance(metadata_payload.get("vision_summary"), dict):
-                description = metadata_payload["vision_summary"].get(media_link.file_sha256)
+                description = metadata_payload["vision_summary"].get(file_sha256_str)
             if not description and isinstance(metadata_payload.get("vision_summary"), str):
                 description = metadata_payload["vision_summary"]
 
@@ -176,6 +237,11 @@ class GroupDigestService:
 
             media_items.append(item)
 
+        # Context7: Извлекаем информацию о пересылке из reply_to JSON
+        reply_to_data = message.reply_to or {}
+        forward_info = reply_to_data.get("forward") if isinstance(reply_to_data, dict) else None
+        is_forwarded = forward_info is not None
+
         return {
             "id": str(message.id),
             "group_id": str(message.group_id),
@@ -189,6 +255,9 @@ class GroupDigestService:
             "has_media": bool(media_items),
             "analytics": analytics_payload,
             "is_service": message.is_service,
+            "is_forwarded": is_forwarded,  # Context7: Флаг пересылки
+            "forward": forward_info,  # Context7: Информация о пересылке (если есть)
+            "reply_to": reply_to_data if isinstance(reply_to_data, dict) and reply_to_data.get("message_id") else None,  # Только для настоящих reply, не forward
         }
 
     async def generate(
@@ -231,6 +300,40 @@ class GroupDigestService:
         if not messages:
             raise ValueError("В указанном окне нет сообщений — нечего анализировать")
 
+        # Context7: Загружаем предыдущий дайджест для другого окна той же группы как baseline
+        # Это позволяет сгенерировать новый дайджест с секцией "По сравнению с прошлым окном"
+        # Оркестратор сам загрузит baseline через load_previous_snapshot, но мы можем передать его заранее
+        # если он уже есть в GroupDigest (более быстрый путь)
+        baseline_snapshot: Optional[Dict[str, Any]] = None
+        previous_digest = (
+            db.query(GroupDigest)
+            .join(GroupConversationWindow, GroupDigest.window_id == GroupConversationWindow.id)
+            .filter(
+                GroupConversationWindow.group_id == window.group_id,
+                GroupConversationWindow.tenant_id == window.tenant_id,
+                GroupDigest.window_id != window.id,  # Context7: Другое окно, не текущее
+                GroupDigest.delivery_status == "sent",
+            )
+            .order_by(GroupDigest.generated_at.desc())
+            .first()
+        )
+        
+        if previous_digest:
+            # Преобразуем предыдущий дайджест в BaselineSnapshot для сравнения
+            digest_payload = previous_digest.payload or {}
+            baseline_snapshot = {
+                "window_id": str(previous_digest.window_id),
+                "topics": digest_payload.get("topics", []),
+                "metrics": previous_digest.evaluation_scores or {},
+                "summary_html": previous_digest.summary or "",
+            }
+            logger.info(
+                "Found previous digest for baseline comparison",
+                current_window_id=str(window.id),
+                baseline_window_id=str(previous_digest.window_id),
+                digest_id=str(previous_digest.id),
+            )
+
         payload = {
             "window": {
                 "window_id": str(window.id),
@@ -242,10 +345,14 @@ class GroupDigestService:
                 "participant_count": window.participant_count,
             },
             "messages": [
-                self._serialize_group_message(message)
+                self._serialize_group_message(message, db=db)
                 for message in messages
             ],
         }
+        
+        # Context7: Передаем baseline_snapshot в payload для использования оркестратором
+        if baseline_snapshot:
+            payload["baseline_snapshot"] = baseline_snapshot
 
         orchestrator_state = await self._orchestrator.generate_async(payload)
         skip = orchestrator_state.get("skip", False)

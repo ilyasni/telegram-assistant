@@ -212,6 +212,25 @@ services:
     profiles:
       - monitoring
 
+  # AlertManager для отправки уведомлений
+  alertmanager:
+    image: prom/alertmanager:latest
+    volumes:
+      - ./prometheus/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+      - '--storage.path=/alertmanager'
+      - '--web.external-url=http://localhost:9093'
+    ports:
+      - "9093:9093"
+    networks:
+      - telegram-network
+    depends_on:
+      - prometheus
+    profiles:
+      - monitoring
+
   # Caddy Reverse Proxy
   caddy:
     image: caddy:2-alpine
@@ -426,6 +445,8 @@ services:
       BOT_WEBHOOK_SECRET: ${BOT_WEBHOOK_SECRET}
       BOT_PUBLIC_URL: ${BOT_PUBLIC_URL}
       DEFAULT_TENANT_ID: ${DEFAULT_TENANT_ID}
+      # Context7: AlertManager Telegram Notifications
+      ALERT_TELEGRAM_CHAT_ID: ${ALERT_TELEGRAM_CHAT_ID:-}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       ENVIRONMENT: ${ENVIRONMENT:-production}
       PYTHONPATH: /app:/opt/project
@@ -777,6 +798,7 @@ volumes:
   redis_data:
   grafana_data:
   prometheus_data:
+  alertmanager_data:
   caddy_data:
   caddy_config:
   qdrant_data:

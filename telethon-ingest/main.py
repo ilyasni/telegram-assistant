@@ -553,20 +553,59 @@ async def run_scheduler_loop():
         # Инициализация компонентов
         config = ParserConfig()
         
-        # Get telegram_client_manager from app_state
+        # Context7: Создаём общий Redis клиент для parser и scheduler с таймаутами
+        import redis.asyncio as redis
+        shared_redis_client = redis.from_url(
+            settings.redis_url,
+            decode_responses=True,
+            socket_connect_timeout=10,  # Timeout для подключения
+            socket_timeout=30,  # Timeout для операций
+            retry_on_timeout=True
+        )
+        logger.info("Shared Redis client created for parser and scheduler")
+        
+        # Context7: Ждём инициализации TelegramClientManager из run_ingest_loop()
+        # Проверяем app_state с таймаутом
+        max_wait = 30  # Maximum wait time in seconds
+        wait_interval = 1  # Check every second
+        waited = 0
+        
         client_manager = app_state.get("telegram_client_manager")
+        while not client_manager and waited < max_wait:
+            await asyncio.sleep(wait_interval)
+            waited += wait_interval
+            client_manager = app_state.get("telegram_client_manager")
+            if client_manager:
+                logger.info("TelegramClientManager found in app_state after waiting", waited_seconds=waited)
+        
+        # Если TelegramClientManager всё ещё недоступен, инициализируем новый
         if not client_manager:
-            logger.warning("TelegramClientManager not available, trying to initialize...")
-            # Попытка инициализации TelegramClientManager
+            logger.warning("TelegramClientManager not available in app_state after waiting, initializing new instance...")
+            # Context7: Правильная инициализация TelegramClientManager с параметрами
             try:
+                import psycopg2
                 from services.telegram_client_manager import TelegramClientManager
-                client_manager = TelegramClientManager()
-                await client_manager.initialize()
+                
+                # Создаём синхронное БД подключение для TelegramClientManager
+                db_connection_sync = psycopg2.connect(
+                    settings.database_url,
+                    connect_timeout=10
+                )
+                
+                client_manager = TelegramClientManager(shared_redis_client, db_connection_sync)
+                await client_manager.start_watchdog()
                 app_state["telegram_client_manager"] = client_manager
                 logger.info("TelegramClientManager initialized successfully for scheduler")
             except Exception as e:
-                logger.error(f"Failed to initialize TelegramClientManager: {e}")
+                logger.error(
+                    "Failed to initialize TelegramClientManager",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    exc_info=True
+                )
                 logger.warning("Scheduler will run in monitoring mode only")
+        else:
+            logger.info("Using existing TelegramClientManager from app_state")
         
         # Создание AsyncSession engine для ChannelParser
         # Replace postgresql:// with postgresql+asyncpg:// for async driver
@@ -607,17 +646,6 @@ async def run_scheduler_loop():
         
         # Создание AsyncSession для парсера
         db_session = AsyncSession(engine)
-        
-        # Context7: Создаём общий Redis клиент для parser и scheduler с таймаутами
-        import redis.asyncio as redis
-        shared_redis_client = redis.from_url(
-            settings.redis_url,
-            decode_responses=True,
-            socket_connect_timeout=10,  # Timeout для подключения
-            socket_timeout=30,  # Timeout для операций
-            retry_on_timeout=True
-        )
-        logger.info("Shared Redis client created for parser and scheduler")
         
         # Context7: Инициализация MediaProcessor для обработки медиа
         media_processor = None

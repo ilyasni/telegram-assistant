@@ -372,6 +372,7 @@ class VisionAnalysisTask:
         # Context7: Флаг для обработки backlog при первом запуске
         backlog_processed = False
         last_pending_check = time.time()
+        last_pel_metrics_update = time.time()
         
         while self.running:
             try:
@@ -481,6 +482,21 @@ class VisionAnalysisTask:
                                     "error_type": type(e).__name__
                                 },
                                 exc_info=True
+                            )
+                    
+                    # Context7: Регулярное обновление метрик PEL (даже если нет pending сообщений)
+                    # Это нужно для корректной работы алерта VisionWorkerNotProcessing
+                    if current_time - last_pel_metrics_update >= 30:  # Обновляем каждые 30 секунд
+                        try:
+                            await self._update_pel_metrics()
+                            last_pel_metrics_update = current_time
+                        except Exception as e:
+                            logger.debug(
+                                "Error updating PEL metrics",
+                                extra={
+                                    "error": str(e),
+                                    "error_type": type(e).__name__
+                                }
                             )
                 
                 except asyncio.CancelledError:
@@ -1085,6 +1101,8 @@ class VisionAnalysisTask:
             if event_emitted:
                 vision_worker_duration_seconds.labels(status="success").observe(duration)
                 vision_worker_processed_total.labels(status="success", reason="completed").inc()
+                # Context7: Инкремент vision_events_total для алерта VisionWorkerNotProcessing
+                vision_events_total.labels(status="processed", reason="completed").inc()
                 self.processed_count += 1
                 
                 # Context7: Учет альбомов в метриках
@@ -1105,6 +1123,8 @@ class VisionAnalysisTask:
             else:
                 vision_worker_duration_seconds.labels(status="error").observe(duration)
                 vision_worker_processed_total.labels(status="error", reason="emit_failed").inc()
+                # Context7: Инкремент vision_events_total для алерта VisionWorkerNotProcessing
+                vision_events_total.labels(status="failed", reason="emit_failed").inc()
                 vision_analysis_errors_total.labels(error_type="emit_failed").inc()
                 if is_album:
                     vision_albums_processed_total.labels(status="failed").inc()
@@ -1122,6 +1142,8 @@ class VisionAnalysisTask:
             duration = time.time() - start_time
             vision_worker_duration_seconds.labels(status="error").observe(duration)
             vision_worker_processed_total.labels(status="error", reason="exception").inc()
+            # Context7: Инкремент vision_events_total для алерта VisionWorkerNotProcessing
+            vision_events_total.labels(status="failed", reason="exception").inc()
             vision_analysis_errors_total.labels(error_type="exception").inc()
             self.error_count += 1
             logger.error(
@@ -3480,12 +3502,15 @@ async def create_vision_analysis_task(
         try:
             # Context7: OCREnhancementService создаст свой GigaChat адаптер если не передан
             # Используем redis_client для кэширования LLM запросов
+            # Context7: Передаем db_pool для автоматических словарей (по аналогии с trends)
             ocr_enhancement_service = OCREnhancementService(
                 redis_client=redis_client,
                 gigachat_adapter=None,  # Создаст свой адаптер
+                db_pool=db_pool,  # Для автоматических словарей
                 enabled=True,
                 llm_fallback_enabled=vision_config.get("ocr_enhancement_llm_fallback", True),
-                entity_extraction_enabled=vision_config.get("ocr_enhancement_entities", True)
+                entity_extraction_enabled=vision_config.get("ocr_enhancement_entities", True),
+                auto_dictionaries_enabled=vision_config.get("ocr_auto_dictionaries_enabled", True)
             )
             logger.info(
                 "OCR Enhancement Service initialized",

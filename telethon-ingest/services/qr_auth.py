@@ -199,36 +199,108 @@ class QrAuthService:
                                    key=key, status=status, tenant_id=tenant_id)
                         continue
                     
-                    # Context7 best practice: валидация только старых authorized сессий (старше 5 минут)
+                    # Context7 best practice: обработка authorized сессий
+                    # ВАЖНО: проверяем, сохранена ли сессия в БД, и сохраняем если нет
                     if status == "authorized":
                         # Context7: с decode_responses=True значение уже строка
-                        created_at = data.get("created_at")
-                        if created_at:
+                        session_string = data.get("session_string")
+                        telegram_user_id_raw = data.get("telegram_user_id")
+                        
+                        if session_string and telegram_user_id_raw:
                             try:
-                                created_timestamp = int(created_at)
-                                current_timestamp = int(time.time())
-                                if current_timestamp - created_timestamp > 300:  # 5 минут
-                                    logger.info("Validating old authorized session", key=key, tenant_id=tenant_id)
-                                    await self._validate_authorized_session(key, tenant_id)
+                                telegram_user_id = int(telegram_user_id_raw)
+                                
+                                # Context7: проверяем, есть ли сессия в БД
+                                if not self.session_storage.db_connection:
+                                    await self.session_storage.init_db()
+                                
+                                db_session = await self.session_storage.get_telegram_session(tenant_id, tenant_id)
+                                
+                                # Context7: если сессия не найдена в БД, сохраняем её
+                                if not db_session or not db_session.get('session_string_enc'):
+                                    logger.info(
+                                        "Authorized session not found in DB, saving now",
+                                        tenant_id=tenant_id,
+                                        telegram_user_id=telegram_user_id,
+                                        key=key
+                                    )
+                                    
+                                    # Получаем данные пользователя из Redis
+                                    first_name = data.get("first_name")
+                                    last_name = data.get("last_name")
+                                    username = data.get("username")
+                                    invite_code = data.get("invite_code")
+                                    
+                                    # Извлекаем dc_id из session_string
+                                    dc_id = 2
+                                    try:
+                                        from telethon.sessions import StringSession
+                                        session = StringSession(session_string)
+                                        dc_id = getattr(session, 'dc_id', None) or 2
+                                    except Exception:
+                                        pass
+                                    
+                                    # Сохраняем сессию в БД
+                                    success, session_id, error_code, error_details = await self.session_storage.save_telegram_session(
+                                        tenant_id=tenant_id,
+                                        user_id=tenant_id,  # Будет заменено на реальный user_id
+                                        session_string=session_string,
+                                        telegram_user_id=telegram_user_id,
+                                        first_name=first_name,
+                                        last_name=last_name,
+                                        username=username,
+                                        invite_code=invite_code,
+                                        dc_id=dc_id
+                                    )
+                                    
+                                    if success:
+                                        logger.info(
+                                            "Authorized session saved to database",
+                                            tenant_id=tenant_id,
+                                            telegram_user_id=telegram_user_id,
+                                            session_id=session_id
+                                        )
+                                    else:
+                                        logger.error(
+                                            "Failed to save authorized session to database",
+                                            tenant_id=tenant_id,
+                                            telegram_user_id=telegram_user_id,
+                                            error_code=error_code,
+                                            error_details=error_details
+                                        )
                                 else:
-                                    logger.debug("Skipping validation for recent session", key=key, tenant_id=tenant_id)
+                                    logger.debug(
+                                        "Authorized session already in database",
+                                        tenant_id=tenant_id,
+                                        telegram_user_id=telegram_user_id
+                                    )
+                                    
+                                    # Context7: валидация старых сессий (старше 5 минут)
+                                    created_at = data.get("created_at")
+                                    if created_at:
+                                        try:
+                                            created_timestamp = int(created_at)
+                                            current_timestamp = int(time.time())
+                                            if current_timestamp - created_timestamp > 300:  # 5 минут
+                                                logger.info("Validating old authorized session", key=key, tenant_id=tenant_id)
+                                                await self._validate_authorized_session(key, tenant_id)
+                                        except (ValueError, AttributeError):
+                                            logger.warning("Invalid created_at timestamp", key=key, tenant_id=tenant_id)
+                                    
                                     # Context7: ensure backfill to ingest Redis key if missing
                                     try:
-                                        # Context7: Ключ сессии для ingest с префиксом t:{tenant}:session
                                         ingest_key = self._get_session_key(tenant_id)
                                         if not self.redis_client.exists(ingest_key):
                                             ss = self.redis_client.hget(key, "session_string")
                                             if ss:
                                                 self.redis_client.set(ingest_key, ss, ex=86400)
                                                 logger.info("Backfilled telegram:session for ingest", tenant_id=tenant_id)
-                                            else:
-                                                # Пометить для повторной авторизации миниаппом
-                                                self.redis_client.hset(key, "status", "not_found")
-                                                logger.warning("Authorized session has no session_string; marked not_found", tenant_id=tenant_id)
                                     except Exception as e:
                                         logger.warning("Backfill to ingest redis failed", tenant_id=tenant_id, error=str(e))
-                            except (ValueError, AttributeError):
-                                logger.warning("Invalid created_at timestamp", key=key, tenant_id=tenant_id)
+                            except (ValueError, TypeError) as e:
+                                logger.warning("Invalid telegram_user_id in authorized session", key=key, error=str(e))
+                        else:
+                            logger.debug("Authorized session missing session_string or telegram_user_id", key=key, tenant_id=tenant_id)
                         continue
                     
                     # Context7 best practice: для failed сессий проверяем наличие session_string
@@ -388,26 +460,34 @@ class QrAuthService:
         try:
             from psycopg2.extras import RealDictCursor
             with self.session_storage.db_connection.cursor(cursor_factory=RealDictCursor) as cursor:
-                # Ищем сессию по telegram_user_id в таблице users
+                # Context7: Исправлено - используем новую схему с identity_id вместо user_id
+                # Ищем сессию по telegram_user_id через identities
                 query = """
                     SELECT 
                         ts.id,
                         ts.session_string_enc,
-                        ts.status,
+                        ts.is_active as status,
                         ts.created_at,
-                        ts.key_id,
+                        NULL as key_id,
                         ts.updated_at,
-                        u.telegram_id as telegram_user_id
+                        i.telegram_id as telegram_user_id
                     FROM telegram_sessions ts
-                    JOIN users u ON u.id::uuid = ts.user_id::uuid
-                    WHERE u.telegram_id = %s 
-                      AND ts.status = 'authorized'
+                    JOIN identities i ON i.id = ts.identity_id
+                    WHERE i.telegram_id = %s 
+                      AND ts.is_active = true
                 """
                 params = [telegram_user_id]
                 
-                # Если указан tenant_id, добавляем его в условие
+                # Context7: tenant_id больше не используется в новой схеме telegram_sessions
+                # Фильтрация по tenant происходит через users.tenant_id
                 if tenant_id:
-                    query += " AND ts.tenant_id::text = %s"
+                    query += """
+                        AND EXISTS (
+                            SELECT 1 FROM users u 
+                            WHERE u.identity_id = i.id 
+                            AND u.tenant_id::text = %s
+                        )
+                    """
                     params.append(tenant_id)
                 
                 query += " ORDER BY ts.updated_at DESC LIMIT 1"

@@ -1434,3 +1434,32 @@ class DLQEvent(Base):
         Index('idx_dlq_events_status', 'status', 'next_retry_at'),
         Index('idx_dlq_events_retry_count', 'retry_count', 'max_attempts'),
     )
+
+
+class OCRDictionary(Base):
+    """Автоматические словари OCR для spell correction.
+    
+    Context7: Реализует автоматическое извлечение терминов из OCR текстов
+    по аналогии с trend_clusters.keywords. Термины извлекаются, категоризируются
+    и обновляются автоматически на основе статистики использования.
+    """
+    __tablename__ = "ocr_dictionaries"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    term = Column(Text, nullable=False)
+    category = Column(Text, nullable=True)  # politics, geography, media, organizations, etc.
+    frequency = Column(Integer, nullable=False, server_default=text("1"))
+    confidence = Column(REAL, nullable=False, server_default=text("0.5"))
+    first_seen_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    last_seen_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    correction_examples = Column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+    
+    __table_args__ = (
+        UniqueConstraint("term", "category", name="uq_ocr_dictionaries_term_category"),
+        Index("idx_ocr_dictionaries_term", "term"),
+        Index("idx_ocr_dictionaries_category", "category"),
+        Index("idx_ocr_dictionaries_frequency", "frequency", postgresql_ops={"frequency": "DESC"}),
+        Index("idx_ocr_dictionaries_last_seen", "last_seen_at", postgresql_ops={"last_seen_at": "DESC"}),
+    )

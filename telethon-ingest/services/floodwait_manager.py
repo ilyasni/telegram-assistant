@@ -4,6 +4,7 @@
 """
 
 import asyncio
+import os
 import time
 from typing import Optional, Dict
 from datetime import datetime
@@ -148,7 +149,7 @@ class FloodWaitManager:
         if hour is None:
             hour = datetime.now().hour
         
-        base_batch_size = 50  # Базовый размер батча
+        base_batch_size = int(os.getenv("FLOODWAIT_BASE_BATCH_SIZE", "50"))  # Базовый размер батча
         
         # Ночью (2-6) - большие батчи
         if 2 <= hour < 6:

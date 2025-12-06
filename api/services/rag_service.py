@@ -340,24 +340,101 @@ class RAGService:
             search_limit = limit * 3 if time_filter else limit
             
             # Поиск
-            search_results = self.qdrant_client.search(
-                collection_name=collection_name,
-                query_vector=query_embedding,
-                query_filter=search_filter,
-                limit=search_limit
-            )
+            # Context7: Используем query_points (правильный метод для QdrantClient)
+            # query_points принимает вектор напрямую в параметре query и filter отдельно
+            try:
+                search_response = self.qdrant_client.query_points(
+                    collection_name=collection_name,
+                    query=query_embedding,  # Вектор напрямую
+                    query_filter=search_filter,  # Фильтр отдельно
+                    limit=search_limit
+                )
+                
+                # Context7: query_points возвращает QueryResponse с points
+                search_results = search_response.points if hasattr(search_response, 'points') else []
+                
+            except AttributeError as e:
+                # Context7: Fallback на search если query_points недоступен (старая версия)
+                try:
+                    search_results = self.qdrant_client.search(
+                        collection_name=collection_name,
+                        query_vector=query_embedding,
+                        query_filter=search_filter,
+                        limit=search_limit
+                    )
+                except Exception as fallback_error:
+                    logger.error(
+                        "QdrantClient search methods not available",
+                        error=str(fallback_error),
+                        collection_name=collection_name,
+                        qdrant_client_type=type(self.qdrant_client).__name__
+                    )
+                    return []
+            except Exception as e:
+                logger.error(
+                    "Error searching Qdrant",
+                    error=str(e),
+                    collection_name=collection_name,
+                    error_type=type(e).__name__
+                )
+                # Возвращаем пустой список вместо падения
+                return []
             
             results = []
+            # Context7: Обработка результатов из query_points
+            logger.info(
+                "Processing Qdrant search results",
+                collection_name=collection_name,
+                results_count=len(search_results) if search_results else 0,
+                has_search_results=bool(search_results)
+            )
+            
             for result in search_results:
+                # query_points возвращает ScoredPoint объекты
+                if hasattr(result, 'payload') and hasattr(result, 'score'):
+                    # Формат query_points (ScoredPoint)
+                    payload = result.payload if result.payload else {}
+                    score = result.score if hasattr(result, 'score') else 0.0
+                elif hasattr(result, 'point'):
+                    # Альтернативный формат (если есть)
+                    point = result.point
+                    payload = point.payload if hasattr(point, 'payload') else {}
+                    score = result.score if hasattr(result, 'score') else 0.0
+                else:
+                    # Неизвестный формат - пропускаем
+                    logger.warning("Unknown result format in Qdrant search", result_type=type(result).__name__)
+                    continue
+                
+                post_id = payload.get('post_id')
+                if not post_id:
+                    logger.debug("Skipping result without post_id", payload_keys=list(payload.keys()))
+                    continue
+                
                 results.append({
-                    'post_id': result.payload.get('post_id'),
-                    'score': result.score,
-                    'payload': result.payload
+                    'post_id': post_id,
+                    'score': score,
+                    'payload': payload
                 })
+            
+            logger.info(
+                "Qdrant search completed",
+                collection_name=collection_name,
+                total_results=len(results),
+                limit=limit,
+                tenant_id=tenant_id
+            )
             
             # Context7: Фильтруем результаты по времени после получения из БД
             if time_filter and db and results:
-                start_time, end_time = time_filter
+                filter_start_time, filter_end_time = time_filter
+                logger.info(
+                    "Filtering Qdrant results by time",
+                    collection_name=collection_name,
+                    results_before=len(results),
+                    filter_start_time=filter_start_time.isoformat() if filter_start_time else None,
+                    filter_end_time=filter_end_time.isoformat() if filter_end_time else None,
+                    tenant_id=tenant_id
+                )
                 post_ids = [UUID(r['post_id']) for r in results if r.get('post_id')]
                 
                 if post_ids:
@@ -365,27 +442,104 @@ class RAGService:
                     posts = db.query(Post).filter(Post.id.in_(post_ids)).all()
                     post_map = {str(post.id): post for post in posts}
                     
+                    logger.info(
+                        "Posts loaded from DB for time filtering",
+                        collection_name=collection_name,
+                        post_ids_count=len(post_ids),
+                        posts_found=len(posts),
+                        tenant_id=tenant_id
+                    )
+                    
                     # Фильтруем результаты по времени
                     filtered_results = []
+                    skipped_no_post = 0
+                    skipped_no_time = 0
+                    skipped_too_old = 0
+                    skipped_too_new = 0
+                    
                     for result in results:
                         post_id = result.get('post_id')
                         if not post_id:
                             continue
                         
                         post = post_map.get(post_id)
-                        if not post or not post.posted_at:
+                        if not post:
+                            skipped_no_post += 1
+                            logger.debug("Post not found in DB", post_id=post_id)
+                            continue
+                        
+                        if not post.posted_at:
+                            skipped_no_time += 1
+                            logger.debug("Post has no posted_at", post_id=post_id)
                             continue
                         
                         # Проверяем временной фильтр
-                        if start_time and post.posted_at < start_time:
+                        # Context7: Учитываем timezone при сравнении
+                        post_time = post.posted_at
+                        if post_time.tzinfo is None:
+                            # Если время без timezone, считаем его UTC
+                            from datetime import timezone
+                            post_time = post_time.replace(tzinfo=timezone.utc)
+                        
+                        # Приводим filter_start_time к timezone-aware если нужно
+                        filter_start_aware = filter_start_time
+                        if filter_start_aware and filter_start_aware.tzinfo is None:
+                            from datetime import timezone
+                            filter_start_aware = filter_start_aware.replace(tzinfo=timezone.utc)
+                        
+                        # Приводим filter_end_time к timezone-aware если нужно
+                        filter_end_aware = filter_end_time
+                        if filter_end_aware and filter_end_aware.tzinfo is None:
+                            from datetime import timezone
+                            filter_end_aware = filter_end_aware.replace(tzinfo=timezone.utc)
+                        
+                        if filter_start_aware and post_time < filter_start_aware:
+                            skipped_too_old += 1
+                            logger.debug(
+                                "Post filtered out: too old",
+                                post_id=post_id,
+                                post_time=post_time.isoformat(),
+                                filter_start_time=filter_start_aware.isoformat()
+                            )
                             continue
-                        if end_time and post.posted_at > end_time:
+                        if filter_end_aware and post_time > filter_end_aware:
+                            skipped_too_new += 1
+                            logger.debug(
+                                "Post filtered out: too new",
+                                post_id=post_id,
+                                post_time=post_time.isoformat(),
+                                filter_end_time=filter_end_aware.isoformat()
+                            )
                             continue
                         
                         filtered_results.append(result)
                     
-                    # Ограничиваем количество результатов
-                    results = filtered_results[:limit]
+                    logger.info(
+                        "Time filtering completed",
+                        collection_name=collection_name,
+                        results_after=len(filtered_results),
+                        filtered_out=len(results) - len(filtered_results),
+                        skipped_no_post=skipped_no_post,
+                        skipped_no_time=skipped_no_time,
+                        skipped_too_old=skipped_too_old,
+                        skipped_too_new=skipped_too_new,
+                        tenant_id=tenant_id
+                    )
+                    
+                    # Context7: Если все результаты отфильтрованы, возвращаем хотя бы часть без фильтра
+                    # Это защита от слишком строгого временного фильтра
+                    if not filtered_results and results:
+                        logger.warning(
+                            "All results filtered out by time filter, returning unfiltered results",
+                            collection_name=collection_name,
+                            original_count=len(results),
+                            tenant_id=tenant_id
+                        )
+                        # Возвращаем первые результаты без фильтрации по времени
+                        results = results[:limit]
+                    else:
+                        # Ограничиваем количество результатов
+                        results = filtered_results[:limit]
             
             return results
         
@@ -553,13 +707,13 @@ class RAGService:
             
             # Добавляем фильтрацию по времени, если указана
             if time_filter:
-                start_time, end_time = time_filter
-                if start_time:
+                filter_start_time, filter_end_time = time_filter
+                if filter_start_time:
                     base_query += " AND p.posted_at >= :start_time"
-                    params["start_time"] = start_time
-                if end_time:
+                    params["start_time"] = filter_start_time
+                if filter_end_time:
                     base_query += " AND p.posted_at <= :end_time"
-                    params["end_time"] = end_time
+                    params["end_time"] = filter_end_time
             
             # Добавляем фильтрацию по channel_ids если указаны
             if channel_ids:
@@ -641,13 +795,13 @@ class RAGService:
             
             # Добавляем фильтрацию по времени, если указана
             if time_filter:
-                start_time, end_time = time_filter
-                if start_time:
+                filter_start_time, filter_end_time = time_filter
+                if filter_start_time:
                     base_query += " AND p.posted_at >= :start_time"
-                    params["start_time"] = start_time
-                if end_time:
+                    params["start_time"] = filter_start_time
+                if filter_end_time:
                     base_query += " AND p.posted_at <= :end_time"
-                    params["end_time"] = end_time
+                    params["end_time"] = filter_end_time
             
             # Добавляем фильтрацию по channel_ids если указаны
             if channel_ids:
@@ -780,32 +934,60 @@ class RAGService:
         qdrant_results = await self._search_qdrant(query_embedding, tenant_id, limit * 2, channel_ids, time_filter=time_filter, db=db)
         fts_results = await self._search_postgres_fts(query, tenant_id, limit * 2, channel_ids, db, time_filter=time_filter)
         
+        logger.info(
+            "Hybrid search intermediate results",
+            qdrant_count=len(qdrant_results) if qdrant_results else 0,
+            fts_count=len(fts_results) if fts_results else 0,
+            graph_count=0,  # Будет обновлено после GraphRAG
+            query=query[:50],
+            tenant_id=tenant_id
+        )
+        
         # Context7: GraphRAG поиск (с fallback при недоступности Neo4j)
         graph_results = []
         try:
             graph_results = await self._search_neo4j_graph(query, user_id, tenant_id=tenant_id, limit=limit * 2, time_filter=time_filter)
+            logger.info(
+                "GraphRAG search completed",
+                graph_count=len(graph_results) if graph_results else 0,
+                query=query[:50],
+                tenant_id=tenant_id
+            )
         except Exception as e:
-            logger.warning("GraphRAG search failed, continuing without graph results", error=str(e))
+            logger.warning("GraphRAG search failed, continuing without graph results", error=str(e), tenant_id=tenant_id)
         
         # Объединение и дедупликация результатов
         post_scores = {}
         
         # Добавляем результаты из Qdrant (вес 0.5)
+        qdrant_added = 0
         for result in qdrant_results:
-            post_id = result['post_id']
-            score = result['score'] * 0.5
+            post_id = result.get('post_id')
+            if not post_id:
+                logger.warning("Qdrant result without post_id", result_keys=list(result.keys()))
+                continue
+            score = result.get('score', 0.0) * 0.5
             if post_id not in post_scores:
                 post_scores[post_id] = {
                     'post_id': post_id,
                     'payload': result.get('payload', {}),
-                    'qdrant_score': result['score'],
+                    'qdrant_score': result.get('score', 0.0),
                     'fts_score': 0.0,
                     'graph_score': 0.0,
                     'hybrid_score': score
                 }
+                qdrant_added += 1
             else:
                 post_scores[post_id]['hybrid_score'] += score
-                post_scores[post_id]['qdrant_score'] = result['score']
+                post_scores[post_id]['qdrant_score'] = result.get('score', 0.0)
+        
+        logger.info(
+            "Qdrant results added to hybrid search",
+            qdrant_input=len(qdrant_results),
+            qdrant_added=qdrant_added,
+            post_scores_count=len(post_scores),
+            tenant_id=tenant_id
+        )
         
         # Добавляем результаты из FTS (вес 0.2)
         for result in fts_results:
@@ -910,7 +1092,32 @@ class RAGService:
             reverse=True
         )
         
-        return sorted_results[:limit]
+        final_results = sorted_results[:limit]
+        
+        logger.info(
+            "Hybrid search completed",
+            query=query[:50],
+            total_posts=len(post_scores),
+            final_results=len(final_results),
+            top_scores=[round(r['hybrid_score'], 3) for r in final_results[:3]] if final_results else [],
+            tenant_id=tenant_id,
+            qdrant_input=len(qdrant_results) if qdrant_results else 0,
+            fts_input=len(fts_results) if fts_results else 0,
+            graph_input=len(graph_results) if graph_results else 0
+        )
+        
+        if not final_results:
+            logger.warning(
+                "Hybrid search returned empty results",
+                query=query[:50],
+                qdrant_count=len(qdrant_results) if qdrant_results else 0,
+                fts_count=len(fts_results) if fts_results else 0,
+                graph_count=len(graph_results) if graph_results else 0,
+                post_scores_count=len(post_scores),
+                tenant_id=tenant_id
+            )
+        
+        return final_results
     
     async def _assemble_context(
         self,
@@ -1337,6 +1544,33 @@ class RAGService:
             )
             return []
     
+    def _safe_get_processing_time_ms(self, start_time: Any) -> int:
+        """
+        Context7: Безопасное вычисление времени обработки.
+        Защищает от переопределения start_time (может быть datetime из time_filter).
+        
+        Args:
+            start_time: Начальное время (float timestamp или datetime)
+        
+        Returns:
+            Время обработки в миллисекундах
+        """
+        if hasattr(start_time, 'timestamp'):
+            # Если start_time это datetime, конвертируем в timestamp
+            start_timestamp = start_time.timestamp()
+        elif isinstance(start_time, (int, float)):
+            # Если start_time это число (timestamp), используем как есть
+            start_timestamp = start_time
+        else:
+            # Если start_time не число и не datetime, используем текущее время
+            logger.warning(
+                "Invalid start_time type, using current time",
+                start_time_type=type(start_time).__name__
+            )
+            start_timestamp = time.time()
+        
+        return int((time.time() - start_timestamp) * 1000)
+    
     async def query(
         self,
         query: str,
@@ -1371,7 +1605,7 @@ class RAGService:
         Returns:
             RAGResult с ответом и источниками
         """
-        start_time = time.time()
+        query_start_time = time.time()  # Context7: Используем query_start_time вместо start_time
         
         # Episodic Memory: запись события run_started для RAG
         try:
@@ -1613,7 +1847,7 @@ class RAGService:
                         except Exception as e:
                             logger.warning("Failed to track user interest", error=str(e))
                         
-                        processing_time = int((time.time() - start_time) * 1000)
+                        processing_time = self._safe_get_processing_time_ms(query_start_time)
                         
                         return RAGResult(
                             answer=answer,
@@ -1640,31 +1874,67 @@ class RAGService:
             # 2. Парсинг временного фильтра из запроса
             time_filter = self._parse_time_filter(query)
             if time_filter:
-                start_time, end_time = time_filter
+                filter_start_time, filter_end_time = time_filter
                 logger.info(
                     "Time filter applied",
                     query=query[:50],
-                    start_time=start_time.isoformat() if start_time else None,
-                    end_time=end_time.isoformat() if end_time else None
+                    filter_start_time=filter_start_time.isoformat() if filter_start_time else None,
+                    filter_end_time=filter_end_time.isoformat() if filter_end_time else None,
+                    tenant_id=tenant_id,
+                    user_id=str(user_id)
+                )
+                # Обновляем time_filter с правильными именами переменных
+                time_filter = (filter_start_time, filter_end_time)
+            else:
+                logger.info(
+                    "No time filter in query",
+                    query=query[:50],
+                    tenant_id=tenant_id
                 )
             
             # 3. Генерация embedding для запроса
             query_embedding = await self._generate_embedding(query)
             
             if not query_embedding:
-                logger.warning("Failed to generate embedding, falling back to FTS only")
+                logger.warning(
+                    "Failed to generate embedding, falling back to FTS only",
+                    query=query[:50],
+                    tenant_id=tenant_id,
+                    user_id=str(user_id)
+                )
+            else:
+                logger.info(
+                    "Embedding generated successfully",
+                    query=query[:50],
+                    embedding_dim=len(query_embedding) if query_embedding else 0,
+                    tenant_id=tenant_id
+                )
             
             # 4. Hybrid search (Qdrant + PostgreSQL FTS + Neo4j GraphRAG)
             if query_embedding:
                 search_results = await self._hybrid_search(
                     query, query_embedding, tenant_id, limit * 2, channel_ids, db, user_id=str(user_id), time_filter=time_filter
                 )
+                logger.info(
+                    "Hybrid search completed in query",
+                    query=query[:50],
+                    results_count=len(search_results) if search_results else 0,
+                    has_embedding=True,
+                    tenant_id=tenant_id
+                )
             else:
                 # Fallback на FTS + GraphRAG (без векторов)
+                logger.debug("No embedding, using FTS + GraphRAG fallback", query=query[:50])
                 fts_results = await self._search_postgres_fts(
                     query, tenant_id, limit * 2, channel_ids, db, time_filter=time_filter
                 )
                 graph_results = await self._search_neo4j_graph(query, str(user_id), tenant_id=tenant_id, limit=limit * 2, time_filter=time_filter)
+                
+                logger.debug(
+                    "FTS + GraphRAG fallback completed",
+                    fts_count=len(fts_results) if fts_results else 0,
+                    graph_count=len(graph_results) if graph_results else 0
+                )
                 
                 # Объединяем результаты
                 post_scores = {}
@@ -1694,6 +1964,18 @@ class RAGService:
                     key=lambda x: x['hybrid_score'],
                     reverse=True
                 )[:limit * 2]
+                
+                logger.debug(
+                    "FTS + GraphRAG results combined",
+                    total_results=len(search_results)
+                )
+            
+            logger.info(
+                "Search results after hybrid search",
+                query=query[:50],
+                results_count=len(search_results) if search_results else 0,
+                tenant_id=tenant_id
+            )
             
             if not search_results:
                 logger.warning("No search results found", query=query[:50], tenant_id=tenant_id)
@@ -1778,7 +2060,7 @@ class RAGService:
                             sources=external_sources[:limit],  # Ограничиваем количество источников
                             confidence=0.4,
                             intent=intent,
-                            processing_time_ms=int((time.time() - start_time) * 1000),
+                            processing_time_ms=self._safe_get_processing_time_ms(query_start_time),
                             llm_calls=1,
                             tokens_used=0,  # TODO: отслеживать токены
                             agent_steps=1
@@ -1816,10 +2098,20 @@ class RAGService:
                             sources=[],
                             confidence=0.0,
                             intent=intent,
-                            processing_time_ms=int((time.time() - start_time) * 1000)
+                            processing_time_ms=self._safe_get_processing_time_ms(query_start_time)
                         )
                         # Возвращаем результат сразу, не продолжаем обработку
                         return result
+                
+                # Context7: Если дошли до этого места без результатов, создаем пустой результат
+                # Это может произойти, если все поиски (включая relaxed и SearXNG) не дали результатов
+                result = RAGResult(
+                    answer="К сожалению, по вашему запросу не найдено информации в каналах.",
+                    sources=[],
+                    confidence=0.0,
+                    intent=intent,
+                    processing_time_ms=self._safe_get_processing_time_ms(query_start_time)
+                )
                 
                 # Context7: Сохранение в историю даже при отсутствии результатов (критично для аналитики)
                 try:
@@ -1950,7 +2242,7 @@ class RAGService:
                 from models.database import RAGQueryHistory
                 from datetime import timezone
                 
-                processing_time_ms = int((time.time() - start_time) * 1000)
+                processing_time_ms = self._safe_get_processing_time_ms(query_start_time)
                 
                 rag_history = RAGQueryHistory(
                     user_id=user_id,
@@ -2038,7 +2330,7 @@ class RAGService:
             except Exception as e:
                 logger.warning("Failed to track user interest", error=str(e))
             
-            processing_time = int((time.time() - start_time) * 1000)
+            processing_time = self._safe_get_processing_time_ms(query_start_time)
             
             # Episodic Memory: запись события run_completed для RAG
             try:
@@ -2109,12 +2401,13 @@ class RAGService:
             except Exception as mem_exc:
                 logger.warning("episodic_memory.record_error_failed", error=str(mem_exc), tenant_id=tenant_id)
             
+            # Context7: Используем безопасную функцию для вычисления времени обработки
             error_result = RAGResult(
                 answer="Произошла ошибка при обработке запроса. Попробуйте позже.",
                 sources=[],
                 confidence=0.0,
                 intent="search",
-                processing_time_ms=int((time.time() - start_time) * 1000),
+                processing_time_ms=self._safe_get_processing_time_ms(query_start_time),
                 llm_calls=0,  # При ошибке LLM не вызывался
                 tokens_used=0,
                 agent_steps=0

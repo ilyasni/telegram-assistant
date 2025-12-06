@@ -351,37 +351,108 @@ def unsubscribe_from_channel(
 ):
     """Отписка от канала (soft delete)."""
     try:
-        # Проверка существования подписки
+        # Context7: Проверка существования активной подписки
+        # Примечание: user_channel имеет составной PK (user_id, channel_id), без отдельной колонки id
         subscription_result = db.execute(
             text("""
-                SELECT id FROM user_channel 
-                WHERE user_id = :user_id AND channel_id = :channel_id AND is_active = true
-            """),
-            {"user_id": user_id, "channel_id": channel_id}
-        )
-        
-        if not subscription_result.fetchone():
-            raise HTTPException(status_code=404, detail="Subscription not found")
-        
-        # Soft delete подписки
-        db.execute(
-            text("""
-                UPDATE user_channel 
-                SET is_active = false, updated_at = NOW()
+                SELECT user_id, channel_id, is_active FROM user_channel 
                 WHERE user_id = :user_id AND channel_id = :channel_id
             """),
             {"user_id": user_id, "channel_id": channel_id}
         )
         
-        db.commit()
+        subscription_row = subscription_result.fetchone()
+        if not subscription_row:
+            raise HTTPException(status_code=404, detail="Subscription not found")
         
-        logger.info(f"User {user_id} unsubscribed from channel {channel_id}")
+        # Context7: Если подписка уже неактивна, возвращаем успех (идемпотентность)
+        if not subscription_row.is_active:
+            logger.info(
+                "Subscription already inactive",
+                user_id=user_id,
+                channel_id=channel_id
+            )
+            return {"status": "already_unsubscribed", "channel_id": channel_id}
+        
+        # Context7: Soft delete подписки
+        # Примечание: user_channel не имеет колонки updated_at, только subscribed_at
+        update_result = db.execute(
+            text("""
+                UPDATE user_channel 
+                SET is_active = false
+                WHERE user_id = :user_id AND channel_id = :channel_id AND is_active = true
+            """),
+            {"user_id": user_id, "channel_id": channel_id}
+        )
+        
+        # Context7: Проверка, что UPDATE действительно обновил строку
+        if update_result.rowcount == 0:
+            logger.warning(
+                "No rows updated during unsubscribe",
+                user_id=user_id,
+                channel_id=channel_id
+            )
+            # Возможно, подписка была деактивирована между проверкой и обновлением
+            # Возвращаем успех для идемпотентности
+            return {"status": "already_unsubscribed", "channel_id": channel_id}
+        
+        # Context7: Коммит транзакции с обработкой ошибок
+        try:
+            db.commit()
+        except Exception as commit_error:
+            logger.error(
+                "Commit failed during unsubscribe",
+                error=str(commit_error),
+                error_type=type(commit_error).__name__,
+                user_id=user_id,
+                channel_id=channel_id
+            )
+            db.rollback()
+            raise HTTPException(
+                status_code=500,
+                detail=f"Database commit failed: {str(commit_error)}"
+            )
+        
+        logger.info(
+            "User unsubscribed from channel",
+            user_id=user_id,
+            channel_id=channel_id
+        )
         return {"status": "unsubscribed", "channel_id": channel_id}
         
     except HTTPException:
+        # Context7: Rollback при HTTPException для предотвращения утечек транзакций
+        try:
+            db.rollback()
+        except Exception as rollback_error:
+            logger.warning(
+                "Rollback failed after HTTPException",
+                error=str(rollback_error),
+                user_id=user_id,
+                channel_id=channel_id
+            )
         raise
     except Exception as e:
-        logger.error(f"Unsubscription failed: {e}")
+        # Context7: Rollback при любых других ошибках
+        try:
+            db.rollback()
+        except Exception as rollback_error:
+            logger.error(
+                "Rollback failed after exception",
+                rollback_error=str(rollback_error),
+                original_error=str(e),
+                user_id=user_id,
+                channel_id=channel_id
+            )
+        
+        logger.error(
+            "Unsubscription failed",
+            error=str(e),
+            error_type=type(e).__name__,
+            user_id=user_id,
+            channel_id=channel_id,
+            exc_info=True
+        )
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @router.get("/users/{user_id}/stats", response_model=ChannelStatsResponse)

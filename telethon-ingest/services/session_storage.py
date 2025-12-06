@@ -268,53 +268,55 @@ class SessionStorageService:
                     {"id": new_tenant_id, "name": f"Tenant {telegram_user_id}"}
                 )
                 db_tenant_uuid = new_tenant_id
+            
+            # Context7 best practice: создаем/находим Identity и Membership через утилиты
+            # Используем SQLAlchemy Session для работы с утилитами
+            # Context7: ВАЖНО - все операции должны быть в одной транзакции
+            # Используем db_session для всех операций, включая telegram_sessions
+            # Context7: ИСПРАВЛЕНО - код должен выполняться всегда, не только если tenant не найден
+            try:
+                # Context7: проверка обязательных полей перед созданием
+                if not telegram_user_id:
+                    raise ValueError("telegram_user_id is required")
+                if not db_tenant_uuid:
+                    raise ValueError("tenant_id is required")
                 
-                # Context7 best practice: создаем/находим Identity и Membership через утилиты
-                # Используем SQLAlchemy Session для работы с утилитами
-                # Context7: ВАЖНО - все операции должны быть в одной транзакции
-                # Используем db_session для всех операций, включая telegram_sessions
-                try:
-                    # Context7: проверка обязательных полей перед созданием
-                    if not telegram_user_id:
-                        raise ValueError("telegram_user_id is required")
-                    if not db_tenant_uuid:
-                        raise ValueError("tenant_id is required")
-                    
-                    # 1. Создаем/находим Identity
-                    identity_id = upsert_identity_sync(db_session, telegram_user_id)
-                    if not identity_id:
-                        raise ValueError(f"Failed to create/find identity for telegram_id={telegram_user_id}")
-                    logger.debug("Identity upserted", 
-                               telegram_id=telegram_user_id, 
-                               identity_id=str(identity_id))
-                    
-                    # 2. Создаем/обновляем Membership (User)
-                    user_id = upsert_membership_sync(
-                        db=db_session,
-                        tenant_id=db_tenant_uuid,
-                        identity_id=identity_id,
-                        telegram_id=telegram_user_id,
-                        username=username,
-                        first_name=first_name,
-                        last_name=last_name,
-                        tier="free"
+                # 1. Создаем/находим Identity
+                identity_id = upsert_identity_sync(db_session, telegram_user_id)
+                if not identity_id:
+                    raise ValueError(f"Failed to create/find identity for telegram_id={telegram_user_id}")
+                logger.debug("Identity upserted", 
+                           telegram_id=telegram_user_id, 
+                           identity_id=str(identity_id))
+                
+                # 2. Создаем/обновляем Membership (User)
+                user_id = upsert_membership_sync(
+                    db=db_session,
+                    tenant_id=db_tenant_uuid,
+                    identity_id=identity_id,
+                    telegram_id=telegram_user_id,
+                    username=username,
+                    first_name=first_name,
+                    last_name=last_name,
+                    tier="free"
+                )
+                if not user_id:
+                    raise ValueError(f"Failed to create/find membership for identity_id={identity_id}, tenant_id={db_tenant_uuid}")
+                logger.debug("Membership upserted",
+                           tenant_id=str(db_tenant_uuid),
+                           identity_id=str(identity_id),
+                           user_id=str(user_id))
+                
+                # 3. Обновляем role если передан через invite_code
+                if resolved_role:
+                    from sqlalchemy import text
+                    db_session.execute(
+                        text("UPDATE users SET role = :role WHERE id = :user_id"),
+                        {"role": resolved_role, "user_id": user_id}
                     )
-                    if not user_id:
-                        raise ValueError(f"Failed to create/find membership for identity_id={identity_id}, tenant_id={db_tenant_uuid}")
-                    logger.debug("Membership upserted",
-                               tenant_id=str(db_tenant_uuid),
-                               identity_id=str(identity_id),
-                               user_id=str(user_id))
-                    
-                    # 3. Обновляем role если передан через invite_code
-                    if resolved_role:
-                        from sqlalchemy import text
-                        db_session.execute(
-                            text("UPDATE users SET role = :role WHERE id = :user_id"),
-                            {"role": resolved_role, "user_id": user_id}
-                        )
-                    
-                    # 4. Обновляем legacy поля для обратной совместимости
+                
+                # 4. Обновляем legacy поля для обратной совместимости (если колонки существуют)
+                try:
                     from sqlalchemy import text
                     db_session.execute(
                         text("""
@@ -334,95 +336,98 @@ class SessionStorageService:
                             "user_id": user_id
                         }
                     )
-                    
-                    # Context7: проверка обязательных полей перед сохранением сессии
-                    if not identity_id:
-                        raise ValueError("identity_id is required for telegram_sessions")
-                    if not telegram_user_id:
-                        raise ValueError("telegram_id is required for telegram_sessions")
-                    if not encrypted_session:
-                        raise ValueError("session_string_enc is required for telegram_sessions")
-                    if dc_id is None:
-                        raise ValueError("dc_id is required for telegram_sessions")
-                    
-                    # 5. Отзываем старые сессии для этой Identity
+                except Exception as e:
+                    # Context7: legacy поля могут отсутствовать в новой схеме - это нормально
+                    logger.debug("Legacy fields update skipped (columns may not exist)", error=str(e))
+                
+                # Context7: проверка обязательных полей перед сохранением сессии
+                if not identity_id:
+                    raise ValueError("identity_id is required for telegram_sessions")
+                if not telegram_user_id:
+                    raise ValueError("telegram_id is required for telegram_sessions")
+                if not encrypted_session:
+                    raise ValueError("session_string_enc is required for telegram_sessions")
+                if dc_id is None:
+                    raise ValueError("dc_id is required for telegram_sessions")
+                
+                # 5. Отзываем старые сессии для этой Identity
+                db_session.execute(
+                    text("""
+                        UPDATE telegram_sessions 
+                        SET is_active = false, updated_at = NOW()
+                        WHERE identity_id = :identity_id 
+                          AND is_active = true
+                    """),
+                    {"identity_id": identity_id}
+                )
+                
+                # 6. INSERT в telegram_sessions (новая схема с identity_id)
+                # Context7 best practice: используем новую схему с identity_id, telegram_id, dc_id
+                db_session.execute(
+                    text("""
+                        INSERT INTO telegram_sessions (
+                            id, identity_id, telegram_id, session_string_enc, dc_id, is_active, created_at, updated_at
+                        ) VALUES (
+                            :session_id, :identity_id, :telegram_id, :encrypted_session, :dc_id, true, NOW(), NOW()
+                        )
+                        ON CONFLICT (identity_id, dc_id) 
+                        DO UPDATE SET
+                            session_string_enc = EXCLUDED.session_string_enc,
+                            is_active = true,
+                            updated_at = NOW()
+                    """),
+                    {
+                        "session_id": session_id,
+                        "identity_id": identity_id,
+                        "telegram_id": telegram_user_id,
+                        "encrypted_session": encrypted_session,
+                        "dc_id": dc_id
+                    }
+                )
+                
+                # 7. Логирование события авторизации
+                try:
+                    from psycopg2.extras import Json
                     db_session.execute(
                         text("""
-                            UPDATE telegram_sessions 
-                            SET is_active = false, updated_at = NOW()
-                            WHERE identity_id = :identity_id 
-                              AND is_active = true
-                        """),
-                        {"identity_id": identity_id}
-                    )
-                    
-                    # 6. INSERT в telegram_sessions (новая схема с identity_id)
-                    # Context7 best practice: используем новую схему с identity_id, telegram_id, dc_id
-                    db_session.execute(
-                        text("""
-                            INSERT INTO telegram_sessions (
-                                id, identity_id, telegram_id, session_string_enc, dc_id, is_active, created_at, updated_at
+                            INSERT INTO telegram_auth_events (
+                                id, user_id, event, reason, at, meta
                             ) VALUES (
-                                :session_id, :identity_id, :telegram_id, :encrypted_session, :dc_id, true, NOW(), NOW()
+                                :event_id, :user_id, 'qr_authorized', :reason, NOW(), :meta
                             )
-                            ON CONFLICT (identity_id, dc_id) 
-                            DO UPDATE SET
-                                session_string_enc = EXCLUDED.session_string_enc,
-                                is_active = true,
-                                updated_at = NOW()
                         """),
                         {
-                            "session_id": session_id,
-                            "identity_id": identity_id,
-                            "telegram_id": telegram_user_id,
-                            "encrypted_session": encrypted_session,
-                            "dc_id": dc_id
+                            "event_id": str(_uuid.uuid4()),
+                            "user_id": user_id,
+                            "reason": f"telegram_user_id={telegram_user_id}",
+                            "meta": Json({"invite_code": invite_code} if invite_code else {})
                         }
                     )
-                    
-                    # 7. Логирование события авторизации
-                    try:
-                        from psycopg2.extras import Json
-                        db_session.execute(
-                            text("""
-                                INSERT INTO telegram_auth_events (
-                                    id, user_id, event, reason, at, meta
-                                ) VALUES (
-                                    :event_id, :user_id, 'qr_authorized', :reason, NOW(), :meta
-                                )
-                            """),
-                            {
-                                "event_id": str(_uuid.uuid4()),
-                                "user_id": user_id,
-                                "reason": f"telegram_user_id={telegram_user_id}",
-                                "meta": Json({"invite_code": invite_code} if invite_code else {})
-                            }
-                        )
-                    except Exception as e:
-                        logger.warning("Failed to create auth event", 
-                                     error=str(e), 
-                                     user_id=str(user_id))
-                    
-                    # Context7: ВАЖНО - коммитим все операции одной транзакцией
-                    db_session.commit()
-                    
-                    logger.info(
-                        "Telegram session saved with Identity/Membership",
-                        session_id=session_id,
-                        identity_id=str(identity_id),
-                        user_id=str(user_id),
-                        telegram_id=telegram_user_id,
-                        tenant_id=str(db_tenant_uuid),
-                        dc_id=dc_id
-                    )
-                    
                 except Exception as e:
-                    db_session.rollback()
-                    logger.error("Failed to save session (Identity/Membership/Session)", 
-                               error=str(e), 
-                               telegram_id=telegram_user_id,
-                               exc_info=True)
-                    raise
+                    logger.warning("Failed to create auth event", 
+                                 error=str(e), 
+                                 user_id=str(user_id))
+                
+                # Context7: ВАЖНО - коммитим все операции одной транзакцией
+                db_session.commit()
+                
+                logger.info(
+                    "Telegram session saved with Identity/Membership",
+                    session_id=session_id,
+                    identity_id=str(identity_id),
+                    user_id=str(user_id),
+                    telegram_id=telegram_user_id,
+                    tenant_id=str(db_tenant_uuid),
+                    dc_id=dc_id
+                )
+                
+            except Exception as e:
+                db_session.rollback()
+                logger.error("Failed to save session (Identity/Membership/Session)", 
+                           error=str(e), 
+                           telegram_id=telegram_user_id,
+                           exc_info=True)
+                raise
             
         finally:
             # Context7: закрываем SQLAlchemy Session
@@ -542,29 +547,29 @@ class SessionStorageService:
         Fallback на users для обратной совместимости.
         """
         with self.db_connection.cursor(cursor_factory=RealDictCursor) as cursor:
-            conditions = ["ts.status = 'authorized'"]
+            # Context7: Исправлено - используем новую схему с identity_id вместо user_id
+            conditions = ["ts.is_active = true"]
             params: list[str] = []
-
-            if tenant_id:
-                conditions.append("ts.tenant_id::text = %s")
-                params.append(tenant_id)
 
             use_user_filter = bool(user_id) and user_id != tenant_id
             if use_user_filter:
-                conditions.append("ts.user_id::text = %s")
+                # Ищем через identity_id пользователя
+                conditions.append("u.id::text = %s")
                 params.append(user_id)
 
+            # Context7: Исправлено - JOIN через identities вместо прямого user_id
             query = f"""
                 SELECT 
                     ts.id,
                     ts.session_string_enc,
-                    ts.status,
+                    ts.is_active as status,
                     ts.created_at,
-                    ts.key_id,
+                    NULL as key_id,
                     ts.updated_at,
-                    u.telegram_id as telegram_user_id
+                    i.telegram_id as telegram_user_id
                 FROM telegram_sessions ts
-                LEFT JOIN users u ON u.id::uuid = ts.user_id::uuid
+                JOIN identities i ON i.id = ts.identity_id
+                LEFT JOIN users u ON u.identity_id = i.id
                 WHERE {' AND '.join(conditions)}
                 ORDER BY ts.updated_at DESC
                 LIMIT 1

@@ -339,6 +339,23 @@ async def cmd_menu(msg: Message):
     )
 
 
+@router.message(Command("remove_keyboard"))
+async def cmd_remove_keyboard(msg: Message):
+    """
+    Сброс клавиатуры ответа (Reply Keyboard) у пользователя.
+    
+    Удаляет кастомную клавиатуру и возвращает стандартную клавиатуру Telegram.
+    """
+    from aiogram.types import ReplyKeyboardRemove
+    
+    await msg.answer(
+        "⌨️ <b>Клавиатура сброшена</b>\n\n"
+        "Стандартная клавиатура восстановлена.",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove(remove_keyboard=True)
+    )
+
+
 @router.message(Command("login"))
 async def cmd_login_disabled(msg: Message):
     """Временная заглушка для /login."""
@@ -721,8 +738,9 @@ async def _add_channel(msg: Message, channel_name: str):
             user = r.json()
         
         # Добавить канал
+        # Context7: telegram_id будет получен автоматически через API при подписке
+        # Если username указан, API сам найдет telegram_id через Telegram API
         channel_data = {
-            "telegram_id": -1001234567890,  # TODO: Получить реальный ID канала
             "username": channel_name[1:],  # Убираем @
             "title": channel_name,
             "settings": {}
@@ -858,25 +876,80 @@ async def _delete_channel_callback(cb: CallbackQuery, channel_id: str):
     """Удалить канал через callback."""
     try:
         # Получить пользователя
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.get(f"{API_BASE}/api/users/{cb.from_user.id}")
             if r.status_code == 404:
                 await cb.message.edit_text("❌ Пользователь не найден")
+                await cb.answer("Пользователь не найден", show_alert=True)
                 return
             r.raise_for_status()
             user = r.json()
         
         # Удалить канал
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.delete(f"{API_BASE}/api/channels/users/{user['id']}/unsubscribe/{channel_id}")
             r.raise_for_status()
         
         await cb.message.edit_text("✅ Канал удален")
         await cb.answer("Канал удален")
         
+    except httpx.HTTPStatusError as e:
+        # Обработка HTTP ошибок с деталями
+        error_detail = None
+        try:
+            if e.response.headers.get("content-type", "").startswith("application/json"):
+                error_data = e.response.json()
+                if isinstance(error_data, dict):
+                    error_detail = error_data.get("detail")
+        except Exception:
+            pass
+        
+        logger.error(
+            "HTTP error deleting channel",
+            status_code=e.response.status_code,
+            response_text=e.response.text[:200],
+            error_detail=error_detail,
+            channel_id=channel_id,
+            user_id=cb.from_user.id
+        )
+        
+        # Специфичные сообщения для разных статусов
+        if e.response.status_code == 404:
+            await cb.message.edit_text("❌ Канал не найден или уже удален")
+            await cb.answer("Канал не найден", show_alert=True)
+        elif e.response.status_code == 403:
+            await cb.message.edit_text("❌ Нет доступа к удалению этого канала")
+            await cb.answer("Нет доступа", show_alert=True)
+        elif e.response.status_code >= 500:
+            await cb.message.edit_text("❌ Ошибка сервера при удалении канала\n\nПопробуйте позже.")
+            await cb.answer("Ошибка сервера", show_alert=True)
+        else:
+            await cb.message.edit_text(f"❌ Ошибка удаления канала (код: {e.response.status_code})")
+            await cb.answer("Ошибка удаления", show_alert=True)
+            
+    except httpx.RequestError as e:
+        # Обработка сетевых ошибок (таймауты, соединение и т.д.)
+        logger.error(
+            "Network error deleting channel",
+            error=str(e),
+            error_type=type(e).__name__,
+            channel_id=channel_id,
+            user_id=cb.from_user.id
+        )
+        await cb.message.edit_text("❌ Ошибка сети при удалении канала\n\nПроверьте подключение и попробуйте позже.")
+        await cb.answer("Ошибка сети", show_alert=True)
+        
     except Exception as e:
-        logger.error("Error deleting channel", error=str(e))
-        await cb.message.edit_text("❌ Ошибка удаления канала")
+        # Обработка прочих ошибок
+        logger.error(
+            "Unexpected error deleting channel",
+            error=str(e),
+            error_type=type(e).__name__,
+            channel_id=channel_id,
+            user_id=cb.from_user.id
+        )
+        await cb.message.edit_text("❌ Неожиданная ошибка при удалении канала\n\nПопробуйте позже.")
+        await cb.answer("Ошибка", show_alert=True)
 
 
 async def _rag_query(msg: Message, question: str, intent_override: Optional[str] = None, voice_transcription: bool = False, audio_file_id: Optional[str] = None):
@@ -923,8 +996,27 @@ async def _rag_query(msg: Message, question: str, intent_override: Optional[str]
             r.raise_for_status()
             result = r.json()
         
+        # Проверяем наличие обязательных полей в ответе
+        if 'result' not in result:
+            logger.error(
+                "Missing 'result' field in RAG response",
+                response_keys=list(result.keys()),
+                user_id=msg.from_user.id
+            )
+            await loading_msg.edit_text("❌ <b>Ошибка формата ответа</b>\n\nПопробуйте позже.")
+            return
+        
+        if 'answer' not in result['result']:
+            logger.error(
+                "Missing 'answer' field in RAG response",
+                result_keys=list(result['result'].keys()),
+                user_id=msg.from_user.id
+            )
+            await loading_msg.edit_text("❌ <b>Ошибка формата ответа</b>\n\nПопробуйте позже.")
+            return
+        
         answer = result['result']['answer']
-        sources = result['result']['sources']
+        sources = result['result'].get('sources', [])
         intent = result['result'].get('intent', 'ask')
         confidence = result['result'].get('confidence', 0.0)
         
@@ -1009,10 +1101,65 @@ async def _rag_query(msg: Message, question: str, intent_override: Optional[str]
     except httpx.TimeoutException:
         await loading_msg.edit_text("⏱️ <b>Превышено время ожидания</b>\n\nПопробуйте позже или упростите запрос.")
     except httpx.HTTPStatusError as e:
-        logger.error("HTTP error in RAG query", status_code=e.response.status_code, response_text=e.response.text[:200])
-        await loading_msg.edit_text("❌ <b>Ошибка обработки запроса</b>\n\nПопробуйте позже.")
+        # Пытаемся извлечь детали ошибки из ответа
+        error_detail = None
+        try:
+            if e.response.headers.get("content-type", "").startswith("application/json"):
+                error_data = e.response.json()
+                if isinstance(error_data, dict):
+                    error_detail = error_data.get("detail")
+                    if isinstance(error_detail, dict):
+                        error_message = error_detail.get("message")
+                        if error_message:
+                            error_detail = error_message
+        except Exception:
+            pass
+        
+        logger.error(
+            "HTTP error in RAG query",
+            status_code=e.response.status_code,
+            response_text=e.response.text[:500],
+            error_detail=error_detail,
+            user_id=msg.from_user.id
+        )
+        
+        # Специфичные сообщения для разных статусов
+        if e.response.status_code == 503:
+            # Индексация не готова
+            if error_detail:
+                await loading_msg.edit_text(f"⏳ <b>Индексация контента</b>\n\n{error_detail}")
+            else:
+                await loading_msg.edit_text(
+                    "⏳ <b>Индексация контента еще не завершена</b>\n\n"
+                    "Пожалуйста, подождите несколько минут и попробуйте снова."
+                )
+        elif e.response.status_code == 404:
+            await loading_msg.edit_text("❌ <b>Ресурс не найден</b>\n\nПопробуйте позже.")
+        elif e.response.status_code == 500:
+            await loading_msg.edit_text("❌ <b>Внутренняя ошибка сервера</b>\n\nПопробуйте позже.")
+        else:
+            # Общее сообщение для других ошибок
+            if error_detail:
+                await loading_msg.edit_text(f"❌ <b>Ошибка обработки запроса</b>\n\n{error_detail}")
+            else:
+                await loading_msg.edit_text("❌ <b>Ошибка обработки запроса</b>\n\nПопробуйте позже.")
+    except KeyError as e:
+        # Ошибка при доступе к полям ответа
+        logger.error(
+            "Missing field in RAG response",
+            error=str(e),
+            response_keys=list(result.keys()) if 'result' in locals() else None,
+            user_id=msg.from_user.id
+        )
+        await loading_msg.edit_text("❌ <b>Ошибка формата ответа</b>\n\nПопробуйте позже.")
     except Exception as e:
-        logger.error("Error in RAG query", error=str(e))
+        logger.error(
+            "Error in RAG query",
+            error=str(e),
+            error_type=type(e).__name__,
+            user_id=msg.from_user.id,
+            exc_info=True
+        )
         await loading_msg.edit_text("❌ <b>Произошла ошибка при обработке запроса</b>\n\nПопробуйте позже.")
 
 

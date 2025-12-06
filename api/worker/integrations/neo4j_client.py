@@ -105,7 +105,9 @@ class Neo4jClient:
         telegram_message_id: Optional[int] = None,
         tg_channel_id: Optional[int] = None,
         posted_at: Optional[str] = None,
-        channel_title: Optional[str] = None
+        channel_title: Optional[str] = None,
+        ocr_preview: Optional[str] = None,
+        has_ocr: bool = False
     ) -> bool:
         """
         Создание узла поста с expires_at property.
@@ -143,7 +145,9 @@ class Neo4jClient:
                     p.telegram_message_id = coalesce($telegram_message_id, p.telegram_message_id),
                     p.tg_channel_id = coalesce($tg_channel_id, p.tg_channel_id),
                     p.posted_at = coalesce($posted_at, p.posted_at),
-                    p.channel_title = coalesce($channel_title, p.channel_title, '')
+                    p.channel_title = coalesce($channel_title, p.channel_title, ''),
+                    p.ocr_preview = coalesce($ocr_preview, p.ocr_preview),
+                    p.has_ocr = coalesce($has_ocr, p.has_ocr, false)
                 MERGE (u:User {user_id: $effective_user_id})
                 SET u.tenant_id = $tenant_id
                 MERGE (c:Channel {channel_id: $channel_id})
@@ -156,6 +160,11 @@ class Neo4jClient:
                 trimmed_content = None
                 if content:
                     trimmed_content = content[:2048]
+                
+                # Context7: Обрезаем OCR preview до 200 символов для Neo4j
+                trimmed_ocr_preview = None
+                if ocr_preview:
+                    trimmed_ocr_preview = ocr_preview[:200]
                 
                 result = await session.run(
                     query,
@@ -170,12 +179,19 @@ class Neo4jClient:
                     telegram_message_id=telegram_message_id,
                     tg_channel_id=tg_channel_id,
                     posted_at=posted_at,
-                    channel_title=channel_title
+                    channel_title=channel_title,
+                    ocr_preview=trimmed_ocr_preview,
+                    has_ocr=has_ocr
                 )
                 
                 record = await result.single()
                 if record and record["post_id"] == post_id:
                     logger.debug("Post node created/updated successfully", post_id=post_id)
+                    
+                    # Context7: Создаем индексы для OCR поиска при первом создании узла с OCR
+                    if has_ocr and ocr_preview:
+                        await self._ensure_ocr_indexes(session)
+                    
                     return True
                 else:
                     logger.error("Failed to create post node", post_id=post_id)
@@ -186,6 +202,40 @@ class Neo4jClient:
                         post_id=post_id,
                         error=str(e))
             return False
+    
+    async def _ensure_ocr_indexes(self, session):
+        """
+        Создать индексы для OCR поиска в Neo4j.
+        
+        Context7: Индексы для быстрого поиска постов с OCR и фильтрации.
+        
+        Args:
+            session: Neo4j session для выполнения запросов
+        """
+        try:
+            # Context7: Индекс для фильтрации постов с OCR
+            index_queries = [
+                """
+                CREATE INDEX has_ocr_index IF NOT EXISTS FOR (p:Post) ON (p.has_ocr);
+                """,
+                # Context7: Fulltext индекс для поиска по OCR preview (требует Neo4j Fulltext Search)
+                # Оставляем закомментированным, так как fulltext индексы требуют специальной настройки
+                # """
+                # CREATE FULLTEXT INDEX ocr_preview_fulltext IF NOT EXISTS FOR (p:Post) ON EACH [p.ocr_preview];
+                # """
+            ]
+            
+            for query in index_queries:
+                try:
+                    await session.run(query.strip())
+                    logger.debug("OCR index created/verified")
+                except Exception as idx_error:
+                    # Игнорируем ошибки "already exists"
+                    error_msg = str(idx_error).lower()
+                    if "already exists" not in error_msg and "equivalent" not in error_msg:
+                        logger.debug("Failed to create OCR index", error=str(idx_error))
+        except Exception as e:
+            logger.debug("Failed to ensure OCR indexes", error=str(e))
     
     async def create_tag_relationships(
         self,

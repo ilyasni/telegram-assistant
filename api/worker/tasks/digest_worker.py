@@ -142,7 +142,7 @@ from shared.utils.circuit_breaker import (  # type: ignore # noqa: E402
     CircuitBreakerOpenError,
 )
 from api.middleware.rls_middleware import set_tenant_id_in_session  # type: ignore # noqa: E402
-from api.models.database import SessionLocal, DigestHistory, GroupDigest, User  # type: ignore # noqa: E402
+from api.models.database import SessionLocal, DigestHistory, GroupDigest, GroupConversationWindow, User  # type: ignore # noqa: E402
 from api.services.digest_service import get_digest_service  # type: ignore # noqa: E402
 from api.services.group_digest_service import (  # type: ignore # noqa: E402
     get_group_digest_service,
@@ -465,6 +465,10 @@ class DigestWorker:
         is_group_context = digest_event.context == "group" or digest_event.group_window_id is not None
         digest_service = self._get_digest_service()
         group_digest_service = self._get_group_digest_service() if is_group_context else None
+
+        # Context7: Для групповых дайджестов существующий дайджест будет использован как baseline
+        # для сравнения при генерации нового. Это позволяет создать секцию "По сравнению с прошлым окном"
+        # Вся логика загрузки baseline перенесена в group_digest_service.generate()
 
         @self._generation_retry
         async def _run_generation():

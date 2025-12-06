@@ -48,27 +48,9 @@ groups:
       
       # ============================================================================
       # S3 STORAGE QUOTA ALERTS
+      # Context7: Дубликаты удалены - используются алерты из storage_quota_alerts.yml
+      # StorageQuotaWarning и StorageQuotaCritical
       # ============================================================================
-      
-      - alert: S3StorageQuotaWarning
-        expr: storage_bucket_usage_gb / 15 > 0.85
-        for: 5m
-        labels:
-          severity: warning
-          component: storage
-        annotations:
-          summary: "S3 storage usage превышает 85% (12.75 GB / 15 GB)"
-          description: "Текущее использование: {{ $value | humanize }} GB ({{ $value | humanizePercentage }} от лимита)"
-      
-      - alert: S3StorageQuotaCritical
-        expr: storage_bucket_usage_gb / 15 > 0.93
-        for: 2m
-        labels:
-          severity: critical
-          component: storage
-        annotations:
-          summary: "S3 storage usage критично (14 GB / 15 GB)"
-          description: "Требуется немедленная очистка! Использование: {{ $value | humanize }} GB"
       
       - alert: S3StorageQuotaViolationsHigh
         expr: rate(storage_quota_violations_total[10m]) > 10
@@ -196,14 +178,30 @@ groups:
       # ============================================================================
       
       - alert: VisionWorkerNotProcessing
-        expr: rate(vision_worker_processed_total[5m]) == 0
+        # Context7: Алерт срабатывает только если есть pending сообщения И нет обработки
+        # Если очередь пуста (vision_pel_size = 0), то отсутствие активности - это нормально
+        # Используем vision_events_total или vision_analysis_duration_seconds_count как индикатор активности
+        expr: |
+          (
+            sum(rate(vision_events_total[5m])) == 0
+            and
+            sum(rate(vision_analysis_duration_seconds_count[5m])) == 0
+            and
+            sum(vision_pel_size) > 0
+          )
         for: 10m
         labels:
           severity: critical
           component: worker
         annotations:
           summary: "Vision worker не обрабатывает события"
-          description: "Worker не обработал ни одного события за последние 10 минут"
+          description: |
+            Нет обработки событий за последние 10 минут при наличии pending сообщений (vision_pel_size > 0).
+            Проверить:
+            1. Логи worker: docker logs telegram-assistant-worker-1 | grep -i vision
+            2. Состояние очереди: docker exec telegram-assistant-redis-1 redis-cli XINFO GROUPS stream:posts:vision
+            3. Pending сообщения: docker exec telegram-assistant-redis-1 redis-cli XPENDING stream:posts:vision vision_workers
+            Если очередь пуста (vision_pel_size = 0), то отсутствие активности - это нормально.
       
       - alert: VisionWorkerHighFailureRate
         expr: |

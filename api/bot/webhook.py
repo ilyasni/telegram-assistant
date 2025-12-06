@@ -187,6 +187,7 @@ async def set_bot_commands() -> None:
             BotCommand(command="trends", description="Тренды в каналах"),
             BotCommand(command="subscription", description="Информация о подписке"),
             BotCommand(command="feedback", description="Отправить feedback"),
+            BotCommand(command="remove_keyboard", description="Сбросить клавиатуру"),
             BotCommand(command="admin", description="Админ-панель"),
         ]
         
