@@ -125,15 +125,151 @@ class SessionStorageService:
             error_code = self._classify_error(e)
             error_details = str(e)
             
+            # Context7: если это ошибка дубликата сессии, это нормально - сессия уже существует
+            # В этом случае нужно попробовать получить существующую сессию
+            if error_code == "duplicate_session":
+                logger.info(
+                    "Session already exists (duplicate), attempting to retrieve existing session",
+                    tenant_id=tenant_id,
+                    telegram_user_id=telegram_user_id
+                )
+                try:
+                    # Пробуем получить существующую сессию
+                    existing_session = await self._get_existing_session_by_telegram_id(telegram_user_id, tenant_id)
+                    if existing_session:
+                        logger.info(
+                            "Retrieved existing session after duplicate error",
+                            tenant_id=tenant_id,
+                            session_id=existing_session.get('id'),
+                            telegram_user_id=telegram_user_id
+                        )
+                        return True, existing_session.get('id'), None, None
+                except Exception as retrieve_error:
+                    logger.warning(
+                        "Failed to retrieve existing session after duplicate error",
+                        error=str(retrieve_error),
+                        tenant_id=tenant_id
+                    )
+            
+            # Context7: если это ошибка дубликата сессии, это нормально - сессия уже существует
+            # В этом случае нужно попробовать получить существующую сессию
+            if error_code == "duplicate_session":
+                logger.info(
+                    "Session already exists (duplicate), attempting to retrieve existing session",
+                    tenant_id=tenant_id,
+                    telegram_user_id=telegram_user_id
+                )
+                try:
+                    # Пробуем получить существующую сессию по telegram_user_id
+                    existing_session = await self._get_existing_session_by_telegram_id(telegram_user_id, tenant_id)
+                    if existing_session and existing_session.get('id'):
+                        logger.info(
+                            "Retrieved existing session after duplicate error",
+                            tenant_id=tenant_id,
+                            session_id=existing_session.get('id'),
+                            telegram_user_id=telegram_user_id
+                        )
+                        return True, existing_session.get('id'), None, None
+                except Exception as retrieve_error:
+                    logger.warning(
+                        "Failed to retrieve existing session after duplicate error",
+                        error=str(retrieve_error),
+                        tenant_id=tenant_id,
+                        telegram_user_id=telegram_user_id
+                    )
+            
             logger.error(
                 "Failed to save Telegram session", 
                 error=str(e),
                 error_code=error_code,
                 tenant_id=tenant_id,
-                user_id=user_id
+                user_id=user_id,
+                telegram_user_id=telegram_user_id
             )
             
             return False, None, error_code, error_details
+    
+    async def _get_existing_session_by_telegram_id(self, telegram_user_id: int, tenant_id: str) -> Optional[dict]:
+        """
+        Context7: получение существующей сессии по telegram_user_id.
+        Используется для обработки случая, когда сессия уже существует.
+        """
+        if not self.db_connection:
+            await self.init_db()
+        
+        try:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                None,
+                self._get_session_by_telegram_id_sync,
+                telegram_user_id,
+                tenant_id
+            )
+        except Exception as e:
+            logger.error("Failed to get existing session by telegram_id", 
+                        error=str(e), 
+                        telegram_user_id=telegram_user_id,
+                        tenant_id=tenant_id)
+            return None
+    
+    def _get_session_by_telegram_id_sync(self, telegram_user_id: int, tenant_id: str) -> Optional[dict]:
+        """Синхронное получение сессии по telegram_user_id."""
+        import sys
+        import os
+        import uuid as _uuid
+        from sqlalchemy import create_engine, text
+        from config import settings
+        
+        # Context7: создаем SQLAlchemy Session для работы с БД
+        engine = create_engine(settings.database_url)
+        SessionLocal = __import__('sqlalchemy.orm', fromlist=['sessionmaker']).sessionmaker(bind=engine)
+        db_session = SessionLocal()
+        
+        try:
+            # Context7: ищем сессию через Identity -> telegram_sessions
+            result = db_session.execute(
+                text("""
+                    SELECT 
+                        ts.id,
+                        ts.identity_id,
+                        ts.telegram_id,
+                        ts.session_string_enc,
+                        ts.dc_id,
+                        ts.is_active,
+                        ts.created_at,
+                        ts.updated_at,
+                        i.telegram_id as identity_telegram_id
+                    FROM telegram_sessions ts
+                    JOIN identities i ON ts.identity_id = i.id
+                    WHERE i.telegram_id = :telegram_id
+                      AND ts.is_active = true
+                    ORDER BY ts.updated_at DESC
+                    LIMIT 1
+                """),
+                {"telegram_id": telegram_user_id}
+            )
+            row = result.fetchone()
+            
+            if row:
+                return {
+                    'id': str(row[0]),
+                    'identity_id': str(row[1]),
+                    'telegram_user_id': row[2],
+                    'session_string_enc': row[3],
+                    'dc_id': row[4],
+                    'is_active': row[5],
+                    'created_at': row[6],
+                    'updated_at': row[7],
+                    'status': 'authorized'
+                }
+            return None
+        except Exception as e:
+            logger.error("Error getting session by telegram_id", 
+                        error=str(e), 
+                        telegram_user_id=telegram_user_id)
+            return None
+        finally:
+            db_session.close()
     
     def _classify_error(self, error: Exception) -> str:
         """Классификация ошибок для детальной диагностики."""
@@ -179,11 +315,56 @@ class SessionStorageService:
         import os
         import uuid as _uuid
         # Context7: добавляем путь к api для импорта утилит
-        api_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'api')
-        if api_path not in sys.path:
-            sys.path.insert(0, api_path)
+        # Правильный путь: от telethon-ingest/services/session_storage.py к api/
+        # В контейнере: /app (telethon-ingest) и /opt/telegram-assistant/api (монтируется)
+        current_file = os.path.abspath(__file__)  # telethon-ingest/services/session_storage.py
+        services_dir = os.path.dirname(current_file)  # telethon-ingest/services
+        telethon_ingest_dir = os.path.dirname(services_dir)  # telethon-ingest
+        project_root = os.path.dirname(telethon_ingest_dir)  # корень проекта
         
-        from utils.identity_membership import upsert_identity_sync, upsert_membership_sync
+        # Context7: пробуем несколько путей для совместимости
+        # ВАЖНО: в контейнере api монтируется в /opt/telegram-assistant/api
+        api_paths = [
+            '/opt/telegram-assistant/api',  # в контейнере: монтируется сюда (ПРИОРИТЕТ)
+            os.path.join(project_root, 'api'),  # локально: /opt/telegram-assistant/api
+            os.path.join(os.path.dirname(telethon_ingest_dir), 'api'),  # альтернативный путь
+            '/app/api',  # fallback для некоторых конфигураций
+        ]
+        
+        api_path = None
+        for path in api_paths:
+            if os.path.exists(path) and os.path.isdir(path):
+                # Context7: проверяем наличие utils/identity_membership.py
+                utils_path = os.path.join(path, 'utils', 'identity_membership.py')
+                if os.path.exists(utils_path):
+                    api_path = path
+                    if path not in sys.path:
+                        sys.path.insert(0, path)
+                    logger.debug("Found API path", api_path=api_path, utils_exists=True)
+                    break
+                else:
+                    logger.debug("API path exists but utils/identity_membership.py not found", 
+                               api_path=path, utils_path=utils_path)
+        
+        if not api_path:
+            logger.error("API path not found or utils/identity_membership.py missing", 
+                        tried_paths=api_paths, 
+                        current_file=current_file,
+                        current_dir=os.getcwd())
+            raise ImportError(f"Could not find api directory with utils/identity_membership.py. Tried: {api_paths}")
+        
+        try:
+            from utils.identity_membership import upsert_identity_sync, upsert_membership_sync
+            logger.debug("Successfully imported identity_membership", api_path=api_path)
+        except ImportError as e:
+            logger.error("Failed to import identity_membership", 
+                        error=str(e), 
+                        api_path=api_path, 
+                        sys_path=sys.path[:5],
+                        current_file=current_file,
+                        utils_path=os.path.join(api_path, 'utils', 'identity_membership.py'),
+                        utils_exists=os.path.exists(os.path.join(api_path, 'utils', 'identity_membership.py')))
+            raise
         from sqlalchemy.orm import Session
         from sqlalchemy import create_engine
         from config import settings

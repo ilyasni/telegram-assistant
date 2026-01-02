@@ -54,27 +54,44 @@ class DigestContextObserver:
         self.consumer: Optional[EventConsumer] = None
 
     async def start(self) -> None:
-        self.redis_client = RedisStreamsClient(self.redis_url)
-        await self.redis_client.connect()
+        # Context7: Логируем начало запуска для диагностики
+        logger.info("DigestContextObserver.start() called", redis_url=self.redis_url)
+        
+        try:
+            self.redis_client = RedisStreamsClient(self.redis_url)
+            await self.redis_client.connect()
+            logger.info("DigestContextObserver: Redis client connected")
 
-        consumer_name = f"digest-context-observer-{os.getpid()}"
-        config = ConsumerConfig(
-            group_name="digest-context-observers",
-            consumer_name=consumer_name,
-            batch_size=20,
-            block_time=1_000,
-            max_retries=5,
-            retry_delay=5,
-        )
-        self.consumer = EventConsumer(self.redis_client, config)
+            consumer_name = f"digest-context-observer-{os.getpid()}"
+            config = ConsumerConfig(
+                group_name="digest-context-observers",
+                consumer_name=consumer_name,
+                batch_size=20,
+                block_time=1_000,
+                max_retries=5,
+                retry_delay=5,
+            )
+            self.consumer = EventConsumer(self.redis_client, config)
+            logger.info("DigestContextObserver: EventConsumer created", consumer_name=consumer_name)
 
-        logger.info(
-            "DigestContextObserver started",
-            redis_url=self.redis_url,
-            consumer_name=consumer_name,
-        )
+            logger.info(
+                "DigestContextObserver started successfully",
+                redis_url=self.redis_url,
+                consumer_name=consumer_name,
+                stream_name="digest.context.prepared"
+            )
 
-        await self.consumer.consume_forever("digest.context.prepared", self._handle_event)
+            # Context7: Логируем начало потребления для диагностики
+            logger.info("DigestContextObserver: Starting consume_forever", stream_name="digest.context.prepared")
+            await self.consumer.consume_forever("digest.context.prepared", self._handle_event)
+        except Exception as e:
+            logger.error(
+                "DigestContextObserver.start() failed",
+                error=str(e),
+                error_type=type(e).__name__,
+                exc_info=True
+            )
+            raise
 
     async def _handle_event(self, payload: Dict[str, Any]) -> None:
         data = payload.get("payload") or payload

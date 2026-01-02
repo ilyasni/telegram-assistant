@@ -409,9 +409,43 @@
                     if (typeof window.Telegram.WebApp.onEvent === 'function') {
                         try {
                             window.Telegram.WebApp.onEvent('themeChanged', applyTheme);
+                            // Context7: добавляем обработчик для получения initData когда он станет доступен
+                            window.Telegram.WebApp.onEvent('viewportChanged', () => {
+                                // Когда viewport изменяется, initData может стать доступен
+                                const data = getInitData();
+                                if (isValidInitData(data) && !cachedInitData) {
+                                    cachedInitData = data;
+                                    console.log('[QR] initData received via viewportChanged event');
+                                }
+                            });
                         } catch (e) {
                             console.warn('[QR] onEvent not supported:', e);
                         }
+                    }
+                    
+                    // Context7: периодически проверяем появление initData (fallback для случаев, когда события не срабатывают)
+                    if (!window._initDataPollInterval) {
+                        window._initDataPollInterval = setInterval(() => {
+                            if (!cachedInitData || !isValidInitData(cachedInitData)) {
+                                const data = getInitData();
+                                if (isValidInitData(data)) {
+                                    cachedInitData = data;
+                                    console.log('[QR] initData received via polling');
+                                    clearInterval(window._initDataPollInterval);
+                                    window._initDataPollInterval = null;
+                                }
+                            } else {
+                                clearInterval(window._initDataPollInterval);
+                                window._initDataPollInterval = null;
+                            }
+                        }, 500);
+                        // Останавливаем polling через 30 секунд
+                        setTimeout(() => {
+                            if (window._initDataPollInterval) {
+                                clearInterval(window._initDataPollInterval);
+                                window._initDataPollInterval = null;
+                            }
+                        }, 30000);
                     }
                 }
             }
@@ -522,14 +556,25 @@
                 return '';
             }
 
-            async function waitForInitData(maxAttempts = 20, delayMs = 150) {
+            async function waitForInitData(maxAttempts = 30, delayMs = 150) {
+                // Context7: увеличиваем количество попыток для новых пользователей
                 for (let attempt = 0; attempt < maxAttempts; attempt++) {
                     const data = getInitData();
                     if (isValidInitData(data)) {
+                        console.log(`[QR] initData found on attempt ${attempt + 1}`);
                         return data;
+                    }
+                    if (attempt === 0) {
+                        console.log('[QR] Waiting for initData...', {
+                            Telegram: !!window.Telegram,
+                            WebApp: !!window.Telegram?.WebApp,
+                            initData: !!window.Telegram?.WebApp?.initData,
+                            initDataUnsafe: !!window.Telegram?.WebApp?.initDataUnsafe
+                        });
                     }
                     await new Promise(resolve => setTimeout(resolve, delayMs));
                 }
+                console.error('[QR] initData not found after', maxAttempts, 'attempts');
                 return '';
             }
 
@@ -709,7 +754,25 @@
                 try {
                     updateStatus('Создание сессии...', 'loading');
 
-                    const initData = await waitForInitData(30, 150);
+                    // Context7: сначала пробуем получить initData с ожиданием
+                    let initData = await waitForInitData(30, 150);
+                    
+                    // Context7: если initData не получен, пробуем еще раз с большим количеством попыток
+                    // Это важно для новых пользователей, где initData может загружаться дольше
+                    if (!isValidInitData(initData)) {
+                        console.warn('[QR] initData not found after first attempt, trying again with more attempts...');
+                        // Проверяем, есть ли хотя бы WebApp объект
+                        if (window.Telegram?.WebApp) {
+                            console.log('[QR] WebApp exists, waiting longer for initData...', {
+                                hasInitData: !!window.Telegram.WebApp.initData,
+                                hasInitDataUnsafe: !!window.Telegram.WebApp.initDataUnsafe,
+                                version: window.Telegram.WebApp.version
+                            });
+                            // Пробуем еще раз с большим количеством попыток
+                            initData = await waitForInitData(50, 200);
+                        }
+                    }
+                    
                     const payload = {};
 
                     if (isValidInitData(initData)) {
@@ -719,14 +782,44 @@
                         if (resolvedTenantId) {
                             payload.tenant_id = resolvedTenantId;
                         }
+                        console.log('[QR] Using initData for session creation, length:', initData.length);
                     } else if (fallbackToken) {
                         console.warn('[QR] initData unavailable, using fallback token');
                         updateStatus('Запуск через одноразовый токен...', 'loading');
                         payload.token = fallbackToken;
                     } else {
-                        console.error('[QR] initData remains empty after waiting and no fallback token');
-                        updateStatus('Ошибка: не удалось получить данные Telegram WebApp. Открой Mini App из Telegram.', 'error');
-                        return;
+                        // Context7: пробуем извлечь tenant_id из initDataUnsafe как fallback
+                        const unsafe = getInitDataUnsafe();
+                        if (unsafe?.user?.id) {
+                            const telegramUserId = unsafe.user.id;
+                            const fallbackTenantId = String(telegramUserId);
+                            console.warn('[QR] initData unavailable, using telegram_user_id from initDataUnsafe as tenant_id', {
+                                telegram_user_id: telegramUserId,
+                                tenant_id: fallbackTenantId
+                            });
+                            payload.tenant_id = fallbackTenantId;
+                            // Context7: также пробуем построить initData из unsafe для отправки
+                            const builtInitData = buildInitDataFromUnsafe(unsafe);
+                            if (isValidInitData(builtInitData)) {
+                                payload.init_data = builtInitData;
+                                cachedInitData = builtInitData;
+                                console.log('[QR] Built initData from initDataUnsafe for payload, length:', builtInitData.length);
+                            }
+                            updateStatus('Создание сессии...', 'loading');
+                        } else {
+                            // Context7: если нет никаких данных, показываем ошибку
+                            console.error('[QR] No initData, no fallbackToken, no initDataUnsafe - cannot create session');
+                            console.log('[QR] WebApp state:', {
+                                Telegram: !!window.Telegram,
+                                WebApp: !!window.Telegram?.WebApp,
+                                initData: !!window.Telegram?.WebApp?.initData,
+                                initDataUnsafe: !!window.Telegram?.WebApp?.initDataUnsafe,
+                                version: window.Telegram?.WebApp?.version,
+                                platform: window.Telegram?.WebApp?.platform
+                            });
+                            updateStatus('Ошибка: не удалось получить данные Telegram WebApp. Открой Mini App из Telegram.', 'error');
+                            return;
+                        }
                     }
 
                     const response = await fetch(`${API_BASE || ''}/tg/qr/start`, {
@@ -905,9 +998,36 @@
                             }
                         }, 2000);
                     } else if (data.status === 'failed') {
-                        updateStatus(`❌ Ошибка: ${data.reason || 'Неизвестная ошибка'}`, 'error');
+                        // Context7: показываем причину ошибки, если она есть
+                        let errorMessage = '❌ Ошибка авторизации';
+                        if (data.reason) {
+                            // Маппинг причин ошибок на понятные сообщения
+                            const reasonMessages = {
+                                'password_required': 'Требуется пароль 2FA',
+                                'ownership_mismatch': 'Несоответствие аккаунта',
+                                'flood_wait': 'Слишком много запросов. Попробуйте позже',
+                                'qr_login_error': 'Ошибка при обработке QR-кода',
+                                'invalid_telegram_user': 'Неверные данные пользователя',
+                                'session_store': 'Ошибка сохранения сессии',
+                                'session_store_integrity_failed': 'Ошибка сохранения сессии: проблема с данными',
+                                'session_store_operational_failed': 'Ошибка сохранения сессии: проблема с операцией',
+                                'session_store_database_failed': 'Ошибка сохранения сессии: проблема с базой данных',
+                                'session_store_unexpected_failed': 'Ошибка сохранения сессии: неожиданная ошибка',
+                                'session_saver_failed': 'Ошибка сохранения сессии: проблема с сохранением'
+                            };
+                            const reasonKey = Object.keys(reasonMessages).find(key => data.reason.includes(key));
+                            if (reasonKey) {
+                                errorMessage = `❌ ${reasonMessages[reasonKey]}`;
+                            } else {
+                                errorMessage = `❌ Ошибка: ${data.reason}`;
+                            }
+                        }
+                        updateStatus(errorMessage, 'error');
                         hideQR();
-                        document.getElementById('password-form').style.display = 'none';
+                        const passwordForm = document.getElementById('password-form');
+                        if (passwordForm) {
+                            passwordForm.style.display = 'none';
+                        }
                         clearInterval(statusCheckInterval);
                     } else if (data.status === 'expired') {
                         updateStatus('⏰ Сессия истекла', 'error');
@@ -1038,6 +1158,7 @@
             }
 
             document.addEventListener('DOMContentLoaded', async () => {
+                // Context7: инициализируем WebApp и ждем полной загрузки
                 initTelegramWebApp();
 
                 // Context7: безопасная проверка isReady - может не поддерживаться
@@ -1055,8 +1176,26 @@
                                     console.warn('[QR] ready() error:', e);
                                 }
                             }
-                            setTimeout(resolve, 100);
+                            setTimeout(resolve, 200);
                         }
+                    });
+                    
+                    // Context7: даем время для инициализации initData после ready()
+                    await new Promise(resolve => setTimeout(resolve, 200));
+                } else {
+                    // Context7: если WebApp не загружен, ждем его появления
+                    await new Promise(resolve => {
+                        const checkInterval = setInterval(() => {
+                            if (window.Telegram?.WebApp) {
+                                clearInterval(checkInterval);
+                                initTelegramWebApp();
+                                setTimeout(resolve, 300);
+                            }
+                        }, 50);
+                        setTimeout(() => {
+                            clearInterval(checkInterval);
+                            resolve();
+                        }, 2000);
                     });
                 }
 

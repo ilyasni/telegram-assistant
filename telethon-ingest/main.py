@@ -48,6 +48,21 @@ logging.basicConfig(
 
 logger = structlog.get_logger()
 
+# Context7: Импортируем метрики scheduler для экспорта через /metrics endpoint
+# Метрики должны быть доступны сразу при старте для мониторинга
+try:
+    from tasks.parse_all_channels_task import (
+        scheduler_last_tick_ts_seconds,
+        scheduler_heartbeat_seconds,
+        parser_runs_total,
+        parsing_duration_seconds,
+        posts_parsed_total
+    )
+    logger.info("Scheduler metrics imported successfully for Prometheus export")
+except ImportError as e:
+    # Если модуль недоступен при импорте, метрики будут доступны после инициализации scheduler
+    logger.warning("Failed to import scheduler metrics at startup", error=str(e))
+
 # Context7 best practice: обработчики сигналов для диагностики segfault/crash
 def signal_handler(signum, frame):
     """
@@ -191,9 +206,10 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.send_header("Content-type", "application/json")
             self.end_headers()
             
+            import json
             status = "healthy" if app_state["status"] == "ready" else "starting"
             response = {"status": status}
-            self.wfile.write(str(response).encode())
+            self.wfile.write(json.dumps(response).encode())
             
         elif self.path == "/health/details":
             self.send_response(200)
@@ -236,7 +252,8 @@ class HealthHandler(BaseHTTPRequestHandler):
                     "rate_limiter": rate_limiter is not None
                 }
             }
-            self.wfile.write(str(response).encode())
+            import json
+            self.wfile.write(json.dumps(response, default=str).encode())
         elif self.path == "/metrics":
             self._serve_metrics()
         else:
@@ -530,13 +547,35 @@ async def run_ingest_loop():
             await app_state["telegram_client_manager"].close_all()
 
 
-async def run_scheduler_loop():
-    """Запуск scheduler loop для incremental парсинга."""
-    logger.info("Scheduler loop starting...")
+async def run_scheduler_loop(restart_count: int = 0):
+    """Запуск scheduler loop для incremental парсинга.
+    
+    Args:
+        restart_count: Количество перезапусков (для защиты от бесконечной рекурсии)
+    """
+    if restart_count > 0:
+        logger.info("Scheduler loop restarting...", restart_count=restart_count)
+    else:
+        logger.info("Scheduler loop starting...")
+    
+    # Context7: Защита от бесконечной рекурсии при перезапусках
+    max_restarts = 5
+    if restart_count >= max_restarts:
+        logger.error(
+            "Scheduler loop exceeded max restart attempts",
+            restart_count=restart_count,
+            max_restarts=max_restarts
+        )
+        # Останавливаем перезапуски, но не падаем - другие циклы продолжают работать
+        while True:
+            await asyncio.sleep(3600)  # Спим час, потом можно попробовать снова
+        return
     
     try:
         # Проверка feature flag
+        logger.debug("Checking feature flag FEATURE_INCREMENTAL_PARSING_ENABLED")
         enabled = os.getenv("FEATURE_INCREMENTAL_PARSING_ENABLED", "true").lower() == "true"
+        logger.info("Feature flag check completed", enabled=enabled)
         if not enabled:
             logger.info("Incremental parsing disabled via feature flag")
             while True:
@@ -544,39 +583,61 @@ async def run_scheduler_loop():
             return
         
         # Ждём инициализации сервисов
+        logger.info("Waiting 10 seconds for other services to initialize...")
         await asyncio.sleep(10)  # Даём время другим сервисам запуститься
+        logger.info("Wait completed, starting imports...")
         
+        logger.debug("Importing ParseAllChannelsTask...")
         from tasks.parse_all_channels_task import ParseAllChannelsTask
+        logger.debug("Importing ParserConfig and ChannelParser...")
         from services.channel_parser import ParserConfig, ChannelParser
+        logger.debug("Importing async engine components...")
         from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+        logger.info("All imports completed successfully")
         
         # Инициализация компонентов
+        logger.debug("Creating ParserConfig...")
         config = ParserConfig()
+        logger.info("ParserConfig created successfully")
         
         # Context7: Создаём общий Redis клиент для parser и scheduler с таймаутами
+        logger.info("Creating shared Redis client for parser and scheduler...")
         import redis.asyncio as redis
-        shared_redis_client = redis.from_url(
-            settings.redis_url,
-            decode_responses=True,
-            socket_connect_timeout=10,  # Timeout для подключения
-            socket_timeout=30,  # Timeout для операций
-            retry_on_timeout=True
-        )
-        logger.info("Shared Redis client created for parser and scheduler")
+        try:
+            shared_redis_client = redis.from_url(
+                settings.redis_url,
+                decode_responses=True,
+                socket_connect_timeout=10,  # Timeout для подключения
+                socket_timeout=30,  # Timeout для операций
+                retry_on_timeout=True
+            )
+            logger.info("Shared Redis client created for parser and scheduler")
+        except Exception as redis_error:
+            logger.error(
+                "Failed to create Redis client",
+                error=str(redis_error),
+                error_type=type(redis_error).__name__,
+                exc_info=True
+            )
+            raise
         
         # Context7: Ждём инициализации TelegramClientManager из run_ingest_loop()
         # Проверяем app_state с таймаутом
+        logger.info("Waiting for TelegramClientManager initialization...")
         max_wait = 30  # Maximum wait time in seconds
         wait_interval = 1  # Check every second
         waited = 0
         
         client_manager = app_state.get("telegram_client_manager")
+        logger.debug("Initial TelegramClientManager check", found=client_manager is not None)
         while not client_manager and waited < max_wait:
             await asyncio.sleep(wait_interval)
             waited += wait_interval
             client_manager = app_state.get("telegram_client_manager")
             if client_manager:
                 logger.info("TelegramClientManager found in app_state after waiting", waited_seconds=waited)
+            elif waited % 5 == 0:  # Логируем каждые 5 секунд
+                logger.debug("Still waiting for TelegramClientManager", waited_seconds=waited, max_wait=max_wait)
         
         # Если TelegramClientManager всё ещё недоступен, инициализируем новый
         if not client_manager:
@@ -608,6 +669,7 @@ async def run_scheduler_loop():
             logger.info("Using existing TelegramClientManager from app_state")
         
         # Создание AsyncSession engine для ChannelParser
+        logger.info("Preparing database URL for async engine...")
         # Replace postgresql:// with postgresql+asyncpg:// for async driver
         import re
         db_url = settings.database_url.replace("postgresql://", "postgresql+asyncpg://", 1)
@@ -631,21 +693,33 @@ async def run_scheduler_loop():
         ))
         logger.info("Creating async engine", db_url=db_url[:100])  # Log first 100 chars to avoid exposing password
         # Context7: Добавляем таймауты для предотвращения зависаний транзакций
-        engine = create_async_engine(
-            db_url, 
-            pool_pre_ping=True, 
-            pool_size=5,
-            pool_timeout=30,  # Timeout для получения соединения из пула
-            connect_args={
-                "command_timeout": 60,  # Timeout для каждой команды (через asyncpg)
-                "server_settings": {
-                    "application_name": "telethon_ingest"
+        try:
+            engine = create_async_engine(
+                db_url, 
+                pool_pre_ping=True, 
+                pool_size=5,
+                pool_timeout=30,  # Timeout для получения соединения из пула
+                connect_args={
+                    "command_timeout": 60,  # Timeout для каждой команды (через asyncpg)
+                    "server_settings": {
+                        "application_name": "telethon_ingest"
+                    }
                 }
-            }
-        )
+            )
+            logger.info("Async engine created successfully")
+        except Exception as engine_error:
+            logger.error(
+                "Failed to create async engine",
+                error=str(engine_error),
+                error_type=type(engine_error).__name__,
+                exc_info=True
+            )
+            raise
         
         # Создание AsyncSession для парсера
+        logger.debug("Creating AsyncSession...")
         db_session = AsyncSession(engine)
+        logger.info("AsyncSession created successfully")
         
         # Context7: Инициализация MediaProcessor для обработки медиа
         media_processor = None
@@ -718,33 +792,55 @@ async def run_scheduler_loop():
             # Продолжаем без MediaProcessor
         
         # Создание ChannelParser с DI и общим Redis клиентом
-        parser = ChannelParser(
-            config=config,
-            db_session=db_session,
-            event_publisher=None,  # Temporarily disabled
-            redis_client=shared_redis_client,  # Context7: Передаём общий Redis клиент
-            telegram_client_manager=client_manager,  # Передаём TelegramClientManager
-            media_processor=media_processor  # Context7: Передаём MediaProcessor
-        )
+        logger.info("Creating ChannelParser instance...")
+        try:
+            parser = ChannelParser(
+                config=config,
+                db_session=db_session,
+                event_publisher=None,  # Temporarily disabled
+                redis_client=shared_redis_client,  # Context7: Передаём общий Redis клиент
+                telegram_client_manager=client_manager,  # Передаём TelegramClientManager
+                media_processor=media_processor  # Context7: Передаём MediaProcessor
+            )
+            logger.info("ChannelParser instance created successfully")
+        except Exception as parser_error:
+            logger.error(
+                "Failed to create ChannelParser",
+                error=str(parser_error),
+                error_type=type(parser_error).__name__,
+                exc_info=True
+            )
+            raise
         
         # Update app_state with parser info
+        logger.debug("Updating app_state with parser info...")
         app_state["parser"] = {
             "initialized": True,
             "version": "1.0.0"
         }
-        
         logger.info("ChannelParser initialized successfully")
         
         # Инициализация scheduler с передачей app_state, parser и общего Redis клиента
-        scheduler = ParseAllChannelsTask(
-            config=config,
-            db_url=settings.database_url,
-            redis_client=shared_redis_client,  # Context7: Используем общий Redis клиент
-            parser=parser,  # Передаём инициализированный parser
-            app_state=app_state,  # Передаём app_state для обновления статуса
-            telegram_client_manager=client_manager,  # Передаём TelegramClientManager если доступен
-            media_processor=media_processor  # Context7: Передаём MediaProcessor
-        )
+        logger.info("Creating ParseAllChannelsTask scheduler instance...")
+        try:
+            scheduler = ParseAllChannelsTask(
+                config=config,
+                db_url=settings.database_url,
+                redis_client=shared_redis_client,  # Context7: Используем общий Redis клиент
+                parser=parser,  # Передаём инициализированный parser
+                app_state=app_state,  # Передаём app_state для обновления статуса
+                telegram_client_manager=client_manager,  # Передаём TelegramClientManager если доступен
+                media_processor=media_processor  # Context7: Передаём MediaProcessor
+            )
+            logger.info("ParseAllChannelsTask instance created successfully")
+        except Exception as scheduler_error:
+            logger.error(
+                "Failed to create ParseAllChannelsTask",
+                error=str(scheduler_error),
+                error_type=type(scheduler_error).__name__,
+                exc_info=True
+            )
+            raise
         
         if client_manager:
             logger.info("Scheduler initialized with TelegramClientManager and parser, starting run_forever loop")
@@ -752,6 +848,7 @@ async def run_scheduler_loop():
             logger.info("Scheduler initialized (monitoring mode), starting run_forever loop")
         
         # Запуск бесконечного цикла scheduler
+        logger.info("Entering scheduler.run_forever() - this will block until scheduler stops")
         await scheduler.run_forever()
         
     except Exception as e:
@@ -759,6 +856,16 @@ async def run_scheduler_loop():
         # Context7: Не прерываем выполнение, но логируем детально
         import traceback
         logger.error("Scheduler loop traceback", traceback=traceback.format_exc())
+        # Context7: Перезапускаем scheduler через некоторое время
+        backoff_seconds = min(30 * (restart_count + 1), 300)  # Экспоненциальный backoff до 5 минут
+        logger.warning(
+            "Scheduler loop crashed, will restart",
+            restart_count=restart_count + 1,
+            backoff_seconds=backoff_seconds
+        )
+        await asyncio.sleep(backoff_seconds)
+        # Рекурсивный перезапуск с увеличенным счетчиком
+        await run_scheduler_loop(restart_count=restart_count + 1)
 
 
 async def main():
@@ -814,12 +921,22 @@ async def main():
         # Context7: Логируем запуск каждого цикла для диагностики
         logger.info("Starting all loops in parallel", loops=["qr", "ingest", "scheduler"])
         try:
-            await asyncio.gather(
+            results = await asyncio.gather(
                 run_qr_loop(),
                 run_ingest_loop(),
                 run_scheduler_loop(),  # НОВЫЙ: Incremental parsing scheduler
                 return_exceptions=True
             )
+            # Context7: Проверяем результаты на исключения
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    loop_name = ["qr", "ingest", "scheduler"][i]
+                    logger.error(
+                        f"Loop {loop_name} crashed with exception",
+                        error=str(result),
+                        error_type=type(result).__name__,
+                        exc_info=result
+                    )
         except Exception as gather_error:
             logger.error("Error in asyncio.gather", error=str(gather_error), exc_info=True)
             raise

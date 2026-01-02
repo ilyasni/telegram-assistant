@@ -246,36 +246,74 @@ class DigestWorker:
 
     async def start(self):
         """Запуск воркера и бесконечное потребление очереди."""
-        self.redis_client = RedisStreamsClient(self.redis_url)
-        await self.redis_client.connect()
-        self.publisher = EventPublisher(self.redis_client)
+        logger.info("DigestWorker.start() called", redis_url=self.redis_url)
+        
+        try:
+            self.redis_client = RedisStreamsClient(self.redis_url)
+            await self.redis_client.connect()
+            logger.info("DigestWorker: Redis client connected")
+            
+            self.publisher = EventPublisher(self.redis_client)
+            logger.info("DigestWorker: EventPublisher created")
 
-        consumer_name = f"digest-worker-{os.getpid()}"
-        config = ConsumerConfig(
-            group_name="digest-workers",
-            consumer_name=consumer_name,
-            batch_size=5,
-            block_time=1000,
-            max_retries=3,
-            retry_delay=5,
-        )
-        self.consumer = EventConsumer(self.redis_client, config)
+            consumer_name = f"digest-worker-{os.getpid()}"
+            config = ConsumerConfig(
+                group_name="digest-workers",
+                consumer_name=consumer_name,
+                batch_size=5,
+                block_time=1000,
+                max_retries=3,
+                retry_delay=5,
+            )
+            self.consumer = EventConsumer(self.redis_client, config)
+            logger.info("DigestWorker: EventConsumer created", consumer_name=consumer_name)
 
-        logger.info(
-            "DigestWorker started",
-            redis_url=self.redis_url,
-            consumer_name=consumer_name,
-        )
+            logger.info(
+                "DigestWorker started successfully",
+                redis_url=self.redis_url,
+                consumer_name=consumer_name,
+                stream_name="digests.generate"
+            )
 
-        await self.consumer.consume_forever("digests.generate", self._handle_event)
+            # Context7: Логируем начало потребления для диагностики
+            logger.info("DigestWorker: Starting consume_forever", stream_name="digests.generate")
+            await self.consumer.consume_forever("digests.generate", self._handle_event)
+        except Exception as e:
+            logger.error(
+                "DigestWorker.start() failed",
+                error=str(e),
+                error_type=type(e).__name__,
+                exc_info=True
+            )
+            raise
 
     async def _handle_event(self, event_data: Dict[str, Any]) -> None:
         """Основной обработчик события digests.generate."""
+        # Context7: Логируем получение события для диагностики
+        logger.info(
+            "DigestWorker: Event received",
+            event_keys=list(event_data.keys()) if isinstance(event_data, dict) else type(event_data),
+            has_payload="payload" in event_data if isinstance(event_data, dict) else False
+        )
+        
         payload = event_data.get("payload") or event_data
         try:
             digest_event = DigestGenerateEvent(**payload)
+            logger.info(
+                "DigestWorker: Event parsed successfully",
+                user_id=digest_event.user_id,
+                tenant_id=digest_event.tenant_id,
+                history_id=digest_event.history_id,
+                trigger=digest_event.trigger
+            )
         except Exception as e:
-            logger.error("Failed to parse digest event payload", error=str(e), payload=payload)
+            logger.error(
+                "Failed to parse digest event payload",
+                error=str(e),
+                error_type=type(e).__name__,
+                payload=payload,
+                exc_info=True
+            )
             raise
 
         session = SessionLocal()

@@ -365,37 +365,174 @@
       }
     }
 
+    // Context7: кэш для initData (best practice из webapp/qr.html)
+    let cachedInitData = '';
+    let cachedInitDataUnsafe = null;
+
+    // Context7: извлечение initData из URL параметров (fallback для некоторых случаев)
+    function getInitDataFromUrl() {
+      try {
+        const searchParams = new URLSearchParams(window.location.search);
+        const tgParam = searchParams.get('tgWebAppData');
+        if (tgParam) {
+          const decoded = decodeURIComponent(tgParam);
+          if (decoded && decoded.includes('=')) {
+            console.log('[QR] initData extracted from URL search, length:', decoded.length);
+            return decoded;
+          }
+        }
+
+        if (window.location.hash && window.location.hash.includes('tgWebAppData=')) {
+          const hashParams = new URLSearchParams(window.location.hash.replace('#', ''));
+          const tgParamHash = hashParams.get('tgWebAppData');
+          if (tgParamHash) {
+            const decodedHash = decodeURIComponent(tgParamHash);
+            if (decodedHash && decodedHash.includes('=')) {
+              console.log('[QR] initData extracted from URL hash, length:', decodedHash.length);
+              return decodedHash;
+            }
+          }
+        }
+      } catch (error) {
+        console.error('[QR] Failed to extract initData from URL:', error);
+      }
+      return '';
+    }
+
+    // Context7: сортировка объекта для правильного построения initData
+    function sortObjectDeep(value) {
+      if (Array.isArray(value)) {
+        return value.map(sortObjectDeep);
+      }
+      if (value && typeof value === 'object') {
+        const sorted = {};
+        Object.keys(value)
+          .sort()
+          .forEach((key) => {
+            sorted[key] = sortObjectDeep(value[key]);
+          });
+        return sorted;
+      }
+      return value;
+    }
+
+    // Context7: построение initData из initDataUnsafe (правильный способ, не JSON.stringify)
+    function buildInitDataFromUnsafe(unsafe) {
+      if (!unsafe || typeof unsafe !== 'object') {
+        return '';
+      }
+      const parts = [];
+      Object.keys(unsafe).sort().forEach((key) => {
+        const value = unsafe[key];
+        if (value === undefined || value === null) {
+          return;
+        }
+        if (typeof value === 'object') {
+          parts.push(`${key}=${encodeURIComponent(JSON.stringify(sortObjectDeep(value)))}`);
+        } else {
+          parts.push(`${key}=${encodeURIComponent(String(value))}`);
+        }
+      });
+      if (parts.length === 0) {
+        return '';
+      }
+      return parts.join('&');
+    }
+
+    // Context7: валидация initData
+    function isValidInitData(data) {
+      if (!data || typeof data !== 'string') {
+        return false;
+      }
+      const trimmed = data.trim();
+      if (trimmed.length === 0 || trimmed === '{}') {
+        return false;
+      }
+      return trimmed.includes('=');
+    }
+
+    // Context7: получение initDataUnsafe с кэшированием
+    function getInitDataUnsafe() {
+      if (cachedInitDataUnsafe) {
+        return cachedInitDataUnsafe;
+      }
+      if (window.Telegram?.WebApp?.initDataUnsafe) {
+        cachedInitDataUnsafe = window.Telegram.WebApp.initDataUnsafe;
+        return cachedInitDataUnsafe;
+      }
+      return null;
+    }
+
+    // Context7: универсальная функция получения initData из всех источников
+    function getInitData() {
+      // 1. Проверяем кэш
+      if (cachedInitData && isValidInitData(cachedInitData)) {
+        return cachedInitData;
+      }
+
+      // 2. Проверяем URL параметры
+      const urlInitData = getInitDataFromUrl();
+      if (isValidInitData(urlInitData)) {
+        cachedInitData = urlInitData;
+        return cachedInitData;
+      }
+
+      // 3. Проверяем Telegram.WebApp.initData
+      if (window.Telegram?.WebApp?.initData && isValidInitData(window.Telegram.WebApp.initData)) {
+        cachedInitData = window.Telegram.WebApp.initData;
+        return cachedInitData;
+      }
+
+      // 4. Строим из initDataUnsafe
+      const unsafe = getInitDataUnsafe();
+      if (unsafe) {
+        const built = buildInitDataFromUnsafe(unsafe);
+        if (isValidInitData(built)) {
+          cachedInitData = built;
+          console.log('[QR] Built initData from initDataUnsafe, length:', cachedInitData.length);
+          return cachedInitData;
+        }
+      }
+
+      return '';
+    }
+
+    // Context7: ожидание загрузки initData с повторными попытками
+    async function waitForInitData(maxAttempts = 30, delayMs = 150) {
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        const data = getInitData();
+        if (isValidInitData(data)) {
+          return data;
+        }
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+      }
+      return '';
+    }
+
     // Start QR login process
     async function startQRLogin() {
       try {
         updateStatus('Инициализация...', 'loading');
         btnRetryEl.classList.add('hidden');
         
-        // Get initData from Telegram WebApp
-        // Context7: проверяем все возможные источники initData
-        let initData = '';
-        if (window.Telegram?.WebApp?.initData) {
-          initData = window.Telegram.WebApp.initData;
-          console.log('initData from Telegram.WebApp.initData, length:', initData.length);
-        } else if (window.Telegram?.WebApp?.initDataUnsafe) {
-          // Fallback для некоторых версий Telegram WebApp
-          console.log('Using initDataUnsafe as fallback');
-          initData = JSON.stringify(window.Telegram.WebApp.initDataUnsafe);
-        } else {
-          console.error('initData NOT FOUND! window.Telegram:', !!window.Telegram, 
-                       'WebApp:', !!window.Telegram?.WebApp,
-                       'initData:', !!window.Telegram?.WebApp?.initData);
-          updateStatus('Ошибка: не удалось получить данные Telegram WebApp', 'error');
+        // Context7: ожидаем загрузки initData (best practice - не сразу, а с повторными попытками)
+        console.log('Waiting for initData...');
+        const initData = await waitForInitData(30, 150);
+        
+        if (!isValidInitData(initData)) {
+          console.error('initData NOT FOUND after waiting!', {
+            Telegram: !!window.Telegram,
+            WebApp: !!window.Telegram?.WebApp,
+            initData: !!window.Telegram?.WebApp?.initData,
+            initDataUnsafe: !!window.Telegram?.WebApp?.initDataUnsafe,
+            url: window.location.href
+          });
+          updateStatus('Ошибка: не удалось получить данные Telegram WebApp. Открой Mini App из Telegram.', 'error');
           btnRetryEl.classList.remove('hidden');
           return;
         }
         
-        if (!initData || initData.length === 0) {
-          console.error('initData is empty!');
-          updateStatus('Ошибка: пустые данные Telegram WebApp', 'error');
-          btnRetryEl.classList.remove('hidden');
-          return;
-        }
+        console.log('initData extracted, length:', initData.length, 'first 50 chars:', initData.substring(0, 50));
         
         console.log('initData extracted, length:', initData.length, 'first 50 chars:', initData.substring(0, 50));
         
@@ -569,12 +706,12 @@
         return false;
       }
       // Context7: проверяем что это действительно WebApp (не MAF)
-      // Если initData отсутствует, значит страница открыта не как WebApp
-      const hasInitData = window.Telegram.WebApp.initData || 
-                         window.Telegram.WebApp.initDataUnsafe;
+      // Используем универсальную функцию getInitData() для проверки всех источников
+      const initData = getInitData();
+      const hasValidInitData = isValidInitData(initData);
       // Context7: проверяем версию WebApp (если есть)
       const hasVersion = window.Telegram.WebApp.version;
-      return hasInitData || hasVersion;
+      return hasValidInitData || hasVersion;
     }
     
     // Context7: асинхронная инициализация Telegram WebApp по best practices
@@ -630,9 +767,21 @@
         await new Promise(resolve => setTimeout(resolve, 100));
       }
       
+      // Context7: ждем загрузки initData перед проверкой (best practice)
+      // Даем время для инициализации WebApp API
+      await new Promise(resolve => setTimeout(resolve, 200));
+      
       // Context7: проверяем что WebApp действительно инициализирован (не MAF)
-      if (!isWebAppInitialized()) {
-        console.error('WebApp not properly initialized - initData missing, page may be opened as MAF');
+      // Пробуем получить initData с несколькими попытками
+      const initDataCheck = await waitForInitData(10, 100);
+      if (!isValidInitData(initDataCheck)) {
+        console.error('WebApp not properly initialized - initData missing, page may be opened as MAF', {
+          Telegram: !!window.Telegram,
+          WebApp: !!window.Telegram?.WebApp,
+          initData: !!window.Telegram?.WebApp?.initData,
+          initDataUnsafe: !!window.Telegram?.WebApp?.initDataUnsafe,
+          version: window.Telegram?.WebApp?.version
+        });
         updateStatus('Ошибка: Mini App не инициализирован. Откройте через бота в Telegram.', 'error');
         btnRetryEl.classList.remove('hidden');
         return false;

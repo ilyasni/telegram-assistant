@@ -533,14 +533,17 @@ class ChannelParser:
             # Определение since_date на основе режима
             since_date = await self._get_since_date(channel_data, mode)
             
+            # Context7: Детальное логирование для диагностики messages_processed: 0
+            last_parsed_at = channel_data.get('last_parsed_at')
             logger.info(
-                "Starting to parse channel",
+                "Starting channel parsing",
                 channel_id=channel_id,
                 channel_title=channel_entity.title,
                 mode=mode,
-                since_date=since_date.isoformat(),
-                last_parsed_at=channel_data.get('last_parsed_at'),
-                is_new_channel=channel_data.get('last_parsed_at') is None
+                since_date=since_date.isoformat() if since_date else None,
+                last_parsed_at=last_parsed_at.isoformat() if last_parsed_at else None,
+                is_new_channel=last_parsed_at is None,
+                tg_channel_id=tg_channel_id
             )
             
             # Парсинг сообщений батчами
@@ -548,10 +551,23 @@ class ChannelParser:
             batch_count = 0
             has_successful_save = False  # Context7: Отслеживаем успешное сохранение хотя бы одного батча
             
+            # Context7: Логирование начала парсинга батчей
+            logger.debug("Starting message batch processing",
+                        channel_id=channel_id,
+                        mode=mode,
+                        since_date=since_date.isoformat() if since_date else None)
+            
             async for message_batch in self._get_message_batches(
                 telegram_client, channel_entity, since_date, mode
             ):
                 batch_count += 1
+                
+                # Context7: Логирование размера батча для диагностики
+                logger.debug("Processing message batch",
+                           channel_id=channel_id,
+                           batch_number=batch_count,
+                           batch_size=len(message_batch),
+                           mode=mode)
                 
                 # Обработка батча с передачей mode, channel_entity и telegram_client
                 batch_result = await self._process_message_batch(
@@ -574,6 +590,14 @@ class ChannelParser:
                 self.stats['messages_parsed'] += batch_processed
                 self.stats['messages_skipped'] += batch_skipped
                 
+                # Context7: Логирование результата батча для диагностики
+                logger.debug("Batch processing result",
+                           channel_id=channel_id,
+                           batch_number=batch_count,
+                           batch_processed=batch_processed,
+                           batch_skipped=batch_skipped,
+                           total_processed=messages_processed)
+                
                 # Context7: Отслеживаем успешное сохранение - если processed > 0, значит сохранение прошло успешно
                 # (в _process_message_batch processed увеличивается только после успешного save_batch_atomic)
                 if batch_processed > 0:
@@ -586,6 +610,13 @@ class ChannelParser:
                 # Задержка между батчами
                 if batch_count < (1000 // self.config.max_messages_per_batch):
                     await asyncio.sleep(self.config.batch_delay_ms / 1000.0)
+            
+            # Context7: Логирование завершения парсинга батчей
+            logger.info("Finished message batch processing",
+                       channel_id=channel_id,
+                       total_batches=batch_count,
+                       total_processed=messages_processed,
+                       has_successful_save=has_successful_save)
             
             # Обновление статистики канала
             await self._update_channel_stats(channel_id, messages_processed)
@@ -1534,7 +1565,15 @@ class ChannelParser:
                     # Historical: парсим назад, останавливаемся когда дошли до since_date
                     # Включаем сообщения с message_date_utc >= since_date
                     if message_date_utc < since_date:
-                        logger.info(f"Reached since_date in historical mode, stopping. message_date_utc={message_date_utc}, since_date={since_date}, messages_yielded={messages_yielded}, messages_filtered={messages_filtered}")
+                        logger.info("Stopping message batch - reached since_date in historical mode",
+                                   channel_id=channel_entity.id,
+                                   mode=mode,
+                                   reason="reached_since_date",
+                                   message_date_utc=message_date_utc.isoformat(),
+                                   since_date=since_date.isoformat(),
+                                   messages_checked=messages_checked,
+                                   messages_yielded=messages_yielded,
+                                   messages_filtered=messages_filtered)
                         break
                 else:  # incremental
                     # Context7: КРИТИЧНО - для incremental режима проверяем, есть ли сообщения новее since_date
@@ -1548,7 +1587,15 @@ class ChannelParser:
                         messages_filtered += 1
                     elif found_newer_messages:
                         # Мы уже нашли новые сообщения, но теперь встретили старое - останавливаемся
-                        logger.info(f"Reached since_date in incremental mode after processing newer messages, stopping. message_date_utc={message_date_utc}, since_date={since_date}, messages_yielded={messages_yielded}, messages_filtered={messages_filtered}, messages_checked={messages_checked}")
+                        logger.info("Stopping message batch - reached since_date after processing newer messages in incremental mode",
+                                   channel_id=channel_entity.id,
+                                   mode=mode,
+                                   reason="reached_since_date_after_newer",
+                                   message_date_utc=message_date_utc.isoformat(),
+                                   since_date=since_date.isoformat(),
+                                   messages_checked=messages_checked,
+                                   messages_yielded=messages_yielded,
+                                   messages_filtered=messages_filtered)
                         break
                     else:
                         # Первое сообщение уже старше since_date
@@ -1556,11 +1603,26 @@ class ChannelParser:
                         # которые могут быть не в начале списка из-за задержек или нехронологического порядка
                         if messages_checked < max_check_before_stop:
                             # Продолжаем проверку - возможно, новые сообщения дальше в списке
-                            logger.debug(f"Message {messages_checked} is older than since_date, but checking more messages. message_date_utc={message_date_utc}, since_date={since_date}, messages_checked={messages_checked}/{max_check_before_stop}")
+                            logger.debug("Message is older than since_date, checking more messages",
+                                       channel_id=channel_entity.id,
+                                       mode=mode,
+                                       message_index=messages_checked,
+                                       message_date_utc=message_date_utc.isoformat(),
+                                       since_date=since_date.isoformat(),
+                                       messages_checked=messages_checked,
+                                       max_check_before_stop=max_check_before_stop)
                             continue
                         else:
                             # Проверили достаточно сообщений - новых нет
-                            logger.info(f"No newer messages found in incremental mode after checking {messages_checked} messages. Last checked message_date: {message_date_utc}, since_date: {since_date}, messages_yielded={messages_yielded}, messages_filtered={messages_filtered}")
+                            logger.info("Stopping message batch - no newer messages found in incremental mode",
+                                       channel_id=channel_entity.id,
+                                       mode=mode,
+                                       reason="no_newer_messages",
+                                       messages_checked=messages_checked,
+                                       last_checked_message_date=message_date_utc.isoformat(),
+                                       since_date=since_date.isoformat(),
+                                       messages_yielded=messages_yielded,
+                                       messages_filtered=messages_filtered)
                         break
                 
                 # Для historical режима добавляем сообщение в batch
@@ -1577,6 +1639,16 @@ class ChannelParser:
             # Возвращаем последний неполный батч
             if batch:
                 yield batch
+            
+            # Context7: Логирование завершения генерации батчей для диагностики
+            logger.info("Finished generating message batches",
+                       channel_id=channel_entity.id,
+                       mode=mode,
+                       total_messages_checked=messages_checked,
+                       total_messages_yielded=messages_yielded,
+                       total_messages_filtered=messages_filtered,
+                       found_newer_messages=found_newer_messages if mode == "incremental" else None,
+                       since_date=since_date.isoformat())
                 
         except Exception as e:
             logger.error("Failed to fetch messages with retry", 

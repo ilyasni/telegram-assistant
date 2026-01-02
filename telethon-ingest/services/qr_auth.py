@@ -659,7 +659,8 @@ class QrAuthService:
                     db_tenant_id = tenant_id
             
             # Сохраняем сессию в БД
-            session_id = await self.session_storage.save_telegram_session(
+            # Context7: save_telegram_session возвращает (success, session_id, error_code, error_details)
+            success, session_id, error_code, error_details = await self.session_storage.save_telegram_session(
                 tenant_id=db_tenant_id,
                 user_id=db_tenant_id,
                 session_string=session_string,
@@ -667,7 +668,7 @@ class QrAuthService:
                 invite_code=None
             )
             
-            if session_id:
+            if success and session_id:
                 logger.info("Successfully processed existing session_string", tenant_id=tenant_id, session_id=session_id)
                 self.redis_client.hset(redis_key, mapping={
                     "status": "authorized",
@@ -683,8 +684,16 @@ class QrAuthService:
                     pass
                 AUTH_QR_SUCCESS.labels(tenant_id=tenant_id or "unknown").inc()
             else:
-                logger.error("Failed to save existing session_string", tenant_id=tenant_id)
-                self.redis_client.hset(redis_key, "status", "failed")
+                logger.error("Failed to save existing session_string", 
+                           tenant_id=tenant_id, 
+                           error_code=error_code, 
+                           error_details=error_details)
+                self.redis_client.hset(redis_key, mapping={
+                    "status": "failed",
+                    "reason": f"session_store_{error_code or 'unexpected_failed'}",
+                    "error_code": error_code or "unknown",
+                    "error_details": error_details or "Unknown error"
+                })
                 AUTH_QR_FAIL.labels(tenant_id=tenant_id or "unknown").inc()
                 
         except Exception as e:

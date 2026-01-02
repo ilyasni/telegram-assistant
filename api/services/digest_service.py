@@ -797,13 +797,13 @@ class DigestService:
     
     def _is_gigachat_filter_response(self, content: str) -> bool:
         """
-        Детектирование ответов с фильтром Gigachat.
+        Детектирование ответов с фильтром Gigachat или других LLM.
         
         Проверяет наличие ключевых фраз и паттернов, указывающих на то,
-        что Gigachat вернул сообщение о фильтрации контента.
+        что LLM вернул сообщение о фильтрации контента.
         
         Args:
-            content: Текст ответа от Gigachat
+            content: Текст ответа от LLM
             
         Returns:
             True если обнаружен фильтр, False иначе
@@ -813,7 +813,21 @@ class DigestService:
         
         content_lower = content.lower()
         
-        # Ключевые фразы для детектирования фильтра
+        # Высокоприоритетные фразы (детектируются сразу при наличии)
+        high_priority_phrases = [
+            "генеративные языковые модели не обладают собственным мнением",
+            "не обладают собственным мнением",
+            "обученной на открытых данных, в которых может содержаться неточная или ошибочная информация",
+            "во избежание неправильного толкования",
+            "чувствительные темы могут быть ограничены",
+        ]
+        
+        # Проверяем высокоприоритетные фразы (достаточно одной)
+        for phrase in high_priority_phrases:
+            if phrase in content_lower:
+                return True
+        
+        # Остальные ключевые фразы для детектирования фильтра
         key_phrases = [
             "некорректных ответов",
             "некорректные ответы",
@@ -822,20 +836,20 @@ class DigestService:
             "ограничены",
             "временно ограничены",
             "генеративные языковые модели",
-            "не обладают собственным мнением",
             "не транслирует мнение своих разработчиков",
-            "обученной на открытых данных, в которых может содержаться неточная или ошибочная информация",
-            "во избежание неправильного толкования",
             "как и любая языковая модель, gigachat",
+            "разговоры на чувствительные темы могут быть ограничены",
         ]
         
         # Подсчитываем количество найденных ключевых фраз
         found_phrases = sum(1 for phrase in key_phrases if phrase in content_lower)
         
-        # Паттерны для детектирования
+        # Паттерны для детектирования (комбинации фраз)
         patterns = [
             ("к сожалению", "ограничены"),
             ("как и любая языковая модель", "ограничены"),
+            ("генеративные языковые модели", "ограничены"),
+            ("чувствительные темы", "ограничены"),
         ]
         
         # Проверяем паттерны
@@ -845,8 +859,8 @@ class DigestService:
                 pattern_found = True
                 break
         
-        # Детектируем фильтр, если найдено 2+ ключевых фразы или один из паттернов
-        return found_phrases >= 2 or pattern_found
+        # Детектируем фильтр, если найдено 1+ ключевая фраза (снижен порог) или один из паттернов
+        return found_phrases >= 1 or pattern_found
     
     async def _generate_with_openrouter(
         self,
@@ -870,7 +884,8 @@ class DigestService:
         
         api_key = os.getenv('OPENROUTER_API_KEY')
         api_base = os.getenv('OPENROUTER_API_BASE', 'https://openrouter.ai/api/v1')
-        model = os.getenv('OPENROUTER_MODEL', 'qwen/qwen-2.5-72b-instruct:free')
+        # Context7: Используем рабочую модель по умолчанию (qwen-2.5-72b-instruct:free недоступна)
+        model = os.getenv('OPENROUTER_MODEL', 'meta-llama/llama-3.3-70b-instruct:free')
         
         if not api_key:
             raise ValueError("OPENROUTER_API_KEY not configured")
@@ -927,7 +942,29 @@ class DigestService:
                 if response.status_code == 200:
                     result = response.json()
                     content = result['choices'][0]['message']['content'].strip()
+                    
+                    # Context7: Проверяем ответ от OpenRouter на наличие фильтра
+                    if self._is_gigachat_filter_response(content):
+                        logger.warning(
+                            "OpenRouter filter detected in response",
+                            content_preview=content[:200] if len(content) > 200 else content
+                        )
+                        # Если OpenRouter тоже вернул фильтр, выбрасываем исключение
+                        # чтобы система могла обработать это как ошибку fallback
+                        raise ValueError("OpenRouter returned filtered response")
+                    
                     return content
+                elif response.status_code == 404:
+                    # Специальная обработка для 404 (модель не найдена)
+                    error_data = response.json() if response.text else {}
+                    error_msg = error_data.get('error', {}).get('message', response.text) or f"Model {model} not found"
+                    logger.error(
+                        "OpenRouter model not found (404)",
+                        model=model,
+                        error=error_msg,
+                        suggestion="Update OPENROUTER_MODEL environment variable"
+                    )
+                    raise ValueError(f"OpenRouter model not found: {model}. {error_msg}")
                 else:
                     error_msg = f"OpenRouter API error: {response.status_code} - {response.text}"
                     logger.error("OpenRouter API request failed", status_code=response.status_code, error=response.text)

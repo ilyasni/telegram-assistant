@@ -524,6 +524,16 @@ async def main():
     
     supervisor = TaskSupervisor()
     
+    # Context7: Запуск health server с supervisor для мониторинга задач
+    try:
+        from health_server import start_health_server
+        health_port = int(os.getenv("HEALTH_PORT", "8000"))
+        # Обновляем health_server для использования supervisor
+        start_health_server(supervisor)
+        logger.info(f"Health server started on port {health_port} with supervisor integration")
+    except Exception as e:
+        logger.warning(f"Failed to start health server: {e}", error=str(e))
+    
     # Регистрация tasks
     supervisor.register_task(TaskConfig(
         name="tagging",

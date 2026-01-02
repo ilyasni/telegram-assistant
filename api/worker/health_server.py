@@ -23,6 +23,8 @@ class WorkerHealthHandler(BaseHTTPRequestHandler):
             self._handle_health()
         elif self.path == "/health/detailed":
             self._handle_detailed_health()
+        elif self.path == "/health/tasks":
+            self._handle_tasks_health()
         elif self.path == "/metrics":
             self._handle_metrics()
         else:
@@ -101,6 +103,59 @@ class WorkerHealthHandler(BaseHTTPRequestHandler):
             }
             self.wfile.write(json.dumps(error_response).encode())
     
+    def _handle_tasks_health(self):
+        """Context7: Health check для всех задач через supervisor."""
+        try:
+            # Получаем supervisor из глобального контекста
+            supervisor = getattr(self.server, 'supervisor', None)
+            
+            if supervisor is None:
+                response = {
+                    "status": "unknown",
+                    "error": "Supervisor not available",
+                    "timestamp": time.time()
+                }
+                self.send_response(503)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(response).encode())
+                return
+            
+            # Context7: Получаем статус всех задач через supervisor.get_status()
+            task_status = supervisor.get_status()
+            
+            # Определяем общий статус
+            all_running = all(
+                task_info.get('status') == 'running'
+                for task_info in task_status.get('tasks', {}).values()
+            )
+            
+            response = {
+                "status": "healthy" if all_running else "degraded",
+                "service": "worker",
+                "timestamp": time.time(),
+                "supervisor": task_status.get('supervisor', {}),
+                "tasks": task_status.get('tasks', {})
+            }
+            
+            status_code = 200 if all_running else 503
+            self.send_response(status_code)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(response, default=str).encode())
+            
+        except Exception as e:
+            logger.error("Tasks health check failed", error=str(e), exc_info=True)
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            error_response = {
+                "status": "unhealthy",
+                "error": str(e),
+                "timestamp": time.time()
+            }
+            self.wfile.write(json.dumps(error_response).encode())
+    
     def _handle_metrics(self):
         """Prometheus метрики для Worker'а."""
         try:
@@ -137,11 +192,12 @@ class WorkerHealthHandler(BaseHTTPRequestHandler):
 class WorkerHealthServer:
     """HTTP сервер для health checks Worker'а."""
     
-    def __init__(self, port: int = 8001):
+    def __init__(self, port: int = 8001, supervisor=None):
         self.port = port
         self.server = None
         self.thread = None
         self.running = False
+        self.supervisor = supervisor
     
     def start(self):
         """Запуск health сервера в отдельном потоке."""
@@ -151,6 +207,8 @@ class WorkerHealthServer:
         try:
             self.server = HTTPServer(('0.0.0.0', self.port), WorkerHealthHandler)
             self.server.start_time = time.time()
+            # Context7: Передаем supervisor в server для доступа из handler
+            self.server.supervisor = self.supervisor
             
             self.thread = Thread(target=self._run_server, daemon=True)
             self.thread.start()
@@ -178,13 +236,19 @@ class WorkerHealthServer:
         self.running = False
         logger.info("Worker health server stopped")
 
-# Глобальный экземпляр сервера
-health_server = WorkerHealthServer()
+# Глобальный экземпляр сервера (будет инициализирован с supervisor)
+health_server = None
 
-def start_health_server():
-    """Запуск health сервера (для использования в main.py)."""
+def start_health_server(supervisor=None):
+    """Context7: Запуск health сервера с supervisor для мониторинга задач."""
+    global health_server
+    if health_server is None:
+        health_server = WorkerHealthServer(supervisor=supervisor)
+    health_server.supervisor = supervisor  # Обновляем supervisor
     health_server.start()
 
 def stop_health_server():
     """Остановка health сервера."""
-    health_server.stop()
+    global health_server
+    if health_server:
+        health_server.stop()

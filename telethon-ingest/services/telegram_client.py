@@ -12,6 +12,7 @@ from telethon.utils import get_peer_id
 import structlog
 import redis.asyncio as redis
 import psycopg2
+from psycopg2 import errors as psycopg2_errors
 from psycopg2.extras import RealDictCursor
 import json
 from datetime import datetime, timezone, timedelta
@@ -1826,63 +1827,171 @@ class TelegramIngestionService:
                 # Context7: Устанавливаем системный tenant_id для RLS перед INSERT
                 cursor.execute("SET LOCAL app.tenant_id = %s", (system_tenant_id,))
                 
-                cursor.execute(
-                    """
-                    INSERT INTO group_messages (
-                        id,
-                        group_id,
-                        tenant_id,
-                        tg_message_id,
-                        sender_tg_id,
-                        sender_username,
-                        content,
-                        media_urls,
-                        reply_to,
-                        posted_at,
-                        created_at,
-                        updated_at,
-                        has_media,
-                        is_service,
-                        action_type
-                    ) VALUES (
-                        %s, %s, %s, %s, %s, %s,
-                        %s, %s::jsonb, %s::jsonb, %s, %s,
-                        NOW(), %s, %s, %s
+                # Context7: Обработка ON CONFLICT с fallback для случаев, когда constraint недоступен
+                # Проблема: PostgreSQL может не найти constraint из-за RLS или других причин
+                try:
+                    cursor.execute(
+                        """
+                        INSERT INTO group_messages (
+                            id,
+                            group_id,
+                            tenant_id,
+                            tg_message_id,
+                            sender_tg_id,
+                            sender_username,
+                            content,
+                            media_urls,
+                            reply_to,
+                            posted_at,
+                            created_at,
+                            updated_at,
+                            has_media,
+                            is_service,
+                            action_type
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, %s,
+                            %s, %s::jsonb, %s::jsonb, %s, %s,
+                            NOW(), %s, %s, %s
+                        )
+                        ON CONFLICT (group_id, tg_message_id)
+                        DO UPDATE SET
+                            content = EXCLUDED.content,
+                            media_urls = EXCLUDED.media_urls,
+                            reply_to = EXCLUDED.reply_to,
+                            sender_tg_id = EXCLUDED.sender_tg_id,
+                            sender_username = EXCLUDED.sender_username,
+                            has_media = EXCLUDED.has_media,
+                            is_service = EXCLUDED.is_service,
+                            action_type = EXCLUDED.action_type,
+                            posted_at = EXCLUDED.posted_at,
+                            updated_at = NOW()
+                        RETURNING id
+                        """,
+                        (
+                            message_data.get("id"),
+                            message_data["group_id"],
+                            system_tenant_id,  # Context7: Системный tenant_id для совместимости
+                            message_data["tg_message_id"],
+                            message_data["sender_tg_id"],
+                            message_data["sender_username"],
+                            message_data["content"],
+                            json.dumps(message_data.get("media_urls", [])),
+                            json.dumps(message_data.get("reply_to")),
+                            message_data.get("posted_at"),
+                            message_data.get("created_at"),
+                            message_data.get("has_media", False),
+                            message_data.get("is_service", False),
+                            message_data.get("action_type"),
+                        ),
                     )
-                    ON CONFLICT (group_id, tg_message_id)
-                    DO UPDATE SET
-                        content = EXCLUDED.content,
-                        media_urls = EXCLUDED.media_urls,
-                        reply_to = EXCLUDED.reply_to,
-                        sender_tg_id = EXCLUDED.sender_tg_id,
-                        sender_username = EXCLUDED.sender_username,
-                        has_media = EXCLUDED.has_media,
-                        is_service = EXCLUDED.is_service,
-                        action_type = EXCLUDED.action_type,
-                        posted_at = EXCLUDED.posted_at,
-                        updated_at = NOW()
-                    RETURNING id
-                    """,
-                    (
-                        message_data.get("id"),
-                        message_data["group_id"],
-                        system_tenant_id,  # Context7: Системный tenant_id для совместимости
-                        message_data["tg_message_id"],
-                        message_data["sender_tg_id"],
-                        message_data["sender_username"],
-                        message_data["content"],
-                        json.dumps(message_data.get("media_urls", [])),
-                        json.dumps(message_data.get("reply_to")),
-                        message_data.get("posted_at"),
-                        message_data.get("created_at"),
-                        message_data.get("has_media", False),
-                        message_data.get("is_service", False),
-                        message_data.get("action_type"),
-                    ),
-                )
-
-                row = cursor.fetchone()
-                group_message_id = row[0]
+                    row = cursor.fetchone()
+                    group_message_id = row[0]
+                except psycopg2_errors.InvalidColumnReference as e:
+                    # Context7: Fallback - constraint не найден, пробуем без ON CONFLICT
+                    # Сначала проверяем, существует ли запись
+                    logger.error("ON CONFLICT failed for group_messages, trying fallback",
+                               error=str(e),
+                               error_code=e.pgcode if hasattr(e, 'pgcode') else None,
+                               group_id=message_data.get("group_id"),
+                               tg_message_id=message_data.get("tg_message_id"))
+                    
+                    # Проверяем существование записи
+                    cursor.execute(
+                        "SELECT id FROM group_messages WHERE group_id = %s AND tg_message_id = %s",
+                        (message_data["group_id"], message_data["tg_message_id"])
+                    )
+                    existing = cursor.fetchone()
+                    
+                    if existing:
+                        # Обновляем существующую запись
+                        cursor.execute(
+                            """
+                            UPDATE group_messages SET
+                                content = %s,
+                                media_urls = %s::jsonb,
+                                reply_to = %s::jsonb,
+                                sender_tg_id = %s,
+                                sender_username = %s,
+                                has_media = %s,
+                                is_service = %s,
+                                action_type = %s,
+                                posted_at = %s,
+                                updated_at = NOW()
+                            WHERE group_id = %s AND tg_message_id = %s
+                            RETURNING id
+                            """,
+                            (
+                                message_data["content"],
+                                json.dumps(message_data.get("media_urls", [])),
+                                json.dumps(message_data.get("reply_to")),
+                                message_data["sender_tg_id"],
+                                message_data["sender_username"],
+                                message_data.get("has_media", False),
+                                message_data.get("is_service", False),
+                                message_data.get("action_type"),
+                                message_data.get("posted_at"),
+                                message_data["group_id"],
+                                message_data["tg_message_id"],
+                            ),
+                        )
+                        row = cursor.fetchone()
+                        group_message_id = row[0]
+                    else:
+                        # Вставляем новую запись без ON CONFLICT
+                        cursor.execute(
+                            """
+                            INSERT INTO group_messages (
+                                id,
+                                group_id,
+                                tenant_id,
+                                tg_message_id,
+                                sender_tg_id,
+                                sender_username,
+                                content,
+                                media_urls,
+                                reply_to,
+                                posted_at,
+                                created_at,
+                                updated_at,
+                                has_media,
+                                is_service,
+                                action_type
+                            ) VALUES (
+                                %s, %s, %s, %s, %s, %s,
+                                %s, %s::jsonb, %s::jsonb, %s, %s,
+                                NOW(), %s, %s, %s
+                            )
+                            RETURNING id
+                            """,
+                            (
+                                message_data.get("id"),
+                                message_data["group_id"],
+                                system_tenant_id,
+                                message_data["tg_message_id"],
+                                message_data["sender_tg_id"],
+                                message_data["sender_username"],
+                                message_data["content"],
+                                json.dumps(message_data.get("media_urls", [])),
+                                json.dumps(message_data.get("reply_to")),
+                                message_data.get("posted_at"),
+                                message_data.get("created_at"),
+                                message_data.get("has_media", False),
+                                message_data.get("is_service", False),
+                                message_data.get("action_type"),
+                            ),
+                        )
+                        row = cursor.fetchone()
+                        group_message_id = row[0]
+                except Exception as e:
+                    # Context7: Логируем все остальные ошибки для диагностики
+                    logger.error("Failed to save group message",
+                               error=str(e),
+                               error_type=type(e).__name__,
+                               error_code=getattr(e, 'pgcode', None),
+                               group_id=message_data.get("group_id"),
+                               tg_message_id=message_data.get("tg_message_id"),
+                               exc_info=True)
+                    raise
 
                 # Mentions
                 if message_data.get("mentions"):

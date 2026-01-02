@@ -159,6 +159,169 @@ groups:
           summary: "Тегирование не обрабатывает события (pending: {{ $value }})"
           description: "Есть события в posts.parsed, но tagging не обрабатывает. Проверить AI провайдеры."
 
+  # Parsing Pipeline Alerts (Context7 Best Practices)
+  - name: parsing_pipeline
+    interval: 30s
+    rules:
+      # Парсинг не выполняется (нет активности)
+      # Context7: Используем scheduler_heartbeat_seconds для проверки активности scheduler'а
+      # и parser_runs_total для проверки активности парсинга
+      - alert: ParsingNoActivity
+        expr: |
+          (
+            (time() - scheduler_heartbeat_seconds) > 300
+          )
+          or
+          (
+            sum(rate(parser_runs_total[10m])) == 0
+            and 
+            (time() - scheduler_last_tick_ts_seconds) > 600
+          )
+        for: 15m
+        labels:
+          severity: critical
+          component: parsing
+        annotations:
+          summary: "Парсинг не выполняется (нет активности)"
+          description: "Парсер не обрабатывает каналы. Heartbeat: {{ $value }}s назад. Проверить логи telethon-ingest и состояние TelegramClientManager."
+          runbook: "Проверить: 1) логи telethon-ingest, 2) статус TelegramClientManager, 3) scheduler_heartbeat_seconds, 4) scheduler_last_tick_ts_seconds"
+      
+      # Высокий error rate парсинга (> 20%)
+      - alert: ParsingErrorRateHigh
+        expr: |
+          (
+            sum(rate(parser_runs_total{status="failed"}[10m]))
+            /
+            (sum(rate(parser_runs_total[10m])) + 1e-6)
+          ) > 0.20
+        for: 10m
+        labels:
+          severity: warning
+          component: parsing
+        annotations:
+          summary: "Parsing error rate превышает 20% ({{ $value | humanizePercentage }})"
+          description: "Error rate парсинга = {{ $value | humanizePercentage }}. Проверить логи telethon-ingest и состояние Telegram API."
+      
+      # Высокая длительность обработки канала (p95 > 60 секунд)
+      - alert: ParsingLatencyHigh
+        expr: |
+          histogram_quantile(0.95, 
+            sum(rate(parser_channel_processing_seconds_bucket[10m])) by (le, mode)
+          ) > 60
+        for: 10m
+        labels:
+          severity: warning
+          component: parsing
+        annotations:
+          summary: "Parsing p95 latency превышает 60 секунд ({{ $value | humanize }}s)"
+          description: "P95 latency обработки канала = {{ $value | humanize }}s. Проверить производительность парсера и состояние Telegram API."
+      
+      # Нет новых постов за последний час при активном парсинге
+      - alert: ParsingNoNewPosts
+        expr: |
+          sum(rate(posts_parsed_total{status="ok"}[1h])) == 0
+          and 
+          sum(rate(parser_runs_total[1h])) > 0
+        for: 1h
+        labels:
+          severity: info
+          component: parsing
+        annotations:
+          summary: "Нет новых постов за последний час при активном парсинге"
+          description: "Парсер работает, но новых постов не обнаружено. Возможно, каналы неактивны или все посты уже обработаны."
+      
+      # Scheduler tick застрял (> 10 минут)
+      - alert: SchedulerTickStuck
+        expr: |
+          (time() - scheduler_last_tick_ts_seconds) > 600
+        for: 5m
+        labels:
+          severity: critical
+          component: scheduler
+        annotations:
+          summary: "Scheduler tick застрял ({{ $value | humanize }}s с последнего тика)"
+          description: "Последний тик scheduler был {{ $value | humanize }}s назад. Проверить логи telethon-ingest и состояние scheduler."
+      
+      # Heartbeat scheduler не обновляется (> 2 минуты)
+      - alert: SchedulerHeartbeatStale
+        expr: |
+          (time() - scheduler_heartbeat_seconds) > 120
+        for: 2m
+        labels:
+          severity: warning
+          component: scheduler
+        annotations:
+          summary: "Scheduler heartbeat не обновляется ({{ $value | humanize }}s)"
+          description: "Heartbeat scheduler не обновлялся {{ $value | humanize }}s. Проверить активность scheduler."
+
+  # Vision Analysis Alerts (Context7 Best Practices)
+  - name: vision_analysis
+    interval: 30s
+    rules:
+      # Vision анализ не обрабатывает события
+      # Context7: Используем vision_worker_processed_total (реальная метрика) и stream:posts:vision (реальный stream)
+      - alert: VisionAnalysisNoActivity
+        expr: |
+          sum(rate(vision_worker_processed_total[10m])) == 0
+          and 
+          sum(stream_pending_size{stream=~"posts\\.vision"}) > 10
+        for: 10m
+        labels:
+          severity: warning
+          component: vision_analysis
+        annotations:
+          summary: "Vision анализ не обрабатывает события (pending: {{ $value }})"
+          description: "Есть события в stream:posts:vision ({{ $value }}), но vision анализ не обрабатывает. Проверить логи worker и состояние GigaChat API."
+      
+      # Высокий error rate vision анализа (> 15%)
+      # Context7: Используем vision_worker_processed_total (реальная метрика)
+      - alert: VisionAnalysisErrorRateHigh
+        expr: |
+          (
+            sum(rate(vision_worker_processed_total{status="error"}[10m]))
+            /
+            (sum(rate(vision_worker_processed_total[10m])) + 1e-6)
+          ) > 0.15
+        for: 10m
+        labels:
+          severity: warning
+          component: vision_analysis
+        annotations:
+          summary: "Vision analysis error rate превышает 15% ({{ $value | humanizePercentage }})"
+          description: "Error rate vision анализа = {{ $value | humanizePercentage }}. Проверить логи worker и состояние GigaChat API."
+      
+      # Высокая latency vision анализа (p95 > 30 секунд)
+      # Context7: Используем vision_worker_duration_seconds (реальная метрика с label status)
+      - alert: VisionAnalysisLatencyHigh
+        expr: |
+          histogram_quantile(0.95, 
+            sum(rate(vision_worker_duration_seconds_bucket[10m])) by (le, status)
+          ) > 30
+        for: 10m
+        labels:
+          severity: warning
+          component: vision_analysis
+        annotations:
+          summary: "Vision analysis p95 latency превышает 30 секунд ({{ $value | humanize }}s)"
+          description: "P95 latency vision анализа = {{ $value | humanize }}s для status={{ $labels.status }}. Проверить производительность GigaChat API."
+      
+      # Низкое покрытие vision анализа (< 70%)
+      # Context7: Используем vision_worker_processed_total{status="success"} и stream:posts:vision
+      - alert: VisionAnalysisCoverageLow
+        expr: |
+          (
+            sum(rate(vision_worker_processed_total{status="success"}[10m]))
+            /
+            (sum(rate(stream_messages_total{stream="posts.vision", phase="new", status="ok"}[10m])) + 1e-6)
+          ) < 0.70
+        for: 15m
+        labels:
+          severity: warning
+          component: vision_analysis
+        annotations:
+          summary: "Vision analysis покрытие < 70% (текущее: {{ $value | humanizePercentage }})"
+          description: "Целевое покрытие: 70%+. Проверить логи worker и состояние GigaChat API."
+
   # Album Pipeline Alerts (Phase 4)
   - name: album_pipeline
     interval: 30s
@@ -955,9 +1118,10 @@ groups:
   - name: context_events
     interval: 30s
     rules:
+      # Context7: digest_context_messages - это Histogram, используем _count для подсчета событий
       - alert: ContextEventsNoActivity
         expr: |
-          sum(rate(digest_context_messages[10m])) == 0
+          sum(rate(digest_context_messages_count[10m])) == 0
           and
           sum(stream_pending_size{stream=~"digest\\.context\\.prepared"}) > 10
         for: 10m

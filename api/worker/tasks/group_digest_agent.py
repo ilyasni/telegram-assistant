@@ -3296,6 +3296,33 @@ class GroupDigestOrchestrator:
                 )
                 model_id = response.model
                 raw = response.content
+                
+                # Context7: Проверяем ответ на наличие фильтра
+                if self._is_filter_response(raw):
+                    logger.warning(
+                        "LLM filter detected in synthesis_agent response",
+                        tenant_id=tenant_id,
+                        trace_id=trace_id,
+                        model=model_id,
+                        content_preview=raw[:200] if len(raw) > 200 else raw
+                    )
+                    # Возвращаем деградированный дайджест вместо фильтрованного контента
+                    degraded_summary = (
+                        "<b>Дайджест не сформирован</b>: "
+                        "Контент был отфильтрован системой безопасности. "
+                        "Попробуйте сгенерировать дайджест позже или измените параметры запроса."
+                    )
+                    result = {
+                        "summary_html": degraded_summary,
+                        "summary": degraded_summary,
+                        "baseline_snapshot": baseline_dict,
+                        "prompt_version": "digest_composer_prompt_v2",
+                        "degraded": True,
+                        "filter_detected": True,
+                    }
+                    self._store_stage_payload(state, "synthesis_agent", result, model_id=model_id)
+                    return result
+                    
             except Exception as exc:  # noqa: BLE001
                 logger.warning("synthesis_agent_failed", error=str(exc))
                 return self._handle_stage_failure(
@@ -3323,6 +3350,73 @@ class GroupDigestOrchestrator:
             }
             self._store_stage_payload(state, "synthesis_agent", result, model_id=model_id)
             return result
+
+    def _is_filter_response(self, content: str) -> bool:
+        """
+        Детектирование ответов с фильтром от LLM.
+        
+        Проверяет наличие ключевых фраз и паттернов, указывающих на то,
+        что LLM вернул сообщение о фильтрации контента.
+        
+        Args:
+            content: Текст ответа от LLM
+            
+        Returns:
+            True если обнаружен фильтр, False иначе
+        """
+        if not content:
+            return False
+        
+        content_lower = content.lower()
+        
+        # Высокоприоритетные фразы (детектируются сразу при наличии)
+        high_priority_phrases = [
+            "генеративные языковые модели не обладают собственным мнением",
+            "не обладают собственным мнением",
+            "обученной на открытых данных, в которых может содержаться неточная или ошибочная информация",
+            "во избежание неправильного толкования",
+            "чувствительные темы могут быть ограничены",
+        ]
+        
+        # Проверяем высокоприоритетные фразы (достаточно одной)
+        for phrase in high_priority_phrases:
+            if phrase in content_lower:
+                return True
+        
+        # Остальные ключевые фразы для детектирования фильтра
+        key_phrases = [
+            "некорректных ответов",
+            "некорректные ответы",
+            "чувствительными темами",
+            "чувствительные темы",
+            "ограничены",
+            "временно ограничены",
+            "генеративные языковые модели",
+            "не транслирует мнение своих разработчиков",
+            "как и любая языковая модель, gigachat",
+            "разговоры на чувствительные темы могут быть ограничены",
+        ]
+        
+        # Подсчитываем количество найденных ключевых фраз
+        found_phrases = sum(1 for phrase in key_phrases if phrase in content_lower)
+        
+        # Паттерны для детектирования (комбинации фраз)
+        patterns = [
+            ("к сожалению", "ограничены"),
+            ("как и любая языковая модель", "ограничены"),
+            ("генеративные языковые модели", "ограничены"),
+            ("чувствительные темы", "ограничены"),
+        ]
+        
+        # Проверяем паттерны
+        pattern_found = False
+        for pattern_start, pattern_end in patterns:
+            if pattern_start in content_lower and pattern_end in content_lower:
+                pattern_found = True
+                break
+        
+        # Детектируем фильтр, если найдено 1+ ключевая фраза (снижен порог) или один из паттернов
+        return found_phrases >= 1 or pattern_found
 
     def _pre_quality_checks(self, state: GroupDigestState) -> Dict[str, Any]:
         """Rule-based проверки качества перед LLM-judge."""

@@ -234,7 +234,11 @@ class ParseAllChannelsTask:
         
         # Context7: Запускаем heartbeat задачу для мониторинга активности scheduler'а
         async def heartbeat_task():
-            """Context7: Обновляем heartbeat метрику каждые 30 секунд для отслеживания активности."""
+            """Context7: Обновляем heartbeat метрику каждые 30 секунд для отслеживания активности.
+            
+            Context7 Best Practices: Используем таймаут для обновления метрики, чтобы предотвратить
+            зависание heartbeat при проблемах с event loop или блокирующих операциях.
+            """
             # Инициализируем heartbeat сразу при запуске
             try:
                 now_ts = datetime.now(timezone.utc).timestamp()
@@ -244,12 +248,22 @@ class ParseAllChannelsTask:
             
             while True:
                 try:
+                    # Context7: Обновляем heartbeat метрику (синхронная операция prometheus_client)
+                    # Обрабатываем все возможные ошибки, чтобы heartbeat не падал
                     now_ts = datetime.now(timezone.utc).timestamp()
                     scheduler_heartbeat_seconds.set(now_ts)
+                    
                     await asyncio.sleep(30)  # Обновляем каждые 30 секунд
+                except asyncio.CancelledError:
+                    logger.info("Heartbeat task cancelled")
+                    raise
                 except Exception as e:
-                    logger.error("Heartbeat task error", error=str(e))
-                    await asyncio.sleep(30)  # Продолжаем даже при ошибке
+                    logger.error("Heartbeat task error", error=str(e), error_type=type(e).__name__, exc_info=True)
+                    # Context7: Продолжаем работу даже при ошибке, но делаем небольшую задержку
+                    try:
+                        await asyncio.sleep(30)
+                    except Exception:
+                        pass  # Игнорируем ошибки sleep
         
         # Запускаем heartbeat в фоне
         asyncio.create_task(heartbeat_task())
@@ -261,6 +275,12 @@ class ParseAllChannelsTask:
                 await self._run_tick()
             except Exception as e:
                 logger.exception("scheduler tick failed", error=str(e))
+                # Context7: Обновляем метрику даже при ошибке в run_forever, чтобы показать активность
+                try:
+                    now_ts = datetime.now(timezone.utc).timestamp()
+                    scheduler_last_tick_ts_seconds.set(now_ts)
+                except Exception:
+                    pass  # Игнорируем ошибки обновления метрики
             
             await asyncio.sleep(self.interval_sec)
     
@@ -746,7 +766,13 @@ class ParseAllChannelsTask:
                 # поэтому НЕ вызываем _update_last_parsed_at здесь, чтобы избежать дублирования
                 if result and "messages_processed" in result:
                     parsed_count = result.get("messages_processed", 0)
-                    posts_parsed_total.labels(mode=mode, status="success").inc(parsed_count)
+                    # Context7: Обновляем метрики даже при 0 сообщениях для отслеживания активности парсинга
+                    # Это позволяет алерту ParsingNoActivity правильно определять, что парсинг работает
+                    if parsed_count > 0:
+                        posts_parsed_total.labels(mode=mode, status="success").inc(parsed_count)
+                    else:
+                        # Обновляем метрику с 0 для отслеживания активности (rate будет > 0)
+                        posts_parsed_total.labels(mode=mode, status="success").inc(0)
                     parser_runs_total.labels(mode=mode, status="ok").inc()
                     status = "ok"
                     logger.info("CHANNEL_PARSE_END",
@@ -839,6 +865,7 @@ class ParseAllChannelsTask:
         
         Context7: Улучшенная обработка ошибок для предотвращения падения процесса.
         Все исключения логируются, но не прерывают выполнение scheduler'а.
+        Context7: Добавлен общий таймаут для всего тика, чтобы гарантировать освобождение lock.
         """
         if not await self._acquire_lock():
             logger.info("Lock held by another instance, skipping tick")
@@ -851,248 +878,321 @@ class ParseAllChannelsTask:
                 pass  # Игнорируем ошибки обновления метрики
             return
         
-        tick_start_time = datetime.now(timezone.utc)
-        lock_acquired = True
-        try:
-            logger.info("Running scheduler tick (lock acquired)")
-            
-            # Получение активных каналов с обработкой ошибок
+        # Context7: Общий таймаут для всего тика
+        # Учитываем архитектуру и вариативность:
+        # - Lock TTL = interval_sec * 2 (защита от зависших тиков)
+        # - max_tick_duration = min(interval_sec * 0.8, 400) (внутренний лимит обработки)
+        # - Общий таймаут должен быть: больше max_tick_duration, но меньше lock TTL
+        # - Формула учитывает разные сценарии:
+        #   * Короткие интервалы (300s): таймаут ~480s (достаточно для обработки)
+        #   * Длинные интервалы (1800s+): таймаут ограничен 1800s (защита от зависаний)
+        #   * Всегда: таймаут < lock_ttl * 0.9 (10% запас до истечения lock)
+        max_tick_duration = min(self.interval_sec * 0.8, 400.0)
+        lock_ttl = self.interval_sec * 2
+        # Общий таймаут: минимум из (lock_ttl * 0.9, max(max_tick_duration * 2, interval_sec * 1.2), 1800)
+        # - lock_ttl * 0.9: оставляем 10% запаса до истечения lock
+        # - max(max_tick_duration * 2, interval_sec * 1.2): даем запас для обработки всех каналов
+        # - 1800: максимальный разумный лимит (30 минут) для защиты от бесконечных зависаний
+        max_total_tick_timeout = min(lock_ttl * 0.9, max(max_tick_duration * 2, self.interval_sec * 1.2), 1800.0)
+        
+        logger.debug("Scheduler tick timeout configuration",
+                   interval_sec=self.interval_sec,
+                   max_tick_duration=max_tick_duration,
+                   lock_ttl=lock_ttl,
+                   max_total_tick_timeout=max_total_tick_timeout)
+        
+        async def _run_tick_internal():
+            tick_start_time = datetime.now(timezone.utc)
+            lock_acquired = True
             try:
-                channels = self._get_active_channels()
-            except Exception as e:
-                logger.error("Failed to get active channels in tick",
-                           error=str(e),
-                           error_type=type(e).__name__,
-                           exc_info=True)
-                channels = []
-            
-            logger.info(
-                "Starting scheduler tick",
-                channels_count=len(channels),
-                tick_interval_sec=self.interval_sec
-            )
-            
-            if not channels:
-                logger.warning("No active channels found for parsing")
-                # Context7: Не делаем return здесь, чтобы finally блок освободил lock
-                # Просто пропускаем парсинг каналов
-            
-            # Context7: Safety-guard для времени tick'а (вторичный механизм)
-            # Динамическое время не требуется, так как число каналов ограничено CHANNELS_PER_TICK
-            max_tick_duration = min(self.interval_sec * 0.8, 400)  # Фиксированный лимит как safety-guard
-            
-            # Context7: Приоритизация уже реализована в SQL через ORDER BY last_parsed_at NULLS FIRST
-            # channels уже отсортированы из БД, дополнительная сортировка не требуется
-            channels_sorted = channels
-            
-            # Context7: Логируем выбор каналов для тика
-            for channel in channels_sorted:
-                is_new_channel = channel.get('last_parsed_at') is None
-                logger.info("CHANNEL_SELECTED_FOR_TICK",
-                           channel_id=channel['id'],
-                           channel_title=channel.get('title'),
-                           channel_username=channel.get('username'),
-                           is_new_channel=is_new_channel,
-                           last_parsed_at=channel.get('last_parsed_at'))
-            
-            # Context7: Параллельная обработка только выбранных N каналов (не всех!)
-            # Context7: Используем новый parse_single_channel с отдельными DB sessions
-            async def process_channel_wrapper(channel, tick_start_time, max_tick_duration):
-                """Wrapper для обработки одного канала с проверкой времени"""
-                # Context7: Проверяем время ПЕРЕД началом обработки канала
-                # Это предотвращает запуск задач, которые заведомо не успеют завершиться
-                elapsed = (datetime.now(timezone.utc) - tick_start_time).total_seconds()
-                if elapsed >= max_tick_duration:
-                    logger.debug("Skipping channel due to tick time limit",
-                                channel_id=channel['id'],
-                                elapsed_seconds=elapsed,
-                                max_duration_seconds=max_tick_duration)
-                    return {"status": "skipped", "reason": "tick_time_limit", "channel_id": channel.get('id')}
-                # Context7: Вызываем parse_single_channel, который сам имеет таймаут individual_task_timeout
-                return await self.parse_single_channel(channel, tick_start_time)
-            
-            # Создаем задачи только для выбранных N каналов (не всех!)
-            # Context7: Создаем Task объекты для возможности отмены при таймауте
-            # Context7: Добавляем индивидуальный таймаут для каждой задачи
-            # Увеличено до 180 секунд, так как парсинг канала может занимать время
-            # (получение клиента, создание parser'а, сам парсинг, обработка медиа)
-            # Особенно важно для больших каналов с большим количеством постов
-            individual_task_timeout = float(os.getenv("PARSER_INDIVIDUAL_TASK_TIMEOUT", "180.0"))  # секунд на обработку одного канала
-            
-            async def process_channel_with_timeout(channel, tick_start_time, max_tick_duration):
-                """Wrapper с индивидуальным таймаутом для каждого канала"""
+                # Context7: Обновляем метрику в начале тика, чтобы показать активность scheduler'а
+                # даже если тик еще не завершился. Это предотвращает ложные алерты при долгих тиках.
                 try:
-                    return await asyncio.wait_for(
-                        process_channel_wrapper(channel, tick_start_time, max_tick_duration),
-                        timeout=individual_task_timeout
-                    )
-                except asyncio.TimeoutError:
-                    logger.warning("CHANNEL_PARSE_TIMEOUT",
-                                 channel_id=channel.get('id'),
-                                 channel_title=channel.get('title'),
-                                 timeout_seconds=individual_task_timeout)
-                    return {"status": "timeout", "channel_id": channel.get('id')}
+                    now_ts = datetime.now(timezone.utc).timestamp()
+                    scheduler_last_tick_ts_seconds.set(now_ts)
+                except Exception:
+                    pass  # Игнорируем ошибки обновления метрики
+                
+                logger.info("Running scheduler tick (lock acquired)")
+                
+                # Получение активных каналов с обработкой ошибок
+                try:
+                    channels = self._get_active_channels()
                 except Exception as e:
-                    logger.error("CHANNEL_PARSE_ERROR",
-                               channel_id=channel.get('id'),
+                    logger.error("Failed to get active channels in tick",
                                error=str(e),
                                error_type=type(e).__name__,
                                exc_info=True)
-                    return {"status": "error", "channel_id": channel.get('id'), "error": str(e)}
-            
-            channel_batch_size = int(os.getenv("CHANNEL_BATCH_SIZE", "20"))
-            channel_batch_size = max(1, channel_batch_size)
-            
-            results: List[Tuple[Dict[str, Any], Any]] = []
-            channels_processed = 0
-            
-            for batch_start in range(0, len(channels_sorted), channel_batch_size):
-                elapsed_before_batch = (datetime.now(timezone.utc) - tick_start_time).total_seconds()
-                if elapsed_before_batch >= max_tick_duration:
-                    logger.debug("Stopping batching due to tick time budget",
-                                elapsed_seconds=elapsed_before_batch,
-                                max_duration_seconds=max_tick_duration,
-                                batch_start=batch_start)
-                    break
+                    channels = []
                 
-                batch = channels_sorted[batch_start:batch_start + channel_batch_size]
-                batch_tasks = [
-                    asyncio.create_task(process_channel_with_timeout(channel, tick_start_time, max_tick_duration))
-                    for channel in batch
-                ]
+                logger.info(
+                    "Starting scheduler tick",
+                    channels_count=len(channels),
+                    tick_interval_sec=self.interval_sec
+                )
                 
-                try:
-                    # Context7: Вычисляем оставшееся время для батча
-                    # Используем min(remaining_timeout, individual_task_timeout + 10) для безопасности
-                    # +10 секунд - запас на завершение задач после таймаута
-                    remaining_timeout = max(1.0, max_tick_duration - elapsed_before_batch)
-                    # Context7: Ограничиваем таймаут батча, чтобы не превышать individual_task_timeout
-                    # Это предотвращает ситуации, когда батч ждет дольше, чем может работать одна задача
-                    batch_timeout = min(remaining_timeout, individual_task_timeout + 10.0)
-                    batch_results = await asyncio.wait_for(
-                        asyncio.gather(*batch_tasks, return_exceptions=True),
-                        timeout=batch_timeout
-                    )
-                except asyncio.TimeoutError:
-                    logger.error("Channel batch processing timeout",
-                                batch_size=len(batch),
-                                timeout_seconds=remaining_timeout,
-                                elapsed_since_tick_start=elapsed_before_batch)
-                    for task in batch_tasks:
-                        if not task.done():
-                            task.cancel()
-                    try:
-                        await asyncio.wait_for(
-                            asyncio.gather(*batch_tasks, return_exceptions=True),
-                            timeout=5.0
-                        )
-                    except Exception:
-                        pass
-                    batch_results = []
-                except Exception as e:
-                    logger.error("Failed to gather channel batch results",
-                               error=str(e),
-                               error_type=type(e).__name__,
-                               batch_size=len(batch),
-                               exc_info=True)
-                    for task in batch_tasks:
-                        if not task.done():
-                            task.cancel()
-                    batch_results = []
+                if not channels:
+                    logger.warning("No active channels found for parsing")
+                    # Context7: Не делаем return здесь, чтобы finally блок освободил lock
+                    # Просто пропускаем парсинг каналов
                 
-                for idx, result in enumerate(batch_results):
-                    results.append((batch[idx], result))
+                # Context7: Safety-guard для времени tick'а (вторичный механизм)
+                # Динамическое время не требуется, так как число каналов ограничено CHANNELS_PER_TICK
+                # Используем ту же формулу, что и для общего таймаута (вычислено выше)
+                # max_tick_duration уже вычислен выше для общего таймаута, используем его
+                # Но для внутреннего лимита используем более консервативное значение
+                max_tick_duration = min(self.interval_sec * 0.8, 400.0)  # Фиксированный лимит как safety-guard
                 
-                elapsed_after_batch = (datetime.now(timezone.utc) - tick_start_time).total_seconds()
-                if elapsed_after_batch >= max_tick_duration:
-                    logger.debug("Stopping batching after batch due to tick time budget",
-                                elapsed_seconds=elapsed_after_batch,
-                                max_duration_seconds=max_tick_duration,
-                                batch_start=batch_start)
-                    break
-            
-            for channel, result in results:
-                if isinstance(result, Exception):
-                    logger.error("Channel processing exception",
+                # Context7: Приоритизация уже реализована в SQL через ORDER BY last_parsed_at NULLS FIRST
+                # channels уже отсортированы из БД, дополнительная сортировка не требуется
+                channels_sorted = channels
+                
+                # Context7: Логируем выбор каналов для тика
+                for channel in channels_sorted:
+                    is_new_channel = channel.get('last_parsed_at') is None
+                    logger.info("CHANNEL_SELECTED_FOR_TICK",
                                channel_id=channel['id'],
-                               error=str(result),
-                               error_type=type(result).__name__,
-                               exc_info=True)
-                    # Context7: Обновляем last_parsed_at через async SQLAlchemy для ошибок
+                               channel_title=channel.get('title'),
+                               channel_username=channel.get('username'),
+                               is_new_channel=is_new_channel,
+                               last_parsed_at=channel.get('last_parsed_at'))
+                
+                # Context7: Параллельная обработка только выбранных N каналов (не всех!)
+                # Context7: Используем новый parse_single_channel с отдельными DB sessions
+                async def process_channel_wrapper(channel, tick_start_time, max_tick_duration):
+                    """Wrapper для обработки одного канала с проверкой времени"""
+                    # Context7: Проверяем время ПЕРЕД началом обработки канала
+                    # Это предотвращает запуск задач, которые заведомо не успеют завершиться
+                    elapsed = (datetime.now(timezone.utc) - tick_start_time).total_seconds()
+                    if elapsed >= max_tick_duration:
+                        logger.debug("Skipping channel due to tick time limit",
+                                    channel_id=channel['id'],
+                                    elapsed_seconds=elapsed,
+                                    max_duration_seconds=max_tick_duration)
+                        return {"status": "skipped", "reason": "tick_time_limit", "channel_id": channel.get('id')}
+                    # Context7: Вызываем parse_single_channel, который сам имеет таймаут individual_task_timeout
+                    return await self.parse_single_channel(channel, tick_start_time)
+                
+                # Создаем задачи только для выбранных N каналов (не всех!)
+                # Context7: Создаем Task объекты для возможности отмены при таймауте
+                # Context7: Добавляем индивидуальный таймаут для каждой задачи
+                # Увеличено до 180 секунд, так как парсинг канала может занимать время
+                # (получение клиента, создание parser'а, сам парсинг, обработка медиа)
+                # Особенно важно для больших каналов с большим количеством постов
+                individual_task_timeout = float(os.getenv("PARSER_INDIVIDUAL_TASK_TIMEOUT", "180.0"))  # секунд на обработку одного канала
+                
+                async def process_channel_with_timeout(channel, tick_start_time, max_tick_duration):
+                    """Wrapper с индивидуальным таймаутом для каждого канала"""
                     try:
-                        async with self.async_session_factory() as db_session:
-                            await self._update_last_parsed_at_async(channel['id'], db_session)
-                    except Exception as update_error:
-                        logger.warning("Failed to update last_parsed_at after exception",
-                                     channel_id=channel['id'],
-                                     error=str(update_error))
-                    channels_processed += 1
-                elif result is not None:
-                    status = result.get("status", "unknown")
-                    if status in ["timeout", "error", "failed"]:
+                        return await asyncio.wait_for(
+                            process_channel_wrapper(channel, tick_start_time, max_tick_duration),
+                            timeout=individual_task_timeout
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning("CHANNEL_PARSE_TIMEOUT",
+                                     channel_id=channel.get('id'),
+                                     channel_title=channel.get('title'),
+                                     timeout_seconds=individual_task_timeout)
+                        return {"status": "timeout", "channel_id": channel.get('id')}
+                    except Exception as e:
+                        logger.error("CHANNEL_PARSE_ERROR",
+                                   channel_id=channel.get('id'),
+                                   error=str(e),
+                                   error_type=type(e).__name__,
+                                   exc_info=True)
+                        return {"status": "error", "channel_id": channel.get('id'), "error": str(e)}
+                
+                channel_batch_size = int(os.getenv("CHANNEL_BATCH_SIZE", "20"))
+                channel_batch_size = max(1, channel_batch_size)
+                
+                results: List[Tuple[Dict[str, Any], Any]] = []
+                channels_processed = 0
+                
+                for batch_start in range(0, len(channels_sorted), channel_batch_size):
+                    elapsed_before_batch = (datetime.now(timezone.utc) - tick_start_time).total_seconds()
+                    if elapsed_before_batch >= max_tick_duration:
+                        logger.debug("Stopping batching due to tick time budget",
+                                    elapsed_seconds=elapsed_before_batch,
+                                    max_duration_seconds=max_tick_duration,
+                                    batch_start=batch_start)
+                        break
+                    
+                    batch = channels_sorted[batch_start:batch_start + channel_batch_size]
+                    batch_tasks = [
+                        asyncio.create_task(process_channel_with_timeout(channel, tick_start_time, max_tick_duration))
+                        for channel in batch
+                    ]
+                    
+                    try:
+                        # Context7: Вычисляем оставшееся время для батча
+                        # Используем min(remaining_timeout, individual_task_timeout + 10) для безопасности
+                        # +10 секунд - запас на завершение задач после таймаута
+                        remaining_timeout = max(1.0, max_tick_duration - elapsed_before_batch)
+                        # Context7: Ограничиваем таймаут батча, чтобы не превышать individual_task_timeout
+                        # Это предотвращает ситуации, когда батч ждет дольше, чем может работать одна задача
+                        batch_timeout = min(remaining_timeout, individual_task_timeout + 10.0)
+                        batch_results = await asyncio.wait_for(
+                            asyncio.gather(*batch_tasks, return_exceptions=True),
+                            timeout=batch_timeout
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error("Channel batch processing timeout",
+                                    batch_size=len(batch),
+                                    timeout_seconds=remaining_timeout,
+                                    elapsed_since_tick_start=elapsed_before_batch)
+                        for task in batch_tasks:
+                            if not task.done():
+                                task.cancel()
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.gather(*batch_tasks, return_exceptions=True),
+                                timeout=5.0
+                            )
+                        except Exception:
+                            pass
+                        batch_results = []
+                    except Exception as e:
+                        logger.error("Failed to gather channel batch results",
+                                   error=str(e),
+                                   error_type=type(e).__name__,
+                                   batch_size=len(batch),
+                                   exc_info=True)
+                        for task in batch_tasks:
+                            if not task.done():
+                                task.cancel()
+                        batch_results = []
+                    
+                    for idx, result in enumerate(batch_results):
+                        results.append((batch[idx], result))
+                    
+                    elapsed_after_batch = (datetime.now(timezone.utc) - tick_start_time).total_seconds()
+                    if elapsed_after_batch >= max_tick_duration:
+                        logger.debug("Stopping batching after batch due to tick time budget",
+                                    elapsed_seconds=elapsed_after_batch,
+                                    max_duration_seconds=max_tick_duration,
+                                    batch_start=batch_start)
+                        break
+                
+                for channel, result in results:
+                    if isinstance(result, Exception):
+                        logger.error("Channel processing exception",
+                                   channel_id=channel['id'],
+                                   error=str(result),
+                                   error_type=type(result).__name__,
+                                   exc_info=True)
                         # Context7: Обновляем last_parsed_at через async SQLAlchemy для ошибок
                         try:
                             async with self.async_session_factory() as db_session:
                                 await self._update_last_parsed_at_async(channel['id'], db_session)
                         except Exception as update_error:
-                            logger.warning("Failed to update last_parsed_at after error",
+                            logger.warning("Failed to update last_parsed_at after exception",
                                          channel_id=channel['id'],
                                          error=str(update_error))
-                    channels_processed += 1
-                else:
-                    continue
-            
-            # Context7: Логируем прогресс после обработки всех каналов
-            elapsed = (datetime.now(timezone.utc) - tick_start_time).total_seconds()
-            logger.info(
-                "Tick completed",
-                channels_processed=channels_processed,
-                channels_total=len(channels),
-                elapsed_seconds=elapsed
-            )
-            
-            # Update scheduler freshness metric
-            now_ts = datetime.now(timezone.utc).timestamp()
-            scheduler_last_tick_ts_seconds.set(now_ts)
-            
-            # Update app_state if available
-            if self.app_state:
-                self.app_state["scheduler"]["last_tick_ts"] = datetime.now(timezone.utc).isoformat()
-                self.app_state["scheduler"]["status"] = "running"
-            
-            tick_duration = (datetime.now(timezone.utc) - tick_start_time).total_seconds()
-            logger.info(
-                "Scheduler tick completed",
-                channels_processed=channels_processed,
-                channels_total=len(channels) if channels else 0,
-                duration_seconds=tick_duration
-            )
-            
-        except Exception as e:
-            # Context7: Обработка всех неожиданных ошибок в тике для предотвращения падения процесса
-            logger.error("Unexpected error in scheduler tick",
-                       error=str(e),
-                       error_type=type(e).__name__,
-                       exc_info=True)
-            # Context7: Обновляем метрику даже при ошибке для отслеживания активности scheduler'а
+                        channels_processed += 1
+                    elif result is not None:
+                        status = result.get("status", "unknown")
+                        if status in ["timeout", "error", "failed"]:
+                            # Context7: Обновляем last_parsed_at через async SQLAlchemy для ошибок
+                            try:
+                                async with self.async_session_factory() as db_session:
+                                    await self._update_last_parsed_at_async(channel['id'], db_session)
+                            except Exception as update_error:
+                                logger.warning("Failed to update last_parsed_at after error",
+                                             channel_id=channel['id'],
+                                             error=str(update_error))
+                        channels_processed += 1
+                    else:
+                        continue
+                
+                # Context7: Логируем прогресс после обработки всех каналов
+                elapsed = (datetime.now(timezone.utc) - tick_start_time).total_seconds()
+                logger.info(
+                    "Tick completed",
+                    channels_processed=channels_processed,
+                    channels_total=len(channels),
+                    elapsed_seconds=elapsed
+                )
+                
+                # Update scheduler freshness metric
+                now_ts = datetime.now(timezone.utc).timestamp()
+                scheduler_last_tick_ts_seconds.set(now_ts)
+                
+                # Update app_state if available
+                if self.app_state:
+                    self.app_state["scheduler"]["last_tick_ts"] = datetime.now(timezone.utc).isoformat()
+                    self.app_state["scheduler"]["status"] = "running"
+                
+                tick_duration = (datetime.now(timezone.utc) - tick_start_time).total_seconds()
+                logger.info(
+                    "Scheduler tick completed",
+                    channels_processed=channels_processed,
+                    channels_total=len(channels) if channels else 0,
+                    duration_seconds=tick_duration
+                )
+                
+            except Exception as e:
+                # Context7: Обработка всех неожиданных ошибок в тике для предотвращения падения процесса
+                logger.error("Unexpected error in scheduler tick",
+                           error=str(e),
+                           error_type=type(e).__name__,
+                           exc_info=True)
+                # Context7: Обновляем метрику даже при ошибке для отслеживания активности scheduler'а
+                try:
+                    now_ts = datetime.now(timezone.utc).timestamp()
+                    scheduler_last_tick_ts_seconds.set(now_ts)
+                except Exception:
+                    pass  # Игнорируем ошибки обновления метрики
+                # Не прерываем выполнение - scheduler продолжит работу в следующем тике
+            finally:
+                # Context7: Всегда освобождаем lock в finally блоке
+                # Context7: Логируем освобождение lock для диагностики
+                try:
+                    await self._release_lock()
+                    logger.debug("Lock released after tick", 
+                               tick_duration_seconds=(datetime.now(timezone.utc) - tick_start_time).total_seconds() if 'tick_start_time' in locals() else None)
+                except Exception as release_error:
+                    logger.error("Failed to release lock in finally block", 
+                               error=str(release_error), 
+                               error_type=type(release_error).__name__,
+                               exc_info=True)
+        
+        # Context7: Обертываем весь тик в общий таймаут для гарантированного завершения
+        try:
+            await asyncio.wait_for(_run_tick_internal(), timeout=max_total_tick_timeout)
+        except asyncio.TimeoutError:
+            logger.error("Scheduler tick timeout - forcing completion",
+                       timeout_seconds=max_total_tick_timeout,
+                       interval_sec=self.interval_sec)
+            # Context7: Обновляем метрику даже при таймауте
             try:
                 now_ts = datetime.now(timezone.utc).timestamp()
                 scheduler_last_tick_ts_seconds.set(now_ts)
             except Exception:
-                pass  # Игнорируем ошибки обновления метрики
-            # Не прерываем выполнение - scheduler продолжит работу в следующем тике
-        finally:
-            # Context7: Всегда освобождаем lock в finally блоке
-            # Context7: Логируем освобождение lock для диагностики
+                pass
+            # Context7: Принудительно освобождаем lock при таймауте
             try:
                 await self._release_lock()
-                logger.debug("Lock released after tick", 
-                           tick_duration_seconds=(datetime.now(timezone.utc) - tick_start_time).total_seconds() if 'tick_start_time' in locals() else None)
+                logger.warning("Lock force-released after tick timeout")
             except Exception as release_error:
-                logger.error("Failed to release lock in finally block", 
-                           error=str(release_error), 
+                logger.error("Failed to force-release lock after timeout",
+                           error=str(release_error),
                            error_type=type(release_error).__name__,
                            exc_info=True)
+        except Exception as e:
+            logger.error("Unexpected error in tick wrapper",
+                       error=str(e),
+                       error_type=type(e).__name__,
+                       exc_info=True)
+            # Context7: Обновляем метрику и освобождаем lock даже при неожиданной ошибке
+            try:
+                now_ts = datetime.now(timezone.utc).timestamp()
+                scheduler_last_tick_ts_seconds.set(now_ts)
+            except Exception:
+                pass
+            try:
+                await self._release_lock()
+            except Exception:
+                pass
     
     async def _check_and_trigger_backfill(self, channel: Dict[str, Any]):
         """

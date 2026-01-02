@@ -625,8 +625,30 @@ class MediaProcessor:
             logger.error("Photo download timeout after 120s", trace_id=trace_id)
             return None
         except Exception as e:
+            error_message = str(e)
+            error_type = type(e).__name__
+            
+            # Context7: Обработка ошибок expired file reference - это нормальная ситуация для старых медиа
+            # Пропускаем медиа с предупреждением, но не блокируем обработку поста
+            if "file reference has expired" in error_message.lower() or "self-destructing media" in error_message.lower():
+                media_processing_failed_total.labels(reason="expired_file_reference").inc()
+                logger.warning(
+                    "Photo file reference expired - skipping media",
+                    error=error_message,
+                    error_type=error_type,
+                    trace_id=trace_id,
+                    note="This is normal for old media or self-destructing content"
+                )
+                return None
+            
             media_processing_failed_total.labels(reason="download_error").inc()
-            logger.error("Failed to process photo", error=str(e), trace_id=trace_id)
+            logger.error(
+                "Failed to process photo",
+                error=error_message,
+                error_type=error_type,
+                trace_id=trace_id,
+                exc_info=True
+            )
             return None
     
     async def _process_document(
@@ -686,8 +708,31 @@ class MediaProcessor:
             logger.error("Document download timeout after 300s", trace_id=trace_id)
             return None
         except Exception as e:
+            error_message = str(e)
+            error_type = type(e).__name__
+            
+            # Context7: Обработка ошибок expired file reference - это нормальная ситуация для старых медиа
+            # Пропускаем медиа с предупреждением, но не блокируем обработку поста
+            if "file reference has expired" in error_message.lower() or "self-destructing media" in error_message.lower():
+                media_processing_failed_total.labels(reason="expired_file_reference").inc()
+                logger.warning(
+                    "Document file reference expired - skipping media",
+                    error=error_message,
+                    error_type=error_type,
+                    trace_id=trace_id,
+                    note="This is normal for old media or self-destructing content"
+                )
+                return None
+            
             media_processing_failed_total.labels(reason="download_error").inc()
-            logger.error("Failed to process document", error=str(e), trace_id=trace_id)
+            logger.error(
+                "Failed to process document",
+                error=error_message,
+                error_type=error_type,
+                trace_id=trace_id,
+                exc_info=True
+            )
+            return None
             return None
     
     async def _upload_to_s3(
@@ -725,45 +770,79 @@ class MediaProcessor:
                 )
                 return None
             
-            # Context7: Загрузка в S3 (идемпотентная - возвращает существующий SHA256 если есть)
-            sha256, s3_key, size_bytes = await self.s3_service.put_media(
-                content=content,
-                mime_type=mime_type,
-                tenant_id=tenant_id
-            )
+            # Context7: Загрузка в S3 с retry логикой для ошибок InvalidDigest
+            # InvalidDigest может возникать из-за проблем с вычислением MD5 на стороне S3
+            max_retries = 3
+            last_error = None
             
-            logger.debug(
-                "Media uploaded to S3 successfully",
-                sha256=sha256[:16] + "...",
-                s3_key=s3_key,
-                size_bytes=size_bytes,
-                mime_type=mime_type,
-                trace_id=trace_id
-            )
+            for attempt in range(max_retries):
+                try:
+                    sha256, s3_key, size_bytes = await self.s3_service.put_media(
+                        content=content,
+                        mime_type=mime_type,
+                        tenant_id=tenant_id
+                    )
+                    
+                    logger.debug(
+                        "Media uploaded to S3 successfully",
+                        sha256=sha256[:16] + "...",
+                        s3_key=s3_key,
+                        size_bytes=size_bytes,
+                        mime_type=mime_type,
+                        trace_id=trace_id,
+                        attempt=attempt + 1 if attempt > 0 else None
+                    )
+                    
+                    # Создание MediaFile объекта
+                    return MediaFile(
+                        sha256=sha256,
+                        s3_key=s3_key,
+                        mime_type=mime_type,
+                        size_bytes=size_bytes
+                    )
+                except Exception as e:
+                    last_error = e
+                    error_type = type(e).__name__
+                    error_message = str(e)
+                    
+                    # Извлекаем дополнительные детали из исключения если доступны
+                    error_code = None
+                    if hasattr(e, 'response'):
+                        # Boto3 ClientError
+                        error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+                    
+                    # Context7: Retry для ошибок InvalidDigest
+                    if error_code == "InvalidDigest" and attempt < max_retries - 1:
+                        logger.warning(
+                            "S3 InvalidDigest error, retrying",
+                            attempt=attempt + 1,
+                            max_retries=max_retries,
+                            error=error_message,
+                            mime_type=mime_type,
+                            size_bytes=len(content),
+                            trace_id=trace_id
+                        )
+                        # Небольшая задержка перед retry
+                        await asyncio.sleep(1.0 * (attempt + 1))
+                        continue
+                    else:
+                        # Не retry-able ошибка или последняя попытка
+                        break
             
-            # Создание MediaFile объекта
-            return MediaFile(
-                sha256=sha256,
-                s3_key=s3_key,
-                mime_type=mime_type,
-                size_bytes=size_bytes
-            )
-            
-        except Exception as e:
             # Context7: Детальное логирование ошибок S3 с полным контекстом
-            error_type = type(e).__name__
-            error_message = str(e)
+            error_type = type(last_error).__name__ if last_error else "Unknown"
+            error_message = str(last_error) if last_error else "Unknown error"
             
             # Извлекаем дополнительные детали из исключения если доступны
             error_details = {}
-            if hasattr(e, 'response'):
+            if last_error and hasattr(last_error, 'response'):
                 # Boto3 ClientError
-                error_details['error_code'] = e.response.get('Error', {}).get('Code', 'Unknown')
-                error_details['request_id'] = e.response.get('ResponseMetadata', {}).get('RequestId', '')
+                error_details['error_code'] = last_error.response.get('Error', {}).get('Code', 'Unknown')
+                error_details['request_id'] = last_error.response.get('ResponseMetadata', {}).get('RequestId', '')
             
             media_processing_failed_total.labels(reason="s3_upload_error").inc()
             logger.error(
-                "Failed to upload media to S3",
+                "Failed to upload media to S3 after retries",
                 error=error_message,
                 error_type=error_type,
                 mime_type=mime_type,
@@ -771,6 +850,7 @@ class MediaProcessor:
                 size_mb=len(content) / (1024 ** 2),
                 tenant_id=tenant_id,
                 trace_id=trace_id,
+                attempts=max_retries,
                 **error_details
             )
             # Context7: Не блокируем создание события - медиа может быть загружено позже через retry

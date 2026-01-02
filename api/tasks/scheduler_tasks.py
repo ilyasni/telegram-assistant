@@ -792,6 +792,9 @@ async def process_digests_task():
     Context7: Проверяет всех пользователей с включенными дайджестами и topics,
     вычисляет локальное время по schedule_tz и генерирует дайджесты.
     """
+    task_start_time = datetime.now(timezone.utc)
+    logger.info("process_digests_task started", timestamp=task_start_time.isoformat())
+    
     try:
         from pytz import timezone as pytz_timezone
         
@@ -801,6 +804,11 @@ async def process_digests_task():
         digest_settings = db.query(DigestSettings).filter(
             DigestSettings.enabled == True
         ).all()
+        
+        logger.info(
+            "process_digests_task: checking users",
+            enabled_settings_count=len(digest_settings)
+        )
         
         current_utc = datetime.now(timezone.utc)
         
@@ -844,7 +852,24 @@ async def process_digests_task():
                     (schedule_time.hour * 60 + schedule_time.minute)
                 )
                 
+                # Context7: Логируем проверку расписания для диагностики
+                logger.debug(
+                    "Checking digest schedule",
+                    user_id=str(setting.user_id),
+                    schedule_time=schedule_time.isoformat() if isinstance(schedule_time, time) else str(schedule_time),
+                    local_time=local_time.isoformat(),
+                    schedule_tz=setting.schedule_tz,
+                    time_diff_minutes=time_diff
+                )
+                
                 if time_diff <= 5:  # В пределах 5 минут от расписания
+                    logger.info(
+                        "Digest schedule matched",
+                        user_id=str(setting.user_id),
+                        schedule_time=schedule_time.isoformat() if isinstance(schedule_time, time) else str(schedule_time),
+                        local_time=local_time.isoformat(),
+                        time_diff_minutes=time_diff
+                    )
                     # Проверяем, не был ли уже сгенерирован дайджест сегодня
                     from datetime import date
                     today = date.today()
@@ -916,10 +941,22 @@ async def process_digests_task():
                 continue
         
         db.close()
-        logger.info("Digest processing task completed")
+        task_duration = (datetime.now(timezone.utc) - task_start_time).total_seconds()
+        logger.info(
+            "Digest processing task completed",
+            duration_seconds=round(task_duration, 2),
+            settings_checked=len(digest_settings) if 'digest_settings' in locals() else 0
+        )
     
     except Exception as e:
-        logger.error("Error in digest processing task", error=str(e))
+        task_duration = (datetime.now(timezone.utc) - task_start_time).total_seconds()
+        logger.error(
+            "Error in digest processing task",
+            error=str(e),
+            error_type=type(e).__name__,
+            duration_seconds=round(task_duration, 2),
+            exc_info=True
+        )
 
 
 async def detect_trends_task():
@@ -1859,12 +1896,15 @@ def setup_scheduled_tasks():
         scheduler = init_scheduler()
     
     # Дайджесты: каждые 15 минут
+    # Context7: Добавляем misfire_grace_time для обработки пропущенных задач
+    # Если задача пропущена (missed), она все равно выполнится в течение 5 минут
     scheduler.add_job(
         process_digests_task,
         trigger=CronTrigger(minute="*/15"),  # Каждые 15 минут
         id="process_digests",
         name="Process user digests",
-        replace_existing=True
+        replace_existing=True,
+        misfire_grace_time=300  # 5 минут - выполнить даже если пропущено
     )
     
     # Тренды: ежедневно в 00:00 UTC
