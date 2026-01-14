@@ -1432,7 +1432,8 @@ class ParseAllChannelsTask:
                       AND (c.blocked_until IS NULL OR c.blocked_until < NOW())
                     GROUP BY c.id
                 )
-                SELECT c.id,
+                SELECT DISTINCT ON (c.id)
+                       c.id,
                        c.tg_channel_id,
                        c.username,
                        c.title,
@@ -1451,6 +1452,10 @@ class ParseAllChannelsTask:
                 WHERE c.is_active = true
                   AND (c.blocked_until IS NULL OR c.blocked_until < NOW())
                 ORDER BY
+                  c.id,  -- Обязательно для DISTINCT ON
+                  -- Приоритет источников: manual > theme (для детерминизма)
+                  uc.source DESC NULLS LAST,
+                  uc.updated_at DESC NULLS LAST,
                   -- Приоритет 1: Критически голодающие каналы (> 24 часа или NULL)
                   (c.last_parsed_at IS NULL OR c.last_parsed_at < NOW() - INTERVAL '24 hours') DESC,
                   -- Приоритет 2: Голодающие каналы (> 6 часов) - анти-starvation

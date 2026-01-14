@@ -727,6 +727,9 @@ services:
         condition: service_healthy
     networks:
       - telegram-network
+    # Context7 best practice: проброс порта для health check и метрик
+    ports:
+      - "8011:8011"
     restart: unless-stopped  # автоматический рестарт
     # Context7 best practice: health check для telethon-ingest на порту 8011
     healthcheck:
@@ -757,7 +760,7 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       ENRICHMENT_CONFIG_PATH: /app/config/enrichment_policy.yml
       FEATURE_CRAWL4AI_ENABLED: ${FEATURE_CRAWL4AI_ENABLED:-true}
-      MAX_CONCURRENT_CRAWLS: 3
+      MAX_CONCURRENT_CRAWLS: 5
       TMPDIR: /tmp/playwright
       # Crawl4AI specific settings
       CRAWL_USER_AGENT: "TelegramAssistant/1.0 (Crawl4AI Bot)"
@@ -790,6 +793,59 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
+    profiles:
+      - core
+
+  # TGStat Parser Service
+  tgstat-parser:
+    build:
+      context: .
+      dockerfile: tgstat-parser/Dockerfile
+    # Context7: Увеличенные лимиты памяти для Selenium Chrome
+    deploy:
+      resources:
+        limits:
+          memory: 3G
+          cpus: '2.0'
+        reservations:
+          memory: 2G
+          cpus: '1.0'
+    # Context7: Увеличение shared memory для предотвращения tab crashes
+    # Context7: Chrome использует /dev/shm для IPC, по умолчанию в Docker это 64MB
+    shm_size: 2gb
+    environment:
+      TGSTAT_DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@supabase-db:5432/${POSTGRES_DB}
+      TGSTAT_BASE_URL: ${TGSTAT_BASE_URL:-https://tgstat.ru}
+      TGSTAT_LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      TGSTAT_RATE_LIMIT_PER_SECOND: ${TGSTAT_RATE_LIMIT_PER_SECOND:-1.0}
+      TGSTAT_RATE_LIMIT_MAX_REQUESTS: ${TGSTAT_RATE_LIMIT_MAX_REQUESTS:-200}
+      TGSTAT_HTTP_TIMEOUT: ${TGSTAT_HTTP_TIMEOUT:-30}
+      TGSTAT_HTTP_MAX_RETRIES: ${TGSTAT_HTTP_MAX_RETRIES:-3}
+      TGSTAT_SCHEDULER_TIMEZONE: ${TGSTAT_SCHEDULER_TIMEZONE:-UTC}
+      TGSTAT_SCHEDULER_MONTHLY_HOUR: ${TGSTAT_SCHEDULER_MONTHLY_HOUR:-3}
+      TGSTAT_SCHEDULER_MONTHLY_MINUTE: ${TGSTAT_SCHEDULER_MONTHLY_MINUTE:-0}
+      TGSTAT_API_HOST: ${TGSTAT_API_HOST:-0.0.0.0}
+      TGSTAT_API_PORT: ${TGSTAT_API_PORT:-8020}
+      # Context7 best practice: timezone для корректной работы с временем
+      TZ: Europe/Moscow
+    volumes:
+      # Context7 best practice: монтируем timezone данные хоста
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    depends_on:
+      supabase-db:
+        condition: service_healthy
+    networks:
+      - telegram-network
+    ports:
+      - "8020:8020"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8020/health', timeout=5)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
     profiles:
       - core
 

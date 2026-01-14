@@ -100,6 +100,7 @@ neo4j_connections_active = Gauge(
 async def lifespan(app: FastAPI):
     # Startup
     # Context7: Явное логирование для диагностики
+    print("INFO: Application startup - lifespan started", flush=True)
     logger.info("Application startup - lifespan started")
     # [C7-ID: dev-mode-002] Логируем окружение при старте
     logger.info(
@@ -117,7 +118,10 @@ async def lifespan(app: FastAPI):
             timestamp=time.time(),
             step="import"
         )
+        # Context7: Явный вывод для диагностики
+        print("INFO: Scheduler initialization started", flush=True)
         from tasks.scheduler_tasks import start_scheduler, scheduler as scheduler_module
+        print(f"INFO: Scheduler module imported, scheduler_module={scheduler_module}", flush=True)
         
         logger.info(
             "Scheduler module imported successfully",
@@ -131,6 +135,7 @@ async def lifespan(app: FastAPI):
             timestamp=time.time(),
             step="start_call"
         )
+        print("INFO: Calling start_scheduler()", flush=True)
         await start_scheduler()  # Context7: AsyncIOScheduler требует async контекст
         
         scheduler_duration = time.time() - scheduler_start_time
@@ -140,6 +145,7 @@ async def lifespan(app: FastAPI):
             step="start_complete",
             duration_seconds=round(scheduler_duration, 3)
         )
+        print(f"INFO: Scheduler started successfully in {round(scheduler_duration, 3)}s", flush=True)
         
         # Context7: Проверяем статус scheduler после запуска
         from tasks.scheduler_tasks import scheduler
@@ -171,6 +177,9 @@ async def lifespan(app: FastAPI):
             duration_seconds=round(scheduler_duration, 3),
             exc_info=True
         )
+        # Context7: Выводим ошибку также в stdout для видимости
+        import sys
+        print(f"ERROR: Failed to import scheduler module: {e}", file=sys.stderr)
         # Продолжаем без scheduler
     except Exception as e:
         scheduler_duration = time.time() - scheduler_start_time
@@ -183,6 +192,10 @@ async def lifespan(app: FastAPI):
             duration_seconds=round(scheduler_duration, 3),
             exc_info=True
         )
+        # Context7: Выводим ошибку также в stdout для видимости
+        print(f"ERROR: Failed to start scheduler: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
         # Продолжаем без scheduler
     
     # Инициализация Redis для rate limiter
@@ -555,6 +568,7 @@ from routers import rag  # RAG API endpoints
 from routers import digest  # Digest API endpoints
 from routers import trends  # Trends API endpoints
 from routers import feedback  # Feedback API endpoints
+from routers import themes  # Context7: TGStat themes and channels API
 from routers import monitoring  # Context7: System monitoring endpoints
 from routers import pipeline_health  # Context7: Pipeline health endpoints
 from routers import metrics as metrics_router  # Context7: Metrics summary endpoints
@@ -574,6 +588,7 @@ app.include_router(digest.router, prefix="/api")  # Digest API endpoints
 app.include_router(groups.router, prefix="/api")  # Groups & group digests
 app.include_router(trends.router, prefix="/api")  # Trends API endpoints
 app.include_router(feedback.router)  # Feedback API endpoints (prefix уже в роутере)
+app.include_router(themes.router, prefix="/api")  # Context7: TGStat themes and channels API
 app.include_router(monitoring.router, prefix="/api/monitoring")  # Context7: System monitoring
 app.include_router(pipeline_health.router, prefix="/api/pipeline")  # Context7: Pipeline health
 app.include_router(metrics_router.router, prefix="/api/metrics")  # Context7: Metrics summary

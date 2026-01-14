@@ -231,10 +231,25 @@ class AlbumAssemblerTask:
         
         logger.info("AlbumAssemblerTask started")
         
+        # Context7: Запускаем обработку pending сообщений перед основным циклом
+        try:
+            pending_processed = await self._process_pending_messages()
+            if pending_processed > 0:
+                logger.info(
+                    "Processed pending messages on startup",
+                    count=pending_processed
+                )
+        except Exception as e:
+            logger.warning(
+                "Failed to process pending messages on startup",
+                error=str(e)
+            )
+        
         # Запускаем обработку обоих стримов параллельно
         await asyncio.gather(
             self._consume_albums_parsed(),
             self._consume_vision_analyzed(),
+            self._process_pending_periodically(),  # Context7: Периодическая обработка pending
             return_exceptions=True
         )
     
@@ -325,6 +340,132 @@ class AlbumAssemblerTask:
             except Exception as e:
                 logger.error("Error in _consume_vision_analyzed", error=str(e), exc_info=True)
                 await asyncio.sleep(5)
+    
+    async def _process_pending_messages(self) -> int:
+        """
+        Context7: Обработка pending сообщений через XAUTOCLAIM для обоих стримов.
+        
+        Returns:
+            int: Количество обработанных pending сообщений
+        """
+        total_processed = 0
+        
+        # Обработка pending для stream:posts:vision:analyzed
+        vision_stream = STREAMS['posts.vision.analyzed']
+        try:
+            result = await self.redis.xautoclaim(
+                name=vision_stream,
+                groupname=self.consumer_group,
+                consumername=self.consumer_name,
+                min_idle_time=5000,  # 5 секунд
+                start_id="0-0",
+                count=50,
+                justid=False
+            )
+            
+            # xautoclaim возвращает [next_id, messages]
+            if isinstance(result, (list, tuple)) and len(result) >= 2:
+                next_id, messages = result[0], result[1]
+            else:
+                messages = result if result else []
+                next_id = None
+            
+            if messages:
+                logger.info(
+                    "Processing pending vision.analyzed messages",
+                    count=len(messages)
+                )
+                
+                for msg_id, fields in messages:
+                    try:
+                        await self._process_vision_analyzed(msg_id, fields)
+                        await self.redis.xack(vision_stream, self.consumer_group, msg_id)
+                        total_processed += 1
+                    except Exception as e:
+                        logger.error(
+                            "Error processing pending vision.analyzed message",
+                            message_id=msg_id,
+                            error=str(e),
+                            exc_info=True
+                        )
+                        # Не ACK - оставляем в PEL для повторной обработки
+        except Exception as e:
+            logger.warning(
+                "Failed to process pending vision.analyzed messages",
+                error=str(e)
+            )
+        
+        # Обработка pending для stream:albums:parsed
+        albums_stream = STREAMS['albums.parsed']
+        try:
+            result = await self.redis.xautoclaim(
+                name=albums_stream,
+                groupname=self.consumer_group,
+                consumername=self.consumer_name,
+                min_idle_time=5000,  # 5 секунд
+                start_id="0-0",
+                count=50,
+                justid=False
+            )
+            
+            if isinstance(result, (list, tuple)) and len(result) >= 2:
+                next_id, messages = result[0], result[1]
+            else:
+                messages = result if result else []
+                next_id = None
+            
+            if messages:
+                logger.info(
+                    "Processing pending albums.parsed messages",
+                    count=len(messages)
+                )
+                
+                for msg_id, fields in messages:
+                    try:
+                        await self._process_album_parsed(msg_id, fields)
+                        await self.redis.xack(albums_stream, self.consumer_group, msg_id)
+                        total_processed += 1
+                    except Exception as e:
+                        logger.error(
+                            "Error processing pending albums.parsed message",
+                            message_id=msg_id,
+                            error=str(e),
+                            exc_info=True
+                        )
+                        # Не ACK - оставляем в PEL для повторной обработки
+        except Exception as e:
+            logger.warning(
+                "Failed to process pending albums.parsed messages",
+                error=str(e)
+            )
+        
+        return total_processed
+    
+    async def _process_pending_periodically(self):
+        """
+        Context7: Периодическая обработка pending сообщений.
+        
+        Запускается каждые 60 секунд для обработки зависших сообщений.
+        """
+        while self.running:
+            try:
+                await asyncio.sleep(60)  # Проверка каждые 60 секунд
+                if self.running:
+                    processed = await self._process_pending_messages()
+                    if processed > 0:
+                        logger.info(
+                            "Processed pending messages",
+                            count=processed
+                        )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(
+                    "Error in periodic pending processing",
+                    error=str(e),
+                    exc_info=True
+                )
+                await asyncio.sleep(60)
     
     async def _process_album_parsed(self, message_id: str, fields: Dict[str, Any]):
         """Обработка события albums.parsed - инициализация состояния альбома."""

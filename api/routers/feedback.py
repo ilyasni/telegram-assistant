@@ -100,6 +100,17 @@ async def create_feedback(
     
     tenant_id = user.tenant_id
     
+    # Context7: Проверка, что tenant_id установлен (не должно быть None из-за nullable=False, но проверяем для безопасности)
+    if not tenant_id:
+        logger.error(
+            "User has no tenant_id when creating feedback",
+            user_id=str(user.id)
+        )
+        raise HTTPException(
+            status_code=400,
+            detail="User tenant_id is not set. Cannot create feedback."
+        )
+    
     # Создаем feedback
     feedback = UserFeedback(
         user_id=user.id,
@@ -153,7 +164,7 @@ async def list_feedback(
     """
     Получить список feedback (только для админов).
     
-    Context7: Фильтрация по tenant_id для multi-tenant изоляции.
+    Context7: Админы видят все feedback из всех tenant'ов для управления системой.
     """
     tenant_id = admin_user.tenant_id
     
@@ -162,8 +173,9 @@ async def list_feedback(
     if status and status not in valid_statuses:
         raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of: {', '.join(valid_statuses)}")
     
-    # Построение запроса
-    query = db.query(UserFeedback).filter(UserFeedback.tenant_id == tenant_id)
+    # Context7: Админы видят все feedback из всех tenant'ов (не фильтруем по tenant_id)
+    # Это позволяет админам управлять feedback от всех пользователей системы
+    query = db.query(UserFeedback)
     
     if status:
         query = query.filter(UserFeedback.status == status)
@@ -202,10 +214,11 @@ async def list_feedback(
     logger.info(
         "Admin listed feedback",
         admin_id=str(admin_user.id),
-        tenant_id=str(tenant_id),
+        admin_tenant_id=str(tenant_id),
         total=total,
         returned=len(items),
-        status=status
+        status=status,
+        all_tenants=True
     )
     
     return FeedbackListResponse(
@@ -226,7 +239,7 @@ async def get_feedback(
     """
     Получить feedback по ID.
     
-    Context7: Админы могут видеть любой feedback в своем tenant.
+    Context7: Админы могут видеть любой feedback из всех tenant'ов.
     Пользователи могут видеть только свой feedback.
     """
     try:
@@ -240,9 +253,8 @@ async def get_feedback(
     
     # Context7: Проверка прав доступа
     if admin_user:
-        # Админ может видеть feedback в своем tenant
-        if feedback.tenant_id != admin_user.tenant_id:
-            raise HTTPException(status_code=403, detail="Access denied: different tenant")
+        # Админы могут видеть feedback из всех tenant'ов (не проверяем tenant_id)
+        pass
     else:
         # Пользователь может видеть только свой feedback
         # Извлекаем user_id из JWT
@@ -287,7 +299,7 @@ async def update_feedback(
     """
     Обновить feedback (только для админов).
     
-    Context7: Админы могут изменять статус и добавлять заметки.
+    Context7: Админы могут изменять статус и добавлять заметки для feedback из всех tenant'ов.
     """
     try:
         feedback_uuid = uuid.UUID(feedback_id)
@@ -298,9 +310,7 @@ async def update_feedback(
     if not feedback:
         raise HTTPException(status_code=404, detail="Feedback not found")
     
-    # Context7: Проверка tenant_id
-    if feedback.tenant_id != admin_user.tenant_id:
-        raise HTTPException(status_code=403, detail="Access denied: different tenant")
+    # Context7: Админы могут обновлять feedback из всех tenant'ов (не проверяем tenant_id)
     
     # Валидация статуса
     valid_statuses = ['pending', 'in_progress', 'resolved', 'closed']

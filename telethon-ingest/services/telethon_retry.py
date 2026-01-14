@@ -56,7 +56,7 @@ NON_RETRIABLE_ERRORS = (
 )
 
 # Константы
-MAX_FLOOD_WAIT = 60  # Максимальный FloodWait для cooldown
+MAX_FLOOD_WAIT = 300  # Context7: Увеличено до 5 минут для обработки больших FloodWait (было 60)
 MAX_RETRIES = 5
 
 
@@ -163,12 +163,21 @@ async def fetch_messages_with_retry(
                               attempt=attempt)
                 
                 if e.seconds > MAX_FLOOD_WAIT:
+                    # Context7: Для больших FloodWait устанавливаем cooldown на MAX_FLOOD_WAIT
+                    # Но логируем реальное время ожидания для диагностики
+                    logger.warning(
+                        "Large FloodWait detected, using cooldown",
+                        channel_id=channel_id,
+                        actual_seconds=e.seconds,
+                        cooldown_seconds=MAX_FLOOD_WAIT
+                    )
                     # Перевести канал в cooldown
                     if redis_client:
-                        await set_channel_cooldown(redis_client, channel_id, e.seconds)
+                        await set_channel_cooldown(redis_client, channel_id, MAX_FLOOD_WAIT)
                     logger.warning("Channel moved to cooldown", 
                                   channel_id=channel_id,
-                                  seconds=e.seconds)
+                                  actual_seconds=e.seconds,
+                                  cooldown_seconds=MAX_FLOOD_WAIT)
                     return []
                     
                 # Ждем FloodWait + 1 секунда

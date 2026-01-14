@@ -112,27 +112,9 @@ def _resolve_admin_webapp_url(tenant_id: str | None, telegram_id: int | None) ->
     params = {"tgWebAppStartParam": MINIAPP_ADMIN_START_PARAM}
     return _build_miniapp_url("admin.html", tenant_id, telegram_id, params)
 
-# Подключение роутеров из подмодулей
-try:
-    from bot.handlers.trends_handlers import router as trends_router
-    router.include_router(trends_router)
-    logger.info("Trends handlers router included")
-except Exception as e:
-    logger.warning("Failed to include trends handlers router", error=str(e))
-
-try:
-    from bot.handlers.digest_handlers import router as digest_router
-    router.include_router(digest_router)
-    logger.info("Digest handlers router included")
-except Exception as e:
-    logger.warning("Failed to include digest handlers router", error=str(e))
-
-try:
-    from bot.handlers.group_handlers import router as group_router
-    router.include_router(group_router)
-    logger.info("Group handlers router included")
-except Exception as e:
-    logger.warning("Failed to include group handlers router", error=str(e))
+# Context7: Роутеры из подмодулей подключаются в webhook.py, не здесь
+# Это предотвращает дублирование подключения роутеров и конфликты при инициализации
+# Роутеры подключаются один раз в init_bot() в webhook.py
 
 
 def _kb_login(url: Optional[str] = None):
@@ -156,6 +138,7 @@ def _kb_main_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Мои каналы", callback_data="menu:channels")],
         [InlineKeyboardButton(text="➕ Добавить канал", callback_data="menu:add_channel")],
+        [InlineKeyboardButton(text="📚 Подборки", callback_data="themes:list")],
         [InlineKeyboardButton(text="👥 Мои группы", callback_data="menu:groups")],
         [InlineKeyboardButton(text="🔍 Поиск", callback_data="menu:search")],
         [InlineKeyboardButton(text="📰 Дайджесты", callback_data="digest:menu")],
@@ -181,9 +164,19 @@ def _kb_channels_list(channels: list):
 def _kb_channel_actions(channel_id: str):
     """Клавиатура действий с каналом."""
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📰 Дайджест", callback_data=f"channel:digest:{channel_id}")],
         [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"channel:delete:{channel_id}")],
         [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"channel:refresh:{channel_id}")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="menu:channels")],
+    ])
+
+def _kb_channel_digest_period(channel_id: str):
+    """Клавиатура выбора периода для дайджеста."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📅 День", callback_data=f"channel:digest:{channel_id}:1")],
+        [InlineKeyboardButton(text="📅 Неделя", callback_data=f"channel:digest:{channel_id}:7")],
+        [InlineKeyboardButton(text="📅 Месяц", callback_data=f"channel:digest:{channel_id}:30")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data=f"channel:view:{channel_id}")],
     ])
 
 
@@ -275,7 +268,15 @@ async def cmd_help(msg: Message):
     - Примеры использования
     - Информация о дополнительных возможностях
     """
-    help_text = """🤖 <b>Помощь по командам бота</b>
+    try:
+        # Context7: Детальное логирование для диагностики
+        logger.info(
+            "Help command received",
+            user_id=msg.from_user.id,
+            username=msg.from_user.username
+        )
+        
+        help_text = """🤖 <b>Помощь по командам бота</b>
 
 <b>🚀 Основные команды</b>
 /start — Начать работу с ботом
@@ -286,6 +287,10 @@ async def cmd_help(msg: Message):
 Пример: <code>/add_channel @durov</code> или <code>/add_channel https://t.me/durov</code>
 
 /my_channels — Показать список ваших подписанных каналов
+
+<b>📚 Подборки каналов</b>
+/themes — Показать доступные подборки каналов
+/my_themes — Показать подключенные подборки
 
 <b>🔍 Поиск и вопросы</b>
 /ask <i>ваш вопрос</i> — Задать вопрос ассистенту
@@ -320,23 +325,116 @@ async def cmd_help(msg: Message):
 
 <b>📝 Примечание</b>
 Для входа в систему используйте Mini App через кнопку внизу (команда /login временно отключена)."""
-    
-    await msg.answer(
-        help_text,
-        parse_mode="HTML",
-        reply_markup=_kb_login(_resolve_qr_webapp_url(None, msg.from_user.id))
-    )
+        
+        await msg.answer(
+            help_text,
+            parse_mode="HTML",
+            reply_markup=_kb_login(_resolve_qr_webapp_url(None, msg.from_user.id))
+        )
+        logger.info("Help sent successfully", user_id=msg.from_user.id)
+        
+    except Exception as e:
+        logger.error(
+            "Error in /help command",
+            error=str(e),
+            error_type=type(e).__name__,
+            user_id=msg.from_user.id,
+            exc_info=True
+        )
+        try:
+            await msg.answer("❌ Произошла ошибка при отображении справки. Попробуйте позже.")
+        except Exception as e2:
+            logger.error(
+                "Failed to send error message to user",
+                error=str(e2),
+                user_id=msg.from_user.id
+            )
 
 
 @router.message(Command("menu"))
 async def cmd_menu(msg: Message):
     """Обработчик команды /menu — показывает главное меню."""
-    await msg.answer(
-        "🤖 <b>Главное меню</b>\n\n"
-        "Выберите действие:",
-        parse_mode="HTML",
-        reply_markup=_kb_main_menu()
-    )
+    try:
+        # Context7: Детальное логирование для диагностики
+        logger.info(
+            "Menu command received",
+            user_id=msg.from_user.id,
+            username=msg.from_user.username,
+            chat_id=msg.chat.id
+        )
+        
+        # Создаем клавиатуру
+        keyboard = _kb_main_menu()
+        logger.debug("Main menu keyboard created", user_id=msg.from_user.id)
+        
+        # Context7: Отправляем сообщение с обработкой ошибок
+        try:
+            # Отправляем сообщение
+            await msg.answer(
+                "🤖 <b>Главное меню</b>\n\n"
+                "Выберите действие:",
+                parse_mode="HTML",
+                reply_markup=keyboard
+            )
+            logger.info("Menu sent successfully", user_id=msg.from_user.id)
+            return
+        except Exception as send_error:
+            # Context7: Если не удалось отправить, пробуем еще раз без клавиатуры
+            logger.warning(
+                "Failed to send menu with keyboard, retrying without keyboard",
+                error=str(send_error),
+                error_type=type(send_error).__name__,
+                user_id=msg.from_user.id
+            )
+            try:
+                # Отправляем основное сообщение
+                await msg.answer(
+                    "🤖 <b>Главное меню</b>\n\n"
+                    "Выберите действие:",
+                    parse_mode="HTML"
+                )
+                # Context7: Пытаемся отправить клавиатуру отдельно, но не критично если не получится
+                try:
+                    await msg.answer(
+                        "Выберите действие:",
+                        reply_markup=keyboard
+                    )
+                except Exception as keyboard_error:
+                    # Context7: Если не удалось отправить клавиатуру - не критично, основное сообщение уже отправлено
+                    logger.warning(
+                        "Failed to send keyboard separately, but main message sent",
+                        error=str(keyboard_error),
+                        user_id=msg.from_user.id
+                    )
+                logger.info("Menu sent in parts successfully", user_id=msg.from_user.id)
+                return
+            except Exception as retry_error:
+                logger.error(
+                    "Failed to send menu even without keyboard",
+                    error=str(retry_error),
+                    user_id=msg.from_user.id
+                )
+                # Context7: Пробрасываем исключение только если все попытки не удались
+                raise
+        
+    except Exception as e:
+        # Context7: Детальное логирование ошибки
+        logger.error(
+            "Error in /menu command",
+            error=str(e),
+            error_type=type(e).__name__,
+            user_id=msg.from_user.id,
+            username=msg.from_user.username,
+            exc_info=True
+        )
+        try:
+            await msg.answer("❌ Произошла ошибка при открытии меню. Попробуйте позже.")
+        except Exception as e2:
+            logger.error(
+                "Failed to send error message to user",
+                error=str(e2),
+                user_id=msg.from_user.id
+            )
 
 
 @router.message(Command("remove_keyboard"))
@@ -723,13 +821,43 @@ async def on_channel_delete_confirm(cb: CallbackQuery):
     await _delete_channel_callback(cb, channel_id)
 
 
+@router.callback_query(F.data.startswith("channel:digest:"))
+async def on_channel_digest(cb: CallbackQuery):
+    """Обработчик запроса дайджеста по каналу."""
+    parts = cb.data.split(":")
+    channel_id = parts[2]
+    
+    # Context7: Логируем параметры для диагностики
+    logger.info(
+        "Channel digest callback received",
+        callback_data=cb.data,
+        channel_id=channel_id,
+        parts_count=len(parts),
+        user_id=cb.from_user.id
+    )
+    
+    # Если период не указан, показываем выбор периода
+    if len(parts) == 3:
+        await cb.message.edit_text(
+            "📰 <b>Дайджест по каналу</b>\n\n"
+            "Выберите период для генерации дайджеста:",
+            reply_markup=_kb_channel_digest_period(channel_id)
+        )
+        await cb.answer()
+        return
+    
+    # Период указан, генерируем дайджест
+    period = int(parts[3])
+    await _generate_channel_digest(cb, channel_id, period)
+
+
 # Helper functions
 
 async def _add_channel(msg: Message, channel_name: str):
     """Добавить канал."""
     try:
         # Получить пользователя
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.get(f"{API_BASE}/api/users/{msg.from_user.id}")
             if r.status_code == 404:
                 await msg.answer("❌ Пользователь не найден. Используйте /start")
@@ -746,7 +874,7 @@ async def _add_channel(msg: Message, channel_name: str):
             "settings": {}
         }
         
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.post(f"{API_BASE}/api/channels/users/{user['id']}/subscribe", json=channel_data)
             r.raise_for_status()
             channel = r.json()
@@ -772,7 +900,7 @@ async def _show_channels(msg: Message):
     """Показать каналы пользователя."""
     try:
         # Получить пользователя
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.get(f"{API_BASE}/api/users/{msg.from_user.id}")
             if r.status_code == 404:
                 await msg.answer("❌ Пользователь не найден. Используйте /start")
@@ -783,7 +911,7 @@ async def _show_channels(msg: Message):
         # Получить каналы
         url = f"{API_BASE}/api/channels/users/{user['id']}/list"
         logger.info(f"[BOT] CALL {url}")
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.get(url)
             logger.info(f"[BOT] RESPONSE {r.status_code} for {url}")
             r.raise_for_status()
@@ -821,7 +949,7 @@ async def _show_channels_callback(cb: CallbackQuery):
     """Показать каналы через callback."""
     try:
         # Получить пользователя
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.get(f"{API_BASE}/api/users/{cb.from_user.id}")
             if r.status_code == 404:
                 await cb.message.edit_text("❌ Пользователь не найден")
@@ -830,7 +958,7 @@ async def _show_channels_callback(cb: CallbackQuery):
             user = r.json()
         
         # Получить каналы
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.get(f"{API_BASE}/api/channels/users/{user['id']}/list")
             r.raise_for_status()
             channels_data = r.json()
@@ -950,6 +1078,170 @@ async def _delete_channel_callback(cb: CallbackQuery, channel_id: str):
         )
         await cb.message.edit_text("❌ Неожиданная ошибка при удалении канала\n\nПопробуйте позже.")
         await cb.answer("Ошибка", show_alert=True)
+
+
+async def _generate_channel_digest(cb: CallbackQuery, channel_id: str, period: int):
+    """Генерация дайджеста по каналу."""
+    try:
+        # Показываем индикатор загрузки
+        period_names = {1: "день", 7: "неделю", 30: "месяц"}
+        period_name = period_names.get(period, f"{period} дней")
+        
+        if period >= 30:
+            await cb.message.edit_text(
+                f"📰 <b>Готовлю дайджест за {period_name}...</b>\n\n"
+                "Это может занять минуту. Пожалуйста, подождите...",
+                reply_markup=None
+            )
+        else:
+            await cb.message.edit_text(
+                f"📰 <b>Готовлю дайджест за {period_name}...</b>\n\n"
+                "Пожалуйста, подождите...",
+                reply_markup=None
+            )
+        
+        await cb.answer()
+        
+        # Получаем пользователя
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            r = await client.get(f"{API_BASE}/api/users/{cb.from_user.id}")
+            if r.status_code == 404:
+                await cb.message.edit_text("❌ Пользователь не найден. Используйте /start")
+                return
+            r.raise_for_status()
+            user = r.json()
+        
+        # Context7: Логируем параметры перед вызовом API
+        logger.info(
+            "Channel digest API call",
+            user_id=user['id'],
+            user_id_type=type(user['id']).__name__,
+            channel_id=channel_id,
+            channel_id_type=type(channel_id).__name__,
+            period=period
+        )
+        
+        # Вызываем API для генерации дайджеста
+        # Context7: Правильный путь endpoint'а: /api/channels/users/{user_id}/channels/{channel_id}/digest
+        url = f"{API_BASE}/api/channels/users/{user['id']}/channels/{channel_id}/digest?period={period}"
+        logger.info("Channel digest API URL", url=url)
+        
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            r = await client.post(url)
+            logger.info(f"[BOT] RESPONSE {r.status_code} for {url}")
+            
+            if r.status_code == 200:
+                data = r.json()
+                
+                if data.get('status') == 'processing':
+                    # Async операция (для месяца в будущем)
+                    job_id = data.get('job_id')
+                    await cb.message.edit_text(
+                        f"⏳ <b>Дайджест генерируется</b>\n\n"
+                        f"Job ID: {job_id}\n"
+                        "Попробуйте запросить позже."
+                    )
+                else:
+                    # Синхронный ответ
+                    content = data.get('content', '')
+                    posts_count = data.get('posts_count', 0)
+                    
+                    if not content:
+                        await cb.message.edit_text(
+                            f"📰 <b>Дайджест за {period_name}</b>\n\n"
+                            "Не найдено постов за выбранный период."
+                        )
+                        return
+                    
+                    # Разбиваем длинный контент на части для Telegram
+                    chunks = markdown_to_telegram_chunks(content, limit=4096)
+                    
+                    # Отправляем первую часть (заменяем сообщение "Готовлю дайджест...")
+                    await cb.message.edit_text(chunks[0], parse_mode="HTML")
+                    
+                    # Отправляем остальные части
+                    for chunk in chunks[1:]:
+                        await cb.message.answer(chunk, parse_mode="HTML")
+            elif r.status_code == 404:
+                # Context7: Детальное логирование для диагностики
+                logger.warning(
+                    "Channel digest 404 - access denied",
+                    user_id=str(user['id']),
+                    channel_id=channel_id,
+                    period=period,
+                    url=url
+                )
+                await cb.message.edit_text(
+                    "❌ Канал не найден или нет доступа.\n\n"
+                    "Проверьте, что канал добавлен в ваши подписки.",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="📊 Мои каналы", callback_data="menu:channels")],
+                        [InlineKeyboardButton(text="🔙 Главное меню", callback_data="menu:main")]
+                    ])
+                )
+            elif r.status_code == 400:
+                error_detail = r.json().get('detail', 'Неверный запрос')
+                await cb.message.edit_text(f"❌ {error_detail}")
+            else:
+                await cb.message.edit_text(
+                    "❌ Ошибка генерации дайджеста.\n\n"
+                    "Попробуйте позже."
+                )
+    
+    except httpx.TimeoutException:
+        await cb.message.edit_text(
+            f"⏱️ <b>Таймаут</b>\n\n"
+            f"Генерация дайджеста за {period_name} заняла слишком много времени.\n"
+            "Попробуйте выбрать меньший период или повторите позже."
+        )
+    except httpx.HTTPStatusError as e:
+        error_detail = None
+        try:
+            if e.response.headers.get("content-type", "").startswith("application/json"):
+                error_data = e.response.json()
+                if isinstance(error_data, dict):
+                    error_detail = error_data.get("detail")
+        except Exception:
+            pass
+        
+        logger.error(
+            "HTTP error generating channel digest",
+            status_code=e.response.status_code,
+            error_detail=error_detail,
+            channel_id=channel_id,
+            period=period,
+            user_id=cb.from_user.id
+        )
+        
+        if e.response.status_code == 404:
+            # Context7: Детальное логирование для диагностики
+            logger.warning(
+                "Channel view 404 - access denied",
+                user_id=cb.from_user.id,
+                channel_id=channel_id
+            )
+            await cb.message.edit_text(
+                "❌ Канал не найден или нет доступа.\n\n"
+                "Проверьте, что канал добавлен в ваши подписки.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="📊 Мои каналы", callback_data="menu:channels")],
+                    [InlineKeyboardButton(text="🔙 Главное меню", callback_data="menu:main")]
+                ])
+            )
+        elif e.response.status_code >= 500:
+            await cb.message.edit_text("❌ Ошибка сервера при генерации дайджеста\n\nПопробуйте позже.")
+        else:
+            await cb.message.edit_text(f"❌ Ошибка: {error_detail or 'Неизвестная ошибка'}")
+    except Exception as e:
+        logger.error(
+            "Error generating channel digest",
+            error=str(e),
+            error_type=type(e).__name__,
+            channel_id=channel_id,
+            period=period,
+            user_id=cb.from_user.id
+        )
+        await cb.message.edit_text("❌ Произошла ошибка при генерации дайджеста\n\nПопробуйте позже.")
 
 
 async def _rag_query(msg: Message, question: str, intent_override: Optional[str] = None, voice_transcription: bool = False, audio_file_id: Optional[str] = None):
@@ -1167,7 +1459,7 @@ async def _show_subscription(msg: Message):
     """Показать информацию о подписке."""
     try:
         # Получить пользователя
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.get(f"{API_BASE}/api/users/{msg.from_user.id}")
             if r.status_code == 404:
                 await msg.answer("❌ Пользователь не найден. Используйте /start")
@@ -1176,7 +1468,7 @@ async def _show_subscription(msg: Message):
             user = r.json()
         
         # Получить информацию о подписке
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.get(f"{API_BASE}/api/users/{user['id']}/subscription")
             r.raise_for_status()
             subscription = r.json()
@@ -1200,7 +1492,7 @@ async def _show_subscription_callback(cb: CallbackQuery):
     """Показать информацию о подписке через callback."""
     try:
         # Получить пользователя
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.get(f"{API_BASE}/api/users/{cb.from_user.id}")
             if r.status_code == 404:
                 await cb.message.edit_text("❌ Пользователь не найден")
@@ -1209,7 +1501,7 @@ async def _show_subscription_callback(cb: CallbackQuery):
             user = r.json()
         
         # Получить информацию о подписке
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.get(f"{API_BASE}/api/users/{user['id']}/subscription")
             r.raise_for_status()
             subscription = r.json()
@@ -1359,42 +1651,9 @@ async def cmd_add_channel(msg: Message):
         logger.error("Error in /add_channel command", error=str(e))
         await msg.answer("❌ Произошла ошибка")
 
-@router.message(Command("my_channels"))
-async def cmd_my_channels(msg: Message):
-    """Команда просмотра каналов пользователя."""
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                f"{API_BASE}/api/channels/users/{msg.from_user.id}/list"
-            )
-            
-            if resp.status_code == 200:
-                data = resp.json()
-                channels = data['channels']
-                
-                if not channels:
-                    await msg.answer("📺 У вас нет подписанных каналов")
-                    return
-                
-                # Inline кнопки для каждого канала
-                builder = InlineKeyboardBuilder()
-                for ch in channels[:10]:  # Первые 10
-                    builder.button(
-                        text=f"📺 {ch['title']}",
-                        callback_data=f"channel:view:{ch['id']}"
-                    )
-                builder.adjust(1)
-                
-                await msg.answer(
-                    f"📋 Ваши каналы ({data['total']}):",
-                    reply_markup=builder.as_markup()
-                )
-            else:
-                await msg.answer("❌ Не удалось загрузить список каналов")
-    
-    except Exception as e:
-        logger.error("Error in /my_channels", error=str(e))
-        await msg.answer("❌ Произошла ошибка")
+# УДАЛЕНО: Дублирование команды /my_channels
+# Команда /my_channels уже определена выше (строка 379) и использует функцию _show_channels()
+# Этот обработчик был дублирован и удалён для предотвращения конфликтов регистрации
 
 
 # ============================================================================

@@ -374,7 +374,12 @@ class ChannelParser:
                                    channel_id=channel_id, tg_channel_id=tg_channel_id)
                         self.stats['cooldown_skipped'] += 1
                         # Context7: Обновляем last_parsed_at даже при cooldown для отслеживания попыток
+                        # КРИТИЧНО: Проверяем и откатываем транзакцию перед обновлением
                         try:
+                            if self.db_session.in_transaction():
+                                await self.db_session.rollback()
+                                logger.debug("Rolled back transaction before updating last_parsed_at after cooldown",
+                                           channel_id=channel_id)
                             logger.info("Updating last_parsed_at after cooldown skip", channel_id=channel_id)
                             await self._update_last_parsed_at(channel_id, 0)
                             logger.info("Successfully updated last_parsed_at after cooldown skip", channel_id=channel_id)
@@ -838,6 +843,55 @@ class ChannelParser:
                         logger.error("Entity has no valid ID", 
                                    channel_id=channel_id, username=username)
                         raise ValueError("Entity has no valid ID")
+                except errors.FloodWaitError as e:
+                    # Context7: Специальная обработка FloodWait при ResolveUsernameRequest
+                    wait_seconds = min(e.seconds, 300)  # Cap at 5 minutes для безопасности
+                    
+                    logger.warning(
+                        "FloodWait when getting entity by username",
+                        channel_id=channel_id,
+                        username=username,
+                        wait_seconds=wait_seconds,
+                        error_seconds=e.seconds
+                    )
+                    
+                    # Context7: Устанавливаем cooldown для канала
+                    # КРИТИЧНО: set_channel_cooldown ожидает tg_channel_id (int), а не channel_id (UUID)
+                    if self.redis_client and tg_channel_id_db is not None:
+                        try:
+                            from .telethon_retry import set_channel_cooldown
+                            tg_channel_id_int = int(tg_channel_id_db)
+                            await set_channel_cooldown(self.redis_client, tg_channel_id_int, wait_seconds)
+                            logger.info("Channel moved to cooldown due to FloodWait",
+                                      channel_id=channel_id,
+                                      tg_channel_id=tg_channel_id_int,
+                                      cooldown_seconds=wait_seconds)
+                        except Exception as cooldown_error:
+                            logger.warning("Failed to set channel cooldown",
+                                         channel_id=channel_id,
+                                         tg_channel_id_db=tg_channel_id_db,
+                                         error=str(cooldown_error))
+                    elif not tg_channel_id_db:
+                        logger.warning("Cannot set cooldown - no tg_channel_id available",
+                                     channel_id=channel_id)
+                    
+                    # Context7: Пытаемся использовать tg_channel_id как fallback
+                    if tg_channel_id_db is not None:
+                        try:
+                            entity = await client.get_entity(int(tg_channel_id_db))
+                            tg_channel_id = int(tg_channel_id_db)
+                            logger.info("Successfully got entity by tg_channel_id after FloodWait",
+                                       channel_id=channel_id)
+                        except Exception as e2:
+                            logger.error("Failed to get entity by tg_channel_id after FloodWait",
+                                        channel_id=channel_id,
+                                        tg_channel_id=tg_channel_id_db,
+                                        error=str(e2))
+                            return None
+                    else:
+                        logger.warning("No tg_channel_id available after FloodWait, skipping channel",
+                                      channel_id=channel_id)
+                        return None
                 except Exception as e:
                     logger.warning("Failed to get entity by username, trying tg_channel_id", 
                                  channel_id=channel_id, username=username, error=str(e))
@@ -1834,14 +1888,18 @@ class ChannelParser:
                         )
                         # Продолжаем обработку даже при ошибке медиа
                 elif message.media:
-                    # Context7: Логируем, почему медиа не обрабатывается
-                    logger.debug(
+                    # Context7: Логируем, почему медиа не обрабатывается (на уровне WARNING для диагностики)
+                    logger.warning(
                         "Media not processed - MediaProcessor or message.media check failed",
                         post_id=post_id,
                         has_media_processor=bool(self.media_processor),
                         has_message_media=bool(message.media),
-                        channel_id=channel_id
+                        has_telegram_client_manager=bool(self.telegram_client_manager),
+                        channel_id=channel_id,
+                        message_id=message.id
                     )
+                    # Context7: Устанавливаем has_media в False, если медиа не обработано
+                    post_data['has_media'] = False
                 
                 # Сохраняем информацию о медиа в post_data для последующего использования
                 if media_files:
@@ -1849,6 +1907,20 @@ class ChannelParser:
                     post_data['media_count'] = len(media_files)
                     # Context7: Извлекаем SHA256 для передачи в событие
                     post_data['media_sha256_list'] = [mf.sha256 for mf in media_files]
+                    # Context7: Обновляем has_media на основе реально обработанных медиа
+                    post_data['has_media'] = True
+                elif message.media:
+                    # Context7: Если медиа есть, но не обработано - логируем предупреждение
+                    logger.warning(
+                        "Message has media but media_files is empty",
+                        post_id=post_id,
+                        channel_id=channel_id,
+                        has_media_processor=bool(self.media_processor),
+                        has_telegram_client_manager=bool(self.telegram_client_manager),
+                        message_id=message.id
+                    )
+                    # Context7: Устанавливаем has_media в False, если медиа не обработано
+                    post_data['has_media'] = False
                 
                 # Context7: КРИТИЧНО - сохраняем grouped_id в post_data для обработки альбомов
                 # grouped_id извлекается из сообщения выше (строка 1530), но может быть не в post_data

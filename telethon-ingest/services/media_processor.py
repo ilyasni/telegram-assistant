@@ -856,6 +856,19 @@ class MediaProcessor:
             # Context7: Не блокируем создание события - медиа может быть загружено позже через retry
             # Возвращаем None чтобы вызывающий код мог обработать это gracefully
             return None
+        except Exception as e:
+            # Context7: Обработка неожиданных ошибок при проверке квоты или других операциях
+            logger.error(
+                "Unexpected error in _upload_to_s3",
+                error=str(e),
+                error_type=type(e).__name__,
+                mime_type=mime_type,
+                size_bytes=len(content),
+                trace_id=trace_id,
+                exc_info=True
+            )
+            media_processing_failed_total.labels(reason="unexpected_error").inc()
+            return None
     
     async def emit_vision_uploaded_event(
         self,

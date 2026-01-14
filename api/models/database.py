@@ -180,6 +180,7 @@ class User(Base):
     identity = relationship("Identity", back_populates="memberships")
     channel_subscriptions = relationship("UserChannel", back_populates="user")
     group_subscriptions = relationship("UserGroup", back_populates="user")
+    theme_subscriptions = relationship("UserTheme", back_populates="user")
     # Context7: Явно указываем foreign_keys для избежания AmbiguousForeignKeysError
     # (UserAuditLog имеет два FK на users: user_id и changed_by)
     # Используем строковое имя колонки через lambda, так как класс UserAuditLog определен ниже
@@ -527,7 +528,12 @@ class TelegramAuthLog(Base):
 # ============================================================================
 
 class UserChannel(Base):
-    """Many-to-many связь пользователей и каналов."""
+    """Many-to-many связь пользователей и каналов.
+    
+    Context7: Поддержка разделения на ручные каналы и каналы из подборок.
+    source='manual' - подключен пользователем вручную
+    source='theme' - подключен через подборку (theme_id указывает на подборку)
+    """
     __tablename__ = "user_channel"
     
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), primary_key=True)
@@ -535,10 +541,48 @@ class UserChannel(Base):
     subscribed_at = Column(DateTime, default=datetime.utcnow)
     is_active = Column(Boolean, default=True)
     settings = Column(JSON, default={})
+    # Context7: Источник подписки - 'manual' (вручную) или 'theme' (через подборку)
+    source = Column(String(20), nullable=False, server_default='manual')
+    # Context7: ID подборки, если source='theme' (nullable для source='manual')
+    theme_id = Column(UUID(as_uuid=True), ForeignKey("themes.id", ondelete="SET NULL"), nullable=True)
+    # Context7: Автоматическое обновление timestamp при изменении записи
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
     
     # Relationships
     user = relationship("User", back_populates="channel_subscriptions")
     channel = relationship("Channel", back_populates="user_subscriptions")
+    
+    __table_args__ = (
+        CheckConstraint("source IN ('manual', 'theme')", name='chk_user_channel_source'),
+        CheckConstraint(
+            "(source = 'theme' AND theme_id IS NOT NULL) OR (source = 'manual' AND theme_id IS NULL)",
+            name='chk_user_channel_source_theme_id'
+        ),
+    )
+
+
+class UserTheme(Base):
+    """Связь пользователей с подборками (themes).
+    
+    Context7: Отслеживает, какие подборки подключены у пользователя.
+    Позволяет администратору управлять составом подборок без влияния на пользователей.
+    """
+    __tablename__ = "user_theme"
+    
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    theme_id = Column(UUID(as_uuid=True), ForeignKey("themes.id", ondelete="CASCADE"), primary_key=True)
+    subscribed_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+    
+    # Relationships
+    user = relationship("User", back_populates="theme_subscriptions")
+    # Примечание: theme relationship будет работать, если таблица themes доступна в этой БД
+    # Если themes в другой БД, relationship не нужен
+    
+    __table_args__ = (
+        Index("ix_user_theme_user_active", "user_id", "is_active"),
+        Index("ix_user_theme_theme_active", "theme_id", "is_active"),
+    )
 
 
 class PostEnrichment(Base):

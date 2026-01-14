@@ -133,6 +133,7 @@ vision_media_duration_seconds = _safe_create_metric(
     'vision_media_duration_seconds',
     'Single media file processing duration',
     buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0]
+    # ПРИМЕЧАНИЕ: Метрика БЕЗ labels - используем .observe() напрямую
 )
 
 vision_experiment_assignments_total = _safe_create_metric(
@@ -179,12 +180,8 @@ ocr_local_latency_seconds = _safe_create_metric(
 )
 
 # Context7: Дополнительные метрики для мониторинга Vision анализа
-vision_analysis_duration_seconds = _safe_create_metric(
-    Histogram,
-    'vision_analysis_duration_seconds',
-    'Vision analysis duration (API call time)',
-    buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0]
-)
+# ПРИМЕЧАНИЕ: vision_analysis_duration_seconds определена в gigachat_vision.py с labels ['provider', 'has_ocr']
+# Не дублируем здесь, чтобы избежать конфликта определений
 
 vision_analysis_tokens_total = _safe_create_metric(
     Counter,
@@ -973,8 +970,21 @@ class VisionAnalysisTask:
                     )
                     media_duration = time.time() - media_start_time
                     analysis_duration = time.time() - analysis_start_time
-                    vision_media_duration_seconds.observe(media_duration)
-                    vision_analysis_duration_seconds.observe(analysis_duration)
+                    # Context7: Безопасная запись метрик с обработкой ошибок
+                    try:
+                        vision_media_duration_seconds.observe(media_duration)
+                    except Exception as metric_error:
+                        logger.warning(
+                            "Failed to record vision_media_duration_seconds metric",
+                            extra={
+                                "error": str(metric_error),
+                                "post_id": post_id,
+                                "sha256": media_id[:16] + "...",
+                                "trace_id": trace_id
+                            }
+                        )
+                    # vision_analysis_duration_seconds записывается в gigachat_vision.py с labels
+                    # Не дублируем здесь, чтобы избежать конфликта определений
                     
                     if result:
                         result = self._attach_experiment_context(result, experiment_variants)
@@ -1030,8 +1040,21 @@ class VisionAnalysisTask:
                         "reason": "exception",
                         "details": {"error": str(e)[:200]}
                     })
-                    vision_media_total.labels(result="failed", reason="exception").inc()
-                    vision_analysis_errors_total.labels(error_type="exception").inc()
+                    # Context7: Безопасная запись метрик с обработкой ошибок
+                    try:
+                        vision_media_total.labels(result="failed", reason="exception").inc()
+                        vision_analysis_errors_total.labels(error_type="exception").inc()
+                    except Exception as metric_error:
+                        logger.warning(
+                            "Failed to record error metrics",
+                            extra={
+                                "metric_error": str(metric_error),
+                                "original_error": str(e),
+                                "post_id": post_id,
+                                "sha256": media_id[:16] + "...",
+                                "trace_id": trace_id
+                            }
+                        )
                     continue
             
             # Context7: Всегда эмитить событие (analyzed или skipped)
@@ -1096,7 +1119,18 @@ class VisionAnalysisTask:
                     )
             
             duration = time.time() - start_time
-            vision_event_duration_seconds.observe(duration)
+            # Context7: Безопасная запись метрики с обработкой ошибок
+            try:
+                vision_event_duration_seconds.observe(duration)
+            except Exception as metric_error:
+                logger.warning(
+                    "Failed to record vision_event_duration_seconds metric",
+                    extra={
+                        "error": str(metric_error),
+                        "post_id": post_id,
+                        "trace_id": trace_id
+                    }
+                )
             
             if event_emitted:
                 vision_worker_duration_seconds.labels(status="success").observe(duration)
@@ -1140,11 +1174,21 @@ class VisionAnalysisTask:
             
         except Exception as e:
             duration = time.time() - start_time
-            vision_worker_duration_seconds.labels(status="error").observe(duration)
-            vision_worker_processed_total.labels(status="error", reason="exception").inc()
-            # Context7: Инкремент vision_events_total для алерта VisionWorkerNotProcessing
-            vision_events_total.labels(status="failed", reason="exception").inc()
-            vision_analysis_errors_total.labels(error_type="exception").inc()
+            # Context7: Безопасная запись метрик с обработкой ошибок
+            try:
+                vision_worker_duration_seconds.labels(status="error").observe(duration)
+                vision_worker_processed_total.labels(status="error", reason="exception").inc()
+                vision_events_total.labels(status="failed", reason="exception").inc()
+                vision_analysis_errors_total.labels(error_type="exception").inc()
+            except Exception as metric_error:
+                logger.warning(
+                    "Failed to record error metrics",
+                    extra={
+                        "metric_error": str(metric_error),
+                        "original_error": str(e),
+                        "message_id": message_id
+                    }
+                )
             self.error_count += 1
             logger.error(
                 "Failed to process vision event",

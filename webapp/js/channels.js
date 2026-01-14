@@ -2,6 +2,9 @@
 const API_BASE = '/api';
 let accessToken = null;
 let channels = [];
+let manualChannels = [];
+let themeChannels = [];
+let currentView = 'all'; // 'all', 'manual', 'theme'
 
 // Инициализация Telegram WebApp
 Telegram.WebApp.ready();
@@ -48,14 +51,20 @@ async function loadChannels() {
     }
     
     try {
-        const resp = await fetch(`${API_BASE}/channels/users/${userId}/list`, {
+        // Загружаем все каналы (без фильтра по source)
+        const resp = await fetch(`${API_BASE}/channels/users/${userId}/list?source=all`, {
             headers: {'Authorization': `Bearer ${accessToken}`}
         });
         
         if (resp.ok) {
             const data = await resp.json();
             channels = data.channels || [];
-            renderChannels(channels);
+            
+            // Разделяем каналы по источникам
+            manualChannels = channels.filter(ch => ch.source === 'manual');
+            themeChannels = channels.filter(ch => ch.source === 'theme');
+            
+            renderChannels();
             updateQuota(userId);
         } else {
             const errorData = await resp.json().catch(() => ({}));
@@ -66,35 +75,127 @@ async function loadChannels() {
     }
 }
 
-// Отображение каналов
-function renderChannels(channelsToRender) {
+// Отображение каналов с разделением по источникам
+function renderChannels() {
     const container = document.getElementById('channels-list');
     
-    if (!channelsToRender || channelsToRender.length === 0) {
+    // Используем отфильтрованные данные, если есть поиск
+    let displayManual = manualChannels;
+    let displayTheme = themeChannels;
+    let displayAll = channels;
+    
+    if (filteredChannels) {
+        displayManual = filteredChannels.manual;
+        displayTheme = filteredChannels.theme;
+        displayAll = filteredChannels.all;
+    }
+    
+    // Определяем, какие каналы показывать
+    let channelsToRender = [];
+    if (currentView === 'manual') {
+        channelsToRender = displayManual;
+    } else if (currentView === 'theme') {
+        channelsToRender = displayTheme;
+    } else {
+        // 'all' - показываем все, но группируем
+        channelsToRender = displayAll;
+    }
+    
+    if (channelsToRender.length === 0) {
         container.innerHTML = `
             <div class="empty-state">
                 <h3>📺 Нет каналов</h3>
-                <p>Добавьте канал, чтобы начать получать уведомления</p>
+                <p>${currentView === 'manual' ? 'Добавьте канал вручную' : currentView === 'theme' ? 'Подключите подборку' : 'Добавьте канал или подключите подборку'}</p>
             </div>
         `;
         return;
     }
     
-    const html = channelsToRender.map(channel => `
-        <div class="channel-card" data-channel-id="${channel.id}">
-            <div class="channel-info">
-                <h3>${escapeHtml(channel.title)}</h3>
-                <p>${channel.subscribers_count || 0} подписчиков</p>
+    // Если показываем все, группируем по источникам
+    if (currentView === 'all') {
+        const html = `
+            ${displayManual.length > 0 ? `
+                <div class="channels-section">
+                    <h2 class="section-title">📝 Мои каналы (${displayManual.length})</h2>
+                    ${renderChannelCards(displayManual)}
+                </div>
+            ` : ''}
+            ${displayTheme.length > 0 ? `
+                <div class="channels-section">
+                    <h2 class="section-title">📚 Каналы из подборок (${displayTheme.length})</h2>
+                    ${renderChannelCards(displayTheme)}
+                </div>
+            ` : ''}
+        `;
+        container.innerHTML = html;
+    } else {
+        container.innerHTML = renderChannelCards(channelsToRender);
+    }
+}
+
+// Рендеринг карточек каналов
+function renderChannelCards(channelsToRender) {
+    return channelsToRender.map(channel => {
+        // Определяем бейджи источников
+        const badges = [];
+        if (channel.source === 'manual') {
+            badges.push('<span class="badge badge-manual">📝 Вручную</span>');
+        }
+        if (channel.source === 'theme' && channel.theme_id) {
+            badges.push('<span class="badge badge-theme">📚 Подборка</span>');
+        }
+        
+        // Если канал в обоих списках (проверяем по оригинальным массивам, не отфильтрованным)
+        const channelInManual = manualChannels.some(c => c.id === channel.id);
+        const channelInTheme = themeChannels.some(c => c.id === channel.id);
+        const isInBoth = channelInManual && channelInTheme;
+        
+        const bothWarning = isInBoth && currentView === 'all' ? 
+            '<p class="channel-hint">ℹ️ Отключение подборки не отключит канал, т.к. он подключён вручную</p>' : '';
+        
+        return `
+            <div class="channel-card" data-channel-id="${channel.id}" data-source="${channel.source || 'manual'}">
+                <div class="channel-info">
+                    <div class="channel-header">
+                        <h3>${escapeHtml(channel.title)}</h3>
+                        <div class="channel-badges">${badges.join('')}</div>
+                    </div>
+                    <p>${channel.subscribers_count || 0} подписчиков</p>
+                    ${bothWarning}
+                </div>
+                <div class="channel-actions">
+                    <button class="btn btn-danger" onclick="deleteChannel('${channel.id}', '${channel.source || 'manual'}')">
+                        🗑️
+                    </button>
+                </div>
             </div>
-            <div class="channel-actions">
-                <button class="btn btn-danger" onclick="deleteChannel('${channel.id}')">
-                    🗑️
-                </button>
-            </div>
-        </div>
-    `).join('');
+        `;
+    }).join('');
+}
+
+// Переключение вида (all/manual/theme)
+function switchView(view) {
+    currentView = view;
+    renderChannels();
+    updateViewButtons();
     
-    container.innerHTML = html;
+    // Обновляем поиск при переключении вида
+    const searchInput = document.getElementById('search');
+    if (searchInput && searchInput.value) {
+        searchInput.dispatchEvent(new Event('input'));
+    }
+}
+
+// Обновление кнопок переключения вида
+function updateViewButtons() {
+    const buttons = document.querySelectorAll('.view-btn');
+    buttons.forEach(btn => {
+        if (btn.dataset.view === currentView) {
+            btn.classList.add('active');
+        } else {
+            btn.classList.remove('active');
+        }
+    });
 }
 
 // Добавление канала
@@ -153,7 +254,7 @@ async function addChannel() {
 }
 
 // Удаление канала
-async function deleteChannel(channelId) {
+async function deleteChannel(channelId, source) {
     const userId = Telegram.WebApp.initDataUnsafe?.user?.id;
     
     if (!userId) {
@@ -161,7 +262,20 @@ async function deleteChannel(channelId) {
         return;
     }
     
-    if (!confirm('Удалить канал из подписок?')) {
+    // Проверяем, есть ли канал в обоих списках
+    const isInManual = manualChannels.some(c => c.id === channelId);
+    const isInTheme = themeChannels.some(c => c.id === channelId);
+    
+    let confirmMessage = 'Удалить канал из подписок?';
+    if (isInManual && isInTheme) {
+        if (source === 'theme') {
+            confirmMessage = 'Отключить канал из подборки? Канал останется активным, т.к. подключён вручную.';
+        } else {
+            confirmMessage = 'Удалить канал? Он также подключён через подборку.';
+        }
+    }
+    
+    if (!confirm(confirmMessage)) {
         return;
     }
     
@@ -172,7 +286,11 @@ async function deleteChannel(channelId) {
         });
         
         if (resp.status === 204) {
-            showToast('✅ Канал удален', 'success');
+            if (isInManual && isInTheme && source === 'theme') {
+                showToast('✅ Канал отключён из подборки, но остаётся активным (подключён вручную)', 'success');
+            } else {
+                showToast('✅ Канал удален', 'success');
+            }
             loadChannels(); // Перезагрузка списка
         } else if (resp.status === 404) {
             showToast('❌ Канал не найден', 'error');
@@ -202,16 +320,51 @@ async function updateQuota(userId) {
 }
 
 // Поиск каналов
+let searchQuery = '';
+let filteredChannels = null; // Кэш отфильтрованных каналов
+
 function setupSearch() {
     const searchInput = document.getElementById('search');
+    if (!searchInput) return;
+    
     searchInput.addEventListener('input', (e) => {
-        const query = e.target.value.toLowerCase();
-        const filtered = channels.filter(channel => 
-            channel.title.toLowerCase().includes(query) ||
-            (channel.username && channel.username.toLowerCase().includes(query))
-        );
-        renderChannels(filtered);
+        searchQuery = e.target.value.toLowerCase();
+        applySearchFilter();
     });
+}
+
+// Применение фильтра поиска
+function applySearchFilter() {
+    if (!searchQuery) {
+        filteredChannels = null;
+        renderChannels();
+        return;
+    }
+    
+    // Фильтруем в зависимости от текущего вида
+    let filteredManual = manualChannels.filter(channel => 
+        channel.title.toLowerCase().includes(searchQuery) ||
+        (channel.username && channel.username.toLowerCase().includes(searchQuery))
+    );
+    
+    let filteredTheme = themeChannels.filter(channel => 
+        channel.title.toLowerCase().includes(searchQuery) ||
+        (channel.username && channel.username.toLowerCase().includes(searchQuery))
+    );
+    
+    let filteredAll = channels.filter(channel => 
+        channel.title.toLowerCase().includes(searchQuery) ||
+        (channel.username && channel.username.toLowerCase().includes(searchQuery))
+    );
+    
+    // Сохраняем отфильтрованные данные
+    filteredChannels = {
+        all: filteredAll,
+        manual: filteredManual,
+        theme: filteredTheme
+    };
+    
+    renderChannels();
 }
 
 // Модальное окно
@@ -260,6 +413,7 @@ document.getElementById('add-modal').addEventListener('click', (e) => {
         if (await authenticate()) {
             await loadChannels();
             setupSearch();
+            updateViewButtons(); // Инициализация кнопок переключения вида
         }
     } catch (e) {
         console.error('App initialization failed', e);
