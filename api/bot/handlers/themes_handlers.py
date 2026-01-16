@@ -32,7 +32,8 @@ def _kb_themes_list(themes: list, subscribed_theme_ids: set, page: int = 0, page
     
     # Кнопки подборок на текущей странице
     for theme in page_themes:
-        is_subscribed = theme['id'] in subscribed_theme_ids
+        theme_id = str(theme['id'])  # Context7: Явное преобразование в строку
+        is_subscribed = theme_id in subscribed_theme_ids
         status_icon = "✅" if is_subscribed else "➕"
         channels_count = theme.get('channels_count', 0)
         builder.button(
@@ -179,7 +180,15 @@ async def _show_themes_list(msg: Message, page: int = 0):
                 if subscribed_resp.status_code == 200:
                     subscribed_data = subscribed_resp.json()
                     subscribed_themes = subscribed_data.get("themes", [])
-                    subscribed_theme_ids = {t["theme_id"] for t in subscribed_themes}
+                    # Context7: Явное преобразование theme_id в строку для сравнения
+                    subscribed_theme_ids = {str(t["theme_id"]) for t in subscribed_themes}
+                    logger.info(
+                        "Loaded subscribed themes",
+                        user_id=msg.from_user.id,
+                        subscribed_count=len(subscribed_theme_ids),
+                        subscribed_ids=list(subscribed_theme_ids),
+                        subscribed_ids_types=[type(sid).__name__ for sid in list(subscribed_theme_ids)[:2]] if subscribed_theme_ids else []
+                    )
             except Exception as e:
                 logger.warning("Failed to load subscribed themes", error=str(e))
             
@@ -197,11 +206,24 @@ async def _show_themes_list(msg: Message, page: int = 0):
             text += "Выберите подборку для подключения:\n\n"
             
             for theme in page_themes:
-                is_subscribed = theme['id'] in subscribed_theme_ids
+                theme_id = str(theme['id'])  # Context7: Явное преобразование в строку
+                is_subscribed = theme_id in subscribed_theme_ids
                 status = "✅ Подключено" if is_subscribed else "➕ Доступно"
                 channels_count = theme.get('channels_count', 0)
                 text += f"{status} <b>{theme['name']}</b>\n"
                 text += f"   📺 {channels_count} каналов\n\n"
+                # Context7: Логирование для отладки сравнения ID
+                if theme.get('slug') in ['diy-mens', 'startup']:
+                    logger.info(
+                        "Theme subscription check",
+                        user_id=msg.from_user.id,
+                        theme_id=theme_id,
+                        theme_id_type=type(theme_id).__name__,
+                        theme_slug=theme.get('slug'),
+                        is_subscribed=is_subscribed,
+                        subscribed_theme_ids=list(subscribed_theme_ids),
+                        subscribed_theme_ids_types=[type(sid).__name__ for sid in list(subscribed_theme_ids)[:2]] if subscribed_theme_ids else []
+                    )
             
             if total_pages > 1:
                 text += f"\n<i>Страница {current_page + 1} из {total_pages}. Всего подборок: {total_themes_for_pagination}</i>"
@@ -229,16 +251,55 @@ async def cmd_my_themes(msg: Message):
         logger.info("My themes command received", user_id=msg.from_user.id)
         
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                f"{API_BASE}/api/themes/users/{msg.from_user.id}/subscribed"
+            url = f"{API_BASE}/api/themes/users/{msg.from_user.id}/subscribed"
+            logger.info("Requesting subscribed themes", user_id=msg.from_user.id, url=url)
+            
+            resp = await client.get(url)
+            
+            logger.info(
+                "API response received",
+                user_id=msg.from_user.id,
+                status_code=resp.status_code,
+                response_text=resp.text[:500] if len(resp.text) > 0 else "empty"
             )
             
             # Обрабатываем случай, когда подборок нет (200 с пустым списком - это нормально)
             if resp.status_code == 200:
-                data = resp.json()
+                try:
+                    data = resp.json()
+                except Exception as e:
+                    logger.error(
+                        "Failed to parse JSON response",
+                        user_id=msg.from_user.id,
+                        error=str(e),
+                        response_text=resp.text[:500]
+                    )
+                    await msg.answer("❌ Ошибка при обработке ответа. Попробуйте позже.")
+                    return
+                
                 themes = data.get("themes", [])
                 
-                if not themes:
+                # Context7: Явная проверка типа и содержимого
+                logger.info(
+                    "My themes API response parsed",
+                    user_id=msg.from_user.id,
+                    status_code=resp.status_code,
+                    themes_count=len(themes),
+                    themes_type=type(themes).__name__,
+                    themes_is_empty=not themes,
+                    themes_bool=bool(themes),
+                    themes_data=themes if len(themes) <= 2 else f"{len(themes)} themes",
+                    raw_data_keys=list(data.keys()) if data else [],
+                    data_total=data.get("total", "N/A"),
+                    data_themes_key_exists="themes" in data if data else False
+                )
+                
+                # Context7: Дополнительная проверка - может быть themes это не список?
+                if themes is None:
+                    logger.warning("Themes is None, treating as empty", user_id=msg.from_user.id)
+                    themes = []
+                
+                if not themes or len(themes) == 0:
                     # Показываем нормальное сообщение с кнопкой для просмотра доступных подборок
                     builder = InlineKeyboardBuilder()
                     builder.button(text="📚 Все подборки", callback_data="themes:list")
@@ -306,27 +367,6 @@ async def cmd_my_themes(msg: Message):
                 parse_mode="HTML"
             )
             return
-            
-            text = "📚 <b>Мои подборки</b>\n\n"
-            for theme in themes:
-                text += f"✅ <b>{theme['theme_name']}</b>\n"
-                text += f"   Подключено: {theme['subscribed_at'][:10]}\n\n"
-            
-            builder = InlineKeyboardBuilder()
-            for theme in themes:
-                builder.button(
-                    text=f"📚 {theme['theme_name']}",
-                    callback_data=f"theme:view:{theme['theme_slug']}"
-                )
-            builder.button(text="📚 Все подборки", callback_data="themes:list")
-            builder.button(text="🔙 Главное меню", callback_data="menu:main")
-            builder.adjust(1)
-            
-            await msg.answer(
-                text,
-                parse_mode="HTML",
-                reply_markup=builder.as_markup()
-            )
             
     except Exception as e:
         logger.error(
@@ -433,31 +473,130 @@ async def handle_theme_view(cb: CallbackQuery):
 @router.callback_query(F.data.startswith("theme:subscribe:"))
 async def handle_theme_subscribe(cb: CallbackQuery):
     """Подключение подборки."""
+    theme_slug = None
     try:
         theme_slug = cb.data.split(":", 2)[2]
+        endpoint = f"{API_BASE}/api/themes/{theme_slug}/subscribe/{cb.from_user.id}"
+        
+        # Context7: Логирование перед запросом
+        logger.info(
+            "Subscribing to theme via bot",
+            theme_slug=theme_slug,
+            user_id=cb.from_user.id,
+            endpoint=endpoint
+        )
         
         async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                f"{API_BASE}/api/themes/{theme_slug}/subscribe/{cb.from_user.id}"
+            resp = await client.post(endpoint)
+            
+            # Context7: Логирование ответа
+            logger.info(
+                "Theme subscription API response",
+                theme_slug=theme_slug,
+                user_id=cb.from_user.id,
+                status_code=resp.status_code
             )
             
             if resp.status_code == 201:
                 data = resp.json()
-                channels_added = data.get("channels_added", 0)
-                await cb.answer(f"✅ Подборка подключена! Добавлено каналов: {channels_added}")
+                
+                # Context7: Обработка структурированного ответа
+                channels_info = data.get("channels", {})
+                channels_added = channels_info.get("added", 0)
+                channels_reactivated = channels_info.get("reactivated", 0)
+                channels_expected = channels_info.get("expected", 0)
+                channels_failed = channels_info.get("failed", 0)
+                channels_skipped_manual = channels_info.get("skipped_manual", 0)
+                errors = data.get("errors")
+                
+                # Формируем понятное сообщение для пользователя
+                total_processed = channels_added + channels_reactivated
+                if total_processed == channels_expected:
+                    # Все каналы успешно подключены
+                    message = f"✅ Подборка подключена!\n"
+                    if channels_added > 0:
+                        message += f"Добавлено: {channels_added} каналов\n"
+                    if channels_reactivated > 0:
+                        message += f"Реактивировано: {channels_reactivated} каналов\n"
+                    if channels_skipped_manual > 0:
+                        message += f"Пропущено (уже подключены вручную): {channels_skipped_manual}"
+                elif total_processed > 0:
+                    # Частично подключено
+                    message = f"⚠️ Подборка подключена частично:\n"
+                    message += f"Подключено: {total_processed} из {channels_expected} каналов\n"
+                    if channels_failed > 0:
+                        message += f"Ошибок: {channels_failed}"
+                else:
+                    # Ничего не подключено
+                    message = f"❌ Не удалось подключить подборку\n"
+                    if channels_skipped_manual == channels_expected:
+                        message = "ℹ️ Все каналы уже подключены вручную"
+                    elif errors:
+                        error_summary = errors[0].get("error", "Неизвестная ошибка")[:100]
+                        message += f"Ошибка: {error_summary}"
+                
+                await cb.answer(message, show_alert=True)
+                
+                # Логируем детали для диагностики
+                if errors:
+                    logger.warning(
+                        "Theme subscription completed with errors",
+                        theme_slug=theme_slug,
+                        user_id=cb.from_user.id,
+                        errors_count=len(errors),
+                        errors=errors[:3]  # Первые 3 ошибки для лога
+                    )
+                
                 # Обновляем информацию о подборке
                 await handle_theme_view(cb)
             elif resp.status_code == 409:
                 await cb.answer("⚠️ Вы уже подключены к этой подборке", show_alert=True)
-            else:
+            elif resp.status_code == 404:
                 error_data = resp.json() if resp.content else {}
-                await cb.answer(f"❌ Ошибка: {error_data.get('detail', resp.status_code)}", show_alert=True)
+                detail = error_data.get('detail', 'Подборка не найдена')
+                await cb.answer(f"❌ {detail}", show_alert=True)
+            elif resp.status_code in (500, 502, 503, 504):
+                # Временная ошибка сервера
+                error_data = resp.json() if resp.content else {}
+                detail = error_data.get('detail', 'Временная ошибка сервера')
+                logger.error(
+                    "Theme subscription server error",
+                    theme_slug=theme_slug,
+                    user_id=cb.from_user.id,
+                    status_code=resp.status_code,
+                    error_detail=detail
+                )
+                await cb.answer("❌ Временная ошибка, повторите позже", show_alert=True)
+            else:
+                # Другие ошибки
+                error_data = resp.json() if resp.content else {}
+                error_body = resp.text[:500] if resp.text else "No error body"
+                detail = error_data.get('detail', f'Ошибка {resp.status_code}')
                 
+                logger.warning(
+                    "Theme subscription failed",
+                    theme_slug=theme_slug,
+                    user_id=cb.from_user.id,
+                    status_code=resp.status_code,
+                    error_detail=detail,
+                    error_body=error_body
+                )
+                await cb.answer(f"❌ Ошибка: {detail}", show_alert=True)
+                
+    except httpx.TimeoutException:
+        logger.error(
+            "Theme subscription timeout",
+            theme_slug=theme_slug,
+            user_id=cb.from_user.id if 'cb' in locals() else None
+        )
+        await cb.answer("❌ Превышено время ожидания, повторите позже", show_alert=True)
     except Exception as e:
         logger.error(
             "Error subscribing to theme",
+            theme_slug=theme_slug,
+            user_id=cb.from_user.id if 'cb' in locals() else None,
             error=str(e),
-            theme_slug=theme_slug if 'theme_slug' in locals() else None,
+            error_type=type(e).__name__,
             exc_info=True
         )
         await cb.answer("❌ Ошибка при подключении подборки", show_alert=True)

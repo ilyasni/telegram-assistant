@@ -12,23 +12,221 @@ import structlog
 
 from telethon.errors import FloodWaitError
 from telethon import TelegramClient
-from prometheus_client import Counter, Histogram
+from prometheus_client import Counter, Histogram, Gauge, REGISTRY
 
 logger = structlog.get_logger()
 
-# Context7: Метрики Prometheus для FloodWait
-telethon_floodwait_total = Counter(
-    'telethon_floodwait_total',
-    'Total FloodWait errors',
-    ['account_id', 'method']
-)
+# Context7: Используем проверку на существование метрики для предотвращения дублирования
+def _get_or_create_counter(name, description, labels):
+    """Получить существующую метрику или создать новую."""
+    try:
+        # Пытаемся найти существующую метрику
+        existing = REGISTRY._names_to_collectors.get(name)
+        if existing:
+            return existing
+    except (AttributeError, KeyError, TypeError):
+        pass
+    
+    # Если метрика не найдена, создаем новую
+    try:
+        return Counter(name, description, labels)
+    except ValueError as e:
+        # Метрика уже существует - пытаемся найти её
+        if "Duplicated timeseries" in str(e):
+            try:
+                # Ищем метрику в реестре
+                for collector_name, collector in REGISTRY._names_to_collectors.items():
+                    if collector_name == name or collector_name.startswith(name):
+                        logger.debug(f"Found existing metric {collector_name} for {name}")
+                        return collector
+            except (AttributeError, KeyError, TypeError):
+                pass
+        # Если не удалось найти, логируем и пробуем создать с другим подходом
+        logger.warning(f"Metric {name} already exists, trying to reuse", error=str(e))
+        raise
 
-telethon_floodwait_duration_seconds = Histogram(
-    'telethon_floodwait_duration_seconds',
-    'FloodWait wait duration',
-    ['account_id', 'method'],
-    buckets=[1, 5, 10, 30, 60, 120, 300, 600]
-)
+def _get_or_create_histogram(name, description, labels, buckets):
+    """Получить существующую метрику Histogram или создать новую."""
+    try:
+        # Пытаемся найти существующую метрику
+        existing = REGISTRY._names_to_collectors.get(name)
+        if existing:
+            return existing
+    except (AttributeError, KeyError, TypeError):
+        pass
+    
+    # Если метрика не найдена, создаем новую
+    try:
+        # Context7: labels не может быть None для Histogram
+        if labels is None:
+            labels = []
+        return Histogram(name, description, labels, buckets=buckets)
+    except ValueError as e:
+        # Метрика уже существует - пытаемся найти её
+        if "Duplicated timeseries" in str(e):
+            try:
+                # Ищем метрику в реестре
+                for collector_name, collector in REGISTRY._names_to_collectors.items():
+                    if collector_name == name or collector_name.startswith(name):
+                        logger.debug(f"Found existing metric {collector_name} for {name}")
+                        return collector
+            except (AttributeError, KeyError, TypeError):
+                pass
+        logger.warning(f"Metric {name} already exists, trying to reuse", error=str(e))
+        raise
+
+def _get_or_create_gauge(name, description, labels):
+    """Получить существующую метрику Gauge или создать новую."""
+    try:
+        # Пытаемся найти существующую метрику
+        existing = REGISTRY._names_to_collectors.get(name)
+        if existing:
+            return existing
+    except (AttributeError, KeyError, TypeError):
+        pass
+    
+    # Если метрика не найдена, создаем новую
+    try:
+        # Context7: labels может быть None для Gauge (метрика без labels)
+        if labels is None:
+            return Gauge(name, description)
+        return Gauge(name, description, labels)
+    except ValueError as e:
+        # Метрика уже существует - пытаемся найти её
+        if "Duplicated timeseries" in str(e):
+            try:
+                # Ищем метрику в реестре
+                for collector_name, collector in REGISTRY._names_to_collectors.items():
+                    if collector_name == name or collector_name.startswith(name):
+                        logger.debug(f"Found existing metric {collector_name} for {name}")
+                        return collector
+            except (AttributeError, KeyError, TypeError):
+                pass
+        logger.warning(f"Metric {name} already exists, trying to reuse", error=str(e))
+        raise
+
+# Context7: Метрики Prometheus для FloodWait
+# Проверяем существование метрик перед созданием
+_telethon_floodwait_total = None
+_telethon_floodwait_duration_seconds = None
+_tg_floodwait_seconds_gauge = None
+
+# Пытаемся найти существующие метрики
+try:
+    _telethon_floodwait_total = REGISTRY._names_to_collectors.get('telethon_floodwait_total')
+except (AttributeError, KeyError, TypeError):
+    pass
+
+try:
+    _telethon_floodwait_duration_seconds = REGISTRY._names_to_collectors.get('telethon_floodwait_duration_seconds')
+except (AttributeError, KeyError, TypeError):
+    pass
+
+try:
+    _tg_floodwait_seconds_gauge = REGISTRY._names_to_collectors.get('tg_floodwait_seconds_gauge')
+except (AttributeError, KeyError, TypeError):
+    pass
+
+# Создаем метрики только если они не существуют
+if _telethon_floodwait_total is None:
+    try:
+        # Пытаемся найти существующую метрику по всем возможным именам
+        for key in ['telethon_floodwait_total', 'telethon_floodwait', 'telethon_floodwait_created']:
+            try:
+                collector = REGISTRY._names_to_collectors.get(key)
+                if collector:
+                    _telethon_floodwait_total = collector
+                    logger.debug(f"Found existing metric {key} for telethon_floodwait_total")
+                    break
+            except (AttributeError, KeyError, TypeError):
+                continue
+        
+        # Если не нашли, создаем новую
+        if _telethon_floodwait_total is None:
+            _telethon_floodwait_total = Counter('telethon_floodwait_total', 'Total FloodWait errors', ['account_id', 'method'])
+    except ValueError as e:
+        # Метрика уже существует, используем существующую
+        if "Duplicated timeseries" in str(e):
+            try:
+                # Ищем метрику по частичному совпадению
+                for key, collector in REGISTRY._names_to_collectors.items():
+                    if 'telethon_floodwait' in key.lower():
+                        _telethon_floodwait_total = collector
+                        logger.debug(f"Found existing metric {key} for telethon_floodwait_total after ValueError")
+                        break
+            except (AttributeError, KeyError, TypeError):
+                pass
+        if _telethon_floodwait_total is None:
+            logger.warning("Failed to get existing telethon_floodwait_total, will use None", error=str(e))
+            # Не падаем, просто используем None - метрика будет недоступна
+
+if _telethon_floodwait_duration_seconds is None:
+    try:
+        # Пытаемся найти существующую метрику
+        for key in ['telethon_floodwait_duration_seconds', 'telethon_floodwait_duration']:
+            try:
+                collector = REGISTRY._names_to_collectors.get(key)
+                if collector:
+                    _telethon_floodwait_duration_seconds = collector
+                    logger.debug(f"Found existing metric {key} for telethon_floodwait_duration_seconds")
+                    break
+            except (AttributeError, KeyError, TypeError):
+                continue
+        
+        # Если не нашли, создаем новую
+        if _telethon_floodwait_duration_seconds is None:
+            _telethon_floodwait_duration_seconds = Histogram('telethon_floodwait_duration_seconds', 'FloodWait wait duration', ['account_id', 'method'], buckets=[1, 5, 10, 30, 60, 120, 300, 600])
+    except ValueError as e:
+        # Метрика уже существует, используем существующую
+        if "Duplicated timeseries" in str(e):
+            try:
+                # Ищем метрику по частичному совпадению
+                for key, collector in REGISTRY._names_to_collectors.items():
+                    if 'telethon_floodwait_duration' in key.lower():
+                        _telethon_floodwait_duration_seconds = collector
+                        logger.debug(f"Found existing metric {key} for telethon_floodwait_duration_seconds after ValueError")
+                        break
+            except (AttributeError, KeyError, TypeError):
+                pass
+        if _telethon_floodwait_duration_seconds is None:
+            logger.warning("Failed to get existing telethon_floodwait_duration_seconds, will use None", error=str(e))
+            # Не падаем, просто используем None - метрика будет недоступна
+
+if _tg_floodwait_seconds_gauge is None:
+    try:
+        # Пытаемся найти существующую метрику
+        for key in ['tg_floodwait_seconds_gauge', 'tg_floodwait_seconds']:
+            try:
+                collector = REGISTRY._names_to_collectors.get(key)
+                if collector:
+                    _tg_floodwait_seconds_gauge = collector
+                    logger.debug(f"Found existing metric {key} for tg_floodwait_seconds_gauge")
+                    break
+            except (AttributeError, KeyError, TypeError):
+                continue
+        
+        # Если не нашли, создаем новую
+        if _tg_floodwait_seconds_gauge is None:
+            _tg_floodwait_seconds_gauge = Gauge('tg_floodwait_seconds_gauge', 'Current global FloodWait duration for session', ['session_id'])
+    except ValueError as e:
+        # Метрика уже существует, используем существующую
+        if "Duplicated timeseries" in str(e):
+            try:
+                # Ищем метрику по частичному совпадению
+                for key, collector in REGISTRY._names_to_collectors.items():
+                    if 'tg_floodwait_seconds' in key.lower():
+                        _tg_floodwait_seconds_gauge = collector
+                        logger.debug(f"Found existing metric {key} for tg_floodwait_seconds_gauge after ValueError")
+                        break
+            except (AttributeError, KeyError, TypeError):
+                pass
+        if _tg_floodwait_seconds_gauge is None:
+            logger.warning("Failed to get existing tg_floodwait_seconds_gauge, will use None", error=str(e))
+            # Не падаем, просто используем None - метрика будет недоступна
+
+telethon_floodwait_total = _telethon_floodwait_total
+telethon_floodwait_duration_seconds = _telethon_floodwait_duration_seconds
+tg_floodwait_seconds_gauge = _tg_floodwait_seconds_gauge
 
 
 class FloodWaitManager:
@@ -49,7 +247,8 @@ class FloodWaitManager:
         self,
         error: FloodWaitError,
         account_id: str,
-        method: str = "unknown"
+        method: str = "unknown",
+        session_id: Optional[str] = None
     ):
         """
         Обработка FloodWait с сохранением состояния в Redis.
@@ -58,6 +257,7 @@ class FloodWaitManager:
             error: FloodWaitError из Telethon
             account_id: Идентификатор аккаунта (telegram_id или identity_id)
             method: Название метода API (для per-method лимитов)
+            session_id: Идентификатор сессии для глобального circuit breaker (опционально)
         """
         wait_seconds = error.seconds
         key = f"floodwait:{account_id}:{method}"
@@ -70,13 +270,30 @@ class FloodWaitManager:
             str(unlock_time)
         )
         
-        # Метрика
-        telethon_floodwait_total.labels(account_id=account_id, method=method).inc()
-        if self.prometheus:
-            telethon_floodwait_duration_seconds.labels(
-                account_id=account_id,
-                method=method
-            ).observe(wait_seconds)
+        # Context7: При большом FloodWait (>60 сек) устанавливаем глобальный circuit breaker
+        if wait_seconds > 60 and session_id:
+            await self.set_global_floodwait(session_id, wait_seconds)
+            logger.error("Global FloodWait circuit breaker activated",
+                        seconds=wait_seconds,
+                        session_id=session_id,
+                        account_id=account_id,
+                        method=method)
+        
+        # Метрика (только если метрика доступна)
+        if telethon_floodwait_total:
+            try:
+                telethon_floodwait_total.labels(account_id=account_id, method=method).inc()
+            except Exception as e:
+                logger.debug("Failed to update telethon_floodwait_total metric", error=str(e))
+        
+        if self.prometheus and telethon_floodwait_duration_seconds:
+            try:
+                telethon_floodwait_duration_seconds.labels(
+                    account_id=account_id,
+                    method=method
+                ).observe(wait_seconds)
+            except Exception as e:
+                logger.debug("Failed to update telethon_floodwait_duration_seconds metric", error=str(e))
         
         logger.warning("FloodWait detected", 
                       seconds=wait_seconds,
@@ -171,6 +388,154 @@ class FloodWaitManager:
             multiplier *= 0.5
         
         return int(base_batch_size * multiplier)
+    
+    async def check_global_floodwait(self, session_id: str) -> Optional[float]:
+        """
+        Проверка глобального FloodWait для сессии.
+        
+        Context7: Глобальный circuit breaker предотвращает массовые запросы
+        при большом FloodWait (например, 14000+ секунд).
+        
+        Args:
+            session_id: Идентификатор сессии Telegram
+        
+        Returns:
+            Оставшееся время в секундах или None если нет блокировки
+        """
+        key = f"tg:floodwait_until:{session_id}"
+        try:
+            unlock_time_str = await self.redis_client.get(key)
+            if unlock_time_str:
+                unlock_time = float(unlock_time_str)
+                wait_time = unlock_time - time.time()
+                if wait_time > 0:
+                    # Обновляем метрику (только если метрика доступна)
+                    if tg_floodwait_seconds_gauge:
+                        try:
+                            tg_floodwait_seconds_gauge.labels(session_id=session_id).set(wait_time)
+                        except Exception as e:
+                            logger.debug("Failed to update tg_floodwait_seconds_gauge metric", error=str(e))
+                    return wait_time
+                else:
+                    # Время истекло - удаляем ключ
+                    await self.redis_client.delete(key)
+                    if tg_floodwait_seconds_gauge:
+                        try:
+                            tg_floodwait_seconds_gauge.labels(session_id=session_id).set(0)
+                        except Exception as e:
+                            logger.debug("Failed to update tg_floodwait_seconds_gauge metric", error=str(e))
+                    return None
+        except Exception as e:
+            logger.debug("Failed to check global FloodWait",
+                        session_id=session_id,
+                        error=str(e))
+        return None
+    
+    async def set_global_floodwait(self, session_id: str, seconds: int):
+        """
+        Установка глобального FloodWait circuit breaker для сессии.
+        
+        Context7: При большом FloodWait (>60 сек) устанавливается глобальная блокировка,
+        которая предотвращает любые попытки резолва до истечения времени.
+        
+        Args:
+            session_id: Идентификатор сессии Telegram
+            seconds: Время блокировки в секундах
+        """
+        key = f"tg:floodwait_until:{session_id}"
+        unlock_time = time.time() + seconds
+        
+        try:
+            # Устанавливаем ключ с TTL = seconds + 60 (запас 1 минута)
+            await self.redis_client.setex(
+                key,
+                seconds + 60,
+                str(unlock_time)
+            )
+            
+            # Обновляем метрику (только если метрика доступна)
+            if tg_floodwait_seconds_gauge:
+                try:
+                    tg_floodwait_seconds_gauge.labels(session_id=session_id).set(seconds)
+                except Exception as e:
+                    logger.debug("Failed to update tg_floodwait_seconds_gauge metric", error=str(e))
+            
+            logger.warning("Global FloodWait circuit breaker set",
+                          session_id=session_id,
+                          seconds=seconds,
+                          unlock_time=unlock_time)
+        except Exception as e:
+            logger.error("Failed to set global FloodWait",
+                        session_id=session_id,
+                        seconds=seconds,
+                        error=str(e))
+    
+    async def get_healthy_sessions(
+        self,
+        session_pool: list[int],
+        max_floodwait_seconds: int = 60
+    ) -> list[int]:
+        """
+        Фильтрует сессии из пула, которые не в FloodWait или FloodWait < max_floodwait_seconds.
+        
+        Context7: Используется для выбора доступных сессий из пула перед резолвом канала.
+        
+        Args:
+            session_pool: Список telegram_id сессий для проверки
+            max_floodwait_seconds: Максимально допустимый FloodWait в секундах
+        
+        Returns:
+            Список доступных сессий (telegram_id)
+        """
+        healthy_sessions = []
+        
+        for account_id in session_pool:
+            session_id = str(account_id)
+            wait_time = await self.check_global_floodwait(session_id)
+            
+            if wait_time is None:
+                # Нет FloodWait - сессия доступна
+                healthy_sessions.append(account_id)
+            elif wait_time <= max_floodwait_seconds:
+                # Малый FloodWait - сессия доступна
+                healthy_sessions.append(account_id)
+            else:
+                # Большой FloodWait - сессия недоступна
+                logger.debug("Session skipped due to FloodWait",
+                           account_id=account_id,
+                           wait_seconds=wait_time)
+        
+        return healthy_sessions
+    
+    async def should_abort_resolution(
+        self,
+        floodwait_seconds: int,
+        context: str
+    ) -> bool:
+        """
+        Определяет, нужно ли прервать проход резолва при FloodWait.
+        
+        Context7: Политика переключения сессий с защитой от каскадного FloodWait.
+        Для repair скриптов - строгие ограничения, для operational парсинга - более мягкие.
+        
+        Args:
+            floodwait_seconds: Длительность FloodWait в секундах
+            context: 'operational' (парсинг) или 'repair' (скрипт валидации)
+        
+        Returns:
+            True если нужно прервать проход резолва
+        """
+        if context == 'repair':
+            # Для repair скриптов: abort при FloodWait > 60-120 сек
+            # Строгие ограничения, чтобы не выжигать все сессии по цепочке
+            return floodwait_seconds > 120
+        elif context == 'operational':
+            # Для operational парсинга: abort при FloodWait > 5 минут
+            # Более мягкие ограничения, но все равно защита от каскадного FloodWait
+            return floodwait_seconds > 300
+        else:
+            # По умолчанию - консервативный подход
+            return floodwait_seconds > 120
 
 
 class TelethonClientWrapper:

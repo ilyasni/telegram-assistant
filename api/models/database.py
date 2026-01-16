@@ -274,6 +274,30 @@ class Channel(Base):
     user_subscriptions = relationship("UserChannel", back_populates="channel")
 
 
+class IngestAccount(Base):
+    """Сервисный аккаунт для ingestion публичных каналов."""
+    __tablename__ = "ingest_accounts"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    telegram_id = Column(BigInteger, unique=True, nullable=False)
+    is_active = Column(Boolean, server_default=text("true"), nullable=False)
+    priority = Column(Integer, server_default=text("100"), nullable=False)  # меньше = выше приоритет
+    role = Column(String(20), server_default=text("'both'"), nullable=False)  # 'read', 'resolver', 'both'
+    max_concurrent_channels = Column(Integer, nullable=True)
+    blocked_until = Column(DateTime(timezone=True), nullable=True)  # защита от FloodWait
+    last_error_code = Column(Text, nullable=True)
+    last_error_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+    last_used_at = Column(DateTime(timezone=True), nullable=True)  # медленный аудит (debounce)
+    notes = Column(Text, nullable=True)
+    
+    __table_args__ = (
+        Index("idx_ingest_accounts_telegram_id", "telegram_id"),
+        Index("idx_ingest_accounts_active_blocked_priority", "is_active", "blocked_until", "priority"),
+    )
+
+
 class TelegramEntity(Base):
     """Модель Telegram сущности (Context7 P1.2: entity-level metadata)."""
     __tablename__ = "tg_entities"

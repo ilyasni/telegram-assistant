@@ -73,9 +73,41 @@ except ImportError:
             existing = REGISTRY._names_to_collectors.get(name)
             if existing:
                 return existing
-        except (AttributeError, KeyError):
+        except (AttributeError, KeyError, TypeError):
             pass
-        return Counter(name, description, labels)
+        
+        try:
+            return Counter(name, description, labels)
+        except ValueError as e:
+            if "Duplicated timeseries" in str(e):
+                try:
+                    return REGISTRY._names_to_collectors.get(name)
+                except (AttributeError, KeyError, TypeError):
+                    pass
+            logger.warning(f"Metric {name} already exists", error=str(e))
+            raise
+    
+    def _get_or_create_histogram(name, description, labels, buckets=None):
+        """Получить существующую метрику или создать новую."""
+        try:
+            existing = REGISTRY._names_to_collectors.get(name)
+            if existing:
+                return existing
+        except (AttributeError, KeyError, TypeError):
+            pass
+        
+        try:
+            if buckets:
+                return Histogram(name, description, labels, buckets=buckets)
+            return Histogram(name, description, labels)
+        except ValueError as e:
+            if "Duplicated timeseries" in str(e):
+                try:
+                    return REGISTRY._names_to_collectors.get(name)
+                except (AttributeError, KeyError, TypeError):
+                    pass
+            logger.warning(f"Metric {name} already exists", error=str(e))
+            raise
     
     channel_not_found_total = _get_or_create_counter(
         'channel_not_found_total',
@@ -95,42 +127,45 @@ except ImportError:
         ['operation']  # operation: 'before_parsing', 'before_entity', 'before_albums'
     )
 
-db_users_upserted_total = Counter(
+db_users_upserted_total = _get_or_create_counter(
     'db_users_upserted_total',
-    'Users upserted'
+    'Users upserted',
+    []
 )
 
-db_channels_upserted_total = Counter(
+db_channels_upserted_total = _get_or_create_counter(
     'db_channels_upserted_total',
-    'Channels upserted'
+    'Channels upserted',
+    []
 )
 
 # Context7: Метрики для CAS операций (media_objects + post_media_map)
-media_objects_upserted_total = Counter(
+media_objects_upserted_total = _get_or_create_counter(
     'media_objects_upserted_total',
     'Total media_objects upserted',
     ['status']  # 'new', 'existing'
 )
 
-media_objects_refs_updated_total = Counter(
+media_objects_refs_updated_total = _get_or_create_counter(
     'media_objects_refs_updated_total',
-    'Total refs_count increments'
+    'Total refs_count increments',
+    []
 )
 
-post_media_map_inserted_total = Counter(
+post_media_map_inserted_total = _get_or_create_counter(
     'post_media_map_inserted_total',
     'Total post_media_map inserts',
     ['status']  # 'new', 'duplicate'
 )
 
-cas_operations_latency_seconds = Histogram(
+cas_operations_latency_seconds = _get_or_create_histogram(
     'cas_operations_latency_seconds',
     'CAS operations latency',
     ['operation'],  # 'save_media_to_cas'
     buckets=[0.01, 0.05, 0.1, 0.5, 1, 2, 5]
 )
 
-cas_operations_errors_total = Counter(
+cas_operations_errors_total = _get_or_create_counter(
     'cas_operations_errors_total',
     'CAS operations errors',
     ['operation', 'error_type']

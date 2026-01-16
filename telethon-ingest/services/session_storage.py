@@ -353,17 +353,35 @@ class SessionStorageService:
                         current_dir=os.getcwd())
             raise ImportError(f"Could not find api directory with utils/identity_membership.py. Tried: {api_paths}")
         
+        # Context7 best practice: используем importlib для прямого импорта файла
+        # [C7-ID: importlib-best-practice-001] Исправление ошибки "No module named 'utils.identity_membership'"
+        # Обычный импорт не работает из-за структуры модулей Python, используем importlib
+        import importlib.util
+        utils_path = os.path.join(api_path, 'utils', 'identity_membership.py')
+        
         try:
-            from utils.identity_membership import upsert_identity_sync, upsert_membership_sync
-            logger.debug("Successfully imported identity_membership", api_path=api_path)
+            if os.path.exists(utils_path):
+                spec = importlib.util.spec_from_file_location("identity_membership", utils_path)
+                identity_membership_module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(identity_membership_module)
+                upsert_identity_sync = identity_membership_module.upsert_identity_sync
+                upsert_membership_sync = identity_membership_module.upsert_membership_sync
+                logger.debug("Successfully imported identity_membership via importlib", api_path=api_path, utils_path=utils_path)
+            else:
+                # Fallback: попробуем обычный импорт
+                if api_path not in sys.path:
+                    sys.path.insert(0, api_path)
+                from utils.identity_membership import upsert_identity_sync, upsert_membership_sync
+                logger.debug("Successfully imported identity_membership via standard import", api_path=api_path)
         except ImportError as e:
             logger.error("Failed to import identity_membership", 
                         error=str(e), 
                         api_path=api_path, 
                         sys_path=sys.path[:5],
                         current_file=current_file,
-                        utils_path=os.path.join(api_path, 'utils', 'identity_membership.py'),
-                        utils_exists=os.path.exists(os.path.join(api_path, 'utils', 'identity_membership.py')))
+                        utils_path=utils_path,
+                        utils_exists=os.path.exists(utils_path),
+                        exc_info=True)
             raise
         from sqlalchemy.orm import Session
         from sqlalchemy import create_engine

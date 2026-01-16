@@ -140,7 +140,10 @@ def test_subscribe_to_theme_success(client: TestClient, sample_user: dict, sampl
     data = response.json()
     assert data["status"] == "subscribed"
     assert data["theme_slug"] == sample_theme["slug"]
-    assert data["channels_added"] >= 0
+    # Context7: Новый структурированный формат ответа
+    assert "channels" in data
+    assert data["channels"]["added"] >= 0
+    assert data["channels"]["expected"] >= 0
     
     # Проверяем, что записи созданы
     user_theme_result = db.execute(

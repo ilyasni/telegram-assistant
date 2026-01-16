@@ -18,6 +18,7 @@ import redis.asyncio as redis
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from telethon import TelegramClient, errors
+from telethon.tl.types import Channel
 from telethon.tl.types import Message, Channel, Chat
 import structlog
 
@@ -25,6 +26,7 @@ import structlog
 from .telethon_retry import fetch_messages_with_retry, is_channel_in_cooldown
 from .atomic_db_saver import AtomicDBSaver
 from .rate_limiter import RateLimiter, check_parsing_rate_limit
+from .session_rate_limiter import SessionRateLimiter
 from .discussion_extractor import (
     get_discussion_message,
     extract_reply_chain,
@@ -43,7 +45,7 @@ logger = structlog.get_logger()
 # Context7: Используем проверку на существование метрики для предотвращения дублирования
 from prometheus_client import REGISTRY
 
-def _get_or_create_counter(name, description, labels):
+def _get_or_create_counter(name, description, labels, namespace=None):
     """Получить существующую метрику или создать новую."""
     try:
         # Пытаемся получить существующую метрику
@@ -54,6 +56,8 @@ def _get_or_create_counter(name, description, labels):
         pass
     
     # Создаём новую метрику
+    if namespace:
+        return Counter(name, description, labels, namespace=namespace)
     return Counter(name, description, labels)
 
 def _get_or_create_gauge(name, description, labels):
@@ -111,6 +115,48 @@ channel_coverage_percent = _get_or_create_gauge(
     'channel_coverage_percent',
     'Channel posts coverage percentage (actual/expected * 100)',
     ['channel_username']  # Используем username вместо channel_id для контроля кардинальности
+)
+
+# Context7: Метрики для резолва каналов
+channel_resolve_attempts_total = _get_or_create_counter(
+    'channel_resolve_attempts_total',
+    'Channel resolution attempts',
+    ['method', 'result']  # method: 'id'|'username', result: 'ok'|'not_found'|'floodwait'|'no_access'|'invalid'
+)
+
+channels_skipped_due_to_global_floodwait_total = _get_or_create_counter(
+    'channels_skipped_due_to_global_floodwait_total',
+    'Channels skipped due to global FloodWait',
+    []  # Без labels для контроля кардинальности
+)
+
+# Context7: Метрики для переключений сессий и подписок collector
+session_switch_total = _get_or_create_counter(
+    'session_switch_total',
+    'Session switches during channel resolution',
+    ['from_account', 'to_account', 'reason'],  # reason: 'floodwait', 'no_access'
+    namespace='telethon'
+)
+
+resolution_aborted_total = _get_or_create_counter(
+    'resolution_aborted_total',
+    'Resolution passes aborted due to policy',
+    ['context', 'reason'],  # context: 'operational', 'repair', reason: 'large_floodwait', 'max_attempts'
+    namespace='telethon'
+)
+
+collector_subscriptions_total = _get_or_create_counter(
+    'collector_subscriptions_total',
+    'Collector subscription attempts',
+    ['status'],  # status: 'subscribed', 'failed', 'private'
+    namespace='telethon'
+)
+
+collector_subscription_attempts_total = _get_or_create_counter(
+    'collector_subscription_attempts_total',
+    'Total collector subscription attempts',
+    [],
+    namespace='telethon'
 )
 
 # ============================================================================
@@ -172,11 +218,17 @@ class ChannelParser:
         atomic_saver: Optional[AtomicDBSaver] = None,
         rate_limiter: Optional[RateLimiter] = None,
         telegram_client_manager: Optional[Any] = None,
-        media_processor: Optional[Any] = None  # MediaProcessor для обработки медиа
+        media_processor: Optional[Any] = None,  # MediaProcessor для обработки медиа
+        floodwait_manager: Optional[Any] = None,  # Context7: FloodWaitManager для глобального circuit breaker
+        session_rate_limiter: Optional[SessionRateLimiter] = None,  # Context7: Per-session rate limiter
+        ingest_account_pool: Optional[Any] = None  # Context7: IngestAccountPool для управления пулом аккаунтов
     ):
         self.config = config
         self.db_session = db_session
         self.event_publisher = event_publisher
+        
+        # Context7: InputPeerChannel для прямого использования в чтении сообщений (снижает лишние запросы)
+        self._current_input_peer = None
         
         # Context7: Redis клиент (переданный или созданный)
         if redis_client:
@@ -190,6 +242,18 @@ class ChannelParser:
         self.rate_limiter = rate_limiter
         self.telegram_client_manager = telegram_client_manager
         self.media_processor = media_processor  # MediaProcessor для обработки медиа
+        self.floodwait_manager = floodwait_manager  # Context7: FloodWaitManager для глобального circuit breaker
+        self.session_rate_limiter = session_rate_limiter  # Context7: Per-session rate limiter
+        self.ingest_account_pool = ingest_account_pool  # Context7: IngestAccountPool для управления пулом аккаунтов
+        
+        # Context7: Инициализация SessionRateLimiter если не передан
+        if not self.session_rate_limiter and self.redis_client:
+            self.session_rate_limiter = SessionRateLimiter(self.redis_client)
+        
+        # Context7: Инициализация IngestAccountPool если не передан
+        if not self.ingest_account_pool and self.db_session and self.redis_client:
+            from services.ingest_account_pool import IngestAccountPool
+            self.ingest_account_pool = IngestAccountPool(self.db_session, self.redis_client)
         
         # Статистика
         self.stats = {
@@ -562,8 +626,33 @@ class ChannelParser:
                         mode=mode,
                         since_date=since_date.isoformat() if since_date else None)
             
+            # Context7: КРИТИЧНО - восстанавливаем _current_input_peer перед использованием
+            # Он был сохранен после _resolve_channel_entity, но очищен в finally блоке
+            # Context7 best practice: используем get_input_entity если InputPeerChannel недоступен
+            if 'saved_input_peer' in locals() and saved_input_peer:
+                self._current_input_peer = saved_input_peer
+                logger.debug("Restored InputPeerChannel for message fetch",
+                           channel_id=channel_id,
+                           has_input_peer=bool(saved_input_peer))
+            elif not self._current_input_peer:
+                # Context7: Fallback - используем get_input_entity для получения InputPeerChannel
+                # Это гарантирует, что мы используем актуальный access_hash
+                try:
+                    from telethon.tl.types import InputPeerChannel
+                    input_entity = await telegram_client.get_input_entity(channel_entity)
+                    if isinstance(input_entity, InputPeerChannel):
+                        self._current_input_peer = input_entity
+                        logger.debug("Created InputPeerChannel via get_input_entity fallback",
+                                   channel_id=channel_id,
+                                   input_channel_id=input_entity.channel_id,
+                                   has_access_hash=bool(input_entity.access_hash))
+                except Exception as e:
+                    logger.warning("Failed to get input_entity for channel",
+                                 channel_id=channel_id,
+                                 error=str(e))
+            
             async for message_batch in self._get_message_batches(
-                telegram_client, channel_entity, since_date, mode
+                telegram_client, channel_entity, since_date, mode, channel_id
             ):
                 batch_count += 1
                 
@@ -697,6 +786,1420 @@ class ChannelParser:
                         channel_id=channel_id, mode=mode, error=str(e))
             raise
     
+    async def _select_session_for_channel(
+        self,
+        channel_id: str,
+        preferred_account_id: Optional[int],
+        context: str = 'operational',
+        max_fallback_sessions: int = 2,
+        task_type: str = 'read'
+    ) -> Optional[tuple[TelegramClient, int, Optional[Any]]]:
+        """
+        Выбор сессии для резолва канала с использованием пула сервисных аккаунтов.
+        
+        Context7: Использует IngestAccountPool для выбора аккаунтов из пула сервисных аккаунтов.
+        Фильтрует по blocked_until и учитывает inflight из Redis.
+        
+        Args:
+            channel_id: UUID канала в БД
+            preferred_account_id: telegram_id предпочтительной сессии (legacy, для обратной совместимости)
+            context: 'operational' (парсинг) или 'repair' (скрипт валидации)
+            max_fallback_sessions: Максимальное количество альтернативных сессий
+            task_type: Тип задачи ('read' или 'resolver')
+        
+        Returns:
+            Tuple (TelegramClient, telegram_id, ingest_account_id) или None если нет доступных сессий
+        """
+        if not self.telegram_client_manager or not self.floodwait_manager:
+            logger.warning("TelegramClientManager or FloodWaitManager not available")
+            return None
+        
+        # Context7: Используем IngestAccountPool если доступен
+        if self.ingest_account_pool:
+            try:
+                # Получаем preferred_ingest_account_id из БД (приоритет) или по telegram_id (fallback)
+                preferred_ingest_account_id = None
+                try:
+                    result = await self.db_session.execute(
+                        text("SELECT preferred_ingest_account_id FROM channels WHERE id = :channel_id"),
+                        {"channel_id": channel_id}
+                    )
+                    row = result.fetchone()
+                    if row and row[0]:
+                        preferred_ingest_account_id = row[0]
+                except Exception as e:
+                    logger.debug("Failed to get preferred_ingest_account_id from DB", 
+                               channel_id=channel_id, error=str(e))
+                
+                # Fallback: если preferred_ingest_account_id не найден, ищем по telegram_id
+                if not preferred_ingest_account_id and preferred_account_id:
+                    account = await self.ingest_account_pool.get_account_by_telegram_id(preferred_account_id)
+                    if account:
+                        preferred_ingest_account_id = account['id']
+                
+                # Выбираем аккаунт из пула
+                result = await self.ingest_account_pool.select_account_for_channel(
+                    channel_id=channel_id,
+                    task_type=task_type,
+                    preferred_account_id=preferred_ingest_account_id
+                )
+                
+                if not result:
+                    logger.warning("No available accounts from pool",
+                                 channel_id=channel_id,
+                                 task_type=task_type)
+                    return None
+                
+                telegram_id, ingest_account_id = result
+                
+                # Проверяем healthy сессии через FloodWaitManager
+                healthy_sessions = await self.floodwait_manager.get_healthy_sessions(
+                    [telegram_id],
+                    max_floodwait_seconds=60
+                )
+                
+                if not healthy_sessions:
+                    # Аккаунт в FloodWait - обновляем blocked_until
+                    logger.warning("Selected account is in FloodWait",
+                                 channel_id=channel_id,
+                                 telegram_id=telegram_id,
+                                 ingest_account_id=str(ingest_account_id))
+                    # Освобождаем inflight
+                    await self.ingest_account_pool.mark_account_complete(ingest_account_id)
+                    return None
+                
+                # Получаем клиент
+                client = await self.telegram_client_manager.get_client(telegram_id)
+                if not client:
+                    logger.warning("Failed to get client for account",
+                                 channel_id=channel_id,
+                                 telegram_id=telegram_id)
+                    # Освобождаем inflight
+                    await self.ingest_account_pool.mark_account_complete(ingest_account_id)
+                    return None
+                
+                # Проверка per-session rate limit
+                if self.session_rate_limiter:
+                    if not await self.session_rate_limiter.acquire_session(telegram_id, timeout=10.0):
+                        logger.debug("Session rate limit reached",
+                                    account_id=telegram_id,
+                                    channel_id=channel_id)
+                        await self.ingest_account_pool.mark_account_complete(ingest_account_id)
+                        return None
+                    
+                    try:
+                        # Джиттер перед запросом
+                        await self.session_rate_limiter.wait_for_token(telegram_id, min_delay=2.0, max_delay=5.0)
+                        # Записываем запрос для метрики
+                        await self.session_rate_limiter.record_request(telegram_id)
+                    except Exception as e:
+                        logger.warning("Error in rate limiter, releasing",
+                                     account_id=telegram_id,
+                                     channel_id=channel_id,
+                                     error=str(e))
+                        await self.session_rate_limiter.release_session(telegram_id)
+                        await self.ingest_account_pool.mark_account_complete(ingest_account_id)
+                        return None
+                
+                logger.debug("Selected account from pool",
+                            channel_id=channel_id,
+                            telegram_id=telegram_id,
+                            ingest_account_id=str(ingest_account_id),
+                            task_type=task_type)
+                
+                return (client, telegram_id, ingest_account_id)
+                
+            except Exception as e:
+                logger.error("Failed to select account from pool",
+                           channel_id=channel_id,
+                           task_type=task_type,
+                           error=str(e))
+                return None
+        
+        # Fallback: старая логика (если пул недоступен)
+        logger.warning("IngestAccountPool not available, using fallback logic")
+        collector_id = int(os.getenv("COLLECTOR_TELEGRAM_ID", "8124731874"))
+        
+        # Формируем пул сессий: [preferred, collector]
+        session_pool = []
+        if preferred_account_id:
+            session_pool.append(preferred_account_id)
+        if collector_id not in session_pool:
+            session_pool.append(collector_id)
+        
+        # Context7: Для repair - только preferred или collector, без других сессий
+        if context == 'repair':
+            max_fallback_sessions = 1
+        
+        # Фильтруем healthy сессии
+        healthy_sessions = await self.floodwait_manager.get_healthy_sessions(
+            session_pool,
+            max_floodwait_seconds=60
+        )
+        
+        if not healthy_sessions:
+            logger.warning("No healthy sessions available for channel",
+                          channel_id=channel_id,
+                          context=context)
+            return None
+        
+        # Пробуем первую доступную сессию
+        account_id = healthy_sessions[0]
+        
+        # Проверка per-session rate limit
+        if self.session_rate_limiter:
+            if not await self.session_rate_limiter.acquire_session(account_id, timeout=10.0):
+                logger.debug("Session rate limit reached",
+                            account_id=account_id,
+                            channel_id=channel_id)
+                return None
+            
+            try:
+                await self.session_rate_limiter.wait_for_token(account_id, min_delay=2.0, max_delay=5.0)
+                client = await self.telegram_client_manager.get_client(account_id)
+                if not client:
+                    await self.session_rate_limiter.release_session(account_id)
+                    return None
+                await self.session_rate_limiter.record_request(account_id)
+                return (client, account_id, None)
+            except Exception as e:
+                logger.warning("Error getting client, releasing semaphore",
+                             account_id=account_id,
+                             channel_id=channel_id,
+                             error=str(e))
+                await self.session_rate_limiter.release_session(account_id)
+                return None
+        else:
+            client = await self.telegram_client_manager.get_client(account_id)
+            if client:
+                return (client, account_id, None)
+        
+        return None
+        
+        # Context7: Детальное логирование причины недоступности сессий
+        healthy_count = len(healthy_sessions) if 'healthy_sessions' in locals() else 0
+        logger.warning("no_available_sessions",
+                      channel_id=channel_id,
+                      context=context,
+                      attempts=attempts,
+                      healthy_sessions_count=healthy_count,
+                      max_fallback_sessions=max_fallback_sessions,
+                      session_pool_size=len(session_pool) if 'session_pool' in locals() else 0)
+        return None
+    
+    async def _get_session_id(self, client: TelegramClient) -> str:
+        """
+        Получение идентификатора сессии Telegram для глобального circuit breaker.
+        
+        Context7: Использует telegram_id из авторизованной сессии или
+        дефолтный идентификатор если telegram_id недоступен.
+        """
+        try:
+            if client.is_connected() and await client.is_user_authorized():
+                me = await client.get_me()
+                if me and hasattr(me, 'id'):
+                    return str(me.id)
+        except Exception as e:
+            logger.debug("Failed to get session_id from client", error=str(e))
+        
+        # Fallback: используем дефолтный идентификатор
+        return "default"
+    
+    def _calculate_backoff(self, attempts: int) -> timedelta:
+        """
+        Вычисление экспоненциального backoff для повторных попыток резолва.
+        
+        Context7: Экспоненциальный backoff: 15min, 1h, 6h, 24h
+        
+        Args:
+            attempts: Количество неудачных попыток
+        
+        Returns:
+            timedelta для blocked_until
+        """
+        if attempts <= 1:
+            return timedelta(minutes=15)
+        elif attempts == 2:
+            return timedelta(hours=1)
+        elif attempts == 3:
+            return timedelta(hours=6)
+        else:
+            return timedelta(hours=24)
+    
+    async def _resolve_channel_entity(
+        self,
+        client: TelegramClient,
+        channel_id: str,
+        tg_channel_id_db: Optional[int],
+        username: Optional[str],
+        title: str,
+        context: str = 'operational'
+    ) -> Optional[tuple[Channel, int]]:
+        """
+        Единая стратегия резолва канала с детерминированным порядком и поддержкой пула сессий.
+        
+        Context7: Детерминированный порядок резолва:
+        1. tg_channel_id (если есть)
+        2. username (если есть и tg_channel_id не сработал/отсутствует)
+        3. hard-fail если нет идентификаторов
+        
+        После успешного резолва по username сохраняет tg_channel_id в БД.
+        При ошибке entity_not_found использует экспоненциальный backoff.
+        Поддерживает пул сессий с ограниченным fallback и защитой от каскадного FloodWait.
+        
+        Args:
+            client: TelegramClient для резолва (может быть заменен через пул сессий)
+            channel_id: UUID канала в БД
+            tg_channel_id_db: tg_channel_id из БД (может быть None)
+            username: username канала (может быть None)
+            title: название канала (для логирования)
+            context: 'operational' (парсинг) или 'repair' (скрипт валидации)
+        
+        Returns:
+            Tuple (entity, tg_channel_id) или None если резолв не удался
+        """
+        # Context7: Переменная для отслеживания account_id и необходимости освобождения семафора
+        account_id = None
+        semaphore_acquired = False
+        
+        try:
+            # Context7: Получаем preferred_ingest_account_id и preferred_account_id из БД
+            preferred_ingest_account_id_db = None
+            preferred_account_id_db = None
+            try:
+                result = await self.db_session.execute(
+                    text("""
+                        SELECT preferred_ingest_account_id, preferred_account_id 
+                        FROM channels 
+                        WHERE id = :channel_id
+                    """),
+                    {"channel_id": channel_id}
+                )
+                row = result.fetchone()
+                if row:
+                    preferred_ingest_account_id_db = row[0]  # UUID из ingest_accounts
+                    preferred_account_id_db = row[1]  # telegram_id (legacy)
+            except Exception as e:
+                logger.debug("Failed to get preferred account from DB", channel_id=channel_id, error=str(e))
+            
+            # Context7: Выбираем сессию из пула с ограниченным fallback
+            session_result = await self._select_session_for_channel(
+                channel_id=channel_id,
+                preferred_account_id=preferred_account_id_db,  # legacy для fallback
+                context=context,
+                max_fallback_sessions=2 if context == 'operational' else 1,
+                task_type='resolver'  # Резолв канала - это resolver задача
+            )
+            
+            # Context7: Если есть preferred_ingest_account_id, используем его для выбора из пула
+            if not session_result and preferred_ingest_account_id_db and self.ingest_account_pool:
+                # Пробуем использовать preferred_ingest_account_id напрямую
+                result = await self.ingest_account_pool.select_account_for_channel(
+                    channel_id=channel_id,
+                    task_type='resolver',
+                    preferred_account_id=preferred_ingest_account_id_db
+                )
+                if result:
+                    telegram_id, ingest_account_id = result
+                    client = await self.telegram_client_manager.get_client(telegram_id)
+                    if client:
+                        session_result = (client, telegram_id, ingest_account_id)
+            
+            if not session_result:
+                logger.warning("No available session for channel resolution",
+                             channel_id=channel_id,
+                             context=context)
+                return None
+            
+            # Используем выбранную сессию
+            # Новый формат: (client, telegram_id, ingest_account_id)
+            if len(session_result) == 3:
+                client, account_id, ingest_account_id = session_result
+            else:
+                # Fallback для старого формата
+                client, account_id = session_result
+                ingest_account_id = None
+            
+            semaphore_acquired = True  # Семафор уже получен в _select_session_for_channel
+            
+            # Context7: Сохраняем ingest_account_id для последующего освобождения inflight
+            
+            # Проверка глобального FloodWait для выбранной сессии
+            if self.floodwait_manager:
+                session_id = str(account_id)
+                global_wait = await self.floodwait_manager.check_global_floodwait(session_id)
+                if global_wait and global_wait > 0:
+                    logger.warning("Skipping resolution due to global FloodWait",
+                                 channel_id=channel_id,
+                                 account_id=account_id,
+                                 wait_seconds=global_wait)
+                    channels_skipped_due_to_global_floodwait_total.inc()
+                    return None
+            
+            entity = None
+            tg_channel_id = None
+            
+            # Context7: Получаем access_hash и preferred_account_id из БД
+            access_hash_db = None
+            try:
+                result = await self.db_session.execute(
+                    text("SELECT access_hash FROM channels WHERE id = :channel_id"),
+                    {"channel_id": channel_id}
+                )
+                row = result.fetchone()
+                if row:
+                    access_hash_db = row[0]
+            except Exception as e:
+                logger.debug("Failed to get access_hash from DB", channel_id=channel_id, error=str(e))
+            
+            # Стратегия 1: tg_channel_id с access_hash (приоритет)
+            if tg_channel_id_db is not None:
+                try:
+                    # Context7: Конвертируем peer_id из БД обратно в channel_id для использования
+                    # Формат в БД: -100{channel_id} (constraint требует < 0)
+                    # Формат для API: положительный channel_id
+                    tg_channel_id_db_int = int(tg_channel_id_db)
+                    input_peer = None
+                    
+                    # Context7: КРИТИЧНО - конвертируем peer_id в channel_id правильно
+                    # Формат в БД: -100{channel_id} (peer_id для каналов)
+                    # Формат для InputPeerChannel: положительный channel_id (entity.id)
+                    if tg_channel_id_db_int < 0:
+                        # Извлекаем channel_id из peer_id: -100{channel_id} → channel_id
+                        # Context7: Используем % 1000000000000 для извлечения "короткого" channel_id
+                        channel_id_for_input = abs(tg_channel_id_db_int) % 1000000000000
+                    else:
+                        # Старый формат (положительный) - используем как есть
+                        channel_id_for_input = tg_channel_id_db_int
+                    
+                    # Context7: ДИАГНОСТИКА - логируем параметры перед созданием InputPeerChannel
+                    logger.debug("Creating InputPeerChannel from DB",
+                               channel_id=channel_id,
+                               tg_channel_id_db=tg_channel_id_db_int,
+                               channel_id_for_input=channel_id_for_input,
+                               access_hash_db=access_hash_db,
+                               access_hash_is_negative=access_hash_db < 0 if access_hash_db is not None else None,
+                               access_hash_length=len(str(access_hash_db)) if access_hash_db else 0)
+                    
+                    # Context7: ВАЛИДАЦИЯ - проверяем, что channel_id_for_input не начинается с 100...
+                    # Если channel_id_for_input >= 1000000000000, это ошибка конвертации
+                    if channel_id_for_input >= 1000000000000:
+                        logger.error("Invalid channel_id_for_input (too large, likely conversion error)",
+                                   channel_id=channel_id,
+                                   tg_channel_id_db=tg_channel_id_db_int,
+                                   channel_id_for_input=channel_id_for_input)
+                        # Используем get_entity напрямую без InputPeerChannel
+                        entity = await client.get_entity(channel_id_for_input)
+                        self._current_input_peer = None
+                    elif access_hash_db is not None:
+                        # Context7: КРИТИЧНО - используем access_hash как signed int64 БЕЗ конвертации
+                        # Context7: Telethon ожидает signed int64, отрицательные значения - нормально
+                        # Context7: В PostgreSQL BIGINT signed, что идеально соответствует требованиям Telethon
+                        # НЕ конвертируем в unsigned - это вызывает struct.error: argument out of range
+                        
+                        # Context7: Валидация диапазона signed int64
+                        MIN_I64 = -(2**63)
+                        MAX_I64 = 2**63 - 1
+                        if access_hash_db < MIN_I64 or access_hash_db > MAX_I64:
+                            logger.error("access_hash out of signed int64 range, using get_entity fallback",
+                                       channel_id=channel_id,
+                                       access_hash=access_hash_db,
+                                       min_i64=MIN_I64,
+                                       max_i64=MAX_I64)
+                            # Используем get_entity напрямую без InputPeerChannel
+                            entity = await client.get_entity(channel_id_for_input)
+                            self._current_input_peer = None
+                        else:
+                            # Context7: Используем InputPeerChannel с access_hash как есть (signed int64)
+                            # Context7 best practice: валидируем InputPeerChannel через get_entity перед использованием
+                            from telethon.tl.types import InputPeerChannel
+                            # Context7: Создаем InputPeerChannel с положительным channel_id и signed access_hash
+                            input_peer = InputPeerChannel(channel_id_for_input, access_hash_db)
+                        
+                        # Context7: ВАЛИДАЦИЯ ПАРЫ - проверяем совместимость (channel_id, access_hash)
+                        try:
+                            # Context7: Валидируем InputPeerChannel через get_entity
+                            # Это гарантирует, что access_hash актуален и соответствует channel_id
+                            entity = await client.get_entity(input_peer)
+                            
+                            # Context7: КРИТИЧНО - проверяем, что entity.id совпадает с channel_id_for_input
+                            if hasattr(entity, 'id') and entity.id != channel_id_for_input:
+                                logger.error("InputPeerChannel validation failed: entity.id mismatch",
+                                           channel_id=channel_id,
+                                           channel_id_for_input=channel_id_for_input,
+                                           entity_id=entity.id,
+                                           error="entity.id != channel_id_for_input")
+                                # Пара несовместима - используем get_entity напрямую
+                                entity = await client.get_entity(channel_id_for_input)
+                                self._current_input_peer = None
+                            else:
+                                # Сохраняем input_peer только после успешной валидации
+                                self._current_input_peer = input_peer
+                                logger.debug("Validated InputPeerChannel from DB",
+                                           channel_id=channel_id,
+                                           input_channel_id=input_peer.channel_id,
+                                           entity_id=entity.id if hasattr(entity, 'id') else None,
+                                           has_access_hash=bool(input_peer.access_hash))
+                        except Exception as e:
+                            # Context7: КРИТИЧНО - если InputPeerChannel невалиден, пара (channel_id, access_hash) битая
+                            # Context7: НЕ используем get_entity(int) - это может вернуть не то из кэша
+                            # Context7: Вместо этого чистим access_hash и форсируем username-resolve
+                            logger.warning("InputPeerChannel from DB is invalid, clearing access_hash and forcing username-resolve",
+                                         channel_id=channel_id,
+                                         input_channel_id=channel_id_for_input,
+                                         error=str(e),
+                                         error_type=type(e).__name__)
+                            
+                            # Чистим access_hash в БД
+                            try:
+                                await self.db_session.execute(
+                                    text("""
+                                        UPDATE channels 
+                                        SET access_hash = NULL,
+                                            resolve_status = 'pending',
+                                            resolve_attempts = 0,
+                                            last_resolve_at = NOW(),
+                                            last_resolve_error = 'peer_hash_mismatch: ' || :error_type
+                                        WHERE id = :channel_id
+                                    """),
+                                    {"channel_id": channel_id, "error_type": type(e).__name__}
+                                )
+                                await self.db_session.commit()
+                            except Exception as db_error:
+                                logger.warning("Failed to clear access_hash", channel_id=channel_id, error=str(db_error))
+                            
+                            # Переходим к username-resolve (если username есть)
+                            # Если username нет - вернем None
+                            if username:
+                                logger.info("Forcing username-resolve after InputPeerChannel validation failed",
+                                          channel_id=channel_id,
+                                          username=username)
+                                # Продолжаем выполнение - username-resolve будет выполнен ниже
+                                entity = None  # Сбрасываем entity, чтобы username-resolve выполнился
+                            else:
+                                # Нет username - возвращаем None
+                                return None
+                    else:
+                        entity = await client.get_entity(channel_id_for_input)
+                        self._current_input_peer = None
+                    # Сохраняем оригинальный peer_id из БД для логирования
+                    tg_channel_id = tg_channel_id_db_int
+                    
+                    # Context7: Structured logging для успешного резолва
+                    logger.info("channel_resolve",
+                              event="channel_resolve",
+                              channel_id=channel_id,
+                              username=username,
+                              tg_channel_id=tg_channel_id,
+                              method="id",
+                              result="ok",
+                              error=None,
+                              blocked_until=None)
+                    
+                    # Метрика
+                    channel_resolve_attempts_total.labels(method="id", result="ok").inc()
+                    
+                    logger.debug("Resolved by tg_channel_id", channel_id=channel_id, tg_channel_id=tg_channel_id)
+                    
+                    # Context7: Успешный резолв - сбрасываем resolve_attempts и обновляем статус
+                    try:
+                        await self.db_session.execute(
+                            text("""
+                                UPDATE channels 
+                                SET resolve_attempts = 0,
+                                    resolve_status = 'ok',
+                                    last_resolve_at = NOW(),
+                                    last_resolve_error = NULL
+                                WHERE id = :channel_id
+                            """),
+                            {"channel_id": channel_id}
+                        )
+                        await self.db_session.commit()
+                    except Exception as reset_error:
+                        logger.warning("Failed to reset resolve_attempts", channel_id=channel_id, error=str(reset_error))
+                    
+                    # Context7: Сохраняем access_hash и preferred_account_id/preferred_ingest_account_id при успешном резолве
+                    if hasattr(entity, 'access_hash') and entity.access_hash:
+                        await self._save_access_hash_and_preferred_account(
+                            channel_id, entity.access_hash, account_id, ingest_account_id
+                        )
+                    
+                    # Context7: КРИТИЧНО - подписка опциональна, только для recovery
+                    # Используем аккаунты с role='resolver' или 'both' для подписки
+                    if ingest_account_id and self.ingest_account_pool:
+                        # Проверяем роль аккаунта
+                        account_info = await self.ingest_account_pool._get_account_by_id(ingest_account_id)
+                        if account_info and account_info.get('role') in ('resolver', 'both'):
+                            await self._ensure_collector_subscription(
+                                client, entity, channel_id, account_id
+                            )
+                    else:
+                        # Fallback: старая логика для обратной совместимости
+                        collector_id = int(os.getenv("COLLECTOR_TELEGRAM_ID", "8124731874"))
+                        if account_id == collector_id:
+                            await self._ensure_collector_subscription(
+                                client, entity, channel_id, account_id
+                            )
+                    
+                    # Освобождаем ресурсы после успешного резолва
+                    semaphore_acquired = False  # Освобождаем семафор
+                    if self.session_rate_limiter:
+                        await self.session_rate_limiter.release_session(account_id)
+                    # Освобождаем inflight в пуле
+                    if ingest_account_id and self.ingest_account_pool:
+                        await self.ingest_account_pool.mark_account_complete(ingest_account_id)
+                    
+                    return (entity, tg_channel_id)
+                except Exception as e:
+                    error_str = str(e).lower()
+                    is_entity_not_found = "could not find the input entity" in error_str
+                    
+                    if is_entity_not_found:
+                        # Context7: Записываем ошибку доступа в channel_access
+                        await self._mark_channel_access(
+                            channel_id=channel_id,
+                            account_id=account_id,
+                            access_level='not_found',
+                            error=str(e)[:500]
+                        )
+                        
+                        # Context7: tg_channel_id неверный - увеличиваем resolve_attempts и устанавливаем экспоненциальный backoff
+                        new_attempts = 0
+                        try:
+                            # Получаем текущее значение resolve_attempts
+                            result = await self.db_session.execute(
+                                text("SELECT resolve_attempts FROM channels WHERE id = :channel_id"),
+                                {"channel_id": channel_id}
+                            )
+                            row = result.fetchone()
+                            current_attempts = row.resolve_attempts if row else 0
+                            new_attempts = current_attempts + 1
+                            
+                            # Вычисляем backoff
+                            backoff = self._calculate_backoff(new_attempts)
+                            blocked_until = datetime.now(timezone.utc) + backoff
+                            
+                            # Обновляем resolve_attempts, resolve_status, last_resolve_at, last_resolve_error и blocked_until
+                            await self.db_session.execute(
+                                text("""
+                                    UPDATE channels 
+                                    SET resolve_attempts = :attempts,
+                                        resolve_status = 'not_found',
+                                        last_resolve_at = NOW(),
+                                        last_resolve_error = :error,
+                                        blocked_until = :blocked_until
+                                    WHERE id = :channel_id
+                                """),
+                                {
+                                    "attempts": new_attempts,
+                                    "error": str(e)[:500],  # Ограничиваем длину ошибки
+                                    "blocked_until": blocked_until,
+                                    "channel_id": channel_id
+                                }
+                            )
+                            await self.db_session.commit()
+                            
+                            # Context7: Structured logging
+                            logger.warning("channel_resolve",
+                                         event="channel_resolve",
+                                         channel_id=channel_id,
+                                         username=username,
+                                         tg_channel_id=tg_channel_id_db,
+                                         method="id",
+                                         result="not_found",
+                                         error=str(e)[:200],
+                                         blocked_until=blocked_until.isoformat(),
+                                         attempts=new_attempts,
+                                         backoff_hours=backoff.total_seconds() / 3600)
+                            
+                            # Метрика
+                            channel_resolve_attempts_total.labels(method="id", result="not_found").inc()
+                            
+                            logger.warning("tg_channel_id invalid, exponential backoff applied",
+                                         channel_id=channel_id,
+                                         tg_channel_id=tg_channel_id_db,
+                                         attempts=new_attempts,
+                                         backoff_hours=backoff.total_seconds() / 3600,
+                                         blocked_until=blocked_until.isoformat())
+                        except Exception as db_error:
+                            logger.error("Failed to update resolve_attempts", channel_id=channel_id, error=str(db_error))
+                            # При ошибке БД используем дефолтное значение
+                            new_attempts = 1
+                        
+                        # Пробуем username только если attempts < 3 (не слишком много попыток)
+                        if new_attempts < 3 and username:
+                            logger.info("Trying username fallback after tg_channel_id failed",
+                                      channel_id=channel_id, attempts=new_attempts)
+                            # Продолжаем к стратегии 2 (username)
+                        else:
+                            # Слишком много попыток или нет username - возвращаем None
+                            return None
+                    else:
+                        # Другие ошибки (Timeout, Connection) - можно попробовать username
+                        logger.warning("tg_channel_id failed with non-entity error, trying username",
+                                     channel_id=channel_id, error=str(e))
+                        # Продолжаем к стратегии 2 (username) - семафор НЕ освобождаем, он будет освобожден в finally
+            
+            # Стратегия 2: username (fallback)
+            if username:
+                try:
+                    clean_username = username.lstrip('@')
+                    entity = await client.get_entity(clean_username)
+                    
+                    # Context7: КРИТИЧНО - диагностика типа entity
+                    # Context7: Логируем тип entity для выявления случаев, когда username резолвится в User/Bot вместо Channel
+                    entity_type = type(entity).__name__
+                    entity_broadcast = getattr(entity, "broadcast", None)
+                    entity_megagroup = getattr(entity, "megagroup", None)
+                    entity_title = getattr(entity, "title", None) if hasattr(entity, "title") else None
+                    entity_id = getattr(entity, "id", None)
+                    entity_access_hash = getattr(entity, "access_hash", None)
+                    
+                    logger.debug("Entity resolved from username",
+                               channel_id=channel_id,
+                               username=clean_username,
+                               entity_type=entity_type,
+                               entity_id=entity_id,
+                               entity_broadcast=entity_broadcast,
+                               entity_megagroup=entity_megagroup,
+                               entity_title=entity_title,
+                               has_access_hash=entity_access_hash is not None)
+                    
+                    # Context7: КРИТИЧНО - жесткая валидация "это канал"
+                    # Context7: Если entity не Channel/ChannelForbidden, это не канал - не сохраняем и возвращаем None
+                    from telethon.tl.types import Channel, ChannelForbidden
+                    if not isinstance(entity, (Channel, ChannelForbidden)):
+                        logger.error("Entity resolved from username is not a Channel",
+                                   channel_id=channel_id,
+                                   username=clean_username,
+                                   entity_type=entity_type,
+                                   entity_id=entity_id)
+                        
+                        # Обновляем статус резолва
+                        try:
+                            await self.db_session.execute(
+                                text("""
+                                    UPDATE channels 
+                                    SET resolve_status = 'not_channel',
+                                        resolve_attempts = resolve_attempts + 1,
+                                        last_resolve_at = NOW(),
+                                        last_resolve_error = 'username_not_channel: entity is ' || :entity_type
+                                    WHERE id = :channel_id
+                                """),
+                                {"channel_id": channel_id, "entity_type": entity_type}
+                            )
+                            await self.db_session.commit()
+                        except Exception as db_error:
+                            logger.warning("Failed to update resolve_status", channel_id=channel_id, error=str(db_error))
+                        
+                        return None
+                    
+                    # Получаем tg_channel_id из entity
+                    # Context7: Конвертируем положительный channel_id в отрицательный peer_id для БД
+                    # Constraint требует tg_channel_id < 0, поэтому используем формат -100{channel_id}
+                    if hasattr(entity, 'id') and entity.id is not None:
+                        # Получаем положительный channel_id из entity
+                        channel_id_positive = entity.id
+                        # Конвертируем в peer_id для хранения в БД (constraint требует < 0)
+                        # Формат: -100{channel_id} для каналов
+                        if channel_id_positive > 0:
+                            tg_channel_id = -1000000000000 - channel_id_positive
+                        else:
+                            tg_channel_id = channel_id_positive
+                        
+                        # Сохраняем положительный channel_id для использования в InputPeerChannel
+                        channel_id_for_api = channel_id_positive
+                        
+                        # Context7: Сохраняем tg_channel_id в БД и обновляем статус
+                        try:
+                            await self.db_session.execute(
+                                text("""
+                                    UPDATE channels 
+                                    SET tg_channel_id = :tg_channel_id,
+                                        resolve_attempts = 0,
+                                        resolve_status = 'ok',
+                                        last_resolve_at = NOW(),
+                                        last_resolve_error = NULL
+                                    WHERE id = :channel_id
+                                """),
+                                {"tg_channel_id": tg_channel_id, "channel_id": channel_id}
+                            )
+                            await self.db_session.commit()
+                            
+                            # Context7: Если есть access_hash, создаем input_peer для будущего использования
+                            # Context7 best practice: используем entity.id напрямую (положительный channel_id)
+                            # InputPeerChannel требует положительный channel_id и валидный access_hash
+                            if hasattr(entity, 'access_hash') and entity.access_hash:
+                                from telethon.tl.types import InputPeerChannel
+                                # Context7: Используем entity.id напрямую (положительный channel_id)
+                                # Это гарантирует соответствие между entity и InputPeerChannel
+                                input_peer = InputPeerChannel(entity.id, entity.access_hash)
+                                self._current_input_peer = input_peer
+                                logger.debug("Created InputPeerChannel from entity",
+                                           channel_id=channel_id,
+                                           entity_id=entity.id,
+                                           input_channel_id=input_peer.channel_id,
+                                           has_access_hash=bool(input_peer.access_hash))
+                            else:
+                                self._current_input_peer = None
+                            
+                            # Context7: Structured logging
+                            logger.info("channel_resolve",
+                                      event="channel_resolve",
+                                      channel_id=channel_id,
+                                      username=username,
+                                      tg_channel_id=tg_channel_id,
+                                      method="username",
+                                      result="ok",
+                                      error=None,
+                                      blocked_until=None)
+                            
+                            # Метрика
+                            channel_resolve_attempts_total.labels(method="username", result="ok").inc()
+                            
+                            logger.info("Auto-saved tg_channel_id from username",
+                                       channel_id=channel_id, username=username, tg_channel_id=tg_channel_id)
+                        except Exception as save_error:
+                            # Context7: Обрабатываем constraint violation и другие ошибки
+                            error_str = str(save_error)
+                            if "CheckViolationError" in error_str or "check constraint" in error_str.lower():
+                                logger.warning("Constraint violation saving tg_channel_id, trying rollback and retry",
+                                             channel_id=channel_id,
+                                             tg_channel_id=tg_channel_id,
+                                             error=error_str)
+                                try:
+                                    await self.db_session.rollback()
+                                except Exception:
+                                    pass
+                            else:
+                                logger.warning("Failed to save tg_channel_id", channel_id=channel_id, error=error_str)
+                        
+                        # Context7: КРИТИЧНО - валидация entity перед сохранением
+                        # Context7: Проверяем, что это Channel и имеет access_hash
+                        from telethon.tl.types import Channel
+                        if not isinstance(entity, Channel):
+                            logger.error("Entity is not a Channel, cannot save access_hash",
+                                       channel_id=channel_id,
+                                       entity_type=type(entity).__name__)
+                        elif not hasattr(entity, 'access_hash') or entity.access_hash is None:
+                            logger.error("Channel entity has no access_hash",
+                                       channel_id=channel_id,
+                                       entity_id=entity.id if hasattr(entity, 'id') else None)
+                        else:
+                            # Context7: КРИТИЧНО - тест истины: проверяем доступ через iter_messages
+                            # Это гарантирует, что entity валиден и доступен для чтения
+                            try:
+                                # Тест: пытаемся получить хотя бы одно сообщение
+                                test_messages = await client.get_messages(entity, limit=1)
+                                logger.debug("Entity validation passed: can fetch messages",
+                                           channel_id=channel_id,
+                                           entity_id=entity.id,
+                                           messages_count=len(test_messages) if test_messages else 0)
+                            except Exception as test_error:
+                                logger.warning("Entity validation failed: cannot fetch messages",
+                                            channel_id=channel_id,
+                                            entity_id=entity.id,
+                                            error=str(test_error),
+                                            error_type=type(test_error).__name__)
+                                # Не сохраняем access_hash, если не можем получить сообщения
+                                # Это предотвращает сохранение невалидной пары (channel_id, access_hash)
+                                return None
+                            
+                            # Context7: Сохраняем access_hash и preferred_account_id/preferred_ingest_account_id при успешном резолве
+                            # Важно: делаем это в отдельной транзакции, чтобы не зависеть от ошибок сохранения tg_channel_id
+                            try:
+                                # Проверяем, что транзакция не в failed состоянии
+                                if self.db_session.in_transaction():
+                                    try:
+                                        await self.db_session.rollback()
+                                    except Exception:
+                                        pass
+                                
+                                await self._save_access_hash_and_preferred_account(
+                                    channel_id, entity.access_hash, account_id, ingest_account_id
+                                )
+                            except Exception as hash_error:
+                                logger.error("Failed to save access_hash after tg_channel_id save",
+                                           channel_id=channel_id,
+                                           error=str(hash_error))
+                        
+                        # Context7: КРИТИЧНО - подписка опциональна, только для recovery
+                        # Используем аккаунты с role='resolver' или 'both' для подписки
+                        if ingest_account_id and self.ingest_account_pool:
+                            # Проверяем роль аккаунта
+                            account_info = await self.ingest_account_pool._get_account_by_id(ingest_account_id)
+                            if account_info and account_info.get('role') in ('resolver', 'both'):
+                                await self._ensure_collector_subscription(
+                                    client, entity, channel_id, account_id
+                                )
+                        else:
+                            # Fallback: старая логика для обратной совместимости
+                            collector_id = int(os.getenv("COLLECTOR_TELEGRAM_ID", "8124731874"))
+                            if account_id == collector_id:
+                                await self._ensure_collector_subscription(
+                                    client, entity, channel_id, account_id
+                                )
+                        
+                        # Освобождаем ресурсы после успешного резолва
+                        semaphore_acquired = False  # Освобождаем семафор
+                        if self.session_rate_limiter:
+                            await self.session_rate_limiter.release_session(account_id)
+                        # Освобождаем inflight в пуле
+                        if ingest_account_id and self.ingest_account_pool:
+                            await self.ingest_account_pool.mark_account_complete(ingest_account_id)
+                        
+                        return (entity, tg_channel_id)
+                    else:
+                        raise ValueError("Entity has no valid ID")
+                        
+                except errors.FloodWaitError as e:
+                    # Context7: Политика переключения сессий с защитой от каскадного FloodWait
+                    # Обновляем blocked_until в пуле аккаунтов
+                    if 'ingest_account_id' in locals() and ingest_account_id and self.ingest_account_pool:
+                        from datetime import timedelta
+                        blocked_until = datetime.now(timezone.utc) + timedelta(seconds=e.seconds)
+                        error_code = f"FLOOD_WAIT_{e.seconds}"
+                        await self.ingest_account_pool.update_blocked_until(
+                            ingest_account_id, blocked_until, error_code
+                        )
+                    
+                    if self.floodwait_manager:
+                        should_abort = await self.floodwait_manager.should_abort_resolution(
+                            e.seconds, context
+                        )
+                        
+                        if should_abort:
+                            # Большой FloodWait - останавливаем весь проход резолва
+                            session_id = str(account_id)
+                            await self.floodwait_manager.set_global_floodwait(session_id, e.seconds)
+                            logger.error("Aborting resolution due to large FloodWait",
+                                       channel_id=channel_id,
+                                       account_id=account_id,
+                                       seconds=e.seconds,
+                                       context=context)
+                            resolution_aborted_total.labels(context=context, reason='large_floodwait').inc()
+                            semaphore_acquired = False  # Освобождаем семафор
+                            if self.session_rate_limiter:
+                                await self.session_rate_limiter.release_session(account_id)
+                            # Освобождаем inflight
+                            if 'ingest_account_id' in locals() and ingest_account_id and self.ingest_account_pool:
+                                await self.ingest_account_pool.mark_account_complete(ingest_account_id)
+                            raise  # Прерываем весь проход резолва
+                        
+                        # Малый FloodWait - устанавливаем для сессии
+                        session_id = str(account_id)
+                        await self.floodwait_manager.set_global_floodwait(session_id, e.seconds)
+                        logger.warning("FloodWait on session",
+                                     channel_id=channel_id,
+                                     account_id=account_id,
+                                     seconds=e.seconds,
+                                     context=context)
+                        # Записываем ошибку доступа в channel_access
+                        await self._mark_channel_access(
+                            channel_id=channel_id,
+                            account_id=account_id,
+                            access_level='no_access',
+                            error=f"FloodWait {e.seconds}s"
+                        )
+                        # Возвращаем None - не пробуем другую сессию (защита от каскадного FloodWait)
+                        return None
+                    
+                    # Малый FloodWait - обрабатываем локально
+                    blocked_until = datetime.now(timezone.utc) + timedelta(seconds=min(e.seconds, 3600))
+                    
+                    # Context7: Structured logging
+                    logger.warning("channel_resolve",
+                                 event="channel_resolve",
+                                 channel_id=channel_id,
+                                 username=username,
+                                 tg_channel_id=None,
+                                 method="username",
+                                 result="floodwait",
+                                 error=f"FloodWait {e.seconds}s",
+                                 blocked_until=blocked_until.isoformat())
+                    
+                    # Метрика
+                    channel_resolve_attempts_total.labels(method="username", result="floodwait").inc()
+                    
+                    logger.warning("FloodWait on username resolution",
+                                 channel_id=channel_id, username=username, seconds=e.seconds)
+                    # Устанавливаем blocked_until и обновляем статус
+                    try:
+                        await self.db_session.execute(
+                            text("""
+                                UPDATE channels 
+                                SET blocked_until = :blocked_until,
+                                    resolve_status = 'floodwait',
+                                    last_resolve_at = NOW(),
+                                    last_resolve_error = :error
+                                WHERE id = :channel_id
+                            """),
+                            {
+                                "blocked_until": blocked_until,
+                                "error": f"FloodWait {e.seconds}s",
+                                "channel_id": channel_id
+                            }
+                        )
+                        await self.db_session.commit()
+                    except Exception as db_error:
+                        logger.error("Failed to set blocked_until after FloodWait",
+                                   channel_id=channel_id, error=str(db_error))
+                    return None
+                    
+                except Exception as e:
+                    error_msg = str(e)[:200]
+                    
+                    # Context7: Structured logging
+                    logger.warning("channel_resolve",
+                                 event="channel_resolve",
+                                 channel_id=channel_id,
+                                 username=username,
+                                 tg_channel_id=None,
+                                 method="username",
+                                 result="invalid",
+                                 error=error_msg,
+                                 blocked_until=None)
+                    
+                    # Метрика
+                    channel_resolve_attempts_total.labels(method="username", result="invalid").inc()
+                    
+                    logger.warning("Failed to resolve by username",
+                                 channel_id=channel_id, username=username, error=error_msg)
+                    
+                    # Context7: Записываем ошибку доступа в channel_access
+                    await self._mark_channel_access(
+                        channel_id=channel_id,
+                        account_id=account_id,
+                        access_level='no_access',
+                        error=error_msg
+                    )
+                    
+                    # Обновляем статус
+                    try:
+                        await self.db_session.execute(
+                            text("""
+                                UPDATE channels 
+                                SET resolve_status = 'invalid_username',
+                                    last_resolve_at = NOW(),
+                                    last_resolve_error = :error
+                                WHERE id = :channel_id
+                            """),
+                            {
+                                "error": str(e)[:500],
+                                "channel_id": channel_id
+                            }
+                        )
+                        await self.db_session.commit()
+                    except Exception as db_error:
+                        logger.warning("Failed to update resolve_status", channel_id=channel_id, error=str(db_error))
+                    return None
+            
+            # Стратегия 3: hard-fail (нет идентификаторов)
+            # Context7: Structured logging
+            logger.warning("channel_resolve",
+                     event="channel_resolve",
+                     channel_id=channel_id,
+                     username=None,
+                     tg_channel_id=None,
+                     method="none",
+                     result="needs_id",
+                     error="No identifiers available",
+                     blocked_until=None)
+        
+            # Метрика
+            channel_resolve_attempts_total.labels(method="none", result="needs_id").inc()
+            
+            logger.warning("Channel has no identifiers for resolution",
+                         channel_id=channel_id, title=title)
+            
+            # Context7: Записываем ошибку доступа в channel_access
+            if account_id:
+                await self._mark_channel_access(
+                    channel_id=channel_id,
+                    account_id=account_id,
+                    access_level='no_access',
+                    error='No identifiers available'
+                )
+            
+            # Обновляем статус
+            try:
+                await self.db_session.execute(
+                    text("""
+                        UPDATE channels 
+                        SET resolve_status = 'needs_id',
+                            last_resolve_at = NOW(),
+                            last_resolve_error = 'No identifiers available'
+                        WHERE id = :channel_id
+                    """),
+                    {"channel_id": channel_id}
+                )
+                await self.db_session.commit()
+            except Exception as db_error:
+                logger.warning("Failed to update resolve_status", channel_id=channel_id, error=str(db_error))
+            return None
+        finally:
+            # Context7: Гарантируем освобождение семафора во всех случаях
+            if semaphore_acquired and self.session_rate_limiter and account_id:
+                try:
+                    await self.session_rate_limiter.release_session(account_id)
+                    logger.debug("Released semaphore in finally block",
+                               channel_id=channel_id,
+                               account_id=account_id)
+                except Exception as release_error:
+                    logger.warning("Failed to release semaphore in finally block",
+                                 channel_id=channel_id,
+                                 account_id=account_id,
+                                 error=str(release_error))
+            
+            # Context7: Гарантируем освобождение inflight в пуле
+            if 'ingest_account_id' in locals() and ingest_account_id and self.ingest_account_pool:
+                try:
+                    await self.ingest_account_pool.mark_account_complete(ingest_account_id)
+                    logger.debug("Released inflight in finally block",
+                               channel_id=channel_id,
+                               ingest_account_id=str(ingest_account_id))
+                except Exception as release_error:
+                    logger.warning("Failed to release inflight in finally block",
+                                 channel_id=channel_id,
+                                 ingest_account_id=str(ingest_account_id) if 'ingest_account_id' in locals() else None,
+                                 error=str(release_error))
+            
+            # Context7: Очищаем input_peer в finally блоке
+            # Это гарантирует, что input_peer не будет использоваться для другого канала
+            self._current_input_peer = None
+    
+    async def _mark_channel_access(
+        self,
+        channel_id: str,
+        account_id: int,
+        access_level: str,
+        error: Optional[str] = None
+    ):
+        """
+        Запись доступа сессии к каналу в channel_access для аналитики.
+        
+        Context7: Отслеживание истории успешных резолвов по сессиям для
+        автоматического выбора лучшей сессии и аналитики доступности каналов.
+        
+        Args:
+            channel_id: UUID канала в БД
+            account_id: telegram_id сессии
+            access_level: 'public_ok', 'member_ok', 'no_access', 'not_found'
+            error: Текст ошибки (если есть)
+        """
+        try:
+            if access_level in ('public_ok', 'member_ok'):
+                # Успешный доступ - обновляем last_ok_at и сбрасываем fail_count
+                await self.db_session.execute(
+                    text("""
+                        INSERT INTO channel_access (channel_id, account_id, access_level, last_ok_at, fail_count, last_error, updated_at)
+                        VALUES (:channel_id, :account_id, :access_level, NOW(), 0, NULL, NOW())
+                        ON CONFLICT (channel_id, account_id)
+                        DO UPDATE SET
+                            access_level = :access_level,
+                            last_ok_at = NOW(),
+                            fail_count = 0,
+                            last_error = NULL,
+                            updated_at = NOW()
+                    """),
+                    {
+                        "channel_id": channel_id,
+                        "account_id": account_id,
+                        "access_level": access_level
+                    }
+                )
+            else:
+                # Ошибка доступа - увеличиваем fail_count
+                await self.db_session.execute(
+                    text("""
+                        INSERT INTO channel_access (channel_id, account_id, access_level, fail_count, last_error, updated_at)
+                        VALUES (:channel_id, :account_id, :access_level, 1, :error, NOW())
+                        ON CONFLICT (channel_id, account_id)
+                        DO UPDATE SET
+                            access_level = :access_level,
+                            fail_count = channel_access.fail_count + 1,
+                            last_error = :error,
+                            updated_at = NOW()
+                    """),
+                    {
+                        "channel_id": channel_id,
+                        "account_id": account_id,
+                        "access_level": access_level,
+                        "error": error[:500] if error else None  # Ограничиваем длину ошибки
+                    }
+                )
+            
+            await self.db_session.commit()
+            
+            logger.debug("Marked channel access",
+                        channel_id=channel_id,
+                        account_id=account_id,
+                        access_level=access_level)
+        except Exception as e:
+            logger.warning("Failed to mark channel access",
+                          channel_id=channel_id,
+                          account_id=account_id,
+                          access_level=access_level,
+                          error=str(e))
+            await self.db_session.rollback()
+    
+    async def _save_access_hash_and_preferred_account(
+        self,
+        channel_id: str,
+        access_hash: int,
+        account_id: int,
+        ingest_account_id: Optional[Any] = None
+    ):
+        """
+        Сохранение access_hash и preferred_account_id/preferred_ingest_account_id в channels и TelegramEntity.
+        
+        Context7: Синхронизация access_hash в оба места для быстрого доступа
+        и нормализованного хранения метаданных. Сохраняет preferred_ingest_account_id (FK) и
+        preferred_account_id (legacy) для обратной совместимости.
+        
+        Args:
+            channel_id: UUID канала в БД
+            access_hash: access_hash из entity
+            account_id: telegram_id сессии, которая успешно резолвит канал
+            ingest_account_id: UUID аккаунта из ingest_accounts (если используется пул)
+        """
+        try:
+            # Сохраняем в channels
+            # Context7: Dual-write для обратной совместимости
+            update_data = {
+                "access_hash": access_hash,
+                "account_id": account_id,
+                "channel_id": channel_id
+            }
+            
+            if ingest_account_id:
+                # Сохраняем preferred_ingest_account_id (FK)
+                update_query = text("""
+                    UPDATE channels 
+                    SET access_hash = :access_hash,
+                        preferred_account_id = :account_id,
+                        preferred_ingest_account_id = :ingest_account_id
+                    WHERE id = :channel_id
+                """)
+                update_data["ingest_account_id"] = ingest_account_id
+            else:
+                # Только legacy preferred_account_id
+                update_query = text("""
+                    UPDATE channels 
+                    SET access_hash = :access_hash,
+                        preferred_account_id = :account_id
+                    WHERE id = :channel_id
+                """)
+            
+            await self.db_session.execute(update_query, update_data)
+            
+            # Context7: Синхронизация с TelegramEntity (если есть tg_channel_id)
+            result = await self.db_session.execute(
+                text("SELECT tg_channel_id FROM channels WHERE id = :channel_id"),
+                {"channel_id": channel_id}
+            )
+            row = result.fetchone()
+            if row and row[0]:
+                tg_channel_id = row[0]
+                # UPSERT в TelegramEntity
+                # Context7: tg_entities использует peer_id и peer_type, не telegram_id и entity_type
+                # Конвертируем peer_id из БД в положительный channel_id для tg_entities
+                peer_id_for_entity = abs(int(tg_channel_id)) % 1000000000000 if tg_channel_id < 0 else abs(int(tg_channel_id))
+                await self.db_session.execute(
+                    text("""
+                        INSERT INTO tg_entities (id, peer_id, peer_type, access_hash, updated_at, is_channel)
+                        VALUES (gen_random_uuid(), :peer_id, 'channel', :access_hash, NOW(), true)
+                        ON CONFLICT (peer_id, peer_type) 
+                        DO UPDATE SET access_hash = :access_hash, updated_at = NOW()
+                    """),
+                    {
+                        "peer_id": peer_id_for_entity,  # TelegramEntity хранит положительный channel_id
+                        "access_hash": access_hash
+                    }
+                )
+            
+            # Context7: Записываем успешный доступ в channel_access
+            await self._mark_channel_access(
+                channel_id=channel_id,
+                account_id=account_id,
+                access_level='public_ok'  # Успешный резолв означает доступ
+            )
+            
+            await self.db_session.commit()
+            
+            logger.info("Saved access_hash and preferred_account_id",
+                       channel_id=channel_id,
+                       account_id=account_id,
+                       access_hash=access_hash)
+        except Exception as e:
+            logger.error("Failed to save access_hash and preferred_account_id",
+                        channel_id=channel_id,
+                        account_id=account_id,
+                        error=str(e))
+            await self.db_session.rollback()
+    
+    async def _ensure_collector_subscription(
+        self,
+        client: TelegramClient,
+        entity: Channel,
+        channel_id: str,
+        account_id: int
+    ) -> bool:
+        """
+        Обеспечивает опциональную подписку сервисного аккаунта на канал (только для recovery).
+        
+        Context7: Подписка опциональна, не обязательна для чтения публичных каналов.
+        Используется только как recovery механизм для конкретных кейсов.
+        Использует аккаунты с role='resolver' или 'both' из пула.
+        
+        Args:
+            client: TelegramClient для сессии
+            entity: Резолвленный entity канала
+            channel_id: UUID канала в БД
+            account_id: telegram_id сессии
+        
+        Returns:
+            True если подписка успешна или не требуется, False если ошибка
+        """
+        # Context7: Проверяем роль аккаунта через пул
+        if self.ingest_account_pool:
+            account_info = await self.ingest_account_pool.get_account_by_telegram_id(account_id)
+            if not account_info or account_info.get('role') not in ('resolver', 'both'):
+                # Аккаунт не предназначен для подписки
+                return True
+        else:
+            # Fallback: старая логика для обратной совместимости
+            collector_id = int(os.getenv("COLLECTOR_TELEGRAM_ID", "8124731874"))
+            if account_id != collector_id:
+                return True  # Не collector - подписка не требуется
+        
+        # Проверяем статус подписки в БД
+        try:
+            result = await self.db_session.execute(
+                text("""
+                    SELECT collector_subscription_status, collector_subscribed_at
+                    FROM channels
+                    WHERE id = :channel_id
+                """),
+                {"channel_id": channel_id}
+            )
+            row = result.fetchone()
+            
+            if row and row[0] == 'subscribed':
+                return True  # Уже подписан
+            
+            if row and row[0] == 'private':
+                return False  # Частный канал, подписка невозможна
+        except Exception as e:
+            logger.warning("Failed to check subscription status",
+                          channel_id=channel_id,
+                          error=str(e))
+        
+        # Пытаемся подписаться
+        try:
+            from telethon.tl.functions.channels import JoinChannelRequest
+            
+            # Context7: Rate limiting для подписок (больше джиттер, чем для резолва)
+            if self.session_rate_limiter:
+                await self.session_rate_limiter.wait_for_token(account_id, min_delay=5.0, max_delay=10.0)
+            
+            await client(JoinChannelRequest(entity))
+            
+            # Метрика успешной подписки
+            collector_subscriptions_total.labels(status='subscribed').inc()
+            collector_subscription_attempts_total.inc()
+            
+            # Обновляем статус в БД
+            await self.db_session.execute(
+                text("""
+                    UPDATE channels
+                    SET collector_subscription_status = 'subscribed',
+                        collector_subscribed_at = NOW()
+                    WHERE id = :channel_id
+                """),
+                {"channel_id": channel_id}
+            )
+            await self.db_session.commit()
+            
+            logger.info("Collector subscribed to channel",
+                       channel_id=channel_id,
+                       account_id=account_id)
+            return True
+            
+        except errors.UserAlreadyParticipantError:
+            # Уже подписан (возможно, подписался вручную)
+            await self.db_session.execute(
+                text("""
+                    UPDATE channels
+                    SET collector_subscription_status = 'subscribed',
+                        collector_subscribed_at = NOW()
+                    WHERE id = :channel_id
+                """),
+                {"channel_id": channel_id}
+            )
+            await self.db_session.commit()
+            return True
+            
+        except errors.ChannelPrivateError:
+            # Частный канал - нужен инвайт
+            collector_subscriptions_total.labels(status='private').inc()
+            collector_subscription_attempts_total.inc()
+            
+            await self.db_session.execute(
+                text("""
+                    UPDATE channels
+                    SET collector_subscription_status = 'private'
+                    WHERE id = :channel_id
+                """),
+                {"channel_id": channel_id}
+            )
+            await self.db_session.commit()
+            logger.warning("Channel is private, cannot subscribe",
+                          channel_id=channel_id)
+            return False
+            
+        except errors.FloodWaitError as e:
+            # FloodWait на подписку - отложить
+            # Context7: Обновляем blocked_until в пуле аккаунтов
+            if self.ingest_account_pool:
+                # Получаем ingest_account_id по telegram_id
+                account_info = await self.ingest_account_pool.get_account_by_telegram_id(account_id)
+                if account_info:
+                    from datetime import timedelta
+                    blocked_until = datetime.now(timezone.utc) + timedelta(seconds=e.seconds)
+                    error_code = f"FLOOD_WAIT_JOIN_{e.seconds}"
+                    await self.ingest_account_pool.update_blocked_until(
+                        account_info['id'], blocked_until, error_code
+                    )
+            
+            if self.floodwait_manager:
+                await self.floodwait_manager.handle_floodwait(
+                    e, str(account_id), "JoinChannel"
+                )
+            logger.warning("FloodWait on subscription, will retry later",
+                         channel_id=channel_id,
+                         seconds=e.seconds)
+            return False
+            
+        except Exception as e:
+            # Другая ошибка
+            collector_subscriptions_total.labels(status='failed').inc()
+            collector_subscription_attempts_total.inc()
+            
+            await self.db_session.execute(
+                text("""
+                    UPDATE channels
+                    SET collector_subscription_status = 'failed'
+                    WHERE id = :channel_id
+                """),
+                {"channel_id": channel_id}
+            )
+            await self.db_session.commit()
+            logger.error("Failed to subscribe collector to channel",
+                        channel_id=channel_id,
+                        error=str(e))
+            return False
+    
     async def _get_channel_entity(
         self, 
         client: TelegramClient, 
@@ -819,141 +2322,90 @@ class ChannelParser:
             username = channel_info.username
             title = channel_info.title
             
-            # Context7 best practice: Получаем entity по username или tg_channel_id
-            entity = None
-            tg_channel_id = None
+            # Context7: Используем единый метод резолва с детерминированным порядком
+            result = await self._resolve_channel_entity(
+                client=client,
+                channel_id=channel_id,
+                tg_channel_id_db=tg_channel_id_db,
+                username=username,
+                title=title,
+                context='operational'  # Context7: operational парсинг
+            )
             
-            if username:
-                # Context7: Нормализация username - убираем @ из начала для корректного поиска
-                clean_username = username.lstrip('@')
-                # Приоритет: username (более надёжный способ)
-                try:
-                    entity = await client.get_entity(clean_username)
-                    # Context7: Для каналов (Channel) ID всегда отрицательный при сохранении в БД
-                    # entity.id может быть положительным для приватных каналов, используем utils.get_peer_id
-                    from telethon import utils
-                    from telethon.tl.types import PeerChannel
-                    if hasattr(entity, 'id') and entity.id is not None:
-                        # Для каналов создаём PeerChannel и получаем правильный ID
-                        if hasattr(entity, 'broadcast') or hasattr(entity, 'megagroup'):
-                            tg_channel_id = utils.get_peer_id(PeerChannel(entity.id))
-                        else:
-                            tg_channel_id = entity.id
-                    else:
-                        logger.error("Entity has no valid ID", 
-                                   channel_id=channel_id, username=username)
-                        raise ValueError("Entity has no valid ID")
-                except errors.FloodWaitError as e:
-                    # Context7: Специальная обработка FloodWait при ResolveUsernameRequest
-                    wait_seconds = min(e.seconds, 300)  # Cap at 5 minutes для безопасности
-                    
-                    logger.warning(
-                        "FloodWait when getting entity by username",
-                        channel_id=channel_id,
-                        username=username,
-                        wait_seconds=wait_seconds,
-                        error_seconds=e.seconds
-                    )
-                    
-                    # Context7: Устанавливаем cooldown для канала
-                    # КРИТИЧНО: set_channel_cooldown ожидает tg_channel_id (int), а не channel_id (UUID)
-                    if self.redis_client and tg_channel_id_db is not None:
-                        try:
-                            from .telethon_retry import set_channel_cooldown
-                            tg_channel_id_int = int(tg_channel_id_db)
-                            await set_channel_cooldown(self.redis_client, tg_channel_id_int, wait_seconds)
-                            logger.info("Channel moved to cooldown due to FloodWait",
-                                      channel_id=channel_id,
-                                      tg_channel_id=tg_channel_id_int,
-                                      cooldown_seconds=wait_seconds)
-                        except Exception as cooldown_error:
-                            logger.warning("Failed to set channel cooldown",
-                                         channel_id=channel_id,
-                                         tg_channel_id_db=tg_channel_id_db,
-                                         error=str(cooldown_error))
-                    elif not tg_channel_id_db:
-                        logger.warning("Cannot set cooldown - no tg_channel_id available",
-                                     channel_id=channel_id)
-                    
-                    # Context7: Пытаемся использовать tg_channel_id как fallback
-                    if tg_channel_id_db is not None:
-                        try:
-                            entity = await client.get_entity(int(tg_channel_id_db))
-                            tg_channel_id = int(tg_channel_id_db)
-                            logger.info("Successfully got entity by tg_channel_id after FloodWait",
-                                       channel_id=channel_id)
-                        except Exception as e2:
-                            logger.error("Failed to get entity by tg_channel_id after FloodWait",
-                                        channel_id=channel_id,
-                                        tg_channel_id=tg_channel_id_db,
-                                        error=str(e2))
-                            return None
-                    else:
-                        logger.warning("No tg_channel_id available after FloodWait, skipping channel",
-                                      channel_id=channel_id)
-                        return None
-                except Exception as e:
-                    logger.warning("Failed to get entity by username, trying tg_channel_id", 
-                                 channel_id=channel_id, username=username, error=str(e))
-                    # Context7: Безопасная проверка tg_channel_id_db на None
-                    if tg_channel_id_db is not None:
-                        try:
-                            entity = await client.get_entity(int(tg_channel_id_db))
-                            tg_channel_id = int(tg_channel_id_db)
-                        except Exception as e2:
-                            logger.error("Failed to get entity by tg_channel_id", 
-                                       channel_id=channel_id, tg_channel_id=tg_channel_id_db, error=str(e2))
-                            return None
-                    else:
-                        # Context7: Для каналов без username и tg_channel_id логируем предупреждение
-                        logger.warning(
-                            "Channel has no username and no tg_channel_id, cannot resolve entity",
-                            channel_id=channel_id,
-                            title=title,
-                            username=username
-                        )
-                        # Context7: Метрика для отслеживания каналов без tg_channel_id
-                        channel_not_found_total.labels(exists_in_db='true').inc()
-                        return None
-            elif tg_channel_id_db is not None:
-                # Fallback: используем tg_channel_id если username отсутствует
-                try:
-                    entity = await client.get_entity(int(tg_channel_id_db))
-                    tg_channel_id = int(tg_channel_id_db)
-                except Exception as e:
-                    logger.error("Failed to get entity by tg_channel_id", 
-                               channel_id=channel_id, tg_channel_id=tg_channel_id_db, error=str(e))
-                    return None
-            else:
-                # Context7: Для каналов без username и tg_channel_id логируем предупреждение
-                # Это может произойти для каналов, которые были созданы без полной информации
-                logger.warning(
-                    "Channel has neither username nor tg_channel_id, cannot resolve entity",
-                    channel_id=channel_id,
-                    title=title
-                )
-                # Context7: Метрика для отслеживания каналов без tg_channel_id
-                channel_not_found_total.labels(exists_in_db='true').inc()
+            if result is None:
                 return None
             
-            # Context7 best practice: Автоматическое заполнение tg_channel_id в БД, если отсутствует
-            if entity and not tg_channel_id_db and tg_channel_id:
+            entity, tg_channel_id = result
+            
+            # Context7: КРИТИЧНО - сохраняем _current_input_peer перед использованием
+            # _resolve_channel_entity устанавливает _current_input_peer, но он очищается в finally блоке
+            # Context7 best practice: используем get_input_entity для получения InputPeerChannel если access_hash есть
+            # Сохраняем input_peer для использования в _get_message_batches
+            saved_input_peer = self._current_input_peer
+            
+            # Context7: Fallback - если _current_input_peer не установлен, но есть access_hash в БД,
+            # создаем InputPeerChannel напрямую из данных БД
+            if not saved_input_peer:
                 try:
-                    # Context7: Проверяем и откатываем активную транзакцию перед началом новой
-                    if self.db_session.in_transaction():
-                        await self.db_session.rollback()
-                    
-                    # Context7: Используем транзакцию через async with для безопасной обработки ошибок
-                    async with self.db_session.begin():
-                        await self.db_session.execute(
-                            text("UPDATE channels SET tg_channel_id = :tg_id WHERE id = :channel_id"),
-                            {"tg_id": tg_channel_id, "channel_id": channel_id}
-                        )
-                    logger.info("Auto-populated tg_channel_id", 
-                              channel_id=channel_id, 
-                              username=username,
-                              tg_channel_id=tg_channel_id)
+                    # Получаем access_hash из БД
+                    result = await self.db_session.execute(
+                        text("SELECT access_hash, tg_channel_id FROM channels WHERE id = :channel_id"),
+                        {"channel_id": channel_id}
+                    )
+                    row = result.fetchone()
+                    if row and row[0]:  # access_hash есть
+                        access_hash_db = row[0]
+                        tg_channel_id_db = row[1]
+                        
+                        # Конвертируем peer_id в channel_id
+                        if tg_channel_id_db and tg_channel_id_db < 0:
+                            channel_id_for_input = abs(tg_channel_id_db) % 1000000000000
+                        else:
+                            channel_id_for_input = tg_channel_id_db if tg_channel_id_db else entity.id
+                        
+                        # Context7 best practice: используем get_input_entity для валидации вместо создания вручную
+                        # Это гарантирует актуальность access_hash и правильность channel_id
+                        # Context7: НЕ используем telegram_client здесь, так как он недоступен в этом контексте
+                        # Вместо этого создаем InputPeerChannel напрямую - он будет валидирован позже через get_input_entity
+                        try:
+                            from telethon.tl.types import InputPeerChannel
+                            # Создаем InputPeerChannel из данных БД
+                            # Валидация произойдет позже при использовании через get_input_entity в _get_message_batches
+                            saved_input_peer = InputPeerChannel(channel_id_for_input, access_hash_db)
+                            logger.debug("Created InputPeerChannel from DB (will be validated later)",
+                                       channel_id=channel_id,
+                                       input_channel_id=saved_input_peer.channel_id,
+                                       has_access_hash=bool(saved_input_peer.access_hash))
+                        except Exception as e:
+                            # Context7: Если создание не удалось, не используем InputPeerChannel
+                            saved_input_peer = None
+                            logger.warning("Failed to create InputPeerChannel from DB",
+                                         channel_id=channel_id,
+                                         error=str(e))
                 except Exception as e:
+                    logger.warning("Failed to create InputPeerChannel from DB",
+                                 channel_id=channel_id,
+                                 error=str(e))
+            
+            # Context7: Успешно получили entity - продолжаем обработку
+            # Примечание: _resolve_channel_entity уже сохраняет tg_channel_id в БД при резолве по username,
+            # поэтому дополнительное сохранение здесь не требуется
+            try:
+                # Context7: Проверяем и откатываем активную транзакцию перед началом новой
+                if self.db_session.in_transaction():
+                    await self.db_session.rollback()
+                
+                # Context7: Используем транзакцию через async with для безопасной обработки ошибок
+                async with self.db_session.begin():
+                    await self.db_session.execute(
+                        text("UPDATE channels SET tg_channel_id = :tg_id WHERE id = :channel_id"),
+                        {"tg_id": tg_channel_id, "channel_id": channel_id}
+                    )
+                logger.info("Auto-populated tg_channel_id", 
+                          channel_id=channel_id, 
+                          username=username,
+                          tg_channel_id=tg_channel_id)
+            except Exception as e:
                     # Context7: Обрабатываем разные типы ошибок gracefully
                     error_str = str(e)
                     if "UniqueViolationError" in error_str or "duplicate key" in error_str.lower():
@@ -1511,7 +2963,8 @@ class ChannelParser:
         client: TelegramClient,
         channel_entity: Channel,
         since_date: datetime,
-        mode: str = "historical"
+        mode: str = "historical",
+        channel_id: Optional[str] = None  # Context7: UUID канала в БД для получения last_message_id
     ):
         """Генератор батчей с временной фильтрацией."""
         batch_size = self.config.max_messages_per_batch
@@ -1525,6 +2978,9 @@ class ChannelParser:
             # - incremental: последние сообщения между last_parsed_at и now
             # - historical: последние 24 часа (для новых каналов)
             # Базовый лимит будет установлен ниже в зависимости от режима
+            # Context7: Оптимизированный лимит для предотвращения таймаутов
+            # Используем разумный лимит, но проверяем больше сообщений через max_check_before_stop
+            # Telegram API может медленно работать с большими лимитами (>10000)
             limit = batch_size * 100 if mode == "incremental" else batch_size * 200
             
             # Context7: КРИТИЧНО - offset_date в Telethon возвращает сообщения ПРЕДШЕСТВУЮЩИЕ дате, а не ПОСЛЕ!
@@ -1534,9 +2990,32 @@ class ChannelParser:
             # - incremental: нужны сообщения НОВЕЕ since_date (последние сообщения)
             # - historical: нужны сообщения НОВЕЕ since_date (последние 24 часа для новых каналов)
             # 
-            # Используем подход: получаем последние сообщения БЕЗ offset_date, затем фильтруем локально
-            # Это гарантирует, что мы получим ВСЕ новые сообщения независимо от режима
+            # Context7: КРИТИЧНО - offset_id в Telethon возвращает сообщения СТАРШЕ указанного ID, а не новее!
+            # Источник: "offset_id: Start getting messages with an identifier lower than this one. Only messages older than the message with id = offset_id will be fetched."
+            # Поэтому НЕ используем offset_id для получения новых сообщений!
+            # Вместо этого получаем последние N сообщений и фильтруем по message.id > last_message_id
             offset_date_param = None
+            offset_id_param = None
+            last_message_id = None
+            
+            if mode == "incremental" and channel_id:
+                # Получаем последний telegram_message_id из БД для фильтрации сообщений
+                # Context7: channel_id - это UUID канала в БД, переданный из parse_channel
+                try:
+                    result = await self.db_session.execute(
+                        text("SELECT MAX(telegram_message_id) FROM posts WHERE channel_id = :channel_id"),
+                        {"channel_id": channel_id}
+                    )
+                    last_message_id = result.scalar()
+                    if last_message_id:
+                        logger.debug("Got last_message_id for filtering",
+                                   channel_id=channel_id,
+                                   last_message_id=last_message_id,
+                                   since_date=since_date.isoformat())
+                except Exception as e:
+                    logger.warning("Failed to get last_message_id for filtering",
+                                 channel_id=channel_id,
+                                 error=str(e))
             
             # Context7: Для historical режима увеличиваем лимит, чтобы гарантированно захватить все сообщения за последние 24 часа
             if mode == "historical":
@@ -1549,12 +3028,97 @@ class ChannelParser:
                         since_date=since_date.isoformat(),
                         offset_date=offset_date_param.isoformat() if offset_date_param else None)
             
+            # Context7: Используем InputPeerChannel напрямую для чтения сообщений, если он есть
+            # Context7 best practice: предпочитаем InputPeerChannel для снижения количества запросов
+            # Если InputPeerChannel недоступен, используем get_input_entity как fallback
+            channel_for_fetch = None
+            
+            if self._current_input_peer:
+                from telethon.tl.types import InputPeerChannel
+                if isinstance(self._current_input_peer, InputPeerChannel):
+                    # Context7: ДИАГНОСТИКА - логируем параметры InputPeerChannel перед использованием
+                    logger.debug("Validating InputPeerChannel before iter_messages",
+                               channel_id=channel_entity.id,
+                               input_channel_id=self._current_input_peer.channel_id,
+                               has_access_hash=bool(self._current_input_peer.access_hash),
+                               access_hash_value=self._current_input_peer.access_hash)
+                    
+                    # Context7: ВАЛИДАЦИЯ - проверяем, что channel_id не начинается с 100...
+                    if self._current_input_peer.channel_id >= 1000000000000:
+                        logger.error("Invalid InputPeerChannel.channel_id (too large, likely conversion error)",
+                                   channel_id=channel_entity.id,
+                                   input_channel_id=self._current_input_peer.channel_id)
+                        channel_for_fetch = None
+                    else:
+                        # Context7: ВАЛИДАЦИЯ ПАРЫ - проверяем совместимость через get_entity
+                        try:
+                            validated_entity = await client.get_entity(self._current_input_peer)
+                            # Context7: КРИТИЧНО - проверяем, что entity.id совпадает с input_channel_id
+                            if hasattr(validated_entity, 'id') and validated_entity.id != self._current_input_peer.channel_id:
+                                logger.error("InputPeerChannel validation failed: entity.id mismatch",
+                                           channel_id=channel_entity.id,
+                                           input_channel_id=self._current_input_peer.channel_id,
+                                           entity_id=validated_entity.id)
+                                channel_for_fetch = None
+                            else:
+                                channel_for_fetch = self._current_input_peer
+                                logger.debug("InputPeerChannel validated successfully",
+                                           channel_id=channel_entity.id,
+                                           input_channel_id=self._current_input_peer.channel_id,
+                                           entity_id=validated_entity.id if hasattr(validated_entity, 'id') else None)
+                        except Exception as e:
+                            logger.warning("InputPeerChannel validation failed, will use get_input_entity",
+                                         channel_id=channel_entity.id,
+                                         input_channel_id=self._current_input_peer.channel_id,
+                                         error=str(e),
+                                         error_type=type(e).__name__)
+                            channel_for_fetch = None
+                else:
+                    logger.warning("_current_input_peer is not InputPeerChannel, using get_input_entity",
+                                 channel_id=channel_entity.id,
+                                 input_type=type(self._current_input_peer).__name__)
+                    channel_for_fetch = None
+            
+            # Context7: Fallback - используем get_input_entity для получения актуального InputPeerChannel
+            # Context7 best practice: get_input_entity использует кеш и возвращает InputPeerChannel
+            if not channel_for_fetch:
+                try:
+                    input_entity = await client.get_input_entity(channel_entity)
+                    if isinstance(input_entity, InputPeerChannel):
+                        channel_for_fetch = input_entity
+                        # Сохраняем для будущего использования
+                        self._current_input_peer = input_entity
+                        logger.debug("Using InputPeerChannel from get_input_entity",
+                                   channel_id=channel_entity.id,
+                                   input_channel_id=input_entity.channel_id,
+                                   has_access_hash=bool(input_entity.access_hash))
+                    else:
+                        # Если get_input_entity не вернул InputPeerChannel, используем entity напрямую
+                        channel_for_fetch = channel_entity
+                        logger.debug("Using Channel entity (get_input_entity returned non-InputPeerChannel)",
+                                   channel_id=channel_entity.id,
+                                   input_type=type(input_entity).__name__)
+                except Exception as e:
+                    # В случае ошибки используем entity напрямую
+                    channel_for_fetch = channel_entity
+                    logger.warning("Failed to get input_entity, using Channel entity",
+                                 channel_id=channel_entity.id,
+                                 error=str(e))
+            
+            # Финальный fallback - если channel_for_fetch все еще None
+            if not channel_for_fetch:
+                channel_for_fetch = channel_entity
+                logger.debug("Using Channel entity as final fallback",
+                           channel_id=channel_entity.id,
+                           entity_id=channel_entity.id if hasattr(channel_entity, 'id') else None)
+            
             messages = await fetch_messages_with_retry(
                 client,
-                channel_entity,
+                channel_for_fetch,
                 limit=limit,
                 redis_client=self.redis_client,
                 offset_date=offset_date_param,  # Всегда None для обоих режимов (получаем последние сообщения)
+                offset_id=None,  # Context7: НЕ используем offset_id - он возвращает старые сообщения!
                 reverse=False  # Context7 P1.3: По умолчанию без reverse (для incremental/historical)
             )
             
@@ -1597,7 +3161,9 @@ class ChannelParser:
             messages_filtered = 0
             found_newer_messages = False  # Context7: Флаг для отслеживания наличия новых сообщений
             messages_checked = 0  # Context7: Счетчик проверенных сообщений для диагностики
-            max_check_before_stop = 20  # Context7: Максимальное количество сообщений для проверки перед остановкой в incremental режиме
+            # Context7: УВЕЛИЧЕНО с 20 до 200 для предотвращения пропуска новых постов
+            # Telegram API может вернуть новые сообщения не сразу или не в начале списка
+            max_check_before_stop = 200  # Context7: Максимальное количество сообщений для проверки перед остановкой в incremental режиме
             
             for message in messages:
                 # Context7: КРИТИЧНО - нормализуем message.date к UTC для корректного сравнения
@@ -1633,8 +3199,13 @@ class ChannelParser:
                     # Context7: КРИТИЧНО - для incremental режима проверяем, есть ли сообщения новее since_date
                     # Улучшенная логика: проверяем несколько сообщений перед остановкой, чтобы не пропустить новые
                     # если они не в начале списка (например, из-за задержек в Telegram API)
-                    if message_date_utc > since_date:
-                        found_newer_messages = True
+                    # Дополнительно фильтруем по message.id > last_message_id для гарантии получения новых постов
+                    is_newer_by_date = message_date_utc > since_date
+                    is_newer_by_id = last_message_id is None or (hasattr(message, 'id') and message.id > last_message_id)
+                    
+                    if is_newer_by_date or is_newer_by_id:
+                        if is_newer_by_date:
+                            found_newer_messages = True
                         # Включаем сообщение в batch
                         batch.append(message)
                         messages_yielded += 1
@@ -1652,10 +3223,25 @@ class ChannelParser:
                                    messages_filtered=messages_filtered)
                         break
                     else:
-                        # Первое сообщение уже старше since_date
+                        # Сообщение старше since_date, но проверяем по ID
                         # Context7: Проверяем несколько сообщений перед остановкой, чтобы не пропустить новые
                         # которые могут быть не в начале списка из-за задержек или нехронологического порядка
-                        if messages_checked < max_check_before_stop:
+                        is_newer_by_id = last_message_id is None or (hasattr(message, 'id') and message.id > last_message_id)
+                        if is_newer_by_id:
+                            # Сообщение новее по ID, даже если дата старше - включаем его
+                            found_newer_messages = True
+                            batch.append(message)
+                            messages_yielded += 1
+                            messages_filtered += 1
+                            logger.debug("Message is newer by ID, including it",
+                                       channel_id=channel_entity.id,
+                                       mode=mode,
+                                       message_id=message.id if hasattr(message, 'id') else None,
+                                       message_date_utc=message_date_utc.isoformat(),
+                                       last_message_id=last_message_id,
+                                       since_date=since_date.isoformat())
+                            continue
+                        elif messages_checked < max_check_before_stop:
                             # Продолжаем проверку - возможно, новые сообщения дальше в списке
                             logger.debug("Message is older than since_date, checking more messages",
                                        channel_id=channel_entity.id,
@@ -1712,10 +3298,14 @@ class ChannelParser:
             # [C7-ID: dev-mode-017] Context7 best practice: для ОБОИХ режимов НЕ используем offset_date
             # Получаем последние сообщения и фильтруем локально по date >= since_date (historical) или date > since_date (incremental)
             # Это гарантирует, что мы получим ВСЕ новые сообщения независимо от режима
-            limit_fallback = batch_size * 200 if mode == "historical" else batch_size * 100
+            # Context7: УВЕЛИЧЕНО для incremental режима с 100 до 500 для предотвращения пропуска новых постов
+            limit_fallback = batch_size * 200 if mode == "historical" else batch_size * 500
             iter_params = {"limit": limit_fallback}
             
-            async for message in client.iter_messages(channel_entity, **iter_params):
+            # Context7: Используем InputPeerChannel напрямую для чтения сообщений, если он есть
+            channel_for_iter = self._current_input_peer if self._current_input_peer else channel_entity
+            
+            async for message in client.iter_messages(channel_for_iter, **iter_params):
                 # [C7-ID: dev-mode-017] Context7: Унифицированная логика фильтрации (соответствует основному пути)
                 # Historical: включаем сообщения >= since_date, останавливаемся на < since_date
                 # Incremental: включаем только сообщения > since_date, останавливаемся на <= since_date

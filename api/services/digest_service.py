@@ -5,6 +5,7 @@ Context7: сбор контента ТОЛЬКО по пользовательс
 
 import time
 import json
+import re
 from collections import Counter
 from typing import List, Dict, Any, Optional
 from uuid import UUID
@@ -457,6 +458,7 @@ class DigestService:
                                     'channel_title': channel.title if channel else "Неизвестный канал",
                                     'channel_username': channel.username if channel else None,
                                     'permalink': post.telegram_post_url,
+                                    'url': post.url,  # Context7: URL для дедупликации репостов
                                     'posted_at': post.posted_at,
                                     'topic': topic,
                                     'score': result.score,
@@ -507,6 +509,7 @@ class DigestService:
                                                 'channel_title': channel.title if channel else "Неизвестный канал",
                                                 'channel_username': channel.username if channel else None,
                                                 'permalink': post.telegram_post_url,
+                                                'url': post.url,  # Context7: URL для дедупликации репостов
                                                 'posted_at': post.posted_at,
                                                 'topic': related_topic,
                                                 'score': graph_post.get('score', 0.7),
@@ -557,6 +560,7 @@ class DigestService:
                             'channel_title': channel.title if channel else "Неизвестный канал",
                             'channel_username': channel.username if channel else None,
                             'permalink': post.telegram_post_url,
+                            'url': post.url,  # Context7: URL для дедупликации репостов
                             'posted_at': post.posted_at,
                             'topic': topic,
                             'score': 0.5,  # Средний score для FTS результатов
@@ -573,15 +577,78 @@ class DigestService:
                 logger.error("Error collecting posts for topic", topic=topic, error=str(e))
                 continue
         
+        # Context7: Фильтрация уже отправленных постов из последних N дайджестов (дефолт: 7 дней)
+        # Исключаем посты, которые были в дайджестах за последние N дней
+        exclude_days = getattr(settings, 'digest_exclude_posts_days', 7)
+        if exclude_days > 0:
+            try:
+                
+                cutoff_date = date.today() - timedelta(days=exclude_days)
+                
+                # Получаем последние дайджесты пользователя
+                recent_digests = db.query(DigestHistory).filter(
+                    and_(
+                        DigestHistory.user_id == user_id,
+                        DigestHistory.digest_date >= cutoff_date,
+                        DigestHistory.status == "sent"  # Только отправленные дайджесты
+                    )
+                ).order_by(DigestHistory.digest_date.desc()).all()
+                
+                # Собираем URL и post_id из контекста дайджестов
+                excluded_urls = set()
+                excluded_post_ids = set()
+                
+                # Context7: Извлекаем post_id из telegram_post_url в контенте дайджеста
+                # Формат ссылки: https://t.me/channel/123 или [Ссылка](https://t.me/channel/123)
+                url_pattern = re.compile(r'https://t\.me/(\w+)/(\d+)')
+                
+                for digest in recent_digests:
+                    if digest.content:
+                        # Ищем ссылки на посты в контенте
+                        matches = url_pattern.findall(digest.content)
+                        for channel_username, post_num in matches:
+                            # Формируем URL для исключения
+                            excluded_urls.add(f"https://t.me/{channel_username}/{post_num}")
+                
+                # Также получаем post_id из постов, которые были в контексте предыдущих дайджестов
+                # Поскольку мы не храним прямую связь, используем эвристику по времени и каналам
+                if all_posts:
+                    # Получаем посты из тех же каналов за период отправленных дайджестов
+                    if recent_digests:
+                        # Берем post_id из постов, которые могли быть в дайджестах
+                        # Это приблизительная фильтрация - полную связь можно добавить через отдельную таблицу
+                        pass  # Пока пропускаем, так как нет прямой связи post_id <-> digest
+                
+                # Фильтруем посты по URL
+                if excluded_urls:
+                    filtered_posts = []
+                    for post in all_posts:
+                        post_url = post.get('url') or post.get('permalink')
+                        if post_url:
+                            # Проверяем, не был ли этот URL уже в дайджесте
+                            if post_url in excluded_urls:
+                                continue
+                        filtered_posts.append(post)
+                    all_posts = filtered_posts
+                    
+                    logger.debug(
+                        "Filtered posts from recent digests",
+                        excluded_urls_count=len(excluded_urls),
+                        remaining_posts=len(all_posts)
+                    )
+            except Exception as e:
+                logger.warning("Error filtering posts from recent digests", error=str(e))
+                # Продолжаем без фильтрации при ошибке
+        
         # Сортируем по времени и релевантности
         all_posts.sort(key=lambda x: (x['posted_at'] or datetime.min, x['score']), reverse=True)
         
         # Дедупликация по post_id
-        seen = set()
+        seen_post_ids = set()
         unique_posts = []
         for post in all_posts:
-            if post['post_id'] not in seen:
-                seen.add(post['post_id'])
+            if post['post_id'] not in seen_post_ids:
+                seen_post_ids.add(post['post_id'])
                 unique_posts.append(post)
         
         # Context7: Дедупликация альбомов - оставляем только первый пост из альбома с наивысшим score
@@ -627,6 +694,32 @@ class DigestService:
                 )
         except Exception as e:
             logger.warning("Error during album deduplication in digest", error=str(e))
+            # Продолжаем без дедупликации при ошибке
+        
+        # Context7: Дедупликация по URL (репосты одного и того же контента)
+        # Аналогично _collect_channel_posts_for_digest - исключаем посты с одинаковым URL
+        try:
+            seen_urls = set()
+            url_deduplicated_posts = []
+            for post in unique_posts:
+                post_url = post.get('url')
+                if post_url:
+                    url_hash = hash(post_url)
+                    if url_hash in seen_urls:
+                        continue
+                    seen_urls.add(url_hash)
+                url_deduplicated_posts.append(post)
+            
+            removed_by_url = len(unique_posts) - len(url_deduplicated_posts)
+            if removed_by_url > 0:
+                logger.debug(
+                    "URL deduplication applied in digest",
+                    removed_duplicates=removed_by_url,
+                    remaining_posts=len(url_deduplicated_posts)
+                )
+            unique_posts = url_deduplicated_posts
+        except Exception as e:
+            logger.warning("Error during URL deduplication in digest", error=str(e))
             # Продолжаем без дедупликации при ошибке
         
         return unique_posts

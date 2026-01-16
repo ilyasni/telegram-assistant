@@ -145,9 +145,30 @@
       const headers = { 'Content-Type': 'application/json' };
       const options = { method, headers };
       if (body) options.body = JSON.stringify(body);
-      const res = await fetch(path, options);
-      if (!res.ok) throw new Error(await res.text());
-      return await res.json();
+      try {
+        const res = await fetch(path, options);
+        if (!res.ok) {
+          let errorText = await res.text();
+          // Context7: пытаемся распарсить JSON ошибку, если это возможно
+          try {
+            const errorJson = JSON.parse(errorText);
+            if (errorJson.detail) {
+              errorText = errorJson.detail;
+            }
+          } catch (e) {
+            // Если не JSON, оставляем текст как есть
+          }
+          throw new Error(errorText || `HTTP ${res.status}: ${res.statusText}`);
+        }
+        return await res.json();
+      } catch (error) {
+        // Context7: если ошибка уже с message, просто пробрасываем
+        if (error instanceof Error) {
+          throw error;
+        }
+        // Context7: для других случаев создаем Error
+        throw new Error(error?.toString() || 'Неизвестная ошибка');
+      }
     }
 
     // Update status display
@@ -349,7 +370,12 @@
             'flood_wait': 'Слишком много запросов. Попробуйте позже',
             'qr_login_error': 'Ошибка при обработке QR-кода',
             'invalid_telegram_user': 'Неверные данные пользователя',
-            'session_store': 'Ошибка сохранения сессии'
+            'session_store': 'Ошибка сохранения сессии',
+            'session_store_integrity_failed': 'Ошибка сохранения сессии: проблема с данными',
+            'session_store_operational_failed': 'Ошибка сохранения сессии: проблема с операцией',
+            'session_store_database_failed': 'Ошибка сохранения сессии: проблема с базой данных',
+            'session_store_unexpected_failed': 'Ошибка сохранения сессии: неожиданная ошибка',
+            'session_saver_failed': 'Ошибка сохранения сессии: проблема с сохранением'
           };
           const reasonKey = Object.keys(reasonMessages).find(key => data.reason.includes(key));
           if (reasonKey) {
@@ -627,8 +653,38 @@
         
       } catch (error) {
         console.error('QR login error:', error);
-        updateStatus('Ошибка: ' + error.message, 'error');
+        // Context7: улучшенная обработка ошибок с проверкой наличия message
+        let errorMessage = 'Ошибка авторизации';
+        if (error instanceof Error && error.message) {
+          errorMessage = error.message;
+          // Context7: если ошибка содержит технические детали, упрощаем для пользователя
+          if (errorMessage.includes('Failed to fetch') || errorMessage.includes('NetworkError')) {
+            errorMessage = 'Ошибка соединения с сервером. Проверьте интернет и попробуйте ещё раз';
+          } else if (errorMessage.includes('401') || errorMessage.includes('Unauthorized')) {
+            if (errorMessage.includes('token expired') || errorMessage.includes('expired')) {
+              errorMessage = 'Сессия истекла. Начните авторизацию заново';
+            } else {
+              errorMessage = 'Ошибка авторизации. Попробуйте ещё раз';
+            }
+          } else if (errorMessage.includes('429') || errorMessage.includes('Too Many Requests')) {
+            errorMessage = 'Слишком много запросов. Подождите немного и попробуйте ещё раз';
+          } else if (errorMessage.includes('500') || errorMessage.includes('Internal Server Error')) {
+            errorMessage = 'Временная ошибка сервера. Попробуйте ещё раз через несколько секунд';
+          }
+        } else if (error && typeof error === 'string') {
+          errorMessage = error;
+        }
+        updateStatus('❌ ' + errorMessage, 'error');
         btnRetryEl.classList.remove('hidden');
+        // Context7: закрываем SSE соединение при ошибке
+        if (eventSource) {
+          eventSource.close();
+          eventSource = null;
+        }
+        if (countdownInterval) {
+          clearInterval(countdownInterval);
+          countdownInterval = null;
+        }
       }
     }
 

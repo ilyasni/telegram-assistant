@@ -59,6 +59,28 @@ api_endpoint_latency_seconds = _safe_create_metric(
     buckets=[0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0]
 )
 
+# Context7: Метрики для подписок на темы
+theme_subscribe_total = _safe_create_metric(
+    Counter,
+    'theme_subscribe_total',
+    'Total theme subscriptions',
+    ['status']
+)
+
+theme_subscribe_channels_total = _safe_create_metric(
+    Counter,
+    'theme_subscribe_channels_total',
+    'Total channels processed in theme subscriptions',
+    ['action']
+)
+
+theme_unsubscribe_total = _safe_create_metric(
+    Counter,
+    'theme_unsubscribe_total',
+    'Total theme unsubscriptions',
+    ['status']
+)
+
 # ============================================================================
 # MIDDLEWARE
 # ============================================================================
@@ -71,8 +93,8 @@ async def metrics_middleware(request: Request, call_next):
     """
     start_time = time.time()
     
-    # Пропускаем запросы к метрикам и health checks
-    if request.url.path in ['/metrics', '/health', '/health/auth', '/health/bot']:
+    # Пропускаем только запросы к метрикам (health checks должны учитываться)
+    if request.url.path == '/metrics':
         return await call_next(request)
     
     response = await call_next(request)
@@ -83,7 +105,7 @@ async def metrics_middleware(request: Request, call_next):
     method = request.method
     status_code = response.status_code
     
-    # Context7: Обновление метрик
+    # Context7: Обновление метрик (включая health checks)
     api_endpoint_requests_total.labels(
         endpoint=endpoint,
         method=method,

@@ -15,6 +15,12 @@ import uuid
 from models.database import get_db
 from api.services.tgstat_service import get_tgstat_service
 from middleware.tracing import get_trace_id
+from api.services.telegram_channel_resolver import resolve_channel_from_telegram
+from middleware.metrics_middleware import (
+    theme_subscribe_total,
+    theme_subscribe_channels_total,
+    theme_unsubscribe_total
+)
 
 logger = structlog.get_logger()
 router = APIRouter(prefix="/themes", tags=["themes"])
@@ -420,63 +426,191 @@ async def subscribe_to_theme(
             raise HTTPException(status_code=404, detail="Theme has no channels")
         
         # 4. Для каждого канала: найти или создать Channel, затем UPSERT в user_channel
-        channels_added = 0
-        channels_skipped = 0
+        # Context7: Детальная статистика для диагностики и структурированного ответа
+        channels_expected = len(theme_channels_result['channels'])
+        channels_created = 0  # Новые каналы созданы
+        channels_found = 0  # Существующие каналы найдены
+        channels_reactivated = 0  # Подписки реактивированы (is_active=false -> true)
+        channels_added = 0  # Новые подписки созданы
+        channels_skipped_manual = 0  # Пропущены из-за manual подписки
+        channels_skipped_existing = 0  # Пропущены из-за существующей активной подписки
+        channels_failed = 0  # Ошибки при создании/подписке
+        errors = []  # Список ошибок для структурированного ответа
         
         for channel_data in theme_channels_result['channels']:
             channel_username = channel_data['channel_username'].lstrip('@')
             channel_title = channel_data['title']
             
-            # Найти или создать Channel
-            channel_result = db.execute(
-                text("SELECT id FROM channels WHERE LTRIM(username, '@') = :username"),
-                {"username": channel_username}
-            )
-            channel_row = channel_result.fetchone()
-            
-            if not channel_row:
-                # Создать новый канал
-                channel_id = uuid.uuid4()
-                db.execute(
+            try:
+                # Context7: Разрешение username через Telegram API для получения tg_channel_id и канонических данных
+                telegram_channel_data = None
+                try:
+                    telegram_channel_data = await resolve_channel_from_telegram(channel_username)
+                    if telegram_channel_data:
+                        logger.debug(
+                            "Channel resolved from Telegram",
+                            channel_username=channel_username,
+                            tg_channel_id=telegram_channel_data.get("tg_channel_id"),
+                            canonical_username=telegram_channel_data.get("username"),
+                            trace_id=trace_id
+                        )
+                except Exception as e:
+                    # Ошибка при resolve не блокирует подписку - используем данные из TGStat
+                    logger.warning(
+                        "Failed to resolve channel from Telegram, using TGStat data",
+                        channel_username=channel_username,
+                        error=str(e),
+                        error_type=type(e).__name__,
+                        trace_id=trace_id
+                    )
+                
+                # Используем данные из Telegram если доступны, иначе из TGStat
+                resolved_username = telegram_channel_data.get("username") if telegram_channel_data else channel_username
+                resolved_title = telegram_channel_data.get("title") if telegram_channel_data else channel_title
+                resolved_tg_channel_id = telegram_channel_data.get("tg_channel_id") if telegram_channel_data else None
+                
+                # Найти или создать Channel (идемпотентно)
+                # Context7: Сначала ищем по tg_channel_id (если есть), затем по username
+                channel_id = None
+                if resolved_tg_channel_id:
+                    # Ищем по tg_channel_id (уникальный индекс)
+                    channel_result = db.execute(
+                        text("SELECT id, username, title FROM channels WHERE tg_channel_id = :tg_channel_id"),
+                        {"tg_channel_id": resolved_tg_channel_id}
+                    )
+                    channel_row = channel_result.fetchone()
+                    if channel_row:
+                        channel_id = channel_row.id
+                        # Обновляем username и title если они изменились
+                        if channel_row.username != resolved_username or channel_row.title != resolved_title:
+                            db.execute(
+                                text("""
+                                    UPDATE channels 
+                                    SET username = :username, title = :title
+                                    WHERE id = :channel_id
+                                """),
+                                {
+                                    "channel_id": channel_id,
+                                    "username": resolved_username,
+                                    "title": resolved_title
+                                }
+                            )
+                        channels_found += 1
+                
+                if not channel_id:
+                    # Ищем по username (если не нашли по tg_channel_id)
+                    channel_result = db.execute(
+                        text("SELECT id FROM channels WHERE LTRIM(username, '@') = :username"),
+                        {"username": resolved_username}
+                    )
+                    channel_row = channel_result.fetchone()
+                    
+                    if channel_row:
+                        channel_id = channel_row.id
+                        channels_found += 1
+                        
+                        # Context7: Обновляем tg_channel_id и title для существующих каналов, если они доступны из Telegram
+                        if resolved_tg_channel_id or resolved_title != channel_title:
+                            update_params = {}
+                            update_set = []
+                            if resolved_tg_channel_id:
+                                update_set.append("tg_channel_id = :tg_channel_id")
+                                update_params["tg_channel_id"] = resolved_tg_channel_id
+                            if resolved_title != channel_title:
+                                update_set.append("title = :title")
+                                update_params["title"] = resolved_title
+                            
+                            if update_set:
+                                update_params["channel_id"] = channel_id
+                                db.execute(
+                                    text(f"""
+                                        UPDATE channels 
+                                        SET {', '.join(update_set)}
+                                        WHERE id = :channel_id
+                                    """),
+                                    update_params
+                                )
+                                logger.debug(
+                                    "Updated existing channel with Telegram data",
+                                    channel_username=channel_username,
+                                    channel_id=str(channel_id),
+                                    tg_channel_id=resolved_tg_channel_id,
+                                    trace_id=trace_id
+                                )
+                
+                if not channel_id:
+                    # Создать новый канал
+                    channel_id = uuid.uuid4()
+                    # Context7: Используем tg_channel_id если доступен (есть unique индекс)
+                    if resolved_tg_channel_id:
+                        # UPSERT по tg_channel_id
+                        db.execute(
+                            text("""
+                                INSERT INTO channels (id, tg_channel_id, username, title, is_active, created_at)
+                                VALUES (:id, :tg_channel_id, :username, :title, true, NOW())
+                                ON CONFLICT (tg_channel_id) DO UPDATE SET
+                                    username = EXCLUDED.username,
+                                    title = EXCLUDED.title
+                            """),
+                            {
+                                "id": channel_id,
+                                "tg_channel_id": resolved_tg_channel_id,
+                                "username": resolved_username,
+                                "title": resolved_title
+                            }
+                        )
+                    else:
+                        # Обычный INSERT (нет tg_channel_id)
+                        db.execute(
+                            text("""
+                                INSERT INTO channels (id, username, title, is_active, created_at)
+                                VALUES (:id, :username, :title, true, NOW())
+                            """),
+                            {
+                                "id": channel_id,
+                                "username": resolved_username,
+                                "title": resolved_title
+                            }
+                        )
+                    channels_created += 1
+                    logger.debug(
+                        "Channel created",
+                        channel_username=channel_username,
+                        resolved_username=resolved_username,
+                        channel_id=str(channel_id),
+                        tg_channel_id=resolved_tg_channel_id,
+                        trace_id=trace_id
+                    )
+                
+                # UPSERT в user_channel с защитой от гонок
+                # Проверяем, нет ли уже manual подписки
+                existing_manual_result = db.execute(
                     text("""
-                        INSERT INTO channels (id, username, title, is_active, created_at)
-                        VALUES (:id, :username, :title, true, NOW())
+                        SELECT user_id, channel_id
+                        FROM user_channel
+                        WHERE user_id = :user_id 
+                          AND channel_id = :channel_id 
+                          AND source = 'manual'
+                          AND is_active = true
                     """),
                     {
-                        "id": channel_id,
-                        "username": channel_username,
-                        "title": channel_title
+                        "user_id": user_uuid,
+                        "channel_id": channel_id
                     }
                 )
-            else:
-                channel_id = channel_row.id
-            
-            # UPSERT в user_channel с защитой от гонок
-            # Проверяем, нет ли уже manual подписки
-            existing_manual_result = db.execute(
-                text("""
-                    SELECT user_id, channel_id
-                    FROM user_channel
-                    WHERE user_id = :user_id 
-                      AND channel_id = :channel_id 
-                      AND source = 'manual'
-                      AND is_active = true
-                """),
-                {
-                    "user_id": user_uuid,
-                    "channel_id": channel_id
-                }
-            )
-            
-            if existing_manual_result.fetchone():
-                # Канал уже подключен вручную, пропускаем
-                logger.debug(
-                    "Channel already subscribed manually, skipping",
-                    channel_username=channel_username,
-                    user_id=str(user_uuid)
-                )
-                channels_skipped += 1
-            else:
+                
+                if existing_manual_result.fetchone():
+                    # Канал уже подключен вручную, пропускаем
+                    logger.debug(
+                        "Channel already subscribed manually, skipping",
+                        channel_username=channel_username,
+                        user_id=str(user_uuid),
+                        channel_id=str(channel_id),
+                        trace_id=trace_id
+                    )
+                    channels_skipped_manual += 1
+                    continue
+                
                 # Проверяем, есть ли уже theme подписка для этой подборки
                 existing_theme_result = db.execute(
                     text("""
@@ -497,7 +631,8 @@ async def subscribe_to_theme(
                 
                 if existing_theme_row:
                     # Обновляем существующую подписку
-                    db.execute(
+                    was_inactive = not existing_theme_row.is_active
+                    update_result = db.execute(
                         text("""
                             UPDATE user_channel
                             SET is_active = true,
@@ -517,7 +652,24 @@ async def subscribe_to_theme(
                             "theme_id": theme_id
                         }
                     )
-                    channels_added += 1
+                    if was_inactive:
+                        channels_reactivated += 1
+                        logger.debug(
+                            "Channel subscription reactivated",
+                            channel_username=channel_username,
+                            user_id=str(user_uuid),
+                            channel_id=str(channel_id),
+                            trace_id=trace_id
+                        )
+                    else:
+                        channels_skipped_existing += 1
+                        logger.debug(
+                            "Channel subscription already active, skipping",
+                            channel_username=channel_username,
+                            user_id=str(user_uuid),
+                            channel_id=str(channel_id),
+                            trace_id=trace_id
+                        )
                 else:
                     # Создаем новую подписку
                     try:
@@ -533,15 +685,47 @@ async def subscribe_to_theme(
                             }
                         )
                         channels_added += 1
-                    except Exception as e:
-                        # Если конфликт (например, race condition), пропускаем
                         logger.debug(
+                            "Channel subscription created",
+                            channel_username=channel_username,
+                            user_id=str(user_uuid),
+                            channel_id=str(channel_id),
+                            trace_id=trace_id
+                        )
+                    except Exception as e:
+                        # Если конфликт (например, race condition), логируем и пропускаем
+                        error_msg = f"Channel subscription conflict: {str(e)}"
+                        errors.append({
+                            "channel_username": channel_username,
+                            "error": error_msg
+                        })
+                        logger.warning(
                             "Channel subscription conflict, skipping",
                             channel_username=channel_username,
                             user_id=str(user_uuid),
-                            error=str(e)
+                            channel_id=str(channel_id),
+                            error=str(e),
+                            error_type=type(e).__name__,
+                            trace_id=trace_id
                         )
-                        channels_skipped += 1
+                        channels_failed += 1
+            except Exception as e:
+                # Ошибка при обработке канала
+                error_msg = f"Failed to process channel: {str(e)}"
+                errors.append({
+                    "channel_username": channel_username,
+                    "error": error_msg
+                })
+                logger.error(
+                    "Error processing channel in theme subscription",
+                    channel_username=channel_username,
+                    user_id=str(user_uuid),
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    trace_id=trace_id,
+                    exc_info=True
+                )
+                channels_failed += 1
         
         # 5. UPSERT в user_theme (идемпотентно)
         db.execute(
@@ -560,26 +744,57 @@ async def subscribe_to_theme(
         # Коммит транзакции
         db.commit()
         
+        # Context7: Детальное логирование статистики для диагностики
         logger.info(
             "User subscribed to theme",
             theme_slug=theme_slug,
+            theme_id=str(theme_id),
             user_id=str(user_uuid),
+            channels_expected=channels_expected,
+            channels_created=channels_created,
+            channels_found=channels_found,
             channels_added=channels_added,
-            channels_skipped=channels_skipped,
+            channels_reactivated=channels_reactivated,
+            channels_skipped_manual=channels_skipped_manual,
+            channels_skipped_existing=channels_skipped_existing,
+            channels_failed=channels_failed,
+            errors_count=len(errors),
             trace_id=trace_id
         )
         
+        # Context7: Prometheus метрики для observability
+        theme_subscribe_total.labels(status="success").inc()
+        theme_subscribe_channels_total.labels(action="created").inc(channels_created)
+        theme_subscribe_channels_total.labels(action="found").inc(channels_found)
+        theme_subscribe_channels_total.labels(action="added").inc(channels_added)
+        theme_subscribe_channels_total.labels(action="reactivated").inc(channels_reactivated)
+        theme_subscribe_channels_total.labels(action="skipped_manual").inc(channels_skipped_manual)
+        theme_subscribe_channels_total.labels(action="skipped_existing").inc(channels_skipped_existing)
+        if channels_failed > 0:
+            theme_subscribe_channels_total.labels(action="failed").inc(channels_failed)
+        
+        # Context7: Структурированный ответ API с детальной статистикой
         return {
             "status": "subscribed",
             "theme_id": str(theme_id),
             "theme_slug": theme_slug,
             "theme_name": theme['name'],
-            "channels_added": channels_added,
-            "channels_skipped": channels_skipped
+            "channels": {
+                "expected": channels_expected,
+                "added": channels_added,
+                "reactivated": channels_reactivated,
+                "skipped_manual": channels_skipped_manual,
+                "skipped_existing": channels_skipped_existing,
+                "failed": channels_failed
+            },
+            "channels_created": channels_created,
+            "channels_found": channels_found,
+            "errors": errors if errors else None
         }
         
     except HTTPException:
         db.rollback()
+        theme_subscribe_total.labels(status="error").inc()
         raise
     except Exception as e:
         db.rollback()
@@ -592,6 +807,8 @@ async def subscribe_to_theme(
             trace_id=trace_id,
             exc_info=True
         )
+        # Context7: Метрика ошибки
+        theme_subscribe_total.labels(status="error").inc()
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -714,6 +931,9 @@ async def unsubscribe_from_theme(
             trace_id=trace_id
         )
         
+        # Context7: Prometheus метрики для observability
+        theme_unsubscribe_total.labels(status="success").inc()
+        
         return {
             "status": "unsubscribed",
             "theme_id": str(theme_id),
@@ -723,6 +943,7 @@ async def unsubscribe_from_theme(
         
     except HTTPException:
         db.rollback()
+        theme_unsubscribe_total.labels(status="error").inc()
         raise
     except Exception as e:
         db.rollback()
@@ -735,6 +956,8 @@ async def unsubscribe_from_theme(
             trace_id=trace_id,
             exc_info=True
         )
+        # Context7: Метрика ошибки
+        theme_unsubscribe_total.labels(status="error").inc()
         raise HTTPException(status_code=500, detail="Internal server error")
 
 

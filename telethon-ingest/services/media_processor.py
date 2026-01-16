@@ -67,20 +67,85 @@ except ImportError:
 logger = structlog.get_logger()
 
 # Context7: Метрики Prometheus для обработки медиа
+# Context7: Функции для предотвращения дублирования метрик
+from prometheus_client import REGISTRY
+
+def _get_or_create_counter(name, description, labels):
+    """Получить существующую метрику или создать новую."""
+    try:
+        existing = REGISTRY._names_to_collectors.get(name)
+        if existing:
+            return existing
+    except (AttributeError, KeyError, TypeError):
+        pass
+    
+    try:
+        return Counter(name, description, labels)
+    except ValueError as e:
+        if "Duplicated timeseries" in str(e):
+            try:
+                return REGISTRY._names_to_collectors.get(name)
+            except (AttributeError, KeyError, TypeError):
+                pass
+        logger.warning(f"Metric {name} already exists", error=str(e))
+        raise
+
+def _get_or_create_histogram(name, description, labels, buckets=None):
+    """Получить существующую метрику или создать новую."""
+    try:
+        existing = REGISTRY._names_to_collectors.get(name)
+        if existing:
+            return existing
+    except (AttributeError, KeyError, TypeError):
+        pass
+    
+    try:
+        if buckets:
+            return Histogram(name, description, labels, buckets=buckets)
+        return Histogram(name, description, labels)
+    except ValueError as e:
+        if "Duplicated timeseries" in str(e):
+            try:
+                return REGISTRY._names_to_collectors.get(name)
+            except (AttributeError, KeyError, TypeError):
+                pass
+        logger.warning(f"Metric {name} already exists", error=str(e))
+        raise
+
+def _get_or_create_gauge(name, description, labels):
+    """Получить существующую метрику или создать новую."""
+    try:
+        existing = REGISTRY._names_to_collectors.get(name)
+        if existing:
+            return existing
+    except (AttributeError, KeyError, TypeError):
+        pass
+    
+    try:
+        return Gauge(name, description, labels)
+    except ValueError as e:
+        if "Duplicated timeseries" in str(e):
+            try:
+                return REGISTRY._names_to_collectors.get(name)
+            except (AttributeError, KeyError, TypeError):
+                pass
+        logger.warning(f"Metric {name} already exists", error=str(e))
+        raise
+
 # Best practice: контроль кардинальности labels, нормализация значений
 if PROMETHEUS_AVAILABLE:
     # Основные метрики обработки медиа
     # stage: parse (парсинг), vision (vision анализ), retag (ретеггинг)
     # media: нормализованные значения - photo, video, album, doc
     # outcome: ok (успех), err (ошибка)
-    media_processing_total = Counter(
+    media_processing_total = _get_or_create_counter(
         'media_processing_total',
         'Total media files processed',
         ['stage', 'media', 'outcome']
     )
     
     # Суммарный объем обработанных медиа в байтах
-    media_bytes_total = Counter(
+    media_bytes_total = _get_or_create_counter(
         'media_bytes_total',
         'Total bytes processed',
         ['media']  # photo, video, album, doc
@@ -88,7 +153,7 @@ if PROMETHEUS_AVAILABLE:
     
     # Гистограмма размеров медиа с предопределенными buckets для SLO
     # Buckets: 50KB, 100KB, 500KB, 1MB, 5MB, 20MB
-    media_size_bytes = Histogram(
+    media_size_bytes = _get_or_create_histogram(
         'media_size_bytes',
         'Media file size in bytes',
         ['media'],
@@ -96,28 +161,28 @@ if PROMETHEUS_AVAILABLE:
     )
     
     # Latency обработки медиа
-    media_processing_duration_seconds = Histogram(
+    media_processing_duration_seconds = _get_or_create_histogram(
         'media_processing_duration_seconds',
         'Duration of media processing in seconds',
         ['stage', 'media', 'outcome']
     )
     
     # Альбомы обработаны
-    media_albums_processed_total = Counter(
+    media_albums_processed_total = _get_or_create_counter(
         'media_albums_processed_total',
         'Total media albums processed',
         ['status']  # success, failed, error
     )
     
     # Ошибки обработки медиа
-    media_processing_failed_total = Counter(
+    media_processing_failed_total = _get_or_create_counter(
         'media_processing_failed_total',
         'Total failed media processing attempts',
         ['reason']  # timeout, quota_exceeded, unsupported_format, download_error, album_item_error
     )
     
     # Здоровье экспорта метрик
-    metrics_backend_up = Gauge(
+    metrics_backend_up = _get_or_create_gauge(
         'metrics_backend_up',
         'Metrics backend availability',
         ['target']  # prometheus

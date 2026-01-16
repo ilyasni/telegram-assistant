@@ -16,6 +16,8 @@ from services.qr_auth import QrAuthService
 from services.telegram_client_manager import TelegramClientManager
 from services.atomic_db_saver import AtomicDBSaver
 from services.rate_limiter import RateLimiter
+from services.session_rate_limiter import SessionRateLimiter
+from services.floodwait_manager import FloodWaitManager
 from config import settings
 
 # Context7 best practice: настройка логирования с faulthandler
@@ -164,14 +166,61 @@ app_state = {
     "telegram_client": None     # Reference to TelegramClient from service
 }
 
+# Context7: Функции для предотвращения дублирования метрик
+from prometheus_client import REGISTRY
+
+def _get_or_create_counter(name, description, labels, namespace=None):
+    """Получить существующую метрику или создать новую."""
+    try:
+        existing = REGISTRY._names_to_collectors.get(name)
+        if existing:
+            return existing
+    except (AttributeError, KeyError, TypeError):
+        pass
+    
+    try:
+        if namespace:
+            return Counter(name, description, labels, namespace=namespace)
+        return Counter(name, description, labels)
+    except ValueError as e:
+        if "Duplicated timeseries" in str(e):
+            try:
+                return REGISTRY._names_to_collectors.get(name)
+            except (AttributeError, KeyError, TypeError):
+                pass
+        logger.warning(f"Metric {name} already exists", error=str(e))
+        raise
+
+def _get_or_create_histogram(name, description, labels, namespace=None):
+    """Получить существующую метрику или создать новую."""
+    try:
+        existing = REGISTRY._names_to_collectors.get(name)
+        if existing:
+            return existing
+    except (AttributeError, KeyError, TypeError):
+        pass
+    
+    try:
+        if namespace:
+            return Histogram(name, description, labels, namespace=namespace)
+        return Histogram(name, description, labels)
+    except ValueError as e:
+        if "Duplicated timeseries" in str(e):
+            try:
+                return REGISTRY._names_to_collectors.get(name)
+            except (AttributeError, KeyError, TypeError):
+                pass
+        logger.warning(f"Metric {name} already exists", error=str(e))
+        raise
+
 # Prometheus метрики
-request_count = Counter(
+request_count = _get_or_create_counter(
     "http_requests_total",
     "Total HTTP requests",
     ["path"],
     namespace="telethon"
 )
-request_duration = Histogram(
+request_duration = _get_or_create_histogram(
     "http_request_duration_seconds",
     "HTTP request duration",
     ["path"],
@@ -179,21 +228,22 @@ request_duration = Histogram(
 )
 
 # Context7 best practice: метрики для мониторинга крашей и критических событий
-crash_signals_total = Counter(
+crash_signals_total = _get_or_create_counter(
     "telethon_ingest_crash_signals_total",
     "Total critical signals received (SIGSEGV, SIGABRT, SIGFPE)",
     ["signal_name"]
 )
 
-crash_state_saved_total = Counter(
+crash_state_saved_total = _get_or_create_counter(
     "telethon_ingest_crash_state_saved_total",
     "Number of times application state was saved before crash",
     ["status"]
 )
 
-faulthandler_dumps_total = Counter(
+faulthandler_dumps_total = _get_or_create_counter(
     "telethon_ingest_faulthandler_dumps_total",
-    "Total number of faulthandler traceback dumps"
+    "Total number of faulthandler traceback dumps",
+    []
 )
 
 
@@ -621,6 +671,21 @@ async def run_scheduler_loop(restart_count: int = 0):
             )
             raise
         
+        # Context7: Создаём FloodWaitManager для глобального circuit breaker
+        logger.info("Creating FloodWaitManager for global circuit breaker...")
+        try:
+            from services.floodwait_manager import FloodWaitManager
+            floodwait_manager = FloodWaitManager(shared_redis_client)
+            session_rate_limiter = SessionRateLimiter(shared_redis_client)
+            logger.info("FloodWaitManager created successfully")
+        except Exception as fw_error:
+            logger.warning(
+                "Failed to create FloodWaitManager, continuing without global circuit breaker",
+                error=str(fw_error),
+                error_type=type(fw_error).__name__
+            )
+            floodwait_manager = None
+        
         # Context7: Ждём инициализации TelegramClientManager из run_ingest_loop()
         # Проверяем app_state с таймаутом
         logger.info("Waiting for TelegramClientManager initialization...")
@@ -794,13 +859,20 @@ async def run_scheduler_loop(restart_count: int = 0):
         # Создание ChannelParser с DI и общим Redis клиентом
         logger.info("Creating ChannelParser instance...")
         try:
+            # Context7: Создаем IngestAccountPool для управления пулом аккаунтов
+            from services.ingest_account_pool import IngestAccountPool
+            ingest_account_pool = IngestAccountPool(db_session, shared_redis_client)
+            
             parser = ChannelParser(
                 config=config,
                 db_session=db_session,
                 event_publisher=None,  # Temporarily disabled
                 redis_client=shared_redis_client,  # Context7: Передаём общий Redis клиент
                 telegram_client_manager=client_manager,  # Передаём TelegramClientManager
-                media_processor=media_processor  # Context7: Передаём MediaProcessor
+                media_processor=media_processor,  # Context7: Передаём MediaProcessor
+                floodwait_manager=floodwait_manager,  # Context7: Передаём FloodWaitManager для глобального circuit breaker
+                session_rate_limiter=session_rate_limiter,  # Context7: Передаём SessionRateLimiter для per-session rate limiting
+                ingest_account_pool=ingest_account_pool  # Context7: Передаём IngestAccountPool
             )
             logger.info("ChannelParser instance created successfully")
         except Exception as parser_error:
@@ -830,7 +902,8 @@ async def run_scheduler_loop(restart_count: int = 0):
                 parser=parser,  # Передаём инициализированный parser
                 app_state=app_state,  # Передаём app_state для обновления статуса
                 telegram_client_manager=client_manager,  # Передаём TelegramClientManager если доступен
-                media_processor=media_processor  # Context7: Передаём MediaProcessor
+                media_processor=media_processor,  # Context7: Передаём MediaProcessor
+                floodwait_manager=floodwait_manager  # Context7: Передаём FloodWaitManager для глобального circuit breaker
             )
             logger.info("ParseAllChannelsTask instance created successfully")
         except Exception as scheduler_error:

@@ -20,46 +20,72 @@ from crypto_utils import encrypt_session
 
 logger = structlog.get_logger()
 
-# Context7 best practice: Prometheus метрики для QR-авторизации (с multi-tenant лейблами)
-AUTH_QR_PUBLISHED = Counter(
-    "auth_qr_published_total",
-    "QR URL published",
-    ["tenant_id"],
-    namespace="telethon"
-)
-AUTH_QR_EXPIRED = Counter(
-    "auth_qr_expired_total",
-    "QR session expired",
-    ["tenant_id"],
-    namespace="telethon"
-)
-AUTH_QR_SUCCESS = Counter(
-    "auth_qr_success_total",
-    "QR session authorized",
-    ["tenant_id"],
-    namespace="telethon"
-)
-AUTH_QR_FAIL = Counter(
-    "auth_qr_fail_total",
-    "QR session failed",
-    ["tenant_id"],
-    namespace="telethon"
-)
-AUTH_QR_2FA_REQUIRED = Counter(
-    "auth_qr_2fa_required_total",
-    "QR session requires 2FA password",
-    ["tenant_id"],
-    namespace="telethon"
-)
+# Context7: Функции для предотвращения дублирования метрик (определяем ПЕРЕД использованием)
+from prometheus_client import REGISTRY
 
-# Context7 best practice: Telethon метрики
-FLOODWAIT_TOTAL = Counter("telethon_floodwait_total", "FloodWait events", ["reason", "seconds"])
-FLOODWAIT_DURATION = Histogram("telethon_floodwait_duration_seconds", "FloodWait wait duration", ["reason"])
-SESSION_CLEANUP_TOTAL = Counter("telethon_session_cleanup_total", "Session cleanup operations", ["status"])
-SESSION_CLEANUP_DURATION = Histogram("telethon_session_cleanup_duration_seconds", "Session cleanup duration")
-QR_SESSION_TOTAL = Counter("telethon_qr_session_total", "QR sessions", ["status"])
-RATE_LIMIT_HITS = Counter("telethon_qr_rate_limit_hits_total", "Rate limit hits", ["endpoint"])
-THROTTLING_DELAY = Histogram("telethon_throttling_delay_seconds", "Request throttling delay")
+def _get_or_create_counter(name, description, labels, namespace=None):
+    """Получить существующую метрику или создать новую."""
+    try:
+        existing = REGISTRY._names_to_collectors.get(name)
+        if existing:
+            return existing
+    except (AttributeError, KeyError, TypeError):
+        pass
+    
+    try:
+        if namespace:
+            return Counter(name, description, labels, namespace=namespace)
+        return Counter(name, description, labels)
+    except ValueError as e:
+        if "Duplicated timeseries" in str(e):
+            try:
+                return REGISTRY._names_to_collectors.get(name)
+            except (AttributeError, KeyError, TypeError):
+                pass
+        logger.warning(f"Metric {name} already exists", error=str(e))
+        raise
+
+def _get_or_create_histogram(name, description, labels=None, buckets=None):
+    """Получить существующую метрику или создать новую."""
+    try:
+        existing = REGISTRY._names_to_collectors.get(name)
+        if existing:
+            return existing
+    except (AttributeError, KeyError, TypeError):
+        pass
+    
+    try:
+        # Context7: labels не может быть None для Histogram
+        if labels is None:
+            labels = []
+        if buckets:
+            return Histogram(name, description, labels, buckets=buckets)
+        return Histogram(name, description, labels)
+    except ValueError as e:
+        if "Duplicated timeseries" in str(e):
+            try:
+                return REGISTRY._names_to_collectors.get(name)
+            except (AttributeError, KeyError, TypeError):
+                pass
+        logger.warning(f"Metric {name} already exists", error=str(e))
+        raise
+
+# Context7: НЕ создаем telethon_floodwait_total и telethon_floodwait_duration_seconds здесь
+# Они уже созданы в floodwait_manager.py - используем их оттуда при необходимости
+# FLOODWAIT_TOTAL и FLOODWAIT_DURATION удалены - используем метрики из floodwait_manager
+
+SESSION_CLEANUP_TOTAL = _get_or_create_counter("telethon_session_cleanup_total", "Session cleanup operations", ["status"])
+SESSION_CLEANUP_DURATION = _get_or_create_histogram("telethon_session_cleanup_duration_seconds", "Session cleanup duration", labels=[])
+QR_SESSION_TOTAL = _get_or_create_counter("telethon_qr_session_total", "QR sessions", ["status"])
+RATE_LIMIT_HITS = _get_or_create_counter("telethon_qr_rate_limit_hits_total", "Rate limit hits", ["endpoint"])
+THROTTLING_DELAY = _get_or_create_histogram("telethon_throttling_delay_seconds", "Request throttling delay", labels=[])
+
+# Context7: Метрики QR-авторизации (namespace="telethon")
+AUTH_QR_PUBLISHED = _get_or_create_counter("telethon_auth_qr_published_total", "QR URL published", ["tenant_id"], namespace="telethon")
+AUTH_QR_SUCCESS = _get_or_create_counter("telethon_auth_qr_success_total", "QR session authorized", ["tenant_id"], namespace="telethon")
+AUTH_QR_FAIL = _get_or_create_counter("telethon_auth_qr_fail_total", "QR failures", ["tenant_id"], namespace="telethon")
+AUTH_QR_EXPIRED = _get_or_create_counter("telethon_auth_qr_expired_total", "QR session expired", ["tenant_id"], namespace="telethon")
+AUTH_QR_2FA_REQUIRED = _get_or_create_counter("telethon_auth_qr_2fa_required_total", "2FA required count", ["tenant_id"], namespace="telethon")
 
 
 class QrAuthService:
@@ -1057,8 +1083,9 @@ class QrAuthService:
             delay = base_delay + jitter
             
             # Метрики FloodWait
-            FLOODWAIT_TOTAL.labels(reason="qr_login", seconds=str(e.seconds)).inc()
-            FLOODWAIT_DURATION.labels(reason="qr_login").observe(delay)
+            # Context7: Используем метрики из floodwait_manager если доступны
+            # Если floodwait_manager недоступен, просто логируем
+            logger.warning("FloodWait during QR login", seconds=e.seconds, delay=delay)
             
             logger.warning("FloodWait during QR login", 
                           seconds=e.seconds, 
@@ -1090,7 +1117,7 @@ class QrAuthService:
                 "reason": f"qr_login_error_{error_type.lower()}",
                 "error_message": error_message[:500]  # Ограничиваем длину сообщения
             })
-            AUTH_QR_FAIL.labels(tenant_id=tenant_id or "unknown", reason=f"qr_login_error_{error_type.lower()}").inc()
+            AUTH_QR_FAIL.labels(tenant_id=tenant_id or "unknown").inc()
         finally:
             # Context7 best practice: гарантированная остановка клиента
             # [C7-ID: telethon-cleanup-003]

@@ -1386,7 +1386,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum(rate(parser_channel_processing_seconds_bucket[5m])) by (le, mode, status))",
+          "expr": "histogram_quantile(0.95, sum(rate(parser_channel_processing_seconds_bucket[15m])) by (le, mode, status))",
           "legendFormat": "p95 - {{mode}}/{{status}}",
           "refId": "A"
         },
@@ -1397,7 +1397,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum(rate(parser_channel_processing_seconds_bucket[5m])) by (le, mode, status))",
+          "expr": "histogram_quantile(0.50, sum(rate(parser_channel_processing_seconds_bucket[15m])) by (le, mode, status))",
           "legendFormat": "p50 - {{mode}}/{{status}}",
           "refId": "B"
         },
@@ -1408,7 +1408,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum(rate(parser_channel_processing_seconds_bucket[5m])) by (le, mode, status))",
+          "expr": "histogram_quantile(0.99, sum(rate(parser_channel_processing_seconds_bucket[15m])) by (le, mode, status))",
           "legendFormat": "p99 - {{mode}}/{{status}}",
           "refId": "C"
         }

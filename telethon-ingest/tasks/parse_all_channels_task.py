@@ -18,68 +18,138 @@ import structlog
 import redis.asyncio as redis
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from prometheus_client import Counter, Histogram, Gauge, Summary
+from prometheus_client import Counter, Histogram, Gauge, Summary, REGISTRY
 
 from config import settings
 from utils.time_utils import ensure_dt_utc
 
 logger = structlog.get_logger()
 
+# Context7: Функции для предотвращения дублирования метрик (определяем ПЕРЕД использованием)
+def _get_or_create_counter(name, description, labels):
+    """Получить существующую метрику или создать новую."""
+    try:
+        existing = REGISTRY._names_to_collectors.get(name)
+        if existing:
+            return existing
+    except (AttributeError, KeyError, TypeError):
+        pass
+    
+    try:
+        return Counter(name, description, labels)
+    except ValueError as e:
+        if "Duplicated timeseries" in str(e):
+            try:
+                return REGISTRY._names_to_collectors.get(name)
+            except (AttributeError, KeyError, TypeError):
+                pass
+        logger.warning(f"Metric {name} already exists", error=str(e))
+        raise
+
+def _get_or_create_histogram(name, description, labels=None, buckets=None):
+    """Получить существующую метрику или создать новую."""
+    try:
+        existing = REGISTRY._names_to_collectors.get(name)
+        if existing:
+            return existing
+    except (AttributeError, KeyError, TypeError):
+        pass
+    
+    try:
+        # Context7: labels не может быть None для Histogram
+        if labels is None:
+            labels = []
+        if buckets:
+            return Histogram(name, description, labels, buckets=buckets)
+        return Histogram(name, description, labels)
+    except ValueError as e:
+        if "Duplicated timeseries" in str(e):
+            try:
+                return REGISTRY._names_to_collectors.get(name)
+            except (AttributeError, KeyError, TypeError):
+                pass
+        logger.warning(f"Metric {name} already exists", error=str(e))
+        raise
+
+def _get_or_create_gauge(name, description, labels=None):
+    """Получить существующую метрику или создать новую."""
+    try:
+        existing = REGISTRY._names_to_collectors.get(name)
+        if existing:
+            return existing
+    except (AttributeError, KeyError, TypeError):
+        pass
+    
+    try:
+        if labels:
+            return Gauge(name, description, labels)
+        return Gauge(name, description)
+    except ValueError as e:
+        if "Duplicated timeseries" in str(e):
+            try:
+                return REGISTRY._names_to_collectors.get(name)
+            except (AttributeError, KeyError, TypeError):
+                pass
+        logger.warning(f"Metric {name} already exists", error=str(e))
+        raise
+
 # Prometheus метрики
-parser_runs_total = Counter(
+parser_runs_total = _get_or_create_counter(
     'parser_runs_total',
     'Total parser runs',
     ['mode', 'status']
 )
 
-parsing_duration_seconds = Histogram(
+parsing_duration_seconds = _get_or_create_histogram(
     'parsing_duration_seconds',
     'Channel parsing duration',
     ['mode']
 )
 
-posts_parsed_total = Counter(
+posts_parsed_total = _get_or_create_counter(
     'posts_parsed_total',
     'Total posts parsed',
     ['mode', 'status']
 )
 
-incremental_watermark_age_seconds = Gauge(
+incremental_watermark_age_seconds = _get_or_create_gauge(
     'incremental_watermark_age_seconds',
     'Age of last_parsed_at watermark',
     ['channel_id']
 )
 
-scheduler_lock_acquired_total = Counter(
+scheduler_lock_acquired_total = _get_or_create_counter(
     'scheduler_lock_acquired_total',
     'Scheduler lock acquisition attempts',
     ['status']
 )
 
-parser_hwm_age_seconds = Gauge(
+parser_hwm_age_seconds = _get_or_create_gauge(
     'parser_hwm_age_seconds',
     'Age of Redis HWM watermark',
     ['channel_id']
 )
 
-parser_mode_forced_total = Counter(
+parser_mode_forced_total = _get_or_create_counter(
     'parser_mode_forced_total',
     'Count of forced mode changes',
     ['reason']
 )
 
-scheduler_last_tick_ts_seconds = Gauge(
+scheduler_last_tick_ts_seconds = _get_or_create_gauge(
     'scheduler_last_tick_ts_seconds',
-    'Unix timestamp of last scheduler tick'
+    'Unix timestamp of last scheduler tick',
+    labels=None
 )
 
 # Context7: Heartbeat метрика для отслеживания активности scheduler'а в реальном времени
-scheduler_heartbeat_seconds = Gauge(
+scheduler_heartbeat_seconds = _get_or_create_gauge(
     'scheduler_heartbeat_seconds',
-    'Scheduler heartbeat timestamp (updated every 30s to track scheduler activity)'
+    'Scheduler heartbeat timestamp (updated every 30s to track scheduler activity)',
+    labels=None
 )
 
-parser_retries_total = Counter(
+parser_retries_total = _get_or_create_counter(
     'parser_retries_total',
     'Total parser retry attempts',
     ['reason']
@@ -87,64 +157,64 @@ parser_retries_total = Counter(
 
 # Context7: Summary для времени обработки каналов с перцентилями
 # Используем Histogram вместо Summary для совместимости с prometheus_client
-parser_channel_processing_seconds = Histogram(
+parser_channel_processing_seconds = _get_or_create_histogram(
     'parser_channel_processing_seconds',
     'Time spent processing a single channel',
     ['mode', 'status'],
     buckets=(0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0)
 )
 
-parser_floodwait_seconds_total = Counter(
+parser_floodwait_seconds_total = _get_or_create_counter(
     'parser_floodwait_seconds_total',
     'Total time spent waiting for FloodWait',
     ['channel_id']
 )
 
 # Context7: Метрики для мониторинга пропусков постов
-posts_missing_duration_seconds = Gauge(
+posts_missing_duration_seconds = _get_or_create_gauge(
     'posts_missing_duration_seconds',
     'Duration of missing posts gap (difference between last_parsed_at and MAX(posted_at))',
     ['channel_id']
 )
 
-posts_backfill_triggered_total = Counter(
+posts_backfill_triggered_total = _get_or_create_counter(
     'posts_backfill_triggered_total',
     'Total backfill operations triggered for missing posts',
     ['channel_id', 'reason']
 )
 
 # Расширенные метрики для адаптивных порогов
-channel_last_post_timestamp_seconds = Gauge(
+channel_last_post_timestamp_seconds = _get_or_create_gauge(
     'channel_last_post_timestamp_seconds',
     'Timestamp of last post (MAX(posted_at)) in epoch seconds',
     ['channel_id']
 )
 
-parser_last_success_seconds = Gauge(
+parser_last_success_seconds = _get_or_create_gauge(
     'parser_last_success_seconds',
     'Timestamp of last successful parsing in epoch seconds',
     ['channel_id']
 )
 
-adaptive_threshold_seconds = Gauge(
+adaptive_threshold_seconds = _get_or_create_gauge(
     'adaptive_threshold_seconds',
     'Current adaptive threshold for missing posts detection in seconds',
     ['channel_id']
 )
 
-channel_gap_seconds = Gauge(
+channel_gap_seconds = _get_or_create_gauge(
     'channel_gap_seconds',
     'Current gap between now and last post (now - MAX(posted_at)) in seconds',
     ['channel_id']
 )
 
-backfill_jobs_total = Counter(
+backfill_jobs_total = _get_or_create_counter(
     'backfill_jobs_total',
     'Total backfill jobs (enqueued, completed, failed)',
     ['channel_id', 'status']
 )
 
-interarrival_seconds = Histogram(
+interarrival_seconds = _get_or_create_histogram(
     'interarrival_seconds',
     'Interarrival time between posts in seconds',
     ['channel_id'],
@@ -155,7 +225,7 @@ interarrival_seconds = Histogram(
 class ParseAllChannelsTask:
     """Scheduler для периодического парсинга всех активных каналов."""
     
-    def __init__(self, config, db_url: str, redis_client: Optional[Any], parser=None, app_state: Optional[Dict] = None, telegram_client_manager: Optional[Any] = None, media_processor: Optional[Any] = None):
+    def __init__(self, config, db_url: str, redis_client: Optional[Any], parser=None, app_state: Optional[Dict] = None, telegram_client_manager: Optional[Any] = None, media_processor: Optional[Any] = None, floodwait_manager: Optional[Any] = None):
         self.config = config
         self.db_url = db_url
         self.redis: Optional[redis.Redis] = redis_client  # Context7: Используем переданный async Redis клиент
@@ -163,6 +233,7 @@ class ParseAllChannelsTask:
         self.app_state = app_state
         self.telegram_client_manager = telegram_client_manager  # TelegramClientManager для парсинга
         self.media_processor = media_processor  # MediaProcessor для обработки медиа
+        self.floodwait_manager = floodwait_manager  # Context7: FloodWaitManager для глобального circuit breaker
         self.interval_sec = int(os.getenv("PARSER_SCHEDULER_INTERVAL_SEC", "300"))
         self.enabled = os.getenv("FEATURE_INCREMENTAL_PARSING_ENABLED", "true").lower() == "true"
         
@@ -739,6 +810,27 @@ class ParseAllChannelsTask:
             logger.debug("Got telegram client",
                         channel_id=channel['id'])
             
+            # Context7: Проверка глобального FloodWait перед парсингом канала
+            if self.floodwait_manager:
+                # Получаем session_id из telegram_client
+                session_id = "default"
+                try:
+                    if telegram_client.is_connected() and await telegram_client.is_user_authorized():
+                        me = await telegram_client.get_me()
+                        if me and hasattr(me, 'id'):
+                            session_id = str(me.id)
+                except Exception as e:
+                    logger.debug("Failed to get session_id from client", error=str(e))
+                
+                global_wait = await self.floodwait_manager.check_global_floodwait(session_id)
+                if global_wait and global_wait > 0:
+                    logger.warning("Skipping channel parsing due to global FloodWait",
+                                 channel_id=channel['id'],
+                                 wait_seconds=global_wait,
+                                 session_id=session_id)
+                    status = "skipped"
+                    return {"status": "skipped", "reason": "global_floodwait", "parsed": 0, "max_message_date": None}
+            
             # Context7: Создаем отдельный DB session для каждого канала
             # Это предотвращает дедлоки при параллельной обработке
             async with self.async_session_factory() as db_session:
@@ -749,13 +841,24 @@ class ParseAllChannelsTask:
                 config.db_url = self.db_url
                 config.redis_url = os.getenv("REDIS_URL", "redis://redis:6379")
                 
+                # Context7: Создаем SessionRateLimiter если не передан
+                from services.session_rate_limiter import SessionRateLimiter
+                session_rate_limiter = SessionRateLimiter(self.redis)
+                
+                # Context7: Создаем IngestAccountPool для управления пулом аккаунтов
+                from services.ingest_account_pool import IngestAccountPool
+                ingest_account_pool = IngestAccountPool(db_session, self.redis)
+                
                 parser = ChannelParser(
                     config=config,
                     db_session=db_session,
                     event_publisher=None,
                     redis_client=self.redis,
                     telegram_client_manager=self.telegram_client_manager,
-                    media_processor=self.media_processor
+                    media_processor=self.media_processor,
+                    floodwait_manager=self.floodwait_manager,  # Context7: Передаем FloodWaitManager
+                    session_rate_limiter=session_rate_limiter,  # Context7: Передаем SessionRateLimiter
+                    ingest_account_pool=ingest_account_pool  # Context7: Передаем IngestAccountPool
                 )
                 
                 # Context7: Парсинг канала с retry (все внутри wait_for)
@@ -957,6 +1060,22 @@ class ParseAllChannelsTask:
                                is_new_channel=is_new_channel,
                                last_parsed_at=channel.get('last_parsed_at'))
                 
+                # Context7: Ограничиваем глобальный параллелизм каналов
+                # Формула: min(кол-во_сессий * max_concurrent_per_session, разумный_предел)
+                # Предполагаем 2 сессии (389326685, 139883458) с max_concurrent=10 → 20 параллельных запросов
+                # Ограничиваем до 15 каналов одновременно для безопасности
+                global_channel_concurrency = min(
+                    int(os.getenv("PARSER_GLOBAL_CHANNEL_CONCURRENCY", "15")),
+                    self.config.max_concurrency * 3  # Не больше чем max_concurrency * 3
+                )
+                logger.info("Global channel concurrency limit",
+                           global_channel_concurrency=global_channel_concurrency,
+                           max_concurrency=self.config.max_concurrency,
+                           channels_selected=len(channels_sorted))
+                
+                # Context7: Создаем дополнительный семафор для ограничения глобального параллелизма каналов
+                global_channel_semaphore = asyncio.Semaphore(global_channel_concurrency)
+                
                 # Context7: Параллельная обработка только выбранных N каналов (не всех!)
                 # Context7: Используем новый parse_single_channel с отдельными DB sessions
                 async def process_channel_wrapper(channel, tick_start_time, max_tick_duration):
@@ -1018,6 +1137,9 @@ class ParseAllChannelsTask:
                         break
                     
                     batch = channels_sorted[batch_start:batch_start + channel_batch_size]
+                    # Context7: Ограничиваем размер батча глобальным семафором
+                    # Берем только столько каналов, сколько можем обработать параллельно
+                    batch = batch[:global_channel_concurrency]
                     batch_tasks = [
                         asyncio.create_task(process_channel_with_timeout(channel, tick_start_time, max_tick_duration))
                         for channel in batch
@@ -1415,6 +1537,9 @@ class ParseAllChannelsTask:
             # 3. Каналы с новыми постами - приоритетный слот
             # 4. Остальные каналы - fairness слот
             
+            # Context7: Оптимизированный запрос с EXISTS вместо DISTINCT ON
+            # Поля uc (source, theme_id) не используются после выборки, только для фильтрации активности
+            # EXISTS проще и быстрее, чем DISTINCT ON с LEFT JOIN
             cursor.execute("""
                 WITH channel_activity AS (
                     SELECT 
@@ -1432,30 +1557,26 @@ class ParseAllChannelsTask:
                       AND (c.blocked_until IS NULL OR c.blocked_until < NOW())
                     GROUP BY c.id
                 )
-                SELECT DISTINCT ON (c.id)
-                       c.id,
+                SELECT c.id,
                        c.tg_channel_id,
                        c.username,
                        c.title,
                        c.last_parsed_at,
                        c.is_active,
                        c.blocked_until,
-                       COALESCE(u.tenant_id::text, '00000000-0000-0000-0000-000000000000') as tenant_id,
-                       COALESCE(uc.user_id::text, '0') as user_id,
                        COALESCE(ca.new_posts_count, 0) as new_posts_count,
                        ca.last_post_time,
                        COALESCE(ca.posts_24h, 0) as posts_24h
                 FROM channels c
-                LEFT JOIN user_channel uc ON c.id = uc.channel_id AND uc.is_active = true
-                LEFT JOIN users u ON uc.user_id = u.id
                 LEFT JOIN channel_activity ca ON c.id = ca.channel_id
                 WHERE c.is_active = true
                   AND (c.blocked_until IS NULL OR c.blocked_until < NOW())
+                  -- Context7: Канал активен, если есть хотя бы одна активная подписка (manual или theme)
+                  AND EXISTS (
+                      SELECT 1 FROM user_channel uc
+                      WHERE uc.channel_id = c.id AND uc.is_active = true
+                  )
                 ORDER BY
-                  c.id,  -- Обязательно для DISTINCT ON
-                  -- Приоритет источников: manual > theme (для детерминизма)
-                  uc.source DESC NULLS LAST,
-                  uc.updated_at DESC NULLS LAST,
                   -- Приоритет 1: Критически голодающие каналы (> 24 часа или NULL)
                   (c.last_parsed_at IS NULL OR c.last_parsed_at < NOW() - INTERVAL '24 hours') DESC,
                   -- Приоритет 2: Голодающие каналы (> 6 часов) - анти-starvation
@@ -1468,15 +1589,29 @@ class ParseAllChannelsTask:
                   ca.last_post_time DESC NULLS LAST,
                   -- Приоритет 5: Давно не парсились (старые last_parsed_at) - fairness
                   c.last_parsed_at ASC NULLS FIRST,
-                  -- Приоритет 6: Fairness между tenant'ами и пользователями
-                  COALESCE(u.tenant_id::text, '00000000-0000-0000-0000-000000000000'),
-                  COALESCE(uc.user_id::text, '0'),
+                  -- Приоритет 6: Fairness - новые каналы первыми
                   c.created_at DESC
                 LIMIT %s
             """, (channels_per_tick,))
             
             channels = cursor.fetchall()
             channels_list = [dict(ch) for ch in channels]
+            
+            # Context7: Очистка истекших блокировок перед обработкой каналов
+            try:
+                cursor.execute("""
+                    UPDATE channels 
+                    SET blocked_until = NULL 
+                    WHERE blocked_until IS NOT NULL 
+                        AND blocked_until < NOW()
+                """)
+                cleared_count = cursor.rowcount
+                if cleared_count > 0:
+                    logger.debug("Cleared expired blocked_until",
+                               cleared_count=cleared_count)
+            except Exception as cleanup_error:
+                logger.warning("Failed to clear expired blocked_until",
+                             error=str(cleanup_error))
             
             # Context7: Логируем статистику для диагностики с информацией о новых постах
             new_channels_count = sum(1 for ch in channels_list if ch.get('last_parsed_at') is None)
