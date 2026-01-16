@@ -7,14 +7,81 @@
 import asyncio
 import asyncpg
 import structlog
+import time
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
 import hashlib
 import json
 from typing import Union
 from event_bus import RedisStreamsClient, EventConsumer, ConsumerConfig
+from prometheus_client import Counter, Histogram, Gauge, REGISTRY
+from api.utils.postgres_metrics import measure_postgres_operation, update_connection_metrics
 
 logger = structlog.get_logger()
+
+# ============================================================================
+# PROMETHEUS METRICS
+# ============================================================================
+
+# Context7: Безопасное создание метрик для избежания дублирования
+def _safe_create_metric(metric_class, name, *args, **kwargs):
+    """Создание метрики с проверкой на дублирование."""
+    try:
+        return metric_class(name, *args, **kwargs)
+    except ValueError as e:
+        if 'Duplicated' in str(e) or 'already registered' in str(e).lower():
+            try:
+                if hasattr(REGISTRY, '_names_to_collectors'):
+                    existing = REGISTRY._names_to_collectors.get(name)
+                    if existing:
+                        logger.debug(f"Found existing metric {name} in REGISTRY, reusing", metric=name)
+                        return existing
+            except (AttributeError, KeyError, TypeError):
+                pass
+            logger.warning(f"Metric {name} exists but could not retrieve from REGISTRY, using mock", metric=name)
+            class MockMetric:
+                def labels(self, **kwargs):
+                    return self
+                def inc(self, value=1):
+                    pass
+                def observe(self, value):
+                    pass
+                def set(self, value):
+                    pass
+            return MockMetric()
+        raise
+
+# Метрики обработки событий
+post_persistence_processed_total = _safe_create_metric(
+    Counter,
+    'post_persistence_processed_total',
+    'Total posts persisted',
+    ['status']  # success, error, skipped
+)
+
+post_persistence_latency_seconds = _safe_create_metric(
+    Histogram,
+    'post_persistence_latency_seconds',
+    'Post persistence latency',
+    ['operation'],  # upsert_post, upsert_channel
+    buckets=[0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0]
+)
+
+# Метрики БД операций
+post_persistence_db_operations_total = _safe_create_metric(
+    Counter,
+    'post_persistence_db_operations_total',
+    'Total DB operations',
+    ['operation', 'status']  # upsert_post, upsert_channel, success, error
+)
+
+# Метрики PEL
+post_persistence_pel_size = _safe_create_metric(
+    Gauge,
+    'post_persistence_pel_size',
+    'Pending Entry List size for post persistence',
+    ['consumer_group']
+)
 
 
 class PostPersistenceWorker:
@@ -31,6 +98,10 @@ class PostPersistenceWorker:
         self.is_running = False
         self.redis_streams_client: Optional[RedisStreamsClient] = None
         self.event_consumer: Optional[EventConsumer] = None
+        self._last_pel_update_time = 0.0
+        self._pel_update_interval = 30.0  # Обновление метрик PEL каждые 30 секунд
+        self._connection_metrics_update_interval = 60.0  # Обновление метрик подключений каждые 60 секунд
+        self._last_connection_metrics_update = 0.0
         
     async def initialize(self):
         """Context7: Инициализация подключений."""
@@ -76,17 +147,69 @@ class PostPersistenceWorker:
         try:
             if not self.event_consumer:
                 raise RuntimeError("EventConsumer not initialized")
-            # Context7: правильный цикл pending→new
-            await self.event_consumer.consume_forever(
-                stream_name=self.stream_name,
-                handler_func=self._handle_post_parsed
-            )
+            
+            # Context7: Периодическое обновление метрик PEL в фоне
+            import asyncio
+            pel_update_task = asyncio.create_task(self._periodic_pel_update())
+            
+            try:
+                # Context7: правильный цикл pending→new
+                await self.event_consumer.consume_forever(
+                    stream_name=self.stream_name,
+                    handler_func=self._handle_post_parsed
+                )
+            finally:
+                pel_update_task.cancel()
+                try:
+                    await pel_update_task
+                except asyncio.CancelledError:
+                    pass
         except Exception as e:
             logger.error("PostPersistenceWorker error", extra={"error": str(e)})
             raise
     
+    async def _periodic_pel_update(self):
+        """Context7: Периодическое обновление метрик PEL и подключений."""
+        while self.is_running:
+            try:
+                await asyncio.sleep(self._pel_update_interval)
+                await self._update_pel_metrics()
+                
+                # Обновление метрик подключений
+                current_time = time.time()
+                if current_time - self._last_connection_metrics_update >= self._connection_metrics_update_interval:
+                    if self.db_pool:
+                        await update_connection_metrics(self.db_pool, database_name="telegram_assistant")
+                    self._last_connection_metrics_update = current_time
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug("Failed to update metrics", error=str(e))
+    
+    async def _update_pel_metrics(self):
+        """Context7: Обновление метрик PEL."""
+        try:
+            if not self.redis_streams_client or not self.redis_streams_client.client:
+                return
+            
+            from event_bus import STREAMS
+            stream_key = STREAMS.get(self.stream_name, self.stream_name)
+            
+            # Получение информации о PEL через XPENDING
+            pending_info = await self.redis_streams_client.client.xpending(
+                stream_key, 
+                self.consumer_group
+            )
+            
+            if pending_info and isinstance(pending_info, dict):
+                pel_size = pending_info.get('pending', 0) if isinstance(pending_info.get('pending'), int) else 0
+                post_persistence_pel_size.labels(consumer_group=self.consumer_group).set(pel_size)
+        except Exception as e:
+            logger.debug("Failed to update PEL metrics", error=str(e))
+    
     async def _handle_post_parsed(self, event_data: Dict[str, Any]):
         """Обработчик одного события posts.parsed с UPSERT в posts."""
+        start_time = time.time()
         try:
             # Если пришёл JSON в поле data — распарсим
             if 'data' in event_data and isinstance(event_data['data'], str):
@@ -100,8 +223,16 @@ class PostPersistenceWorker:
             post_data = self._map_flat_parsed_to_post(parsed)
             async with self.db_pool.acquire() as conn:
                 await self._upsert_post(conn, post_data)
+            
+            # Context7: Обновление метрик
+            post_persistence_processed_total.labels(status='success').inc()
+            # Метрики БД операций обновляются через декоратор @measure_postgres_operation
+            
             logger.info("post_persist_ok", extra={"post_id": post_data.get('id')})
         except Exception as e:
+            # Context7: Обновление метрик ошибок
+            post_persistence_processed_total.labels(status='error').inc()
+            # Метрики БД операций обновляются через декоратор @measure_postgres_operation
             logger.error("post_persist_failed", extra={"error": str(e)})
     
     async def _process_batch(self, messages: List):
@@ -170,6 +301,7 @@ class PostPersistenceWorker:
         except Exception as e:
             logger.error("Failed to process batch", extra={"error": str(e)})
     
+    @measure_postgres_operation('upsert_post')
     async def _upsert_post(self, conn: asyncpg.Connection, post_data: Dict[str, Any]):
         """Context7: UPSERT поста с идемпотентностью."""
         try:
@@ -229,6 +361,8 @@ class PostPersistenceWorker:
                 int(post_data.get('forwards_count') or 0),
                 int(post_data.get('reactions_count') or 0),
             )
+            
+            # Context7: Метрика длительности операции уже обновляется в _handle_post_parsed
             
         except Exception as e:
             logger.error("Failed to upsert post", extra={"post_id": post_data.get('id'), "error": str(e)})
@@ -299,6 +433,7 @@ class PostPersistenceWorker:
             # В крайнем случае — текущий UTC
             return datetime.now(timezone.utc)
     
+    @measure_postgres_operation('upsert_channel')
     async def _upsert_channel(self, conn: asyncpg.Connection, channel_data: Dict[str, Any]):
         """Context7: UPSERT канала."""
         try:
@@ -324,6 +459,8 @@ class PostPersistenceWorker:
                 channel_data.get('description'),
                 channel_data.get('member_count')
             )
+            
+            # Context7: Метрики обновляются через декоратор @measure_postgres_operation
             
         except Exception as e:
             logger.error("Failed to upsert channel", extra={"channel_id": channel_data.get('id'), "error": str(e)})

@@ -4,6 +4,9 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Telegram Assistant - QR Login</title>
+  <!-- Context7: загружаем Telegram WebApp API ПЕРВЫМ, до основного скрипта -->
+  <!-- Это критично для правильной инициализации WebApp контейнера -->
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <style>
     * { box-sizing: border-box; }
     body { 
@@ -95,6 +98,25 @@
         4. Отсканируйте QR-код
       </div>
       
+      <!-- Context7: Форма для ввода 2FA пароля -->
+      <div id="password-form" class="password-form hidden">
+        <h3 style="margin-top: 0; margin-bottom: 16px;">🔐 Требуется пароль 2FA</h3>
+        <p style="color: #6b7280; font-size: 14px; margin-bottom: 16px;">
+          Введите пароль двухфакторной аутентификации для завершения входа
+        </p>
+        <input 
+          type="password" 
+          id="password-input" 
+          placeholder="Пароль 2FA" 
+          style="width: 100%; padding: 12px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 14px; margin-bottom: 12px;"
+          autocomplete="current-password"
+        />
+        <button id="btn-submit-password" class="btn" style="width: 100%;">
+          Отправить пароль
+        </button>
+        <div id="password-error" style="margin-top: 12px; color: #dc2626; font-size: 14px; display: none;"></div>
+      </div>
+      
       <button id="btn-retry" class="btn hidden">Повторить</button>
     </div>
   </div>
@@ -106,6 +128,10 @@
     const qrEl = document.getElementById('qr');
     const timerEl = document.getElementById('timer');
     const btnRetryEl = document.getElementById('btn-retry');
+    const passwordFormEl = document.getElementById('password-form');
+    const passwordInputEl = document.getElementById('password-input');
+    const btnSubmitPasswordEl = document.getElementById('btn-submit-password');
+    const passwordErrorEl = document.getElementById('password-error');
 
     // State
     let sessionToken = null;
@@ -119,9 +145,30 @@
       const headers = { 'Content-Type': 'application/json' };
       const options = { method, headers };
       if (body) options.body = JSON.stringify(body);
-      const res = await fetch(path, options);
-      if (!res.ok) throw new Error(await res.text());
-      return await res.json();
+      try {
+        const res = await fetch(path, options);
+        if (!res.ok) {
+          let errorText = await res.text();
+          // Context7: пытаемся распарсить JSON ошибку, если это возможно
+          try {
+            const errorJson = JSON.parse(errorText);
+            if (errorJson.detail) {
+              errorText = errorJson.detail;
+            }
+          } catch (e) {
+            // Если не JSON, оставляем текст как есть
+          }
+          throw new Error(errorText || `HTTP ${res.status}: ${res.statusText}`);
+        }
+        return await res.json();
+      } catch (error) {
+        // Context7: если ошибка уже с message, просто пробрасываем
+        if (error instanceof Error) {
+          throw error;
+        }
+        // Context7: для других случаев создаем Error
+        throw new Error(error?.toString() || 'Неизвестная ошибка');
+      }
     }
 
     // Update status display
@@ -160,28 +207,105 @@
         eventSource.close();
       }
       
+      console.log('Starting SSE connection with token:', token ? token.substring(0, 20) + '...' : 'null');
       eventSource = new EventSource(`/tg/qr/sse?token=${encodeURIComponent(token)}`);
       
       eventSource.onmessage = function(event) {
         try {
           const data = JSON.parse(event.data);
+          console.log('SSE message received:', data);
+          // Context7: логируем все SSE сообщения для отладки в Mini App
+          // В Mini App console.log виден через DevTools или можно использовать Telegram.WebApp.showAlert
+          if (window.Telegram?.WebApp?.showAlert && data.status === 'password_required') {
+            // Показываем уведомление только один раз при первом получении password_required
+            if (!window._passwordAlertShown) {
+              window.Telegram.WebApp.showAlert('Требуется пароль 2FA');
+              window._passwordAlertShown = true;
+            }
+          }
           handleSSEMessage(data);
         } catch (e) {
           console.error('SSE parse error:', e);
+          if (window.Telegram?.WebApp?.showAlert) {
+            window.Telegram.WebApp.showAlert('Ошибка обработки данных: ' + e.message);
+          }
         }
       };
       
       eventSource.onerror = function(err) {
         console.error('SSE error:', err);
+        // Context7: в Mini App показываем ошибку через Telegram WebApp API
+        if (window.Telegram?.WebApp?.showAlert) {
+          window.Telegram.WebApp.showAlert('Ошибка соединения. Попробуйте ещё раз');
+        }
         updateStatus('Ошибка соединения. Попробуйте ещё раз', 'error');
         btnRetryEl.classList.remove('hidden');
         if (eventSource) eventSource.close();
+      };
+      
+      // Context7: логируем открытие SSE соединения для отладки
+      eventSource.onopen = function() {
+        console.log('SSE connection opened successfully');
       };
     }
 
     // Handle SSE messages
     function handleSSEMessage(data) {
-      console.log('SSE message:', data);
+      console.log('handleSSEMessage called with:', data);
+      // Context7: ВАЖНО! Обрабатываем password_required ПЕРВЫМ, до обработки qr_url
+      // Это гарантирует, что форма пароля показывается даже если есть qr_url в данных
+      
+      // Context7: проверяем статус password_required СТРОГО в начале
+      if (data.status === 'password_required') {
+        console.log('Password required detected in handleSSEMessage, showing form');
+        // Context7: Context7 best practice - используем Telegram.WebApp API для уведомлений
+        // Но показываем alert только один раз, чтобы не спамить пользователя
+        if (window.Telegram?.WebApp?.showAlert && !window._passwordAlertShown) {
+          window.Telegram.WebApp.showAlert('Требуется пароль 2FA для завершения входа');
+          window._passwordAlertShown = true;
+        }
+        
+        updateStatus('🔐 Требуется пароль 2FA', 'pending');
+        qrContainerEl.classList.add('hidden');
+        
+        // Context7: проверяем наличие элементов перед использованием
+        if (!passwordFormEl) {
+          console.error('passwordFormEl not found!');
+          // Context7: если элемент не найден, показываем ошибку через Telegram API
+          updateStatus('❌ Ошибка: форма пароля не найдена', 'error');
+          if (window.Telegram?.WebApp?.showAlert) {
+            window.Telegram.WebApp.showAlert('Ошибка: форма пароля не найдена. Перезагрузите страницу.');
+          }
+          return;
+        }
+        
+        console.log('Showing password form, passwordFormEl:', passwordFormEl, 'hidden class:', passwordFormEl.classList.contains('hidden'));
+        // Context7: показываем форму пароля
+        passwordFormEl.classList.remove('hidden');
+        console.log('Password form should be visible now, hidden class:', passwordFormEl.classList.contains('hidden'));
+        const instructionsEl = document.querySelector('.instructions');
+        if (instructionsEl) {
+          instructionsEl.classList.add('hidden');
+        }
+        
+        // Context7: Context7 best practice - фокус на поле ввода с небольшой задержкой
+        // для корректной работы в Mini App
+        setTimeout(() => {
+          if (passwordInputEl) {
+            passwordInputEl.focus();
+            // Context7: в Mini App может потребоваться явный вызов для фокуса
+            if (passwordInputEl.focus) {
+              try {
+                passwordInputEl.focus();
+              } catch (e) {
+                // Игнорируем ошибки фокуса в Mini App
+              }
+            }
+          }
+        }, 200); // Увеличена задержка для Mini App
+        
+        return; // Context7: выходим сразу, не обрабатываем другие статусы
+      }
       
       // Context7 best practice: показываем QR-код при получении qr_url или статусе awaiting_scan
       // Это гарантирует отображение QR-кода даже если статус изменился
@@ -220,9 +344,12 @@
         updateStatus('Ожидание QR-кода...', 'loading');
       }
       
+      // Context7: обработка password_required уже выполнена выше (в начале функции)
+      
       if (data.status === 'authorized') {
         updateStatus('✅ Успешная авторизация!', 'success');
         qrContainerEl.classList.add('hidden');
+        passwordFormEl.classList.add('hidden');
         if (eventSource) eventSource.close();
         if (countdownInterval) clearInterval(countdownInterval);
         
@@ -233,11 +360,179 @@
           }
         }, 2000);
       } else if (data.status === 'failed') {
-        updateStatus('❌ Ошибка авторизации', 'error');
+        // Context7: показываем причину ошибки, если она есть
+        let errorMessage = '❌ Ошибка авторизации';
+        if (data.reason) {
+          // Маппинг причин ошибок на понятные сообщения
+          const reasonMessages = {
+            'password_required': 'Требуется пароль 2FA',
+            'ownership_mismatch': 'Несоответствие аккаунта',
+            'flood_wait': 'Слишком много запросов. Попробуйте позже',
+            'qr_login_error': 'Ошибка при обработке QR-кода',
+            'invalid_telegram_user': 'Неверные данные пользователя',
+            'session_store': 'Ошибка сохранения сессии',
+            'session_store_integrity_failed': 'Ошибка сохранения сессии: проблема с данными',
+            'session_store_operational_failed': 'Ошибка сохранения сессии: проблема с операцией',
+            'session_store_database_failed': 'Ошибка сохранения сессии: проблема с базой данных',
+            'session_store_unexpected_failed': 'Ошибка сохранения сессии: неожиданная ошибка',
+            'session_saver_failed': 'Ошибка сохранения сессии: проблема с сохранением'
+          };
+          const reasonKey = Object.keys(reasonMessages).find(key => data.reason.includes(key));
+          if (reasonKey) {
+            errorMessage = `❌ ${reasonMessages[reasonKey]}`;
+          } else {
+            errorMessage = `❌ Ошибка: ${data.reason}`;
+          }
+        }
+        updateStatus(errorMessage, 'error');
         btnRetryEl.classList.remove('hidden');
         if (eventSource) eventSource.close();
         if (countdownInterval) clearInterval(countdownInterval);
       }
+    }
+
+    // Context7: кэш для initData (best practice из webapp/qr.html)
+    let cachedInitData = '';
+    let cachedInitDataUnsafe = null;
+
+    // Context7: извлечение initData из URL параметров (fallback для некоторых случаев)
+    function getInitDataFromUrl() {
+      try {
+        const searchParams = new URLSearchParams(window.location.search);
+        const tgParam = searchParams.get('tgWebAppData');
+        if (tgParam) {
+          const decoded = decodeURIComponent(tgParam);
+          if (decoded && decoded.includes('=')) {
+            console.log('[QR] initData extracted from URL search, length:', decoded.length);
+            return decoded;
+          }
+        }
+
+        if (window.location.hash && window.location.hash.includes('tgWebAppData=')) {
+          const hashParams = new URLSearchParams(window.location.hash.replace('#', ''));
+          const tgParamHash = hashParams.get('tgWebAppData');
+          if (tgParamHash) {
+            const decodedHash = decodeURIComponent(tgParamHash);
+            if (decodedHash && decodedHash.includes('=')) {
+              console.log('[QR] initData extracted from URL hash, length:', decodedHash.length);
+              return decodedHash;
+            }
+          }
+        }
+      } catch (error) {
+        console.error('[QR] Failed to extract initData from URL:', error);
+      }
+      return '';
+    }
+
+    // Context7: сортировка объекта для правильного построения initData
+    function sortObjectDeep(value) {
+      if (Array.isArray(value)) {
+        return value.map(sortObjectDeep);
+      }
+      if (value && typeof value === 'object') {
+        const sorted = {};
+        Object.keys(value)
+          .sort()
+          .forEach((key) => {
+            sorted[key] = sortObjectDeep(value[key]);
+          });
+        return sorted;
+      }
+      return value;
+    }
+
+    // Context7: построение initData из initDataUnsafe (правильный способ, не JSON.stringify)
+    function buildInitDataFromUnsafe(unsafe) {
+      if (!unsafe || typeof unsafe !== 'object') {
+        return '';
+      }
+      const parts = [];
+      Object.keys(unsafe).sort().forEach((key) => {
+        const value = unsafe[key];
+        if (value === undefined || value === null) {
+          return;
+        }
+        if (typeof value === 'object') {
+          parts.push(`${key}=${encodeURIComponent(JSON.stringify(sortObjectDeep(value)))}`);
+        } else {
+          parts.push(`${key}=${encodeURIComponent(String(value))}`);
+        }
+      });
+      if (parts.length === 0) {
+        return '';
+      }
+      return parts.join('&');
+    }
+
+    // Context7: валидация initData
+    function isValidInitData(data) {
+      if (!data || typeof data !== 'string') {
+        return false;
+      }
+      const trimmed = data.trim();
+      if (trimmed.length === 0 || trimmed === '{}') {
+        return false;
+      }
+      return trimmed.includes('=');
+    }
+
+    // Context7: получение initDataUnsafe с кэшированием
+    function getInitDataUnsafe() {
+      if (cachedInitDataUnsafe) {
+        return cachedInitDataUnsafe;
+      }
+      if (window.Telegram?.WebApp?.initDataUnsafe) {
+        cachedInitDataUnsafe = window.Telegram.WebApp.initDataUnsafe;
+        return cachedInitDataUnsafe;
+      }
+      return null;
+    }
+
+    // Context7: универсальная функция получения initData из всех источников
+    function getInitData() {
+      // 1. Проверяем кэш
+      if (cachedInitData && isValidInitData(cachedInitData)) {
+        return cachedInitData;
+      }
+
+      // 2. Проверяем URL параметры
+      const urlInitData = getInitDataFromUrl();
+      if (isValidInitData(urlInitData)) {
+        cachedInitData = urlInitData;
+        return cachedInitData;
+      }
+
+      // 3. Проверяем Telegram.WebApp.initData
+      if (window.Telegram?.WebApp?.initData && isValidInitData(window.Telegram.WebApp.initData)) {
+        cachedInitData = window.Telegram.WebApp.initData;
+        return cachedInitData;
+      }
+
+      // 4. Строим из initDataUnsafe
+      const unsafe = getInitDataUnsafe();
+      if (unsafe) {
+        const built = buildInitDataFromUnsafe(unsafe);
+        if (isValidInitData(built)) {
+          cachedInitData = built;
+          console.log('[QR] Built initData from initDataUnsafe, length:', cachedInitData.length);
+          return cachedInitData;
+        }
+      }
+
+      return '';
+    }
+
+    // Context7: ожидание загрузки initData с повторными попытками
+    async function waitForInitData(maxAttempts = 30, delayMs = 150) {
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        const data = getInitData();
+        if (isValidInitData(data)) {
+          return data;
+        }
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+      }
+      return '';
     }
 
     // Start QR login process
@@ -246,31 +541,24 @@
         updateStatus('Инициализация...', 'loading');
         btnRetryEl.classList.add('hidden');
         
-        // Get initData from Telegram WebApp
-        // Context7: проверяем все возможные источники initData
-        let initData = '';
-        if (window.Telegram?.WebApp?.initData) {
-          initData = window.Telegram.WebApp.initData;
-          console.log('initData from Telegram.WebApp.initData, length:', initData.length);
-        } else if (window.Telegram?.WebApp?.initDataUnsafe) {
-          // Fallback для некоторых версий Telegram WebApp
-          console.log('Using initDataUnsafe as fallback');
-          initData = JSON.stringify(window.Telegram.WebApp.initDataUnsafe);
-        } else {
-          console.error('initData NOT FOUND! window.Telegram:', !!window.Telegram, 
-                       'WebApp:', !!window.Telegram?.WebApp,
-                       'initData:', !!window.Telegram?.WebApp?.initData);
-          updateStatus('Ошибка: не удалось получить данные Telegram WebApp', 'error');
+        // Context7: ожидаем загрузки initData (best practice - не сразу, а с повторными попытками)
+        console.log('Waiting for initData...');
+        const initData = await waitForInitData(30, 150);
+        
+        if (!isValidInitData(initData)) {
+          console.error('initData NOT FOUND after waiting!', {
+            Telegram: !!window.Telegram,
+            WebApp: !!window.Telegram?.WebApp,
+            initData: !!window.Telegram?.WebApp?.initData,
+            initDataUnsafe: !!window.Telegram?.WebApp?.initDataUnsafe,
+            url: window.location.href
+          });
+          updateStatus('Ошибка: не удалось получить данные Telegram WebApp. Открой Mini App из Telegram.', 'error');
           btnRetryEl.classList.remove('hidden');
           return;
         }
         
-        if (!initData || initData.length === 0) {
-          console.error('initData is empty!');
-          updateStatus('Ошибка: пустые данные Telegram WebApp', 'error');
-          btnRetryEl.classList.remove('hidden');
-          return;
-        }
+        console.log('initData extracted, length:', initData.length, 'first 50 chars:', initData.substring(0, 50));
         
         console.log('initData extracted, length:', initData.length, 'first 50 chars:', initData.substring(0, 50));
         
@@ -346,24 +634,243 @@
           updateTimer();
         }
         
+        // Context7: проверяем начальный статус перед запуском SSE
+        // Если статус уже password_required, показываем форму сразу
+        try {
+          const initialStatus = await callApi('/tg/qr/status', 'POST', { session_token: sessionToken });
+          console.log('Initial QR status:', initialStatus);
+          if (initialStatus.status === 'password_required') {
+            console.log('Status is already password_required, showing form immediately');
+            handleSSEMessage({ status: 'password_required', reason: initialStatus.reason });
+          }
+        } catch (e) {
+          console.warn('Failed to check initial status:', e);
+        }
+        
         // Start SSE for real-time updates
+        console.log('Starting SSE with sessionToken:', sessionToken ? sessionToken.substring(0, 24) + '...' : 'null');
         startSSE(sessionToken);
         
       } catch (error) {
         console.error('QR login error:', error);
-        updateStatus('Ошибка: ' + error.message, 'error');
+        // Context7: улучшенная обработка ошибок с проверкой наличия message
+        let errorMessage = 'Ошибка авторизации';
+        if (error instanceof Error && error.message) {
+          errorMessage = error.message;
+          // Context7: если ошибка содержит технические детали, упрощаем для пользователя
+          if (errorMessage.includes('Failed to fetch') || errorMessage.includes('NetworkError')) {
+            errorMessage = 'Ошибка соединения с сервером. Проверьте интернет и попробуйте ещё раз';
+          } else if (errorMessage.includes('401') || errorMessage.includes('Unauthorized')) {
+            if (errorMessage.includes('token expired') || errorMessage.includes('expired')) {
+              errorMessage = 'Сессия истекла. Начните авторизацию заново';
+            } else {
+              errorMessage = 'Ошибка авторизации. Попробуйте ещё раз';
+            }
+          } else if (errorMessage.includes('429') || errorMessage.includes('Too Many Requests')) {
+            errorMessage = 'Слишком много запросов. Подождите немного и попробуйте ещё раз';
+          } else if (errorMessage.includes('500') || errorMessage.includes('Internal Server Error')) {
+            errorMessage = 'Временная ошибка сервера. Попробуйте ещё раз через несколько секунд';
+          }
+        } else if (error && typeof error === 'string') {
+          errorMessage = error;
+        }
+        updateStatus('❌ ' + errorMessage, 'error');
         btnRetryEl.classList.remove('hidden');
+        // Context7: закрываем SSE соединение при ошибке
+        if (eventSource) {
+          eventSource.close();
+          eventSource = null;
+        }
+        if (countdownInterval) {
+          clearInterval(countdownInterval);
+          countdownInterval = null;
+        }
       }
     }
 
+    // Context7: функция для отправки 2FA пароля
+    async function submitPassword() {
+      const password = passwordInputEl.value.trim();
+      if (!password) {
+        passwordErrorEl.textContent = 'Введите пароль';
+        passwordErrorEl.style.display = 'block';
+        return;
+      }
+      
+      if (!sessionToken) {
+        passwordErrorEl.textContent = 'Ошибка: сессия не найдена';
+        passwordErrorEl.style.display = 'block';
+        return;
+      }
+      
+      try {
+        passwordErrorEl.style.display = 'none';
+        btnSubmitPasswordEl.disabled = true;
+        btnSubmitPasswordEl.textContent = 'Отправка...';
+        
+        const response = await callApi('/tg/qr/password', 'POST', {
+          session_token: sessionToken,
+          password: password
+        });
+        
+        console.log('Password submission response:', response);
+        
+        if (response.status === 'authorized') {
+          updateStatus('✅ Пароль принят, завершение авторизации...', 'success');
+          passwordFormEl.classList.add('hidden');
+          
+          // Продолжаем слушать SSE для получения финального статуса
+          if (!eventSource) {
+            startSSE(sessionToken);
+          }
+        } else {
+          throw new Error(response.message || 'Неизвестная ошибка');
+        }
+      } catch (error) {
+        console.error('Password submission error:', error);
+        passwordErrorEl.textContent = error.message || 'Ошибка при отправке пароля';
+        passwordErrorEl.style.display = 'block';
+        passwordInputEl.value = '';
+        passwordInputEl.focus();
+      } finally {
+        btnSubmitPasswordEl.disabled = false;
+        btnSubmitPasswordEl.textContent = 'Отправить пароль';
+      }
+    }
+    
+    // Обработчики для формы пароля
+    btnSubmitPasswordEl.addEventListener('click', submitPassword);
+    passwordInputEl.addEventListener('keypress', (e) => {
+      if (e.key === 'Enter') {
+        submitPassword();
+      }
+    });
+
     // Retry button handler
     btnRetryEl.addEventListener('click', () => {
+      passwordFormEl.classList.add('hidden');
+      passwordErrorEl.style.display = 'none';
+      passwordInputEl.value = '';
       startQRLogin();
     });
 
+    // Context7: проверка что страница открыта как WebApp, а не как MAF
+    // Основное различие WebApp vs MAF — наличие initData/initDataUnsafe
+    // Если их нет → страница открыта НЕ как WebApp
+    function isWebAppInitialized() {
+      if (!window.Telegram || !window.Telegram.WebApp) {
+        return false;
+      }
+      // Context7: проверяем что это действительно WebApp (не MAF)
+      // Используем универсальную функцию getInitData() для проверки всех источников
+      const initData = getInitData();
+      const hasValidInitData = isValidInitData(initData);
+      // Context7: проверяем версию WebApp (если есть)
+      const hasVersion = window.Telegram.WebApp.version;
+      return hasValidInitData || hasVersion;
+    }
+    
+    // Context7: асинхронная инициализация Telegram WebApp по best practices
+    // Согласно документации Telegram Mini Apps, нужно вызвать ready() и expand()
+    // ВАЖНО: ждем загрузки API, проверяем инициализацию, только потом запускаем QR
+    async function initTelegramWebApp() {
+      // Context7: проверяем что скрипт загружен
+      if (typeof window.Telegram === 'undefined') {
+        // Если скрипт еще не загружен, ждем
+        await new Promise(resolve => {
+          const checkInterval = setInterval(() => {
+            if (typeof window.Telegram !== 'undefined') {
+              clearInterval(checkInterval);
+              resolve();
+            }
+          }, 50);
+          // Timeout через 2 секунды
+          setTimeout(() => {
+            clearInterval(checkInterval);
+            resolve();
+          }, 2000);
+        });
+      }
+      
+      if (!window.Telegram?.WebApp) {
+        console.error('Telegram WebApp not available - page may be opened as MAF, not WebApp');
+        updateStatus('Ошибка: страница открыта не как Mini App. Откройте через бота в Telegram.', 'error');
+        btnRetryEl.classList.remove('hidden');
+        return false;
+      }
+      
+      // Context7: уведомляем Telegram, что Mini App готов
+      window.Telegram.WebApp.ready();
+      
+      // Context7: ждем пока WebApp будет готов (если есть isReady)
+      if (window.Telegram.WebApp.isReady !== undefined) {
+        if (!window.Telegram.WebApp.isReady) {
+          await new Promise(resolve => {
+            const checkReady = setInterval(() => {
+              if (window.Telegram.WebApp.isReady) {
+                clearInterval(checkReady);
+                resolve();
+              }
+            }, 50);
+            setTimeout(() => {
+              clearInterval(checkReady);
+              resolve();
+            }, 1000);
+          });
+        }
+      } else {
+        // Если isReady нет, ждем небольшую задержку для инициализации
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      
+      // Context7: ждем загрузки initData перед проверкой (best practice)
+      // Даем время для инициализации WebApp API
+      await new Promise(resolve => setTimeout(resolve, 200));
+      
+      // Context7: проверяем что WebApp действительно инициализирован (не MAF)
+      // Пробуем получить initData с несколькими попытками
+      const initDataCheck = await waitForInitData(10, 100);
+      if (!isValidInitData(initDataCheck)) {
+        console.error('WebApp not properly initialized - initData missing, page may be opened as MAF', {
+          Telegram: !!window.Telegram,
+          WebApp: !!window.Telegram?.WebApp,
+          initData: !!window.Telegram?.WebApp?.initData,
+          initDataUnsafe: !!window.Telegram?.WebApp?.initDataUnsafe,
+          version: window.Telegram?.WebApp?.version
+        });
+        updateStatus('Ошибка: Mini App не инициализирован. Откройте через бота в Telegram.', 'error');
+        btnRetryEl.classList.remove('hidden');
+        return false;
+      }
+      
+      // Context7: разворачиваем Mini App на весь экран
+      window.Telegram.WebApp.expand();
+      
+      // Context7: настраиваем тему, если доступна
+      if (window.Telegram.WebApp.themeParams) {
+        const theme = window.Telegram.WebApp.themeParams;
+        if (theme.bg_color) {
+          document.documentElement.style.setProperty('--tg-theme-bg-color', theme.bg_color);
+        }
+        if (theme.text_color) {
+          document.documentElement.style.setProperty('--tg-theme-text-color', theme.text_color);
+        }
+      }
+      
+      return true;
+    }
+    
     // Initialize on page load
-    document.addEventListener('DOMContentLoaded', () => {
-      startQRLogin();
+    document.addEventListener('DOMContentLoaded', async () => {
+      // Context7: инициализируем WebApp и ждем результата
+      const webAppInitialized = await initTelegramWebApp();
+      
+      // Context7: запускаем QR login только если WebApp инициализирован
+      if (webAppInitialized) {
+        startQRLogin();
+      } else {
+        console.error('Cannot start QR login - WebApp not initialized');
+      }
     });
 
     // Cleanup on page unload
@@ -372,7 +879,7 @@
       if (countdownInterval) clearInterval(countdownInterval);
     });
   </script>
-  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <!-- Context7: telegram-web-app.js уже загружен в <head>, удаляем отсюда -->
   <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
 </body>
 </html>

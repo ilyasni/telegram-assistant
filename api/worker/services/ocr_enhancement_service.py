@@ -14,6 +14,7 @@ import unicodedata
 from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime, timezone
 
+import asyncpg
 import structlog
 from langchain_gigachat import GigaChat
 from langchain_core.prompts import ChatPromptTemplate
@@ -22,6 +23,7 @@ from redis.asyncio import Redis
 
 from config import settings
 from ai_providers.embedding_service import normalize_text
+from services.ocr_dictionary_extractor import OCRDictionaryExtractor
 
 logger = structlog.get_logger()
 
@@ -64,6 +66,31 @@ ocr_enhancement_cache_hits_total = Counter(
     ['type']  # spell, entities
 )
 
+# Context7: Метрики качества OCR согласно плану улучшений
+ocr_quality_score = Histogram(
+    'ocr_quality_score',
+    'OCR quality score (0-1)',
+    buckets=[0.0, 0.5, 0.7, 0.8, 0.9, 1.0]
+)
+
+ocr_entities_coverage = Counter(
+    'ocr_entities_coverage_total',
+    'OCR texts with extracted entities',
+    ['status']  # with_entities, without_entities
+)
+
+ocr_enhancement_impact = Histogram(
+    'ocr_enhancement_impact',
+    'Impact of OCR enhancement on embedding quality (difference in length before/after)',
+    buckets=[0, 10, 50, 100, 500, 1000, 5000]
+)
+
+ocr_dictionary_updates_total = Counter(
+    'ocr_dictionary_updates_total',
+    'OCR dictionary term updates',
+    ['category']  # politics, geography, media, organizations, general
+)
+
 # ============================================================================
 # DOMAIN DICTIONARIES
 # ============================================================================
@@ -85,7 +112,24 @@ DOMAIN_DICTS = {
     ],
     "brands": [
         "Visa", "Mastercard", "МИР", "Мир", "UnionPay", "American Express",
-        "Apple Pay", "Google Pay", "Samsung Pay", "Яндекс.Пэй", "СБП"
+        "Apple Pay", "Google Pay", "Samsung Pay", "Яндекс.Пэй", "СБП", "Microsoft"
+    ],
+    # Context7: Расширение словарей для лучшего покрытия разных доменов
+    "politics": [
+        "Европейская комиссия", "ЕС", "Еврактив", "правительство",
+        "министерство", "парламент", "президент", "министр", "премьер-министр",
+        "комиссия", "Европа", "Европейский союз"
+    ],
+    "geography": [
+        "Киев", "Москва", "Бельгия", "Россия", "Украина", "Европа",
+        "Санкт-Петербург", "Берлин", "Париж", "Лондон"
+    ],
+    "media": [
+        "Financial Times", "Reuters", "Bloomberg", "Ведомости", "РБК",
+        "Коммерсант", "Интерфакс", "ТАСС", "РИА Новости"
+    ],
+    "organizations": [
+        "Европейская комиссия", "ЕС", "НАТО", "ООН", "МВФ", "Всемирный банк"
     ]
 }
 
@@ -116,9 +160,11 @@ class OCREnhancementService:
         self,
         redis_client: Optional[Redis] = None,
         gigachat_adapter: Optional[Any] = None,
+        db_pool: Optional[asyncpg.Pool] = None,
         enabled: bool = True,
         llm_fallback_enabled: bool = True,
-        entity_extraction_enabled: bool = True
+        entity_extraction_enabled: bool = True,
+        auto_dictionaries_enabled: bool = True
     ):
         """
         Инициализация OCR Enhancement Service.
@@ -126,24 +172,43 @@ class OCREnhancementService:
         Args:
             redis_client: Redis клиент для кэширования
             gigachat_adapter: GigaChat адаптер (опционально, создаст свой если не передан)
+            db_pool: Пул подключений к БД для автоматических словарей (опционально)
             enabled: Включение/выключение пайплайна
             llm_fallback_enabled: Включение LLM fallback для spell correction
             entity_extraction_enabled: Включение извлечения сущностей
+            auto_dictionaries_enabled: Включение автоматических словарей из БД
         """
         self.redis_client = redis_client
         self.enabled = enabled
         self.llm_fallback_enabled = llm_fallback_enabled
         self.entity_extraction_enabled = entity_extraction_enabled
+        self.auto_dictionaries_enabled = auto_dictionaries_enabled
+        
+        # Context7: Инициализация OCR Dictionary Extractor для автоматических словарей
+        self.dictionary_extractor = None
+        if auto_dictionaries_enabled and db_pool:
+            try:
+                self.dictionary_extractor = OCRDictionaryExtractor(db_pool=db_pool)
+                logger.info("OCR Dictionary Extractor initialized in OCREnhancementService")
+            except Exception as e:
+                logger.warning("Failed to initialize OCR Dictionary Extractor", error=str(e))
+        
+        # Кэш для автоматических словарей (lazy loading)
+        self._auto_dictionaries_cache: Optional[Dict[str, str]] = None
+        self._auto_dictionaries_loaded_at: Optional[float] = None
+        self._auto_dictionaries_cache_ttl = 3600  # 1 час
         
         # Инициализация GigaChat для LLM запросов
         if gigachat_adapter:
             self.llm = gigachat_adapter
         else:
             # Context7: Используем gpt2giga-proxy как OpenAI-compatible endpoint
+            # Context7: URL без /v1 для обработки редиректов прокси (как в rag_service.py)
             api_base = getattr(settings, 'openai_api_base', None) or "http://gpt2giga-proxy:8090"
             api_base = api_base.rstrip("/")
-            if not api_base.endswith("/v1"):
-                api_base = f"{api_base}/v1"
+            # Убираем /v1, LangChain автоматически добавит при необходимости
+            if api_base.endswith("/v1"):
+                api_base = api_base[:-3]
             
             credentials = getattr(settings, 'gigachat_credentials', None)
             if credentials:
@@ -180,28 +245,55 @@ class OCREnhancementService:
         ])
         
         # Промпт для entity extraction
+        # Context7: Универсальный промпт для разных типов текстов (политика, финансы, новости)
         self.entity_extraction_prompt = ChatPromptTemplate.from_messages([
-            ("system", """Ты — эксперт по извлечению сущностей из текста.
+            ("system", """Ты — эксперт по извлечению именованных сущностей (NER) из текста.
 
-Извлеки сущности из OCR текста. Типы:
-- ORG (обязательно): банки, магазины, сервисы
-- PRODUCT (обязательно): тип карт, эквайринг, конкретные продукты
-- PERSON (опционально): если явно присутствует (имена, должности)
-- LOC (опционально): города, адреса
+Извлеки все именованные сущности из OCR текста. Типы сущностей:
+- ORG: организации, компании, банки, правительственные органы, международные организации, министерства, комиссии
+  Примеры: "Сбербанк", "Европейская комиссия", "ЕС", "Еврактив", "ВТБ", "правительство", "министерство"
+- PERSON: имена людей, фамилии, политические деятели (включая должности с именами)
+  Примеры: "де Бевер", "Петр Иванов", "президент", "министр", "Крис"
+- LOC: города, страны, регионы, географические названия
+  Примеры: "Киев", "Бельгия", "Россия", "Москва", "Европа", "Украина"
+- PRODUCT: конкретные продукты, услуги, финансовые инструменты (только если это конкретное название)
+  Примеры: "дебетовая карта Visa", "эквайринг", "iPhone 15", "кредит"
 
-Верни ТОЛЬКО валидный JSON массив без дополнительного текста:
-[{"text": "название", "type": "ORG|PRODUCT|PERSON|LOC", "confidence": 0.0-1.0}]"""),
+ВАЖНО:
+- Извлекай сущности даже из текста с опечатками OCR (например, "Bевер" → "Бевер", "Киeвy" → "Киев")
+- Используй контекст для определения типа (например, "Европейская комиссия" = ORG, "премьер-министр Бельгии" = PERSON)
+- Если сущность упоминается несколько раз, используй наиболее полную и точную форму
+- Извлекай только явные именованные сущности, не общие слова или абстрактные понятия
+- Если сущностей нет, верни пустой массив []
+
+Верни ТОЛЬКО валидный JSON массив без дополнительного текста, комментариев и markdown блоков:
+[{{"text": "название сущности", "type": "ORG|PERSON|LOC|PRODUCT", "confidence": 0.0-1.0}}]"""),
             ("human", "Извлеки сущности из этого текста:\n\n{text}")
         ])
         
         # Инициализация spellchecker (lazy)
         self._spell_checker = None
         
+        # Context7: Инициализация OCR Dictionary Extractor для автоматических словарей
+        self.dictionary_extractor = None
+        if auto_dictionaries_enabled and db_pool:
+            try:
+                self.dictionary_extractor = OCRDictionaryExtractor(db_pool=db_pool)
+                logger.info("OCR Dictionary Extractor initialized in OCREnhancementService")
+            except Exception as e:
+                logger.warning("Failed to initialize OCR Dictionary Extractor", error=str(e))
+        
+        # Кэш для автоматических словарей (lazy loading)
+        self._auto_dictionaries_cache: Optional[Dict[str, str]] = None
+        self._auto_dictionaries_loaded_at: Optional[float] = None
+        self._auto_dictionaries_cache_ttl = 3600  # 1 час
+        
         logger.info(
             "OCR Enhancement Service initialized",
             enabled=enabled,
             llm_fallback_enabled=llm_fallback_enabled,
-            entity_extraction_enabled=entity_extraction_enabled
+            entity_extraction_enabled=entity_extraction_enabled,
+            auto_dictionaries_enabled=auto_dictionaries_enabled
         )
     
     def _get_spell_checker(self):
@@ -272,6 +364,122 @@ class OCREnhancementService:
             )
         except Exception as e:
             logger.warning("Failed to set to cache", cache_key=cache_key, error=str(e))
+    
+    async def _load_auto_dictionaries(self) -> Dict[str, str]:
+        """
+        Загрузить автоматические словари из БД.
+        
+        Context7: Lazy loading с кэшированием для производительности.
+        По аналогии с trend_clusters.keywords - автоматическое обновление на основе данных.
+        
+        Returns:
+            Словарь {normalized_term: original_term} для быстрого поиска
+        """
+        # Проверка кэша
+        now = time.time()
+        if (
+            self._auto_dictionaries_cache is not None
+            and self._auto_dictionaries_loaded_at is not None
+            and (now - self._auto_dictionaries_loaded_at) < self._auto_dictionaries_cache_ttl
+        ):
+            return self._auto_dictionaries_cache
+        
+        if not self.dictionary_extractor:
+            return {}
+        
+        try:
+            # Загружаем все категории
+            auto_dicts = await self.dictionary_extractor.get_dictionary_terms(
+                category=None,
+                min_frequency=2,  # Минимум 2 упоминания для надежности
+                limit=5000  # Ограничение для производительности
+            )
+            
+            self._auto_dictionaries_cache = auto_dicts
+            self._auto_dictionaries_loaded_at = now
+            
+            logger.debug(
+                "Auto dictionaries loaded",
+                terms_count=len(auto_dicts)
+            )
+            
+            return auto_dicts
+            
+        except Exception as e:
+            logger.warning("Failed to load auto dictionaries", error=str(e))
+            return {}
+    
+    async def _update_dictionary_from_ocr(
+        self,
+        ocr_text: str,
+        corrections: List[Dict[str, Any]]
+    ):
+        """
+        Обновить автоматические словари на основе обработанного OCR текста.
+        
+        Context7: Аналогично trends - автоматическое обучение на основе реальных данных.
+        
+        Args:
+            ocr_text: Оригинальный OCR текст
+            corrections: Список исправлений
+        """
+        if not self.dictionary_extractor or not self.auto_dictionaries_enabled:
+            return
+        
+        try:
+            # Извлекаем термины из текста
+            terms = self.dictionary_extractor.extract_terms_from_ocr(ocr_text)
+            
+            # Обновляем словарь для каждого термина
+            update_tasks = []
+            for term in terms:
+                if len(term) >= 3:  # Минимум 3 символа
+                    category = await self.dictionary_extractor.categorize_term(term, ocr_text)
+                    
+                    # Находим исправления для этого термина
+                    confidence = 0.5
+                    correction_example = None
+                    for correction in corrections:
+                        if correction.get("original", "").lower() == term.lower():
+                            confidence = correction.get("confidence", 0.5)
+                            correction_example = {
+                                "original": correction.get("original", ""),
+                                "corrected": correction.get("corrected", "")
+                            }
+                            break
+                    
+                    update_tasks.append((
+                        term,
+                        category,
+                        confidence,
+                        correction_example
+                    ))
+            
+            # Батч-обновление (максимум 50 терминов за раз)
+            if update_tasks:
+                for term, category, conf, example in update_tasks[:50]:
+                    await self.dictionary_extractor.update_dictionary(
+                        term=term,
+                        category=category,
+                        confidence=conf,
+                        correction_example=example
+                    )
+                
+                # Инвалидируем кэш для перезагрузки при следующем запросе
+                self._auto_dictionaries_loaded_at = None
+                
+                # Context7: Метрика обновлений словарей
+                for term, cat, conf, example in update_tasks[:50]:
+                    category = cat or 'general'
+                    ocr_dictionary_updates_total.labels(category=category).inc()
+                
+                logger.debug(
+                    "Auto dictionaries updated",
+                    terms_count=min(len(update_tasks), 50)
+                )
+                
+        except Exception as e:
+            logger.debug("Failed to update auto dictionaries", error=str(e))
     
     def _detect_language(self, text: str) -> Tuple[str, float]:
         """
@@ -347,19 +555,30 @@ class OCREnhancementService:
         # Быстрый слой: проверка по доменным словарям и spellchecker
         spell_checker = self._get_spell_checker()
         
+        # Context7: Загружаем автоматические словари из БД
+        auto_dicts = await self._load_auto_dictionaries()
+        
+        # Объединяем статические и автоматические словари
+        combined_dicts = {**DOMAIN_DICT_FLAT, **auto_dicts}
+        
         corrected_words = {}
         for start, end, word in word_positions:
             word_lower = word.lower()
             
-            # Проверка доменного словаря
-            if word_lower in DOMAIN_DICT_FLAT:
-                corrected = DOMAIN_DICT_FLAT[word_lower]
+            # Проверка доменного словаря (статический + автоматический)
+            if word_lower in combined_dicts:
+                corrected = combined_dicts[word_lower]
                 if corrected != word:
+                    # Определяем источник исправления
+                    method = "dictionary"
+                    if word_lower in auto_dicts:
+                        method = "auto_dictionary"
+                    
                     corrections.append({
                         "original": word,
                         "corrected": corrected,
-                        "confidence": 0.98,
-                        "method": "dictionary"
+                        "confidence": 0.98 if method == "dictionary" else 0.90,
+                        "method": method
                     })
                     corrected_words[(start, end)] = corrected
                     continue
@@ -520,6 +739,13 @@ class OCREnhancementService:
             else:
                 response_text = str(response).strip()
             
+            # Context7: Детальное логирование ответа LLM для диагностики
+            logger.debug(
+                "LLM response received for entity extraction",
+                response_length=len(response_text) if 'response_text' in locals() else 0,
+                response_preview=response_text[:300] if 'response_text' in locals() else "N/A"
+            )
+            
             # Парсинг JSON ответа
             # Удаляем markdown code blocks если есть
             response_text = re.sub(r'```json\s*', '', response_text)
@@ -529,10 +755,16 @@ class OCREnhancementService:
             entities = json.loads(response_text)
             
             if not isinstance(entities, list):
+                logger.warning(
+                    "Entity extraction returned non-list result",
+                    result_type=type(entities).__name__,
+                    result_preview=str(entities)[:200]
+                )
                 entities = []
             
             # Валидация и фильтрация
             valid_entities = []
+            invalid_count = 0
             for entity in entities:
                 if isinstance(entity, dict) and "text" in entity and "type" in entity:
                     entity_type = entity.get("type", "").upper()
@@ -543,6 +775,30 @@ class OCREnhancementService:
                             "confidence": float(entity.get("confidence", 0.8))
                         })
                         ocr_entities_extracted_total.labels(type=entity_type).inc()
+                    else:
+                        invalid_count += 1
+                        logger.debug(
+                            "Entity filtered out - invalid type",
+                            entity_text=entity.get("text", "N/A")[:50],
+                            entity_type=entity_type
+                        )
+                else:
+                    invalid_count += 1
+            
+            # Context7: Логирование результатов извлечения
+            logger.debug(
+                "Entity extraction completed",
+                total_found=len(entities),
+                valid_entities=len(valid_entities),
+                invalid_filtered=invalid_count,
+                text_length=len(text_for_extraction)
+            )
+            
+            # Context7: Метрика coverage entities
+            if valid_entities:
+                ocr_entities_coverage.labels(status="with_entities").inc()
+            else:
+                ocr_entities_coverage.labels(status="without_entities").inc()
             
             # Кэширование
             await self._set_to_cache(cache_key, valid_entities)
@@ -552,11 +808,24 @@ class OCREnhancementService:
             return valid_entities
             
         except json.JSONDecodeError as e:
-            response_preview = response_text[:200] if 'response_text' in locals() else "N/A"
-            logger.error("Failed to parse entity extraction JSON", error=str(e), response=response_preview)
+            response_preview = response_text[:500] if 'response_text' in locals() else "N/A"
+            logger.error(
+                "Failed to parse entity extraction JSON",
+                error=str(e),
+                error_type=type(e).__name__,
+                response_preview=response_preview,
+                text_length=len(text_for_extraction) if 'text_for_extraction' in locals() else 0
+            )
             return []
         except Exception as e:
-            logger.error("Entity extraction failed", error=str(e))
+            logger.error(
+                "Entity extraction failed",
+                error=str(e),
+                error_type=type(e).__name__,
+                text_length=len(text_for_extraction) if 'text_for_extraction' in locals() else 0
+            )
+            import traceback
+            logger.debug("Entity extraction traceback", traceback=traceback.format_exc())
             return []
     
     async def enhance_ocr_data(
@@ -602,16 +871,31 @@ class OCREnhancementService:
         ocr_enhancement_total.labels(stage="spell").inc()
         spell_result = await self.correct_spelling_hybrid(normalized)
         
+        # Context7: Безопасный доступ к spell_result с проверкой типа и fallback
+        if not isinstance(spell_result, dict):
+            logger.warning(
+                "spell_result is not a dict, using normalized text",
+                result_type=type(spell_result).__name__,
+                post_id=post_id,
+                trace_id=trace_id
+            )
+            spell_result = {"text_enhanced": normalized, "corrections": [], "method": "none"}
+        
+        # Безопасное извлечение text_enhanced с fallback
+        text_enhanced = spell_result.get("text_enhanced") or normalized or original_text
+        
         # Этап 3: Entity extraction (на исправленном тексте)
         entities = []
         if self.entity_extraction_enabled:
             ocr_enhancement_total.labels(stage="entities").inc()
-            entities = await self.extract_entities(spell_result["text_enhanced"])
+            # Context7: Передаем строку, а не словарь
+            if text_enhanced and text_enhanced.strip():
+                entities = await self.extract_entities(text_enhanced)
         
         # Формирование результата
         enhanced_ocr = ocr_data.copy()
         enhanced_ocr["text"] = original_text  # Сохраняем оригинал
-        enhanced_ocr["text_enhanced"] = spell_result["text_enhanced"]
+        enhanced_ocr["text_enhanced"] = text_enhanced
         enhanced_ocr["corrections"] = spell_result.get("corrections", [])
         enhanced_ocr["entities"] = entities
         enhanced_ocr["enhanced_at"] = datetime.now(timezone.utc).isoformat()
@@ -624,14 +908,32 @@ class OCREnhancementService:
         else:
             enhanced_ocr["text_confidence"] = 0.85  # Высокая уверенность если нет исправлений
         
+        # Context7: Метрики качества OCR
+        ocr_quality_score.observe(enhanced_ocr.get("text_confidence", 0.85))
+        
+        # Context7: Метрика impact enhancement (разница в длине до/после)
+        enhancement_impact = abs(len(text_enhanced) - len(original_text))
+        ocr_enhancement_impact.observe(enhancement_impact)
+        
         ocr_enhancement_duration_seconds.labels(stage="total").observe(time.time() - start_time)
+        
+        # Context7: Обновляем автоматические словари на основе обработанного текста
+        # Делаем это асинхронно, не блокируя основной поток
+        if self.auto_dictionaries_enabled and spell_result.get("corrections"):
+            try:
+                await self._update_dictionary_from_ocr(
+                    ocr_text=original_text,
+                    corrections=spell_result.get("corrections", [])
+                )
+            except Exception as e:
+                logger.debug("Failed to update auto dictionaries", error=str(e))
         
         logger.debug(
             "OCR text enhanced",
             post_id=post_id,
             trace_id=trace_id,
             original_length=len(original_text),
-            enhanced_length=len(spell_result["text_enhanced"]),
+            enhanced_length=len(text_enhanced),
             corrections_count=len(spell_result.get("corrections", [])),
             entities_count=len(entities),
             method=spell_result.get("method", "none")

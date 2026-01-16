@@ -22,8 +22,8 @@ async function loadUsersSection() {
                        id="users-search" 
                        placeholder="Поиск по имени, username..." 
                        class="filter-input"
-                       onkeyup="debounceUsersSearch(event)">
-                <select id="users-tier-filter" class="filter-select" onchange="filterUsersByTier()">
+                       data-filter="search">
+                <select id="users-tier-filter" class="filter-select" data-filter="tier">
                     <option value="">Все tier</option>
                     <option value="free">Free</option>
                     <option value="basic">Basic</option>
@@ -31,7 +31,7 @@ async function loadUsersSection() {
                     <option value="pro">Pro</option>
                     <option value="enterprise">Enterprise</option>
                 </select>
-                <select id="users-role-filter" class="filter-select" onchange="filterUsersByRole()">
+                <select id="users-role-filter" class="filter-select" data-filter="role">
                     <option value="">Все роли</option>
                     <option value="user">Пользователь</option>
                     <option value="admin">Администратор</option>
@@ -45,6 +45,9 @@ async function loadUsersSection() {
     `;
     
     await loadUsers();
+    
+    // Context7: Telegram Mini App - делегирование событий для фильтров
+    setupFiltersEventDelegation();
 }
 
 /**
@@ -91,6 +94,9 @@ async function loadUsers(forceRefresh = false) {
         renderUsersList(data.users);
         renderUsersPagination(data.total, data.limit, data.offset);
         
+        // Context7: Telegram Mini App - настраиваем делегирование событий после рендера
+        setupUsersEventDelegation();
+        
     } catch (error) {
         list.innerHTML = `<div class="error">Ошибка загрузки: ${error.message}</div>`;
         showToast(`Ошибка загрузки пользователей: ${error.message}`, 'error');
@@ -99,10 +105,16 @@ async function loadUsers(forceRefresh = false) {
 
 /**
  * Отображение списка пользователей
+ * Context7: Telegram Mini App - используем data-атрибуты и делегирование событий
  */
 function renderUsersList(users) {
     const list = document.getElementById('users-list');
     if (!list) return;
+    
+    const userName = (user) => {
+        const name = ((user.first_name || '') + ' ' + (user.last_name || '')).trim();
+        return name || user.username || String(user.telegram_id);
+    };
     
     list.innerHTML = users.map(user => `
         <div class="user-card" data-user-id="${user.id}">
@@ -121,14 +133,17 @@ function renderUsersList(users) {
                 </div>
             </div>
             <div class="user-actions">
-                <button class="btn btn-sm btn-primary" onclick="viewUserDetail('${user.id}')">
+                <button class="btn btn-sm btn-primary" data-action="view-detail" data-user-id="${user.id}">
                     👁️ Детали
                 </button>
-                <button class="btn btn-sm btn-secondary" onclick="editUserTier('${user.id}', '${user.tier}')">
+                <button class="btn btn-sm btn-secondary" data-action="edit-tier" data-user-id="${user.id}" data-user-tier="${user.tier}">
                     ✏️ Tier
                 </button>
-                <button class="btn btn-sm btn-secondary" onclick="editUserRole('${user.id}', '${user.role}')">
+                <button class="btn btn-sm btn-secondary" data-action="edit-role" data-user-id="${user.id}" data-user-role="${user.role}">
                     👤 Роль
+                </button>
+                <button class="btn btn-sm btn-danger" data-action="delete" data-user-id="${user.id}" data-user-name="${escapeHtml(userName(user))}" style="background-color: #dc2626; color: white;">
+                    🗑️ Удалить
                 </button>
             </div>
         </div>
@@ -137,6 +152,7 @@ function renderUsersList(users) {
 
 /**
  * Отображение пагинации
+ * Context7: Telegram Mini App - используем data-атрибуты вместо inline onclick
  */
 function renderUsersPagination(total, limit, offset) {
     const pagination = document.getElementById('users-pagination');
@@ -153,13 +169,13 @@ function renderUsersPagination(total, limit, offset) {
     let html = '<div class="pagination-controls">';
     
     if (currentPage > 1) {
-        html += `<button class="btn btn-sm" onclick="goToUsersPage(${currentPage - 2})">← Назад</button>`;
+        html += `<button class="btn btn-sm" data-action="page" data-page="${currentPage - 2}">← Назад</button>`;
     }
     
     html += `<span>Страница ${currentPage} из ${totalPages} (всего: ${total})</span>`;
     
     if (currentPage < totalPages) {
-        html += `<button class="btn btn-sm" onclick="goToUsersPage(${currentPage})">Вперёд →</button>`;
+        html += `<button class="btn btn-sm" data-action="page" data-page="${currentPage}">Вперёд →</button>`;
     }
     
     html += '</div>';
@@ -172,6 +188,125 @@ function renderUsersPagination(total, limit, offset) {
 function goToUsersPage(page) {
     usersPage = page;
     loadUsers();
+}
+
+/**
+ * Context7: Telegram Mini App - делегирование событий для кнопок
+ * Используется вместо inline onclick для совместимости с Telegram Mini App
+ */
+function setupUsersEventDelegation() {
+    const usersSection = document.getElementById('admin-content');
+    if (!usersSection) return;
+    
+    // Удаляем старый обработчик, если есть
+    if (usersSection._usersClickHandler) {
+        usersSection.removeEventListener('click', usersSection._usersClickHandler);
+    }
+    
+    // Создаем новый обработчик
+    usersSection._usersClickHandler = (event) => {
+        const button = event.target.closest('button[data-action]');
+        if (!button) return;
+        
+        const action = button.getAttribute('data-action');
+        const userId = button.getAttribute('data-user-id');
+        
+        switch (action) {
+            case 'view-detail':
+                if (userId) {
+                    viewUserDetail(userId);
+                }
+                break;
+                
+            case 'edit-tier':
+                if (userId) {
+                    const tier = button.getAttribute('data-user-tier');
+                    editUserTier(userId, tier);
+                }
+                break;
+                
+            case 'edit-role':
+                if (userId) {
+                    const role = button.getAttribute('data-user-role');
+                    editUserRole(userId, role);
+                }
+                break;
+                
+            case 'delete':
+                if (userId) {
+                    const userName = button.getAttribute('data-user-name');
+                    deleteUser(userId, userName);
+                }
+                break;
+                
+            case 'page':
+                const page = parseInt(button.getAttribute('data-page'), 10);
+                if (!isNaN(page)) {
+                    goToUsersPage(page);
+                }
+                break;
+        }
+    };
+    
+    // Добавляем обработчик на контейнер (делегирование событий)
+    usersSection.addEventListener('click', usersSection._usersClickHandler);
+}
+
+/**
+ * Context7: Telegram Mini App - делегирование событий для фильтров
+ */
+function setupFiltersEventDelegation() {
+    const usersSection = document.getElementById('admin-content');
+    if (!usersSection) return;
+    
+    // Поиск
+    const searchInput = document.getElementById('users-search');
+    if (searchInput) {
+        // Удаляем старый обработчик, если есть
+        if (searchInput._searchHandler) {
+            searchInput.removeEventListener('keyup', searchInput._searchHandler);
+        }
+        
+        searchInput._searchHandler = debounce((event) => {
+            usersFilter.search = event.target.value.trim() || null;
+            usersPage = 0;
+            loadUsers();
+        }, 500);
+        
+        searchInput.addEventListener('keyup', searchInput._searchHandler);
+    }
+    
+    // Фильтр по tier
+    const tierFilter = document.getElementById('users-tier-filter');
+    if (tierFilter) {
+        if (tierFilter._tierHandler) {
+            tierFilter.removeEventListener('change', tierFilter._tierHandler);
+        }
+        
+        tierFilter._tierHandler = () => {
+            usersFilter.tier = tierFilter.value || null;
+            usersPage = 0;
+            loadUsers();
+        };
+        
+        tierFilter.addEventListener('change', tierFilter._tierHandler);
+    }
+    
+    // Фильтр по роли
+    const roleFilter = document.getElementById('users-role-filter');
+    if (roleFilter) {
+        if (roleFilter._roleHandler) {
+            roleFilter.removeEventListener('change', roleFilter._roleHandler);
+        }
+        
+        roleFilter._roleHandler = () => {
+            usersFilter.role = roleFilter.value || null;
+            usersPage = 0;
+            loadUsers();
+        };
+        
+        roleFilter.addEventListener('change', roleFilter._roleHandler);
+    }
 }
 
 /**
@@ -236,25 +371,77 @@ async function viewUserDetail(userId) {
                 <div class="detail-item">
                     <strong>Последняя активность:</strong> ${formatDate(user.last_active_at) || '-'}
                 </div>
-                <div class="detail-actions" style="margin-top: 16px;">
-                    <button class="btn btn-primary" onclick="viewUserSubscriptions('${user.id}')">
+                <div class="detail-actions" style="margin-top: 16px;" data-user-detail-actions="${user.id}">
+                    <button class="btn btn-primary" data-action="view-subscriptions" data-user-id="${user.id}">
                         📋 Подписки
                     </button>
-                    <button class="btn btn-secondary" onclick="editUserTier('${user.id}', '${user.tier}')">
+                    <button class="btn btn-secondary" data-action="edit-tier" data-user-id="${user.id}" data-user-tier="${user.tier}">
                         ✏️ Изменить Tier
                     </button>
-                    <button class="btn btn-secondary" onclick="editUserRole('${user.id}', '${user.role}')">
+                    <button class="btn btn-secondary" data-action="edit-role" data-user-id="${user.id}" data-user-role="${user.role}">
                         👤 Изменить Роль
+                    </button>
+                    <button class="btn btn-danger" data-action="delete" data-user-id="${user.id}" data-user-name="${escapeHtml(((user.first_name || '') + ' ' + (user.last_name || '')).trim() || user.username || String(user.telegram_id))}" style="background-color: #dc2626; color: white; margin-top: 8px;">
+                        🗑️ Удалить пользователя
                     </button>
                 </div>
             </div>
         `;
         
-        createModal('Детали пользователя', content);
+        const modal = createModal('Детали пользователя', content);
+        
+        // Context7: Telegram Mini App - делегирование событий для модалки
+        setupModalEventDelegation(modal);
         
     } catch (error) {
         showToast(`Ошибка загрузки деталей: ${error.message}`, 'error');
     }
+}
+
+/**
+ * Context7: Telegram Mini App - делегирование событий для модального окна
+ */
+function setupModalEventDelegation(modal) {
+    if (!modal) return;
+    
+    const modalClickHandler = (event) => {
+        const button = event.target.closest('button[data-action]');
+        if (!button) return;
+        
+        const action = button.getAttribute('data-action');
+        const userId = button.getAttribute('data-user-id');
+        
+        switch (action) {
+            case 'view-subscriptions':
+                if (userId) {
+                    viewUserSubscriptions(userId);
+                }
+                break;
+                
+            case 'edit-tier':
+                if (userId) {
+                    const tier = button.getAttribute('data-user-tier');
+                    editUserTier(userId, tier);
+                }
+                break;
+                
+            case 'edit-role':
+                if (userId) {
+                    const role = button.getAttribute('data-user-role');
+                    editUserRole(userId, role);
+                }
+                break;
+                
+            case 'delete':
+                if (userId) {
+                    const userName = button.getAttribute('data-user-name');
+                    deleteUser(userId, userName);
+                }
+                break;
+        }
+    };
+    
+    modal.addEventListener('click', modalClickHandler);
 }
 
 /**
@@ -468,7 +655,10 @@ async function viewUserSubscriptions(userId) {
                         </div>
                         <div class="subscription-actions">
                             <button class="btn btn-sm" 
-                                    onclick="toggleSubscription('${userId}', '${sub.id}', ${sub.is_active})">
+                                    data-action="toggle-subscription" 
+                                    data-user-id="${userId}" 
+                                    data-subscription-id="${sub.id}" 
+                                    data-subscription-active="${sub.is_active}">
                                 ${sub.is_active ? 'Деактивировать' : 'Активировать'}
                             </button>
                         </div>
@@ -477,11 +667,35 @@ async function viewUserSubscriptions(userId) {
             </div>
         `;
         
-        createModal(`Подписки пользователя (${data.total})`, content);
+        const modal = createModal(`Подписки пользователя (${data.total})`, content);
+        
+        // Context7: Telegram Mini App - делегирование событий для подписок
+        setupSubscriptionsEventDelegation(modal, userId);
         
     } catch (error) {
         showToast(`Ошибка загрузки подписок: ${error.message}`, 'error');
     }
+}
+
+/**
+ * Context7: Telegram Mini App - делегирование событий для подписок
+ */
+function setupSubscriptionsEventDelegation(modal, userId) {
+    if (!modal) return;
+    
+    const subscriptionsClickHandler = (event) => {
+        const button = event.target.closest('button[data-action="toggle-subscription"]');
+        if (!button) return;
+        
+        const subscriptionId = button.getAttribute('data-subscription-id');
+        const isActive = button.getAttribute('data-subscription-active') === 'true';
+        
+        if (subscriptionId) {
+            toggleSubscription(userId, subscriptionId, isActive);
+        }
+    };
+    
+    modal.addEventListener('click', subscriptionsClickHandler);
 }
 
 /**
@@ -532,6 +746,58 @@ function updateUserCardOptimistically(userId, updates) {
                 span.textContent = formatRole(updates.role);
             }
         });
+    }
+}
+
+/**
+ * Удаление пользователя
+ */
+async function deleteUser(userId, userName) {
+    // Context7: Подтверждение перед удалением
+    const confirmed = await showConfirm(
+        `Вы уверены, что хотите удалить пользователя "${userName}"?\n\n` +
+        `Это действие нельзя отменить. Будут удалены:\n` +
+        `- Подписки на каналы и группы\n` +
+        `- Подписки на подборки\n` +
+        `- История изменений\n` +
+        `- Обратная связь\n\n` +
+        `ВНИМАНИЕ: Нельзя удалить самого себя!`
+    );
+    
+    if (!confirmed) {
+        return;
+    }
+    
+    try {
+        // Context7: Отправляем запрос на удаление
+        const response = await adminApiCall(`/users/${userId}`, {
+            method: 'DELETE'
+        });
+        
+        showToast(`Пользователь "${userName}" успешно удалён`, 'success');
+        
+        // Context7: Обновляем список пользователей после удаления
+        await loadUsers(true);
+        
+        // Context7: Закрываем модальное окно, если оно открыто
+        const modal = document.querySelector('.modal');
+        if (modal) {
+            modal.remove();
+        }
+        
+    } catch (error) {
+        console.error('[Admin] Delete user error:', error);
+        
+        // Context7: Специальная обработка для ошибки "нельзя удалить самого себя"
+        if (error.message && error.message.includes('Cannot delete yourself')) {
+            showToast('Нельзя удалить самого себя!', 'error');
+        } else if (error.message && error.message.includes('not found')) {
+            showToast('Пользователь не найден', 'error');
+            // Обновляем список на случай, если пользователь уже был удалён
+            await loadUsers(true);
+        } else {
+            showToast(`Ошибка удаления пользователя: ${error.message}`, 'error');
+        }
     }
 }
 

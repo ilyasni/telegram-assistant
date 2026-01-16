@@ -4,15 +4,17 @@ Context7: сбор контента ТОЛЬКО по пользовательс
 """
 
 import time
+import json
+import re
 from collections import Counter
 from typing import List, Dict, Any, Optional
 from uuid import UUID
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timedelta, timezone
 
 import structlog
-from prometheus_client import Counter as PromCounter, Histogram
+from prometheus_client import Counter as PromCounter, Histogram, Gauge
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, or_, func
+from sqlalchemy import and_, or_, func, desc
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue, MatchAny
 from langchain_gigachat import GigaChat
@@ -46,6 +48,55 @@ digest_graph_hits_total = PromCounter(
     ['tenant_id']
 )
 
+digest_gigachat_filter_detected_total = PromCounter(
+    'digest_gigachat_filter_detected_total',
+    'Количество обнаруженных ответов с фильтром Gigachat',
+    ['tenant_id']
+)
+
+digest_openrouter_fallback_total = PromCounter(
+    'digest_openrouter_fallback_total',
+    'Количество успешных fallback на OpenRouter',
+    ['tenant_id']
+)
+
+digest_openrouter_fallback_failed_total = PromCounter(
+    'digest_openrouter_fallback_failed_total',
+    'Количество неудачных fallback на OpenRouter',
+    ['tenant_id']
+)
+
+# Context7: Метрики для канальных дайджестов (низкая кардинальность - без channel_id)
+channel_digest_generation_total = PromCounter(
+    'channel_digest_generation_total',
+    'Количество запросов на генерацию канального дайджеста',
+    ['tenant_id', 'period']
+)
+
+channel_digest_generation_duration_seconds = Histogram(
+    'channel_digest_generation_duration_seconds',
+    'Время генерации канального дайджеста',
+    ['tenant_id', 'period']
+)
+
+channel_digest_posts_count = Gauge(
+    'channel_digest_posts_count',
+    'Количество постов в канальном дайджесте',
+    ['tenant_id', 'period']
+)
+
+channel_digest_context_tokens = Gauge(
+    'channel_digest_context_tokens',
+    'Размер контекста в токенах для канального дайджеста',
+    ['tenant_id', 'period']
+)
+
+channel_digest_cache_hits_total = PromCounter(
+    'channel_digest_cache_hits_total',
+    'Количество попаданий в кеш канальных дайджестов',
+    ['tenant_id', 'period']
+)
+
 # ============================================================================
 # PYDANTIC MODELS
 # ============================================================================
@@ -70,7 +121,8 @@ class DigestService:
         qdrant_url: str,
         qdrant_client: Optional[QdrantClient] = None,
         openai_api_base: Optional[str] = None,
-        graph_service: Optional[Any] = None
+        graph_service: Optional[Any] = None,
+        redis_client: Optional[Any] = None
     ):
         """
         Инициализация Digest Service.
@@ -80,7 +132,9 @@ class DigestService:
             qdrant_client: Qdrant клиент (опционально)
             openai_api_base: URL gpt2giga-proxy
             graph_service: GraphService для работы с Neo4j (опционально)
+            redis_client: Redis клиент для кеширования (опционально)
         """
+        self.redis_client = redis_client
         self.qdrant_url = qdrant_url
         self.qdrant_client = qdrant_client or QdrantClient(url=qdrant_url)
         
@@ -117,6 +171,92 @@ class DigestService:
             verify_ssl=self.llm.verify_ssl_certs,
         )
         
+        # Context7: Промпт для канального дайджеста (облегченный формат)
+        self.channel_digest_prompt = ChatPromptTemplate.from_messages([
+            ("system", """Ты — эксперт по составлению дайджестов новостей из конкретного Telegram канала.
+
+Создай краткий и практичный дайджест для пользователя, который давно не читал этот канал.
+
+СТРУКТУРА ДАЙДЖЕСТА:
+
+1. **Executive Summary** (3-6 буллетов):
+   - Главные события и тренды
+   - Что важно не пропустить
+   - Краткая характеристика активности канала
+
+2. **Топ-10 важных постов**:
+   - Для каждого поста:
+     * **Заголовок как ссылка** - заголовок должен быть кликабельной ссылкой на пост: [Заголовок поста](ссылка)
+     * **Суть** (1-2 предложения с ключевой информацией)
+     * **Почему важно** (одно предложение)
+
+3. **Тренды и повторяющиеся темы** (3-5 пунктов):
+   - Какие темы часто встречались
+   - Что было в фокусе
+
+ФОРМАТ ОТВЕТА (Markdown):
+
+## 📊 Executive Summary
+
+• [Буллет 1: главное событие]
+• [Буллет 2: важный тренд]
+• [Буллет 3: на что обратить внимание]
+...
+
+## 📰 Топ важных постов
+
+**1. [Заголовок поста](ссылка)**
+[Суть: 1-2 предложения с ключевой информацией]
+
+Почему важно: [одно предложение]
+
+**2. [Заголовок поста](ссылка)**
+...
+
+## 🔍 Тренды и повторяющиеся темы
+
+• [Тема 1]
+• [Тема 2]
+• [Тема 3]
+
+ВАЖНО:
+- Будь кратким и конкретным
+- Выделяй самое важное по метрикам популярности (👁️ просмотры, ❤️ реакции, ↪️ репосты)
+- Всегда включай ссылки на оригинальные посты
+- Используй только информацию из предоставленных постов"""),
+            ("human", "Посты из канала за период:\n{context}\n\nСоздай дайджест для пользователя, который давно не читал этот канал:")
+        ])
+        
+        # Context7: Промпт для Stage A (саммари по чанкам для месяца)
+        self.channel_digest_map_prompt = ChatPromptTemplate.from_messages([
+            ("system", """Ты — эксперт по анализу новостей. Создай краткое саммари постов за период (неделя или группа дней).
+
+Задача: выдели главное, важные события, тренды за этот период.
+
+ФОРМАТ:
+- 3-5 главных событий (каждое в 1-2 предложениях)
+- 2-3 тренда или повторяющиеся темы
+- Топ-5 самых важных постов (заголовок + 1 предложение сути)
+
+Будь кратким и конкретным."""),
+            ("human", "Посты за период:\n{context}\n\nСоздай краткое саммари:")
+        ])
+        
+        # Context7: Промпт для Stage B (финальный дайджест из саммари Stage A)
+        self.channel_digest_reduce_prompt = ChatPromptTemplate.from_messages([
+            ("system", """Ты — эксперт по составлению финальных дайджестов.
+
+На основе саммари разных периодов создай финальный дайджест для пользователя, который давно не читал канал.
+
+СТРУКТУРА:
+1. **Executive Summary** (3-6 буллетов) - главное за весь период
+2. **Топ-10 важных постов** из всех периодов
+3. **Тренды** - обобщение трендов из всех периодов
+
+Будь кратким, выделяй самое важное, избегай дублирования."""),
+            ("human", "Саммари разных периодов:\n{context}\n\nСоздай финальный дайджест:")
+        ])
+        
         # Context7: Структурированный промпт для генерации дайджеста с executive summary и улучшенной версткой
         self.digest_prompt = ChatPromptTemplate.from_messages([
             ("system", """Ты — эксперт по составлению дайджестов новостей из Telegram каналов.
@@ -138,7 +278,7 @@ class DigestService:
    - **Заголовок**: краткий заголовок новости (1 строка)
    - **Суть**: 1-2 предложения с ключевой информацией (что произошло, почему важно)
    - **Метрики**: [Популярность: X%] если указаны в данных
-   - **Ссылка**: [Канал](ссылка) на оригинальный пост
+   - **Ссылка**: [Ссылка на пост](ссылка) - прямая ссылка на конкретное сообщение
 
 ВАЖНО:
 - ВСЕГДА начинай с Executive Summary
@@ -156,22 +296,22 @@ class DigestService:
 ## Тема 1: [Название темы]
 
 **Заголовок новости 1**
-Суть новости: [1-2 предложения с ключевой информацией] [Популярность: X%] [Канал](ссылка)
+Суть новости: [1-2 предложения с ключевой информацией] [Популярность: X%] [Ссылка на пост](ссылка)
 
 **Заголовок новости 2**
-Суть новости: [1-2 предложения с ключевой информацией] [Популярность: X%] [Канал](ссылка)
+Суть новости: [1-2 предложения с ключевой информацией] [Популярность: X%] [Ссылка на пост](ссылка)
 
 **Заголовок новости 3**
-Суть новости: [1-2 предложения с ключевой информацией] [Популярность: X%] [Канал](ссылка)
+Суть новости: [1-2 предложения с ключевой информацией] [Популярность: X%] [Ссылка на пост](ссылка)
 
 
 ## Тема 2: [Название темы]
 
 **Заголовок новости 1**
-Суть новости: [1-2 предложения с ключевой информацией] [Популярность: X%] [Канал](ссылка)
+Суть новости: [1-2 предложения с ключевой информацией] [Популярность: X%] [Ссылка на пост](ссылка)
 
 **Заголовок новости 2**
-Суть новости: [1-2 предложения с ключевой информацией] [Популярность: X%] [Канал](ссылка)
+Суть новости: [1-2 предложения с ключевой информацией] [Популярность: X%] [Ссылка на пост](ссылка)
 
 ...
 
@@ -318,6 +458,7 @@ class DigestService:
                                     'channel_title': channel.title if channel else "Неизвестный канал",
                                     'channel_username': channel.username if channel else None,
                                     'permalink': post.telegram_post_url,
+                                    'url': post.url,  # Context7: URL для дедупликации репостов
                                     'posted_at': post.posted_at,
                                     'topic': topic,
                                     'score': result.score,
@@ -368,6 +509,7 @@ class DigestService:
                                                 'channel_title': channel.title if channel else "Неизвестный канал",
                                                 'channel_username': channel.username if channel else None,
                                                 'permalink': post.telegram_post_url,
+                                                'url': post.url,  # Context7: URL для дедупликации репостов
                                                 'posted_at': post.posted_at,
                                                 'topic': related_topic,
                                                 'score': graph_post.get('score', 0.7),
@@ -418,6 +560,7 @@ class DigestService:
                             'channel_title': channel.title if channel else "Неизвестный канал",
                             'channel_username': channel.username if channel else None,
                             'permalink': post.telegram_post_url,
+                            'url': post.url,  # Context7: URL для дедупликации репостов
                             'posted_at': post.posted_at,
                             'topic': topic,
                             'score': 0.5,  # Средний score для FTS результатов
@@ -434,15 +577,78 @@ class DigestService:
                 logger.error("Error collecting posts for topic", topic=topic, error=str(e))
                 continue
         
+        # Context7: Фильтрация уже отправленных постов из последних N дайджестов (дефолт: 7 дней)
+        # Исключаем посты, которые были в дайджестах за последние N дней
+        exclude_days = getattr(settings, 'digest_exclude_posts_days', 7)
+        if exclude_days > 0:
+            try:
+                
+                cutoff_date = date.today() - timedelta(days=exclude_days)
+                
+                # Получаем последние дайджесты пользователя
+                recent_digests = db.query(DigestHistory).filter(
+                    and_(
+                        DigestHistory.user_id == user_id,
+                        DigestHistory.digest_date >= cutoff_date,
+                        DigestHistory.status == "sent"  # Только отправленные дайджесты
+                    )
+                ).order_by(DigestHistory.digest_date.desc()).all()
+                
+                # Собираем URL и post_id из контекста дайджестов
+                excluded_urls = set()
+                excluded_post_ids = set()
+                
+                # Context7: Извлекаем post_id из telegram_post_url в контенте дайджеста
+                # Формат ссылки: https://t.me/channel/123 или [Ссылка](https://t.me/channel/123)
+                url_pattern = re.compile(r'https://t\.me/(\w+)/(\d+)')
+                
+                for digest in recent_digests:
+                    if digest.content:
+                        # Ищем ссылки на посты в контенте
+                        matches = url_pattern.findall(digest.content)
+                        for channel_username, post_num in matches:
+                            # Формируем URL для исключения
+                            excluded_urls.add(f"https://t.me/{channel_username}/{post_num}")
+                
+                # Также получаем post_id из постов, которые были в контексте предыдущих дайджестов
+                # Поскольку мы не храним прямую связь, используем эвристику по времени и каналам
+                if all_posts:
+                    # Получаем посты из тех же каналов за период отправленных дайджестов
+                    if recent_digests:
+                        # Берем post_id из постов, которые могли быть в дайджестах
+                        # Это приблизительная фильтрация - полную связь можно добавить через отдельную таблицу
+                        pass  # Пока пропускаем, так как нет прямой связи post_id <-> digest
+                
+                # Фильтруем посты по URL
+                if excluded_urls:
+                    filtered_posts = []
+                    for post in all_posts:
+                        post_url = post.get('url') or post.get('permalink')
+                        if post_url:
+                            # Проверяем, не был ли этот URL уже в дайджесте
+                            if post_url in excluded_urls:
+                                continue
+                        filtered_posts.append(post)
+                    all_posts = filtered_posts
+                    
+                    logger.debug(
+                        "Filtered posts from recent digests",
+                        excluded_urls_count=len(excluded_urls),
+                        remaining_posts=len(all_posts)
+                    )
+            except Exception as e:
+                logger.warning("Error filtering posts from recent digests", error=str(e))
+                # Продолжаем без фильтрации при ошибке
+        
         # Сортируем по времени и релевантности
         all_posts.sort(key=lambda x: (x['posted_at'] or datetime.min, x['score']), reverse=True)
         
         # Дедупликация по post_id
-        seen = set()
+        seen_post_ids = set()
         unique_posts = []
         for post in all_posts:
-            if post['post_id'] not in seen:
-                seen.add(post['post_id'])
+            if post['post_id'] not in seen_post_ids:
+                seen_post_ids.add(post['post_id'])
                 unique_posts.append(post)
         
         # Context7: Дедупликация альбомов - оставляем только первый пост из альбома с наивысшим score
@@ -488,6 +694,32 @@ class DigestService:
                 )
         except Exception as e:
             logger.warning("Error during album deduplication in digest", error=str(e))
+            # Продолжаем без дедупликации при ошибке
+        
+        # Context7: Дедупликация по URL (репосты одного и того же контента)
+        # Аналогично _collect_channel_posts_for_digest - исключаем посты с одинаковым URL
+        try:
+            seen_urls = set()
+            url_deduplicated_posts = []
+            for post in unique_posts:
+                post_url = post.get('url')
+                if post_url:
+                    url_hash = hash(post_url)
+                    if url_hash in seen_urls:
+                        continue
+                    seen_urls.add(url_hash)
+                url_deduplicated_posts.append(post)
+            
+            removed_by_url = len(unique_posts) - len(url_deduplicated_posts)
+            if removed_by_url > 0:
+                logger.debug(
+                    "URL deduplication applied in digest",
+                    removed_duplicates=removed_by_url,
+                    remaining_posts=len(url_deduplicated_posts)
+                )
+            unique_posts = url_deduplicated_posts
+        except Exception as e:
+            logger.warning("Error during URL deduplication in digest", error=str(e))
             # Продолжаем без дедупликации при ошибке
         
         return unique_posts
@@ -709,6 +941,45 @@ class DigestService:
             response = await self.llm.ainvoke(messages)
             content = response.content if hasattr(response, 'content') else str(response)
             
+            # Context7: Проверяем, не вернул ли Gigachat ответ с фильтром
+            if self._is_gigachat_filter_response(content):
+                logger.warning(
+                    "Gigachat filter detected, falling back to OpenRouter",
+                    user_id=str(user_id),
+                    tenant_id=tenant_id_str,
+                    content_preview=content[:200] if len(content) > 200 else content
+                )
+                digest_gigachat_filter_detected_total.labels(tenant_id=tenant_id_str).inc()
+                
+                try:
+                    # Генерируем дайджест через OpenRouter
+                    openrouter_content = await self._generate_with_openrouter(
+                        messages=messages,
+                        context=context,
+                        topics=", ".join(topics)
+                    )
+                    
+                    # Используем результат от OpenRouter
+                    content = openrouter_content
+                    digest_openrouter_fallback_total.labels(tenant_id=tenant_id_str).inc()
+                    
+                    logger.info(
+                        "Digest generated via OpenRouter fallback",
+                        user_id=str(user_id),
+                        tenant_id=tenant_id_str
+                    )
+                    
+                except Exception as fallback_error:
+                    # При ошибке fallback возвращаем оригинальный ответ Gigachat
+                    digest_openrouter_fallback_failed_total.labels(tenant_id=tenant_id_str).inc()
+                    logger.error(
+                        "OpenRouter fallback failed, using original Gigachat response",
+                        user_id=str(user_id),
+                        tenant_id=tenant_id_str,
+                        error=str(fallback_error)
+                    )
+                    # content остается от Gigachat (даже если с фильтром)
+            
             # Парсим секции из markdown (простой парсинг)
             sections = self._parse_sections(content, topics)
             
@@ -738,6 +1009,185 @@ class DigestService:
             duration = time.perf_counter() - start_time
             digest_generation_duration_seconds.labels(tenant_id=tenant_id_str).observe(duration)
     
+    def _is_gigachat_filter_response(self, content: str) -> bool:
+        """
+        Детектирование ответов с фильтром Gigachat или других LLM.
+        
+        Проверяет наличие ключевых фраз и паттернов, указывающих на то,
+        что LLM вернул сообщение о фильтрации контента.
+        
+        Args:
+            content: Текст ответа от LLM
+            
+        Returns:
+            True если обнаружен фильтр, False иначе
+        """
+        if not content:
+            return False
+        
+        content_lower = content.lower()
+        
+        # Высокоприоритетные фразы (детектируются сразу при наличии)
+        high_priority_phrases = [
+            "генеративные языковые модели не обладают собственным мнением",
+            "не обладают собственным мнением",
+            "обученной на открытых данных, в которых может содержаться неточная или ошибочная информация",
+            "во избежание неправильного толкования",
+            "чувствительные темы могут быть ограничены",
+        ]
+        
+        # Проверяем высокоприоритетные фразы (достаточно одной)
+        for phrase in high_priority_phrases:
+            if phrase in content_lower:
+                return True
+        
+        # Остальные ключевые фразы для детектирования фильтра
+        key_phrases = [
+            "некорректных ответов",
+            "некорректные ответы",
+            "чувствительными темами",
+            "чувствительные темы",
+            "ограничены",
+            "временно ограничены",
+            "генеративные языковые модели",
+            "не транслирует мнение своих разработчиков",
+            "как и любая языковая модель, gigachat",
+            "разговоры на чувствительные темы могут быть ограничены",
+        ]
+        
+        # Подсчитываем количество найденных ключевых фраз
+        found_phrases = sum(1 for phrase in key_phrases if phrase in content_lower)
+        
+        # Паттерны для детектирования (комбинации фраз)
+        patterns = [
+            ("к сожалению", "ограничены"),
+            ("как и любая языковая модель", "ограничены"),
+            ("генеративные языковые модели", "ограничены"),
+            ("чувствительные темы", "ограничены"),
+        ]
+        
+        # Проверяем паттерны
+        pattern_found = False
+        for pattern_start, pattern_end in patterns:
+            if pattern_start in content_lower and pattern_end in content_lower:
+                pattern_found = True
+                break
+        
+        # Детектируем фильтр, если найдено 1+ ключевая фраза (снижен порог) или один из паттернов
+        return found_phrases >= 1 or pattern_found
+    
+    async def _generate_with_openrouter(
+        self,
+        messages: List[Any],
+        context: str,
+        topics: str
+    ) -> str:
+        """
+        Генерация дайджеста через OpenRouter API (fallback).
+        
+        Args:
+            messages: Список сообщений в формате LangChain
+            context: Контекст с постами
+            topics: Темы для дайджеста
+            
+        Returns:
+            Сгенерированный контент дайджеста
+        """
+        import os
+        import httpx
+        
+        api_key = os.getenv('OPENROUTER_API_KEY')
+        api_base = os.getenv('OPENROUTER_API_BASE', 'https://openrouter.ai/api/v1')
+        # Context7: Используем рабочую модель по умолчанию (qwen-2.5-72b-instruct:free недоступна)
+        model = os.getenv('OPENROUTER_MODEL', 'meta-llama/llama-3.3-70b-instruct:free')
+        
+        if not api_key:
+            raise ValueError("OPENROUTER_API_KEY not configured")
+        
+        # Преобразуем LangChain messages в формат OpenRouter API
+        openrouter_messages = []
+        for msg in messages:
+            if hasattr(msg, 'content') and hasattr(msg, 'type'):
+                # LangChain message (BaseMessage)
+                # Типы: system, human, ai, tool
+                msg_type = getattr(msg, 'type', 'human')
+                if msg_type == "system":
+                    role = "system"
+                elif msg_type == "ai" or msg_type == "assistant":
+                    role = "assistant"
+                else:
+                    role = "user"
+                openrouter_messages.append({
+                    "role": role,
+                    "content": str(msg.content) if msg.content else ""
+                })
+            elif isinstance(msg, dict):
+                # Уже в формате dict
+                openrouter_messages.append(msg)
+            else:
+                # Fallback: пытаемся извлечь content как строку
+                logger.warning("Unknown message format in OpenRouter fallback", msg_type=type(msg).__name__)
+                if hasattr(msg, 'content'):
+                    openrouter_messages.append({
+                        "role": "user",
+                        "content": str(msg.content) if msg.content else ""
+                    })
+        
+        headers = {
+            'Authorization': f'Bearer {api_key}',
+            'Content-Type': 'application/json',
+            'HTTP-Referer': os.getenv('OPENROUTER_HTTP_REFERER', 'https://github.com/telegram-assistant'),
+            'X-Title': 'Telegram Assistant Digest'
+        }
+        
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                response = await client.post(
+                    f'{api_base}/chat/completions',
+                    headers=headers,
+                    json={
+                        'model': model,
+                        'messages': openrouter_messages,
+                        'temperature': 0.7,
+                        'max_tokens': 4000,
+                    }
+                )
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    content = result['choices'][0]['message']['content'].strip()
+                    
+                    # Context7: Проверяем ответ от OpenRouter на наличие фильтра
+                    if self._is_gigachat_filter_response(content):
+                        logger.warning(
+                            "OpenRouter filter detected in response",
+                            content_preview=content[:200] if len(content) > 200 else content
+                        )
+                        # Если OpenRouter тоже вернул фильтр, выбрасываем исключение
+                        # чтобы система могла обработать это как ошибку fallback
+                        raise ValueError("OpenRouter returned filtered response")
+                    
+                    return content
+                elif response.status_code == 404:
+                    # Специальная обработка для 404 (модель не найдена)
+                    error_data = response.json() if response.text else {}
+                    error_msg = error_data.get('error', {}).get('message', response.text) or f"Model {model} not found"
+                    logger.error(
+                        "OpenRouter model not found (404)",
+                        model=model,
+                        error=error_msg,
+                        suggestion="Update OPENROUTER_MODEL environment variable"
+                    )
+                    raise ValueError(f"OpenRouter model not found: {model}. {error_msg}")
+                else:
+                    error_msg = f"OpenRouter API error: {response.status_code} - {response.text}"
+                    logger.error("OpenRouter API request failed", status_code=response.status_code, error=response.text)
+                    raise Exception(error_msg)
+                    
+        except httpx.RequestError as e:
+            logger.error("OpenRouter API request exception", error=str(e))
+            raise
+    
     def _parse_sections(self, content: str, topics: List[str]) -> List[Dict[str, Any]]:
         """Парсинг секций из markdown контента."""
         sections = []
@@ -763,6 +1213,697 @@ class DigestService:
             sections.append(current_section)
         
         return sections
+    
+    # ============================================================================
+    # CHANNEL DIGEST METHODS
+    # ============================================================================
+    
+    def _estimate_tokens(self, text: str) -> int:
+        """Грубая оценка количества токенов для русского текста."""
+        return len(text) // 4
+    
+    def _get_cache_key(
+        self,
+        tenant_id: str,
+        user_id: UUID,
+        channel_id: UUID,
+        period_days: int,
+        window_end_date: date
+    ) -> str:
+        """Получение ключа кеша для канального дайджеста."""
+        return f"channel_digest:{tenant_id}:{user_id}:{channel_id}:{period_days}:{window_end_date.isoformat()}"
+    
+    def _get_cache_ttl(self, period_days: int) -> int:
+        """Получение TTL для кеша в зависимости от периода."""
+        if period_days <= 1:
+            return 3600 * 2  # 2 часа для дня
+        elif period_days <= 7:
+            return 3600 * 8  # 8 часов для недели
+        else:
+            return 3600 * 24  # 24 часа для месяца
+    
+    async def _get_cached_digest(
+        self,
+        cache_key: str
+    ) -> Optional[DigestContent]:
+        """Получение дайджеста из кеша."""
+        if not self.redis_client:
+            return None
+        
+        try:
+            # Context7: В проекте используется redis.asyncio, поэтому всегда async
+            # Проверяем тип клиента для правильной обработки
+            redis_type = type(self.redis_client).__module__
+            is_async_redis = 'asyncio' in redis_type or 'async' in redis_type.lower()
+            
+            if is_async_redis:
+                cached_data = await self.redis_client.get(cache_key)
+            else:
+                # Синхронный Redis клиент (fallback для совместимости)
+                cached_data = self.redis_client.get(cache_key)
+            
+            if cached_data:
+                # Context7: decode_responses=True уже декодирует в строки, но проверяем на всякий случай
+                if isinstance(cached_data, bytes):
+                    cached_data = cached_data.decode('utf-8')
+                data = json.loads(cached_data)
+                return DigestContent(**data)
+        except (TypeError, AttributeError) as e:
+            # Если await не поддерживается или метод отсутствует
+            logger.debug("Redis client operation failed, trying sync", error=str(e))
+            try:
+                if hasattr(self.redis_client, 'get'):
+                    cached_data = self.redis_client.get(cache_key)
+                    if cached_data:
+                        if isinstance(cached_data, bytes):
+                            cached_data = cached_data.decode('utf-8')
+                        data = json.loads(cached_data)
+                        return DigestContent(**data)
+            except Exception as sync_error:
+                logger.debug("Sync Redis also failed", error=str(sync_error))
+        except Exception as e:
+            logger.warning("Failed to get cached digest", error=str(e), cache_key=cache_key)
+        
+        return None
+    
+    async def _save_to_cache(
+        self,
+        cache_key: str,
+        content: DigestContent,
+        ttl: int
+    ) -> None:
+        """Сохранение дайджеста в кеш."""
+        if not self.redis_client:
+            return
+        
+        try:
+            data = content.model_dump()
+            json_data = json.dumps(data, ensure_ascii=False)
+            
+            # Context7: В проекте используется redis.asyncio, поэтому всегда async
+            # Проверяем тип клиента для правильной обработки
+            redis_type = type(self.redis_client).__module__
+            is_async_redis = 'asyncio' in redis_type or 'async' in redis_type.lower()
+            
+            if is_async_redis:
+                await self.redis_client.setex(cache_key, ttl, json_data)
+            else:
+                # Синхронный Redis клиент (fallback для совместимости)
+                self.redis_client.setex(cache_key, ttl, json_data)
+        except (TypeError, AttributeError) as e:
+            # Если await не поддерживается или метод отсутствует
+            logger.debug("Async Redis setex failed, trying sync", error=str(e))
+            try:
+                if hasattr(self.redis_client, 'setex'):
+                    self.redis_client.setex(cache_key, ttl, json_data)
+            except Exception as sync_error:
+                logger.debug("Sync Redis setex also failed", error=str(sync_error))
+        except Exception as e:
+            logger.warning("Failed to save digest to cache", error=str(e), cache_key=cache_key)
+    
+    async def _collect_channel_posts_for_digest(
+        self,
+        channel_id: UUID,
+        period_days: int,
+        db: Session,
+        max_candidates: int = 100
+    ) -> List[Post]:
+        """
+        Сбор и ранжирование постов из канала за период.
+        
+        Context7: Гибридное ранжирование - engagement + freshness + diversity фильтр.
+        
+        Args:
+            channel_id: ID канала
+            period_days: Период в днях
+            db: SQLAlchemy сессия
+            max_candidates: Максимальное количество кандидатов для LLM rerank
+            
+        Returns:
+            Список Post объектов, отсортированных по важности
+        """
+        cutoff_date = datetime.now(timezone.utc) - timedelta(days=period_days)
+        
+        # Получаем все посты за период
+        posts_query = db.query(Post).filter(
+            Post.channel_id == channel_id,
+            Post.posted_at >= cutoff_date,
+            Post.content.isnot(None),
+            Post.content != ""
+        )
+        
+        posts = posts_query.order_by(desc(Post.posted_at)).all()
+        
+        if not posts:
+            logger.info(
+                "No posts found for channel digest",
+                channel_id=str(channel_id),
+                period_days=period_days
+            )
+            return []
+        
+        # Гибридное ранжирование: engagement_score + бонус за свежесть
+        now = datetime.now(timezone.utc)
+        posts_with_scores = []
+        
+        for post in posts:
+            engagement_score = float(post.engagement_score) if post.engagement_score else 0.0
+            
+            # Бонус за свежесть (недавние посты получают небольшой бонус)
+            if post.posted_at:
+                age_hours = (now - post.posted_at).total_seconds() / 3600
+                freshness_bonus = max(0, 1.0 - (age_hours / (period_days * 24))) * 0.1  # До 10% бонуса
+            else:
+                freshness_bonus = 0.0
+            
+            final_score = engagement_score * (1 + freshness_bonus)
+            
+            posts_with_scores.append({
+                'post': post,
+                'score': final_score,
+                'engagement_score': engagement_score,
+                'posted_at': post.posted_at
+            })
+        
+        # Сортируем по финальному score
+        posts_with_scores.sort(key=lambda x: x['score'], reverse=True)
+        
+        # Diversity фильтр: не более N постов с одинаковыми тегами/ссылками
+        selected_posts = []
+        seen_urls = set()
+        seen_tags = {}  # tag -> count
+        
+        # Получаем теги для постов (из enrichment)
+        post_ids = [p['post'].id for p in posts_with_scores[:max_candidates]]
+        enrichments = db.query(PostEnrichment).filter(
+            PostEnrichment.post_id.in_(post_ids),
+            PostEnrichment.kind == 'tags'
+        ).all()
+        
+        post_tags_map = {}
+        for enrichment in enrichments:
+            tags = enrichment.data.get('tags', [])
+            if isinstance(tags, list):
+                post_tags_map[str(enrichment.post_id)] = [str(tag) for tag in tags if tag]
+        
+        for item in posts_with_scores[:max_candidates]:
+            post = item['post']
+            post_id_str = str(post.id)
+            
+            # Проверяем URL (дедупликация репостов одного и того же контента)
+            if post.url:
+                url_hash = hash(post.url)
+                if url_hash in seen_urls:
+                    continue
+                seen_urls.add(url_hash)
+            
+            # Проверяем теги (diversity фильтр)
+            tags = post_tags_map.get(post_id_str, [])
+            if tags:
+                max_same_tag = 3  # Не более 3 постов с одним тегом
+                skip = False
+                for tag in tags[:3]:  # Проверяем только первые 3 тега
+                    count = seen_tags.get(tag, 0)
+                    if count >= max_same_tag:
+                        skip = True
+                        break
+                
+                if skip:
+                    continue
+                
+                # Увеличиваем счетчики
+                for tag in tags[:3]:
+                    seen_tags[tag] = seen_tags.get(tag, 0) + 1
+            
+            selected_posts.append(post)
+            
+            if len(selected_posts) >= max_candidates:
+                break
+        
+        logger.info(
+            "Channel posts collected for digest",
+            channel_id=str(channel_id),
+            period_days=period_days,
+            total_posts=len(posts),
+            selected_posts=len(selected_posts)
+        )
+        
+        return selected_posts
+    
+    async def _llm_rerank_posts(
+        self,
+        posts: List[Post],
+        top_n: int = 20
+    ) -> List[Post]:
+        """
+        LLM rerank для топ-N кандидатов.
+        
+        Context7: Применяется только к top-20 для снижения стоимости.
+        """
+        if len(posts) <= top_n:
+            return posts
+        
+        # Для упрощения возвращаем top-N по engagement (можно улучшить через LLM)
+        # В будущем можно добавить промпт для LLM rerank
+        return posts[:top_n]
+    
+    async def _assemble_channel_context(
+        self,
+        posts: List[Post],
+        period_days: int,
+        max_tokens: int = 7000
+    ) -> str:
+        """
+        Сборка контекста из постов с токен-бюджет подходом.
+        
+        Context7: Адаптивная обрезка в зависимости от периода и токен-бюджета.
+        """
+        if not posts:
+            return ""
+        
+        # Определяем бюджет токенов в зависимости от периода
+        if period_days <= 1:
+            budget = min(max_tokens, 7000)
+            chars_per_post = 600
+        elif period_days <= 7:
+            budget = min(max_tokens, 7000)
+            chars_per_post = 500
+        else:  # месяц
+            budget = min(max_tokens, 30000)
+            chars_per_post = 400
+        
+        context_parts = []
+        used_tokens = 0
+        max_posts = 50  # Максимум постов для контекста
+        
+        # Вычисляем максимальный engagement_score для нормализации
+        engagement_scores = [float(p.engagement_score) if p.engagement_score else 0.0 for p in posts]
+        max_engagement = max(engagement_scores) if engagement_scores else 1.0
+        if max_engagement == 0:
+            max_engagement = 1.0
+        
+        for idx, post in enumerate(posts[:max_posts], 1):
+            content = post.content or ""
+            
+            # Начальная обрезка по символам
+            if len(content) > chars_per_post:
+                content = content[:chars_per_post] + "..."
+            
+            # Оценка токенов
+            post_text = f"[{idx}] {content}"
+            estimated_tokens = self._estimate_tokens(post_text)
+            
+            # Проверяем бюджет
+            if used_tokens + estimated_tokens > budget:
+                # Пытаемся сократить текущий пост
+                remaining_tokens = budget - used_tokens - 100  # Запас
+                max_chars = remaining_tokens * 4
+                if max_chars > 50:  # Минимум 50 символов
+                    content = content[:max_chars] + "..."
+                    post_text = f"[{idx}] {content}"
+                else:
+                    break  # Нет места для этого поста
+            
+            # Вычисляем метрики
+            engagement_score = float(post.engagement_score) if post.engagement_score else 0.0
+            popularity_percent = int((engagement_score / max_engagement) * 100) if max_engagement > 0 else 0
+            
+            # Формируем метрики
+            metrics_parts = []
+            if post.views_count:
+                metrics_parts.append(f"👁️ {post.views_count}")
+            if post.reactions_count:
+                metrics_parts.append(f"❤️ {post.reactions_count}")
+            if post.forwards_count:
+                metrics_parts.append(f"↪️ {post.forwards_count}")
+            if post.replies_count:
+                metrics_parts.append(f"💬 {post.replies_count}")
+            
+            metrics_str = " | ".join(metrics_parts) if metrics_parts else "—"
+            
+            # Формируем строку поста
+            post_header = f"[{idx}]"
+            if popularity_percent > 0:
+                post_header += f" Популярность: {popularity_percent}%"
+            if metrics_str != "—":
+                post_header += f" | {metrics_str}"
+            
+            if post.telegram_post_url:
+                post_header += f" | [Ссылка]({post.telegram_post_url})"
+            
+            post_line = f"{post_header}\n\n**Текст поста:**\n{content}"
+            
+            context_parts.append(post_line)
+            used_tokens += self._estimate_tokens(post_line)
+        
+        logger.debug(
+            "Channel context assembled",
+            period_days=period_days,
+            posts_count=len(context_parts),
+            estimated_tokens=used_tokens,
+            budget=budget
+        )
+        
+        return "\n\n".join(context_parts)
+    
+    async def _generate_map_reduce_digest(
+        self,
+        posts: List[Post],
+        period_days: int,
+        tenant_id: str
+    ) -> DigestContent:
+        """
+        Двухступенчатый саммари для месяца (map-reduce).
+        
+        Context7: Stage A - группировка по неделям и саммари, Stage B - финальный дайджест.
+        """
+        if not posts:
+            return DigestContent(
+                content="Не найдено постов за выбранный период.",
+                posts_count=0,
+                topics=[],
+                sections=[]
+            )
+        
+        # Stage A: Группировка по неделям
+        week_groups = {}
+        for post in posts:
+            if not post.posted_at:
+                continue
+            
+            # Определяем неделю (количество недель с начала периода)
+            days_since_start = (datetime.now(timezone.utc) - post.posted_at).days
+            week_num = days_since_start // 7
+            
+            if week_num not in week_groups:
+                week_groups[week_num] = []
+            week_groups[week_num].append(post)
+        
+        # Если постов мало, группируем по 3-5 дней
+        if len(week_groups) == 1 and len(posts) > 50:
+            # Разбиваем на чанки по 5 дней
+            chunk_size = 5
+            week_groups = {}
+            for post in posts:
+                if not post.posted_at:
+                    continue
+                days_since_start = (datetime.now(timezone.utc) - post.posted_at).days
+                chunk_num = days_since_start // chunk_size
+                
+                if chunk_num not in week_groups:
+                    week_groups[chunk_num] = []
+                week_groups[chunk_num].append(post)
+        
+        # Генерируем саммари для каждого чанка
+        chunk_summaries = []
+        for chunk_num, chunk_posts in sorted(week_groups.items()):
+            if not chunk_posts:
+                continue
+            
+            # Собираем контекст для чанка (ограниченный размер)
+            chunk_context = await self._assemble_channel_context(chunk_posts, period_days, max_tokens=3000)
+            
+            if not chunk_context:
+                continue
+            
+            try:
+                # Генерируем саммари для чанка
+                messages = self.channel_digest_map_prompt.format_messages(context=chunk_context)
+                response = await self.llm.ainvoke(messages)
+                summary = response.content if hasattr(response, 'content') else str(response)
+                
+                chunk_summaries.append({
+                    'chunk_num': chunk_num,
+                    'posts_count': len(chunk_posts),
+                    'summary': summary
+                })
+            except Exception as e:
+                logger.warning(
+                    "Failed to generate chunk summary",
+                    chunk_num=chunk_num,
+                    error=str(e)
+                )
+                continue
+        
+        if not chunk_summaries:
+            # Fallback: обычная генерация
+            context = await self._assemble_channel_context(posts, period_days, max_tokens=30000)
+            messages = self.channel_digest_prompt.format_messages(context=context)
+            response = await self.llm.ainvoke(messages)
+            content = response.content if hasattr(response, 'content') else str(response)
+            
+            return DigestContent(
+                content=content,
+                posts_count=len(posts),
+                topics=[],
+                sections=[]
+            )
+        
+        # Stage B: Финальный дайджест из саммари
+        summaries_context = "\n\n---\n\n".join([
+            f"**Период {chunk['chunk_num'] + 1}** ({chunk['posts_count']} постов):\n{chunk['summary']}"
+            for chunk in chunk_summaries
+        ])
+        
+        try:
+            messages = self.channel_digest_reduce_prompt.format_messages(context=summaries_context)
+            response = await self.llm.ainvoke(messages)
+            content = response.content if hasattr(response, 'content') else str(response)
+        except Exception as e:
+            logger.error("Failed to generate final digest from summaries", error=str(e))
+            # Fallback: объединяем саммари
+            content = "## 📊 Executive Summary\n\nОбзор по периодам:\n\n" + summaries_context
+        
+        return DigestContent(
+            content=content,
+            posts_count=len(posts),
+            topics=[],
+            sections=[]
+        )
+    
+    async def generate_channel_digest(
+        self,
+        channel_id: UUID,
+        user_id: UUID,
+        tenant_id: str,
+        db: Session,
+        period_days: int = 7
+    ) -> DigestContent:
+        """
+        Генерация дайджеста по конкретному каналу.
+        
+        Context7: Кеширование, валидация доступа, выбор модели в зависимости от периода.
+        
+        Args:
+            channel_id: ID канала
+            user_id: ID пользователя
+            tenant_id: ID арендатора
+            db: SQLAlchemy сессия
+            period_days: Период в днях (1, 7 или 30)
+            
+        Returns:
+            DigestContent с сгенерированным дайджестом
+        """
+        tenant_id_str = str(tenant_id)
+        start_time = time.perf_counter()
+        period_str = str(period_days)
+        
+        # Логирование начала генерации
+        logger.info(
+            "Starting channel digest generation",
+            tenant_id=tenant_id_str,
+            user_id=str(user_id),
+            channel_id=str(channel_id),
+            period_days=period_days
+        )
+        
+        # Проверка кеша
+        window_end_date = date.today()
+        cache_key = self._get_cache_key(tenant_id_str, user_id, channel_id, period_days, window_end_date)
+        cached = await self._get_cached_digest(cache_key)
+        
+        if cached:
+            channel_digest_cache_hits_total.labels(tenant_id=tenant_id_str, period=period_str).inc()
+            logger.info(
+                "Channel digest retrieved from cache",
+                tenant_id=tenant_id_str,
+                user_id=str(user_id),
+                channel_id=str(channel_id),
+                period_days=period_days
+            )
+            return cached
+        
+        # Context7: Проверка доступа к каналу через JOIN с проверкой tenant_id
+        access_check = db.query(UserChannel, Channel).join(
+            Channel, Channel.id == UserChannel.channel_id
+        ).filter(
+            UserChannel.user_id == user_id,
+            UserChannel.channel_id == channel_id,
+            UserChannel.is_active == True
+        ).first()
+        
+        if not access_check:
+            logger.warning(
+                "Channel access denied - user_channel not found",
+                tenant_id=tenant_id_str,
+                user_id=str(user_id),
+                channel_id=str(channel_id)
+            )
+            raise ValueError("Канал не найден или нет доступа")
+        
+        user_channel, channel = access_check
+        
+        # Дополнительная проверка: убеждаемся, что канал существует и активен
+        if not channel or not channel.is_active:
+            logger.warning(
+                "Channel access denied - channel not active",
+                tenant_id=tenant_id_str,
+                user_id=str(user_id),
+                channel_id=str(channel_id)
+            )
+            raise ValueError("Канал не активен")
+        
+        # Собираем посты
+        posts = await self._collect_channel_posts_for_digest(channel_id, period_days, db)
+        
+        if not posts:
+            logger.info(
+                "No posts found for channel digest",
+                tenant_id=tenant_id_str,
+                channel_id=str(channel_id),
+                period_days=period_days
+            )
+            return DigestContent(
+                content=f"В канале не было постов за последние {period_days} дней.",
+                posts_count=0,
+                topics=[],
+                sections=[]
+            )
+        
+        # LLM rerank для месяца (только top-20)
+        if period_days >= 30:
+            posts = await self._llm_rerank_posts(posts, top_n=20)
+        
+        # Генерация дайджеста
+        context = None  # Инициализация для метрик
+        try:
+            if period_days >= 30:
+                # Двухступенчатый саммари для месяца
+                result = await self._generate_map_reduce_digest(posts, period_days, tenant_id_str)
+            else:
+                # Обычная генерация для дня/недели
+                context = await self._assemble_channel_context(posts, period_days)
+                
+                # Выбор модели в зависимости от периода
+                if period_days <= 7:
+                    # Используем текущий GigaChat (Pro с 8K)
+                    messages = self.channel_digest_prompt.format_messages(context=context)
+                    response = await self.llm.ainvoke(messages)
+                    content = response.content if hasattr(response, 'content') else str(response)
+                else:
+                    # Для больших периодов можно использовать модель с большим контекстом
+                    messages = self.channel_digest_prompt.format_messages(context=context)
+                    response = await self.llm.ainvoke(messages)
+                    content = response.content if hasattr(response, 'content') else str(response)
+                
+                # Проверка на фильтр Gigachat
+                if self._is_gigachat_filter_response(content):
+                    logger.warning(
+                        "Gigachat filter detected in channel digest, falling back to OpenRouter",
+                        tenant_id=tenant_id_str,
+                        channel_id=str(channel_id)
+                    )
+                    try:
+                        content = await self._generate_with_openrouter(
+                            messages=messages,
+                            context=context,
+                            topics=""  # Нет тем для канального дайджеста
+                        )
+                    except Exception as fallback_error:
+                        logger.error(
+                            "OpenRouter fallback failed for channel digest",
+                            error=str(fallback_error)
+                        )
+                
+                result = DigestContent(
+                    content=content,
+                    posts_count=len(posts),
+                    topics=[],
+                    sections=[]
+                )
+            
+            # Сохранение в кеш
+            ttl = self._get_cache_ttl(period_days)
+            await self._save_to_cache(cache_key, result, ttl)
+            
+            # Сохранение в БД (digest_history)
+            try:
+                history = DigestHistory(
+                    user_id=user_id,
+                    tenant_id=UUID(tenant_id_str) if tenant_id_str else None,
+                    digest_date=window_end_date,
+                    content=result.content,
+                    posts_count=result.posts_count,
+                    topics=[],  # Нет тем для канального дайджеста
+                    status="sent"
+                )
+                db.add(history)
+                db.commit()
+            except Exception as e:
+                logger.warning("Failed to save channel digest to DB", error=str(e))
+                db.rollback()
+            
+            # Метрики
+            duration = time.perf_counter() - start_time
+            channel_digest_generation_duration_seconds.labels(
+                tenant_id=tenant_id_str,
+                period=period_str
+            ).observe(duration)
+            
+            channel_digest_posts_count.labels(
+                tenant_id=tenant_id_str,
+                period=period_str
+            ).set(result.posts_count)
+            
+            # Вычисляем размер контекста для метрики (для месяца используется map-reduce, нет единого context)
+            if period_days < 30 and context:
+                context_tokens = self._estimate_tokens(context)
+            else:
+                # Для месяца используем примерную оценку на основе постов
+                context_tokens = len(posts) * 200  # ~200 токенов на пост
+            
+            channel_digest_context_tokens.labels(
+                tenant_id=tenant_id_str,
+                period=period_str
+            ).set(context_tokens)
+            
+            channel_digest_generation_total.labels(
+                tenant_id=tenant_id_str,
+                period=period_str
+            ).inc()
+            
+            logger.info(
+                "Channel digest generated successfully",
+                tenant_id=tenant_id_str,
+                user_id=str(user_id),
+                channel_id=str(channel_id),
+                period_days=period_days,
+                posts_count=result.posts_count,
+                duration_seconds=duration
+            )
+            
+            return result
+            
+        except Exception as e:
+            logger.error(
+                "Error generating channel digest",
+                tenant_id=tenant_id_str,
+                user_id=str(user_id),
+                channel_id=str(channel_id),
+                period_days=period_days,
+                error=str(e)
+            )
+            raise
 
 
 # ============================================================================
@@ -773,12 +1914,22 @@ _digest_service: Optional[DigestService] = None
 
 
 def get_digest_service(
-    qdrant_url: Optional[str] = None
+    qdrant_url: Optional[str] = None,
+    redis_client: Optional[Any] = None
 ) -> DigestService:
-    """Получение singleton экземпляра DigestService."""
+    """
+    Получение singleton экземпляра DigestService.
+    
+    Args:
+        qdrant_url: URL Qdrant (опционально)
+        redis_client: Redis клиент для кеширования (опционально)
+    """
     global _digest_service
     if _digest_service is None:
         qdrant_url = qdrant_url or getattr(settings, 'qdrant_url', 'http://qdrant:6333')
-        _digest_service = DigestService(qdrant_url=qdrant_url)
+        _digest_service = DigestService(qdrant_url=qdrant_url, redis_client=redis_client)
+    elif redis_client and not _digest_service.redis_client:
+        # Обновляем redis_client если был передан и его еще нет
+        _digest_service.redis_client = redis_client
     return _digest_service
 

@@ -10,26 +10,71 @@ import time
 from typing import Optional, Dict, Any
 import structlog
 import redis.asyncio as redis
-from prometheus_client import Counter, Gauge
+from prometheus_client import Counter, Gauge, REGISTRY
 
 logger = structlog.get_logger()
 
+# Context7: Функции для предотвращения дублирования метрик
+def _get_or_create_counter(name, description, labels, namespace=None):
+    """Получить существующую метрику или создать новую."""
+    try:
+        existing = REGISTRY._names_to_collectors.get(name)
+        if existing:
+            return existing
+    except (AttributeError, KeyError, TypeError):
+        pass
+    
+    try:
+        if namespace:
+            return Counter(name, description, labels, namespace=namespace)
+        return Counter(name, description, labels)
+    except ValueError as e:
+        if "Duplicated timeseries" in str(e):
+            try:
+                return REGISTRY._names_to_collectors.get(name)
+            except (AttributeError, KeyError, TypeError):
+                pass
+        logger.warning(f"Metric {name} already exists", error=str(e))
+        raise
+
+def _get_or_create_gauge(name, description, labels, namespace=None):
+    """Получить существующую метрику или создать новую."""
+    try:
+        existing = REGISTRY._names_to_collectors.get(name)
+        if existing:
+            return existing
+    except (AttributeError, KeyError, TypeError):
+        pass
+    
+    try:
+        if namespace:
+            return Gauge(name, description, labels, namespace=namespace)
+        return Gauge(name, description, labels)
+    except ValueError as e:
+        if "Duplicated timeseries" in str(e):
+            try:
+                return REGISTRY._names_to_collectors.get(name)
+            except (AttributeError, KeyError, TypeError):
+                pass
+        logger.warning(f"Metric {name} already exists", error=str(e))
+        raise
+
 # Context7: Метрики rate limiting
-rate_limit_hits_total = Counter(
+rate_limit_hits_total = _get_or_create_counter(
     'rate_limit_hits_total',
     'Rate limit hits',
     ['type'],  # user, channel, global
     namespace='telethon'
 )
 
-rate_limit_requests_total = Counter(
+rate_limit_requests_total = _get_or_create_counter(
     'rate_limit_requests_total',
     'Rate limit requests',
     ['type', 'result'],  # user/channel/global, allowed/blocked
     namespace='telethon'
 )
 
-active_rate_limits = Gauge(
+active_rate_limits = _get_or_create_gauge(
     'active_rate_limits',
     'Currently active rate limits',
     ['type'],

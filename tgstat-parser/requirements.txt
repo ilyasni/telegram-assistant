@@ -1,0 +1,33 @@
+# TGStat Parser Service dependencies
+# Context7: минимальный набор зависимостей для безопасности и производительности
+
+# HTTP client (для fallback)
+requests==2.31.0
+
+# Browser automation для обхода Cloudflare
+selenium==4.15.2
+undetected-chromedriver==3.5.4
+
+# HTML parsing
+beautifulsoup4==4.12.2
+lxml==5.3.0
+
+# Scheduler
+apscheduler==3.10.4
+
+# Database
+psycopg2-binary==2.9.9
+sqlalchemy==2.0.23
+
+# Logging and monitoring
+structlog==23.2.0
+prometheus-client==0.19.0
+
+# Configuration
+pydantic==2.5.0
+pydantic-settings==2.1.0
+python-dotenv==1.0.0
+
+# HTTP server
+fastapi==0.104.1
+uvicorn[standard]==0.24.0

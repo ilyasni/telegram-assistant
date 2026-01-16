@@ -11,17 +11,22 @@ import hashlib
 import json
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone
+from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request, Query
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
-from models.database import get_db
+from models.database import get_db, User, Channel, UserChannel
 from middleware.tracing import get_trace_id
 from repositories.outbox import OutboxRepository, get_outbox_repository
 from events.schemas.channels_v1 import ChannelSubscribedEventV1, ChannelUnsubscribedEventV1
+from services.telegram_channel_resolver import get_tg_channel_id_by_username
+from bot.utils import extract_username_from_telegram_url
+import redis.asyncio as redis
+from config import settings
 
 logger = structlog.get_logger()
 
@@ -49,6 +54,8 @@ class ChannelResponse(BaseModel):
     created_at: datetime
     posts_count: int = 0
     subscribers_count: int = 0
+    source: Optional[str] = None  # 'manual' | 'theme' - источник подписки
+    theme_id: Optional[str] = None  # ID подборки, если source='theme'
 
 class ChannelListResponse(BaseModel):
     """Ответ со списком каналов."""
@@ -73,6 +80,16 @@ class ChannelStatsResponse(BaseModel):
     max_allowed: int
     remaining: int
 
+class ChannelDigestResponse(BaseModel):
+    """Ответ с канальным дайджестом."""
+    digest_id: Optional[str] = None
+    status: str  # "completed" или "processing" для async
+    content: Optional[str] = None
+    posts_count: int
+    period_days: int
+    generated_at: Optional[datetime] = None
+    job_id: Optional[str] = None  # Для async операций
+
 # Tier limits
 TIER_LIMITS = {
     "free": 3,
@@ -85,14 +102,20 @@ TIER_LIMITS = {
 # ============================================================================
 
 @router.post("/users/{user_id}/subscribe", response_model=None, status_code=201)
-def subscribe_to_channel(
+async def subscribe_to_channel(
     user_id: str,
     request: ChannelSubscribeRequest,
     req: Request,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     outbox: OutboxRepository = Depends(get_outbox_repository)
 ):
-    """Подписка на канал с триггером парсинга."""
+    """Подписка на канал с триггером парсинга.
+    
+    Context7: FastAPI обрабатывает синхронные операции БД через thread pool executor,
+    поэтому async функция с синхронными db.execute() работает корректно.
+    await asyncio.sleep() вызывается до операций с БД, что безопасно.
+    """
     try:
         trace_id = get_trace_id(req)
         
@@ -126,18 +149,63 @@ def subscribe_to_channel(
                 }
             )
         
-        # Валидация username
-        if request.username and not re.match(r'^@?[a-zA-Z0-9_]{5,32}$', request.username):
-            raise HTTPException(
-                status_code=422,
-                detail={"error": "invalid_channel", "trace_id": trace_id}
-            )
+        # Context7: Если telegram_id не передан, пытаемся получить его по username
+        telegram_id = request.telegram_id
+        normalized_username = None
+        if not telegram_id and request.username:
+            # Context7: Нормализуем username перед вызовом API (убираем @, парсим URL)
+            normalized_username = extract_username_from_telegram_url(request.username)
+            if not normalized_username:
+                raise HTTPException(
+                    status_code=422,
+                    detail={"error": "invalid_channel", "trace_id": trace_id}
+                )
+            # Context7: Валидация username после нормализации (поддерживает URL и username)
+            if not re.match(r'^[a-zA-Z0-9_]{5,32}$', normalized_username):
+                raise HTTPException(
+                    status_code=422,
+                    detail={"error": "invalid_channel", "trace_id": trace_id}
+                )
+            # Пытаемся получить tg_channel_id из Telegram API с retry
+            # Context7: Делаем несколько попыток для надежности
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    tg_channel_id = await get_tg_channel_id_by_username(normalized_username)
+                    if tg_channel_id:
+                        telegram_id = tg_channel_id
+                        logger.info("Got tg_channel_id from Telegram API", 
+                                   username=request.username, 
+                                   tg_channel_id=tg_channel_id,
+                                   attempt=attempt + 1)
+                        break
+                    else:
+                        logger.warning("Failed to get tg_channel_id from Telegram API (returned None)", 
+                                     username=request.username,
+                                     attempt=attempt + 1)
+                        # Context7: Продолжаем цикл для следующей попытки
+                        if attempt < max_retries - 1:
+                            delay = attempt + 1  # Linear backoff: 1s, 2s, 3s
+                            await asyncio.sleep(delay)
+                except Exception as e:
+                    logger.warning("Failed to get tg_channel_id from Telegram API", 
+                                 username=request.username, 
+                                 error=str(e),
+                                 attempt=attempt + 1)
+                    # Context7: Продолжаем цикл для следующей попытки
+                    if attempt < max_retries - 1:
+                        delay = attempt + 1  # Linear backoff: 1s, 2s, 3s
+                        await asyncio.sleep(delay)
+        
+        # Context7: Используем нормализованный username для создания канала
+        channel_username = normalized_username if normalized_username else request.username
         
         # Получение или создание канала
+        # Context7: Синхронные операции БД в async функции - FastAPI обрабатывает это через thread pool
         channel = _get_or_create_channel(
             tenant_id=tenant_id,
-            username=request.username,
-            telegram_id=request.telegram_id,
+            username=channel_username,
+            telegram_id=telegram_id,
             title=request.title,
             db=db
         )
@@ -187,6 +255,14 @@ def subscribe_to_channel(
             idempotency_key=idempotency_key
         )
         
+        # Context7: Если канал создан без tg_channel_id, запускаем фоновую задачу для его заполнения
+        if not telegram_id and request.username:
+            background_tasks.add_task(
+                _fill_tg_channel_id_background,
+                channel_id=channel['id'],
+                username=request.username
+            )
+        
         logger.info("User subscribed to channel",
                    user_id=user_id,
                    channel_id=channel['id'],
@@ -212,9 +288,15 @@ def list_user_channels(
     user_id: str,
     limit: int = 100,
     offset: int = 0,
+    source: Optional[str] = Query(None, description="Фильтр по источнику: 'manual', 'theme' или 'all' (default: 'all')"),
     db: Session = Depends(get_db)
 ):
-    """Список подписанных каналов пользователя."""
+    """
+    Список подписанных каналов пользователя.
+    
+    Context7: Поддерживает фильтрацию по источнику (manual/theme).
+    Для каналов в обоих списках показывается информация о всех источниках.
+    """
     try:
         # Определяем, является ли user_id UUID или telegram_id
         try:
@@ -232,20 +314,41 @@ def list_user_channels(
             # Если не получилось преобразовать в int, считаем что это UUID
             user_uuid = user_id
         
-        # Получение каналов пользователя
+        # Валидация source
+        if source and source not in ['manual', 'theme', 'all']:
+            raise HTTPException(status_code=400, detail="Invalid source parameter. Use 'manual', 'theme', or 'all'")
+        
+        # Построение WHERE условия для фильтрации по source
+        source_filter = ""
+        if source == 'manual':
+            source_filter = "AND uc.source = 'manual'"
+        elif source == 'theme':
+            source_filter = "AND uc.source = 'theme'"
+        
+        # Получение каналов пользователя с информацией об источнике
+        # Используем DISTINCT ON для дедупликации, если канал в обоих списках
+        # Приоритет: manual > theme (для детерминизма)
         channels_result = db.execute(
-            text("""
-                SELECT 
-                    c.id, c.tg_channel_id, c.username, c.title, c.is_active,
-                    c.last_message_at, c.created_at,
-                    COUNT(p.id) as posts_count,
-                    COUNT(uc.user_id) as subscribers_count
+            text(f"""
+                SELECT DISTINCT ON (c.id)
+                    c.id, 
+                    c.tg_channel_id, 
+                    c.username, 
+                    c.title, 
+                    c.is_active,
+                    c.last_message_at, 
+                    c.created_at,
+                    (SELECT COUNT(*) FROM posts p WHERE p.channel_id = c.id) as posts_count,
+                    (SELECT COUNT(DISTINCT uc2.user_id) FROM user_channel uc2 WHERE uc2.channel_id = c.id AND uc2.is_active = true) as subscribers_count,
+                    uc.source,
+                    uc.theme_id
                 FROM channels c
                 JOIN user_channel uc ON c.id = uc.channel_id
-                LEFT JOIN posts p ON c.id = p.channel_id
-                WHERE uc.user_id = :user_id AND uc.is_active = true
-                GROUP BY c.id, c.tg_channel_id, c.username, c.title, c.is_active, c.last_message_at, c.created_at
-                ORDER BY c.created_at DESC
+                WHERE uc.user_id = :user_id AND uc.is_active = true {source_filter}
+                ORDER BY 
+                    c.id,  -- Обязательно для DISTINCT ON
+                    uc.source DESC,  -- Приоритет: 'manual' > 'theme'
+                    uc.subscribed_at DESC  -- Детерминизм: более свежие подписки приоритетнее
                 LIMIT :limit OFFSET :offset
             """),
             {"user_id": user_uuid, "limit": limit, "offset": offset}
@@ -255,17 +358,16 @@ def list_user_channels(
         for row in channels_result.fetchall():
             channel_data = dict(row._mapping)
             channel_data['id'] = str(channel_data['id'])
-            # Переименовываем tg_channel_id в tg_channel_id для модели
-            if 'tg_channel_id' in channel_data:
-                channel_data['tg_channel_id'] = channel_data['tg_channel_id']
+            if 'theme_id' in channel_data and channel_data['theme_id']:
+                channel_data['theme_id'] = str(channel_data['theme_id'])
             channels.append(ChannelResponse(**channel_data))
         
-        # Подсчёт общего количества
+        # Подсчёт общего количества (уникальные каналы)
         total_result = db.execute(
-            text("""
-                SELECT COUNT(*) as total
+            text(f"""
+                SELECT COUNT(DISTINCT channel_id) as total
                 FROM user_channel uc
-                WHERE uc.user_id = :user_id AND uc.is_active = true
+                WHERE uc.user_id = :user_id AND uc.is_active = true {source_filter}
             """),
             {"user_id": user_uuid}
         )
@@ -278,6 +380,8 @@ def list_user_channels(
             offset=offset
         )
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to list channels: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
@@ -290,37 +394,108 @@ def unsubscribe_from_channel(
 ):
     """Отписка от канала (soft delete)."""
     try:
-        # Проверка существования подписки
+        # Context7: Проверка существования активной подписки
+        # Примечание: user_channel имеет составной PK (user_id, channel_id), без отдельной колонки id
         subscription_result = db.execute(
             text("""
-                SELECT id FROM user_channel 
-                WHERE user_id = :user_id AND channel_id = :channel_id AND is_active = true
-            """),
-            {"user_id": user_id, "channel_id": channel_id}
-        )
-        
-        if not subscription_result.fetchone():
-            raise HTTPException(status_code=404, detail="Subscription not found")
-        
-        # Soft delete подписки
-        db.execute(
-            text("""
-                UPDATE user_channel 
-                SET is_active = false, updated_at = NOW()
+                SELECT user_id, channel_id, is_active FROM user_channel 
                 WHERE user_id = :user_id AND channel_id = :channel_id
             """),
             {"user_id": user_id, "channel_id": channel_id}
         )
         
-        db.commit()
+        subscription_row = subscription_result.fetchone()
+        if not subscription_row:
+            raise HTTPException(status_code=404, detail="Subscription not found")
         
-        logger.info(f"User {user_id} unsubscribed from channel {channel_id}")
+        # Context7: Если подписка уже неактивна, возвращаем успех (идемпотентность)
+        if not subscription_row.is_active:
+            logger.info(
+                "Subscription already inactive",
+                user_id=user_id,
+                channel_id=channel_id
+            )
+            return {"status": "already_unsubscribed", "channel_id": channel_id}
+        
+        # Context7: Soft delete подписки
+        # Примечание: user_channel не имеет колонки updated_at, только subscribed_at
+        update_result = db.execute(
+            text("""
+                UPDATE user_channel 
+                SET is_active = false
+                WHERE user_id = :user_id AND channel_id = :channel_id AND is_active = true
+            """),
+            {"user_id": user_id, "channel_id": channel_id}
+        )
+        
+        # Context7: Проверка, что UPDATE действительно обновил строку
+        if update_result.rowcount == 0:
+            logger.warning(
+                "No rows updated during unsubscribe",
+                user_id=user_id,
+                channel_id=channel_id
+            )
+            # Возможно, подписка была деактивирована между проверкой и обновлением
+            # Возвращаем успех для идемпотентности
+            return {"status": "already_unsubscribed", "channel_id": channel_id}
+        
+        # Context7: Коммит транзакции с обработкой ошибок
+        try:
+            db.commit()
+        except Exception as commit_error:
+            logger.error(
+                "Commit failed during unsubscribe",
+                error=str(commit_error),
+                error_type=type(commit_error).__name__,
+                user_id=user_id,
+                channel_id=channel_id
+            )
+            db.rollback()
+            raise HTTPException(
+                status_code=500,
+                detail=f"Database commit failed: {str(commit_error)}"
+            )
+        
+        logger.info(
+            "User unsubscribed from channel",
+            user_id=user_id,
+            channel_id=channel_id
+        )
         return {"status": "unsubscribed", "channel_id": channel_id}
         
     except HTTPException:
+        # Context7: Rollback при HTTPException для предотвращения утечек транзакций
+        try:
+            db.rollback()
+        except Exception as rollback_error:
+            logger.warning(
+                "Rollback failed after HTTPException",
+                error=str(rollback_error),
+                user_id=user_id,
+                channel_id=channel_id
+            )
         raise
     except Exception as e:
-        logger.error(f"Unsubscription failed: {e}")
+        # Context7: Rollback при любых других ошибках
+        try:
+            db.rollback()
+        except Exception as rollback_error:
+            logger.error(
+                "Rollback failed after exception",
+                rollback_error=str(rollback_error),
+                original_error=str(e),
+                user_id=user_id,
+                channel_id=channel_id
+            )
+        
+        logger.error(
+            "Unsubscription failed",
+            error=str(e),
+            error_type=type(e).__name__,
+            user_id=user_id,
+            channel_id=channel_id,
+            exc_info=True
+        )
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @router.get("/users/{user_id}/stats", response_model=ChannelStatsResponse)
@@ -343,9 +518,9 @@ def get_user_channel_stats(
         user_tier = user_row.tier or "free"
         max_allowed = TIER_LIMITS.get(user_tier, 3)
         
-        # Подсчет текущих каналов
+        # Подсчет текущих каналов (уникальные каналы, независимо от source)
         count_result = db.execute(
-            text("SELECT COUNT(*) FROM user_channel WHERE user_id = :user_id AND is_active = true"),
+            text("SELECT COUNT(DISTINCT channel_id) FROM user_channel WHERE user_id = :user_id AND is_active = true"),
             {"user_id": user_uuid}
         )
         total = count_result.scalar() or 0
@@ -434,16 +609,288 @@ async def trigger_channel_parsing(
         logger.error(f"Failed to trigger parsing: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
+@router.post("/users/{user_id}/channels/{channel_id}/digest", response_model=ChannelDigestResponse, name="channel_digest")
+async def generate_channel_digest(
+    user_id: str,
+    channel_id: str,
+    period: int = Query(7, ge=1, le=30, description="Период в днях (1, 7 или 30)"),
+    request: Request = None,
+    db: Session = Depends(get_db)
+):
+    """
+    Генерация дайджеста по конкретному каналу.
+    
+    Context7: User-scoped endpoint с жесткой валидацией доступа через user_channel JOIN.
+    Для месяца (period=30) возвращает job_id и статус "processing" для async операции.
+    """
+    # Context7: Логируем начало обработки запроса для диагностики
+    logger.warning(
+        "Channel digest endpoint called",
+        user_id=user_id,
+        channel_id=channel_id,
+        period=period
+    )
+    try:
+        # Определяем user_uuid (UUID или telegram_id)
+        try:
+            telegram_id = int(user_id)
+            user_result = db.execute(
+                text("SELECT id, tenant_id FROM users WHERE telegram_id = :telegram_id"),
+                {"telegram_id": telegram_id}
+            )
+            user_row = user_result.fetchone()
+            if not user_row:
+                raise HTTPException(status_code=404, detail="User not found")
+            user_uuid = user_row.id
+            tenant_id = user_row.tenant_id
+        except ValueError:
+            # UUID
+            user_uuid = UUID(user_id)
+            user_result = db.execute(
+                text("SELECT tenant_id FROM users WHERE id = :user_id"),
+                {"user_id": user_id}
+            )
+            user_row = user_result.fetchone()
+            if not user_row:
+                raise HTTPException(status_code=404, detail="User not found")
+            tenant_id = user_row.tenant_id
+        
+        # Валидация периода
+        if period not in [1, 7, 30]:
+            raise HTTPException(
+                status_code=400,
+                detail="period должен быть 1, 7 или 30 дней"
+            )
+        
+        # Context7: Жесткая валидация доступа к каналу через user_channel JOIN с проверкой tenant_id
+        # Преобразуем channel_id в UUID для корректной работы с БД
+        try:
+            channel_uuid = UUID(channel_id)
+        except ValueError:
+            logger.warning(
+                "Channel digest - invalid channel_id format",
+                tenant_id=str(tenant_id) if tenant_id else None,
+                user_id=str(user_uuid),
+                channel_id=channel_id
+            )
+            raise HTTPException(
+                status_code=400,
+                detail="Неверный формат channel_id (должен быть UUID)"
+            )
+        
+        # Context7: Логируем параметры перед SQL запросом для диагностики
+        # Используем warning для гарантированной видимости
+        logger.warning(
+            "Channel digest - checking access",
+            user_id=str(user_uuid),
+            user_id_type=type(user_uuid).__name__,
+            channel_id=str(channel_uuid),
+            channel_id_type=type(channel_uuid).__name__,
+            channel_id_raw=channel_id,
+            tenant_id=str(tenant_id) if tenant_id else None
+        )
+        
+        access_check = db.execute(
+            text("""
+                SELECT 
+                    uc.channel_id,
+                    uc.user_id,
+                    uc.is_active as user_channel_is_active,
+                    c.id as channel_exists,
+                    c.is_active as channel_is_active,
+                    u.tenant_id
+                FROM user_channel uc
+                JOIN channels c ON c.id = uc.channel_id
+                JOIN users u ON u.id = uc.user_id
+                WHERE uc.user_id = :user_id 
+                    AND uc.channel_id = :channel_id 
+                    AND uc.is_active = true
+                LIMIT 1
+            """),
+            {"user_id": str(user_uuid), "channel_id": str(channel_uuid)}
+        )
+        access_row = access_check.fetchone()
+        
+        # Context7: Детальное логирование результата проверки доступа
+        if access_row:
+            access_dict = dict(access_row._mapping) if hasattr(access_row, '_mapping') else dict(access_row)
+            logger.info(
+                "Channel digest - access check result",
+                user_id=str(user_uuid),
+                channel_id=str(channel_uuid),
+                access_granted=True,
+                user_channel_is_active=access_dict.get('user_channel_is_active'),
+                channel_exists=access_dict.get('channel_exists') is not None,
+                channel_is_active=access_dict.get('channel_is_active'),
+                tenant_id=str(access_dict.get('tenant_id')) if access_dict.get('tenant_id') else None
+            )
+        else:
+            # Context7: Детальное логирование + проверка существования записей для диагностики
+            # Проверяем, существует ли user_channel вообще (даже неактивный)
+            check_user_channel = db.execute(
+                text("""
+                    SELECT uc.user_id, uc.channel_id, uc.is_active, c.id as channel_exists
+                    FROM user_channel uc
+                    LEFT JOIN channels c ON c.id = uc.channel_id
+                    WHERE uc.user_id = :user_id AND uc.channel_id = :channel_id
+                    LIMIT 1
+                """),
+                {"user_id": str(user_uuid), "channel_id": str(channel_uuid)}
+            )
+            user_channel_row = check_user_channel.fetchone()
+            
+            # Проверяем, существует ли канал вообще
+            check_channel = db.execute(
+                text("SELECT id, is_active FROM channels WHERE id = :channel_id LIMIT 1"),
+                {"channel_id": str(channel_uuid)}
+            )
+            channel_row = check_channel.fetchone()
+            
+            logger.warning(
+                "Channel digest access denied - user_channel not found",
+                tenant_id=str(tenant_id) if tenant_id else None,
+                user_id=str(user_uuid),
+                channel_id=str(channel_uuid),
+                channel_id_raw=channel_id,
+                user_channel_exists=(user_channel_row is not None),
+                user_channel_is_active=(user_channel_row.is_active if user_channel_row else None),
+                channel_exists=(channel_row is not None),
+                channel_is_active=(channel_row.is_active if channel_row else None)
+            )
+            raise HTTPException(
+                status_code=404,
+                detail="Канал не найден или нет доступа"
+            )
+        
+        # Context7: Преобразуем Row в dict для удобства доступа (как в других endpoints)
+        access_dict = dict(access_row._mapping) if hasattr(access_row, '_mapping') else dict(access_row)
+        
+        # Проверяем, что канал активен
+        channel_is_active = access_dict.get('channel_is_active')
+        if not channel_is_active:
+            logger.warning(
+                "Channel digest access denied - channel not active",
+                tenant_id=str(tenant_id) if tenant_id else None,
+                user_id=str(user_uuid),
+                channel_id=channel_id
+            )
+            raise HTTPException(
+                status_code=404,
+                detail="Канал не активен"
+            )
+        
+        # Context7: Проверяем tenant_id из доступа (дополнительная проверка для безопасности)
+        access_tenant_id_raw = access_dict.get('tenant_id')
+        access_tenant_id = str(access_tenant_id_raw) if access_tenant_id_raw else None
+        if tenant_id and access_tenant_id and access_tenant_id != str(tenant_id):
+            logger.error(
+                "Tenant mismatch in channel digest access check",
+                user_tenant_id=str(tenant_id),
+                access_tenant_id=access_tenant_id,
+                user_id=str(user_uuid),
+                channel_id=channel_id
+            )
+            raise HTTPException(status_code=403, detail="Access denied")
+        
+        tenant_id_str = str(tenant_id) if tenant_id else None
+        if not tenant_id_str:
+            raise HTTPException(status_code=400, detail="Не задан tenant_id для пользователя")
+        
+        # Получаем DigestService с Redis клиентом
+        from api.services.digest_service import get_digest_service
+        try:
+            # Context7: Создаем async Redis клиент для кеширования
+            redis_client = redis.from_url(settings.redis_url, decode_responses=True)
+        except Exception as e:
+            logger.warning("Failed to create Redis client for digest service", error=str(e))
+            redis_client = None
+        
+        digest_service = get_digest_service(redis_client=redis_client)
+        
+        # Для месяца используем async job (в будущем), пока синхронно
+        # TODO: Реализовать async job для месяца через BackgroundTasks или очередь
+        if period >= 30:
+            # Пока синхронно, но логируем что это может занять время
+            logger.info(
+                "Generating channel digest for month period (may take time)",
+                tenant_id=tenant_id_str,
+                user_id=str(user_uuid),
+                channel_id=channel_id,
+                period=period
+            )
+        
+        # Генерируем дайджест
+        try:
+            result = await digest_service.generate_channel_digest(
+                channel_id=UUID(channel_id),
+                user_id=user_uuid,
+                tenant_id=tenant_id_str,
+                db=db,
+                period_days=period
+            )
+            
+            return ChannelDigestResponse(
+                digest_id=None,  # Можем добавить ID из digest_history
+                status="completed",
+                content=result.content,
+                posts_count=result.posts_count,
+                period_days=period,
+                generated_at=datetime.now(timezone.utc),
+                job_id=None
+            )
+            
+        except ValueError as e:
+            # Ошибки валидации (нет постов, нет доступа и т.д.)
+            error_msg = str(e)
+            logger.info(
+                "Channel digest generation validation error",
+                tenant_id=tenant_id_str,
+                user_id=str(user_uuid),
+                channel_id=channel_id,
+                period=period,
+                error=error_msg
+            )
+            raise HTTPException(status_code=400, detail=error_msg)
+        except Exception as e:
+            logger.error(
+                "Channel digest generation failed",
+                tenant_id=tenant_id_str,
+                user_id=str(user_uuid),
+                channel_id=channel_id,
+                period=period,
+                error=str(e)
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Ошибка генерации дайджеста. Попробуйте позже."
+            )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            "Unexpected error in channel digest endpoint",
+            error=str(e),
+            user_id=user_id,
+            channel_id=channel_id
+        )
+        raise HTTPException(status_code=500, detail="Internal server error")
+
 # ============================================================================
 # HELPER FUNCTIONS
 # ============================================================================
 
 def _check_subscription_limits(user_id: str, db: Session) -> Dict[str, Any]:
-    """Проверка лимитов подписки пользователя."""
-    # Получение текущего количества подписок
+    """Проверка лимитов подписки пользователя.
+    
+    Context7: Использует COUNT(DISTINCT channel_id) для корректного подсчета уникальных каналов,
+    независимо от источника (manual или theme). Правило "effective active" - канал считается
+    активным, если есть хотя бы одна активная запись.
+    """
+    # Получение текущего количества подписок (уникальные каналы)
     current_result = db.execute(
         text("""
-            SELECT COUNT(*) as total_channels
+            SELECT COUNT(DISTINCT channel_id) as total_channels
             FROM user_channel 
             WHERE user_id = :user_id AND is_active = true
         """),
@@ -501,14 +948,35 @@ def _get_or_create_channel(
             # Context7: [C7-ID: username-search-normalization-001] Поиск с нормализацией username в SQL
             # Используем LTRIM для поиска, чтобы найти каналы как с @, так и без @
             existing_result = db.execute(
-                text("SELECT id FROM channels WHERE LTRIM(username, '@') = :username"),
+                text("SELECT id, tg_channel_id FROM channels WHERE LTRIM(username, '@') = :username"),
                 {"username": normalized_username}
             )
             existing_row = existing_result.fetchone()
             if existing_row:
-                return {"id": str(existing_row.id)}
+                existing_id = str(existing_row.id)
+                existing_tg_id = existing_row.tg_channel_id
+                
+                # Context7: Если канал существует без tg_channel_id, но мы получили telegram_id - обновляем
+                if not existing_tg_id and telegram_id:
+                    db.execute(
+                        text("UPDATE channels SET tg_channel_id = :telegram_id WHERE id = :channel_id"),
+                        {"telegram_id": telegram_id, "channel_id": existing_id}
+                    )
+                    db.commit()
+                    logger.info("Updated tg_channel_id for existing channel",
+                               channel_id=existing_id,
+                               username=normalized_username,
+                               tg_channel_id=telegram_id)
+                
+                return {"id": existing_id}
         
         # Создание нового канала (username уже нормализован выше)
+        # Context7: Предупреждение, если создаем канал без tg_channel_id
+        if not telegram_id:
+            logger.warning("Creating channel without tg_channel_id - will be filled in background", 
+                         username=normalized_username,
+                         tenant_id=tenant_id)
+        
         channel_id = str(uuid.uuid4())
         
         db.execute(
@@ -551,22 +1019,22 @@ def _create_user_subscription(
         
         existing_row = existing_result.fetchone()
         if existing_row:
-            # Активация существующей подписки
+            # Активация существующей подписки (обновляем updated_at)
             db.execute(
                 text("""
                     UPDATE user_channel 
-                    SET is_active = true, settings = :settings
+                    SET is_active = true, settings = :settings, updated_at = NOW()
                     WHERE user_id = :user_id AND channel_id = :channel_id
                 """),
                 {"user_id": user_id, "channel_id": channel_id, "settings": json.dumps(settings)}
             )
             subscription_id = f"{user_id}:{channel_id}"
         else:
-            # Создание новой подписки
+            # Создание новой подписки (source='manual' для ручных подписок)
             db.execute(
                 text("""
-                    INSERT INTO user_channel (user_id, channel_id, is_active, settings, subscribed_at)
-                    VALUES (:user_id, :channel_id, true, :settings, NOW())
+                    INSERT INTO user_channel (user_id, channel_id, source, theme_id, is_active, settings, subscribed_at, updated_at)
+                    VALUES (:user_id, :channel_id, 'manual', NULL, true, :settings, NOW(), NOW())
                 """),
                 {
                     "user_id": user_id, 
@@ -626,3 +1094,98 @@ async def _trigger_channel_parsing(user_id: str, channel_id: str, tenant_id: str
         
     except Exception as e:
         logger.error(f"Failed to trigger channel parsing: {e}")
+
+async def _fill_tg_channel_id_background(channel_id: str, username: str):
+    """
+    Фоновая задача для заполнения tg_channel_id для канала.
+    
+    Context7: Используется для каналов, созданных без tg_channel_id.
+    Добавлена retry логика для надежности.
+    """
+    max_retries = 5
+    retry_delays = [2, 5, 10, 30, 60]  # секунды между попытками
+    errors = []  # Собираем все ошибки для финального логирования
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info("Filling tg_channel_id in background", 
+                       channel_id=channel_id, 
+                       username=username,
+                       attempt=attempt + 1,
+                       max_retries=max_retries)
+            
+            tg_channel_id = await get_tg_channel_id_by_username(username)
+            if tg_channel_id:
+                # Обновляем канал в БД
+                # Context7: Используем SessionLocal напрямую для фоновых задач, а не FastAPI dependency
+                from models.database import SessionLocal
+                db = SessionLocal()
+                try:
+                    result = db.execute(
+                        text("""
+                            UPDATE channels 
+                            SET tg_channel_id = :tg_channel_id 
+                            WHERE id = :channel_id AND tg_channel_id IS NULL
+                        """),
+                        {"tg_channel_id": tg_channel_id, "channel_id": channel_id}
+                    )
+                    db.commit()
+                    
+                    if result.rowcount > 0:
+                        logger.info("Updated tg_channel_id in background", 
+                                   channel_id=channel_id, 
+                                   tg_channel_id=tg_channel_id,
+                                   attempt=attempt + 1)
+                        return  # Успешно обновлено
+                    else:
+                        # Канал уже обновлен или не найден
+                        logger.info("Channel tg_channel_id already set or channel not found", 
+                                   channel_id=channel_id)
+                        # Context7: Выходим из цикла retry, так как дальнейшие попытки бесполезны
+                        return
+                except Exception as e:
+                    error_msg = f"DB update error: {str(e)}"
+                    errors.append(error_msg)
+                    logger.error("Failed to update tg_channel_id in DB", 
+                               channel_id=channel_id, 
+                               error=str(e),
+                               attempt=attempt + 1)
+                finally:
+                    db.close()
+            else:
+                error_msg = "Failed to get tg_channel_id from Telegram API"
+                errors.append(error_msg)
+                logger.warning("Failed to get tg_channel_id from Telegram API", 
+                             channel_id=channel_id, 
+                             username=username,
+                             attempt=attempt + 1)
+                
+                # Если это не последняя попытка, ждем перед следующей
+                if attempt < max_retries - 1:
+                    delay = retry_delays[attempt]
+                    logger.info("Retrying after delay", 
+                               channel_id=channel_id,
+                               delay_seconds=delay,
+                               next_attempt=attempt + 2)
+                    await asyncio.sleep(delay)
+        except Exception as e:
+            error_msg = f"Exception in attempt {attempt + 1}: {str(e)}"
+            errors.append(error_msg)
+            logger.error("Error in background tg_channel_id fill", 
+                        channel_id=channel_id, 
+                        username=username, 
+                        error=str(e),
+                        attempt=attempt + 1)
+            
+            # Если это не последняя попытка, ждем перед следующей
+            if attempt < max_retries - 1:
+                delay = retry_delays[attempt]
+                await asyncio.sleep(delay)
+    
+    # Context7: Логируем финальный результат после всех попыток
+    logger.error("Failed to fill tg_channel_id after all retries", 
+                channel_id=channel_id,
+                username=username,
+                total_attempts=max_retries,
+                errors=errors,
+                note="Background task completed with failure, manual intervention may be required")

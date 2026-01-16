@@ -7,6 +7,7 @@
 import redis
 import redis.exceptions
 import json
+import os
 import structlog
 from typing import Dict, Any, Optional
 from datetime import datetime, timezone
@@ -56,10 +57,11 @@ class EventBusSync:
             }
             
             # Context7: Публикация в Redis Stream
+            redis_stream_maxlen = int(os.getenv("REDIS_STREAM_MAXLEN", "10000"))
             message_id = self.redis_client.xadd(
                 self.stream_name,
                 event,
-                maxlen=10000,  # Context7: Ограничение размера stream
+                maxlen=redis_stream_maxlen,  # Context7: Ограничение размера stream
                 approximate=True
             )
             
@@ -89,10 +91,11 @@ class EventBusSync:
                 "source": "telethon-ingest"
             }
             
+            redis_stream_maxlen = int(os.getenv("REDIS_STREAM_MAXLEN", "10000"))
             message_id = self.redis_client.xadd(
                 self.stream_name,
                 event,
-                maxlen=10000,
+                maxlen=redis_stream_maxlen,
                 approximate=True
             )
             

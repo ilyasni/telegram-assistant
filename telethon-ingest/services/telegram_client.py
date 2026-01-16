@@ -12,6 +12,7 @@ from telethon.utils import get_peer_id
 import structlog
 import redis.asyncio as redis
 import psycopg2
+from psycopg2 import errors as psycopg2_errors
 from psycopg2.extras import RealDictCursor
 import json
 from datetime import datetime, timezone, timedelta
@@ -68,21 +69,55 @@ class TelegramIngestionService:
             logger.info("Database connected")
             
             # Context7: Получаем клиент через TelegramClientManager
-            # Сначала получаем telegram_id из БД
+            # Сначала получаем telegram_id авторизованного пользователя с сессией из БД
             cursor = self.db_connection.cursor()
-            cursor.execute("SELECT telegram_id FROM users WHERE telegram_id IS NOT NULL LIMIT 1")
+            cursor.execute("""
+                SELECT telegram_id 
+                FROM users 
+                WHERE telegram_auth_status = 'authorized' 
+                  AND telegram_session_enc IS NOT NULL
+                ORDER BY telegram_auth_created_at DESC
+                LIMIT 1
+            """)
             result = cursor.fetchone()
             cursor.close()
             
             if not result:
-                logger.error("No telegram_id found in users table")
+                logger.error(
+                    "No authorized user with session found in users table",
+                    available_users_count=0
+                )
+                # Context7: Дополнительная диагностика - проверяем, сколько пользователей есть
+                cursor = self.db_connection.cursor()
+                cursor.execute("""
+                    SELECT 
+                        COUNT(*) FILTER (WHERE telegram_auth_status = 'authorized') as authorized_count,
+                        COUNT(*) FILTER (WHERE telegram_auth_status = 'pending') as pending_count,
+                        COUNT(*) FILTER (WHERE telegram_session_enc IS NOT NULL) as with_session_count
+                    FROM users
+                    WHERE telegram_id IS NOT NULL
+                """)
+                stats = cursor.fetchone()
+                cursor.close()
+                if stats:
+                    logger.warning(
+                        "User session statistics",
+                        authorized_count=stats[0] or 0,
+                        pending_count=stats[1] or 0,
+                        with_session_count=stats[2] or 0,
+                    )
                 return
                 
             telegram_id = result[0]
             self.telegram_id = telegram_id  # Context7: Сохраняем для использования в других методах
+            logger.info("Selected authorized user for Telegram client", telegram_id=telegram_id)
             self.client = await self.client_manager.get_client(telegram_id)
             if not self.client:
-                logger.error("No available Telegram client from manager")
+                logger.error(
+                    "No available Telegram client from manager",
+                    telegram_id=telegram_id,
+                    reason="Session may be invalid or expired"
+                )
                 return
                 
             logger.info("Telegram client obtained from manager", telegram_id=telegram_id)
@@ -205,9 +240,11 @@ class TelegramIngestionService:
                     """)
                     self._active_group_ids = {int(row['tg_chat_id']) for row in cursor.fetchall() if row['tg_chat_id']}
                     
-                    logger.debug("Active chats cache refreshed",
+                    logger.info("Active chats cache refreshed",
                                channels_count=len(self._active_channel_ids),
-                               groups_count=len(self._active_group_ids))
+                               groups_count=len(self._active_group_ids),
+                               active_channel_ids=list(self._active_channel_ids)[:10],  # Первые 10 для диагностики
+                               active_group_ids=list(self._active_group_ids)[:10])  # Первые 10 для диагностики
             except Exception as e:
                 logger.warning("Failed to refresh active chats cache", error=str(e))
         
@@ -230,13 +267,33 @@ class TelegramIngestionService:
                 chat_id = getattr(event.message.peer_id, 'channel_id', None) or getattr(event.message.peer_id, 'chat_id', None)
                 if chat_id:
                     chat_id_int = int(chat_id)
-                    if chat_id_int not in self._active_channel_ids and chat_id_int not in self._active_group_ids:
-                        # Не активный канал/группа - пропускаем
+                    is_channel = chat_id_int in self._active_channel_ids
+                    is_group = chat_id_int in self._active_group_ids
+                    
+                    if not is_channel and not is_group:
+                        # Context7: Детальное логирование для диагностики пропущенных сообщений
+                        logger.debug(
+                            "Message skipped - not in active chats",
+                            chat_id=chat_id_int,
+                            active_channels_count=len(self._active_channel_ids),
+                            active_groups_count=len(self._active_group_ids),
+                            is_channel=is_channel,
+                            is_group=is_group,
+                        )
                         return
+                    
+                    # Context7: Логирование успешной обработки для диагностики
+                    logger.info(
+                        "Processing new message",
+                        chat_id=chat_id_int,
+                        message_id=event.message.id,
+                        is_channel=is_channel,
+                        is_group=is_group,
+                    )
                 
                 await self._process_message(event)
             except Exception as e:
-                logger.error("Error processing message", error=str(e), message_id=event.message.id)
+                logger.error("Error processing message", error=str(e), message_id=event.message.id, exc_info=True)
         
         @self.client.on(events.MessageEdited)
         async def handle_message_edited(event):
@@ -302,64 +359,127 @@ class TelegramIngestionService:
             logger.error("Failed to load channels", error=str(e))
 
     async def _load_active_groups(self):
-        """Загрузка активных групп из БД для подписки на события."""
+        """Загрузка активных групп из БД для подписки на события.
+        
+        Context7: Использует клиент пользователя, подписанного на группу.
+        Только группы с активными подписками в user_group загружаются.
+        """
         try:
+            # Context7: Получаем группы с информацией о подписанных пользователях
             with self.db_connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                # Получаем только группы с активными подписками в user_group
                 cursor.execute("""
-                    SELECT id, tenant_id, tg_chat_id, username, title
-                    FROM groups
-                    WHERE is_active = true
+                    SELECT 
+                        g.id, 
+                        g.tenant_id, 
+                        g.tg_chat_id, 
+                        g.username, 
+                        g.title,
+                        u.telegram_id as subscriber_telegram_id
+                    FROM groups g
+                    INNER JOIN user_group ug ON g.id = ug.group_id
+                    INNER JOIN users u ON ug.user_id = u.id
+                    WHERE g.is_active = true
+                      AND ug.is_active = true
+                      AND u.telegram_auth_status = 'authorized'
+                      AND u.telegram_session_enc IS NOT NULL
+                    ORDER BY ug.subscribed_at DESC
                 """)
-                groups = cursor.fetchall() or []
+                groups_with_users = cursor.fetchall() or []
 
-            for group in groups:
+            if not groups_with_users:
+                logger.warning(
+                    "No groups with authorized users found",
+                    total_groups=0
+                )
+                return
+
+            for group_data in groups_with_users:
                 try:
+                    subscriber_telegram_id = group_data.get("subscriber_telegram_id")
+                    if not subscriber_telegram_id or not self.client_manager:
+                        logger.warning(
+                            "Group has no subscriber or client manager unavailable",
+                            group_id=group_data.get("id"),
+                            subscriber_telegram_id=subscriber_telegram_id,
+                        )
+                        continue
+
+                    # Context7: Получаем клиент пользователя, подписанного на группу
+                    subscriber_telegram_id_int = int(subscriber_telegram_id)
+                    group_client = await self.client_manager.get_client(subscriber_telegram_id_int)
+                    if not group_client:
+                        logger.warning(
+                            "No client available for group subscriber",
+                            group_id=group_data.get("id"),
+                            subscriber_telegram_id=subscriber_telegram_id_int,
+                        )
+                        continue
+
                     entity = None
-                    if group.get("username"):
-                        clean_username = group["username"].lstrip("@")
-                        entity = await self.client.get_entity(clean_username)
-                    elif group.get("tg_chat_id"):
-                        entity = await self.client.get_entity(int(group["tg_chat_id"]))
+                    if group_data.get("username"):
+                        clean_username = group_data["username"].lstrip("@")
+                        entity = await group_client.get_entity(clean_username)
+                    elif group_data.get("tg_chat_id"):
+                        entity = await group_client.get_entity(int(group_data["tg_chat_id"]))
 
                     logger.info(
                         "Loaded group for real-time ingest",
-                        group_id=group["id"],
-                        tg_chat_id=group.get("tg_chat_id"),
-                        username=group.get("username"),
-                        title=group.get("title"),
+                        group_id=group_data["id"],
+                        tg_chat_id=group_data.get("tg_chat_id"),
+                        username=group_data.get("username"),
+                        title=group_data.get("title"),
+                        subscriber_telegram_id=subscriber_telegram_id_int,
                         entity_type=type(entity).__name__ if entity else None,
                     )
                 except Exception as e:
                     logger.warning(
                         "Failed to load group entity",
-                        group_id=group.get("id"),
-                        tg_chat_id=group.get("tg_chat_id"),
+                        group_id=group_data.get("id"),
+                        tg_chat_id=group_data.get("tg_chat_id"),
+                        subscriber_telegram_id=group_data.get("subscriber_telegram_id"),
                         error=str(e),
                     )
         except Exception as e:
             logger.error("Failed to load groups", error=str(e))
 
     async def _group_sync_worker(self):
-        """Периодическая синхронизация истории сообщений групп."""
+        """Периодическая синхронизация истории сообщений групп.
+        
+        Context7: Использует сессию пользователя, подписанного на группу.
+        """
         poll_interval = int(os.getenv("GROUP_SYNC_INTERVAL_SEC", "180"))
         max_messages = int(os.getenv("GROUP_SYNC_LIMIT", "200"))
         lookback_hours = int(os.getenv("GROUP_SYNC_LOOKBACK_HOURS", "24"))
 
         while True:
-            if not self.is_running or not self.client or not self.db_connection:
+            if not self.is_running or not self.client_manager or not self.db_connection:
                 await asyncio.sleep(poll_interval)
                 continue
 
             try:
+                # Context7: Получаем группы с информацией о подписанных пользователях
                 with self.db_connection.cursor(cursor_factory=RealDictCursor) as cursor:
                     cursor.execute(
                         """
-                        SELECT id, tenant_id, tg_chat_id, username, title
-                        FROM groups
-                        WHERE is_active = true
+                        SELECT 
+                            g.id, 
+                            g.tenant_id, 
+                            g.tg_chat_id, 
+                            g.username, 
+                            g.title,
+                            u.telegram_id as subscriber_telegram_id
+                        FROM groups g
+                        INNER JOIN user_group ug ON g.id = ug.group_id
+                        INNER JOIN users u ON ug.user_id = u.id
+                        WHERE g.is_active = true
+                          AND ug.is_active = true
+                          AND u.telegram_auth_status = 'authorized'
+                          AND u.telegram_session_enc IS NOT NULL
+                        ORDER BY ug.subscribed_at DESC
                         """
                     )
-                    groups = cursor.fetchall() or []
+                    groups_with_users = cursor.fetchall() or []
             except Exception as fetch_err:
                 logger.error("Failed to load groups for sync", error=str(fetch_err))
                 try:
@@ -371,25 +491,47 @@ class TelegramIngestionService:
 
             lookback_threshold = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
 
-            for group in groups:
-                tg_chat_id = group.get("tg_chat_id")
-                if tg_chat_id is None:
+            for group_data in groups_with_users:
+                tg_chat_id = group_data.get("tg_chat_id")
+                subscriber_telegram_id = group_data.get("subscriber_telegram_id")
+                if tg_chat_id is None or subscriber_telegram_id is None:
+                    continue
+
+                # Context7: Получаем клиент пользователя, подписанного на группу
+                try:
+                    subscriber_telegram_id_int = int(subscriber_telegram_id)
+                    group_client = await self.client_manager.get_client(subscriber_telegram_id_int)
+                    if not group_client:
+                        logger.warning(
+                            "No client available for group subscriber",
+                            group_id=group_data.get("id"),
+                            subscriber_telegram_id=subscriber_telegram_id_int,
+                        )
+                        continue
+                except Exception as client_err:
+                    logger.warning(
+                        "Failed to get client for group subscriber",
+                        error=str(client_err),
+                        group_id=group_data.get("id"),
+                        subscriber_telegram_id=subscriber_telegram_id,
+                    )
                     continue
 
                 try:
-                    entity = await self.client.get_entity(int(tg_chat_id))
+                    entity = await group_client.get_entity(int(tg_chat_id))
                 except Exception as entity_err:
                     logger.warning(
                         "Failed to resolve group entity for sync",
                         error=str(entity_err),
-                        group_id=group.get("id"),
+                        group_id=group_data.get("id"),
                         tg_chat_id=tg_chat_id,
+                        subscriber_telegram_id=subscriber_telegram_id_int,
                     )
                     continue
 
                 processed = 0
                 try:
-                    async for message in self.client.iter_messages(entity, limit=max_messages):
+                    async for message in group_client.iter_messages(entity, limit=max_messages):
                         message_date = getattr(message, "date", None)
                         if isinstance(message_date, datetime):
                             msg_dt = (
@@ -400,22 +542,24 @@ class TelegramIngestionService:
                             if msg_dt < lookback_threshold:
                                 break
 
-                        await self._process_group_message(message, group)
+                        await self._process_group_message(message, dict(group_data))
                         processed += 1
                 except Exception as sync_err:
                     logger.warning(
                         "Group sync iteration failed",
                         error=str(sync_err),
-                        group_id=group.get("id"),
+                        group_id=group_data.get("id"),
                         tg_chat_id=tg_chat_id,
+                        subscriber_telegram_id=subscriber_telegram_id_int,
                     )
                     continue
 
                 if processed:
                     logger.info(
                         "Group history synced",
-                        group_id=group.get("id"),
+                        group_id=group_data.get("id"),
                         tg_chat_id=tg_chat_id,
+                        subscriber_telegram_id=subscriber_telegram_id_int,
                         processed=processed,
                         lookback_hours=lookback_hours,
                     )
@@ -1098,7 +1242,10 @@ class TelegramIngestionService:
             raise
     
     async def _process_message(self, event):
-        """Обработка нового сообщения."""
+        """Обработка нового сообщения.
+        
+        Context7: Для групп использует клиент пользователя, подписанного на группу.
+        """
         try:
             message = event.message
             channel = await event.get_chat()
@@ -1109,7 +1256,40 @@ class TelegramIngestionService:
                 # Попытка найти группу
                 group_info = await self._get_group_info(channel.id)
                 if group_info:
-                    await self._process_group_message(message, group_info)
+                    # Context7: Для групп используем клиент подписанного пользователя
+                    subscriber_telegram_id = group_info.get("subscriber_telegram_id")
+                    if subscriber_telegram_id and self.client_manager:
+                        try:
+                            subscriber_telegram_id_int = int(subscriber_telegram_id)
+                            group_client = await self.client_manager.get_client(subscriber_telegram_id_int)
+                            if group_client:
+                                # Сохраняем оригинальный клиент и временно используем клиент подписчика
+                                original_client = self.client
+                                self.client = group_client
+                                try:
+                                    await self._process_group_message(message, group_info)
+                                finally:
+                                    self.client = original_client
+                            else:
+                                logger.warning(
+                                    "No client available for group subscriber",
+                                    group_id=group_info.get("id"),
+                                    subscriber_telegram_id=subscriber_telegram_id_int,
+                                )
+                        except Exception as client_err:
+                            logger.warning(
+                                "Failed to get client for group subscriber",
+                                error=str(client_err),
+                                group_id=group_info.get("id"),
+                                subscriber_telegram_id=subscriber_telegram_id,
+                            )
+                    else:
+                        # Context7: Пропускаем сообщение, если нет подписчика в user_group
+                        logger.warning(
+                            "Group message skipped - no subscriber in user_group",
+                            group_id=group_info.get("id"),
+                            tg_chat_id=channel.id,
+                        )
                 else:
                     logger.warning(
                         "Chat not registered as channel or group",
@@ -1396,15 +1576,36 @@ class TelegramIngestionService:
             return None
 
     async def _get_group_info(self, telegram_id: int) -> Optional[dict]:
-        """Получение информации о группе из БД."""
+        """Получение информации о группе из БД с информацией о подписанном пользователе.
+        
+        Context7: Возвращает группу и telegram_id пользователя, подписанного на неё.
+        Если подписки нет, использует пользователя из того же tenant с авторизованной сессией.
+        """
         try:
             with self.db_connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                # Context7: Сначала ищем группу с подписанным пользователем
                 cursor.execute("""
-                    SELECT id, tenant_id, tg_chat_id, username, title, settings
-                    FROM groups
-                    WHERE tg_chat_id = %s AND is_active = true
+                    SELECT 
+                        g.id, 
+                        g.tenant_id, 
+                        g.tg_chat_id, 
+                        g.username, 
+                        g.title, 
+                        g.settings,
+                        u.telegram_id as subscriber_telegram_id
+                    FROM groups g
+                    INNER JOIN user_group ug ON g.id = ug.group_id
+                    INNER JOIN users u ON ug.user_id = u.id
+                    WHERE g.tg_chat_id = %s 
+                      AND g.is_active = true
+                      AND ug.is_active = true
+                      AND u.telegram_auth_status = 'authorized'
+                      AND u.telegram_session_enc IS NOT NULL
+                    ORDER BY ug.subscribed_at DESC
+                    LIMIT 1
                 """, (telegram_id,))
                 row = cursor.fetchone()
+                
                 return row
         except Exception as e:
             logger.error("Failed to get group info", error=str(e))
@@ -1516,6 +1717,35 @@ class TelegramIngestionService:
         except Exception:
             reply_to_info = None
 
+        # Context7: Извлечение информации о пересылках (forwarded messages)
+        forward_info = None
+        is_forwarded = False
+        try:
+            if hasattr(message, "fwd_from") and message.fwd_from:
+                fwd_from = message.fwd_from
+                forward_peer_id_data = None
+                
+                if hasattr(fwd_from, "from_id") and fwd_from.from_id:
+                    from_id = fwd_from.from_id
+                    if hasattr(from_id, "user_id"):
+                        forward_peer_id_data = {"user_id": from_id.user_id}
+                    elif hasattr(from_id, "channel_id"):
+                        forward_peer_id_data = {"channel_id": from_id.channel_id}
+                    elif hasattr(from_id, "chat_id"):
+                        forward_peer_id_data = {"chat_id": from_id.chat_id}
+                
+                forward_info = {
+                    "from_peer_id": forward_peer_id_data,
+                    "from_chat_id": forward_peer_id_data.get("channel_id") or forward_peer_id_data.get("chat_id") if forward_peer_id_data else None,
+                    "from_message_id": getattr(fwd_from, "channel_post", None) or getattr(fwd_from, "saved_from_msg_id", None),
+                    "from_name": getattr(fwd_from, "from_name", None),
+                    "forward_date": fwd_from.date.isoformat() if hasattr(fwd_from, "date") and fwd_from.date else None,
+                }
+                is_forwarded = True
+        except Exception as e:
+            logger.debug("Failed to extract forward info from group message", error=str(e))
+            forward_info = None
+
         mentions = self._extract_mentions(message)
         indicators_stub = {
             "tone": "unknown",
@@ -1530,6 +1760,12 @@ class TelegramIngestionService:
             posted_at = datetime.now(timezone.utc)
         created_at = datetime.now(timezone.utc)
 
+        # Context7: Сохраняем информацию о пересылке в reply_to JSON для совместимости с существующей схемой БД
+        # В будущем можно добавить отдельное поле forward в GroupMessage
+        reply_to_final = reply_to_info or {}
+        if forward_info:
+            reply_to_final["forward"] = forward_info
+
         message_data = {
             "group_id": group_id,
             "tenant_id": tenant_id,
@@ -1538,11 +1774,12 @@ class TelegramIngestionService:
             "sender_username": sender_username,
             "content": message.message or message.text or "",
             "media_urls": media_urls,
-            "reply_to": reply_to_info,
+            "reply_to": reply_to_final,  # Context7: Содержит reply_to_info и forward_info
             "mentions": mentions,
             "has_media": bool(media_urls),
             "is_service": bool(getattr(message, "action", None)),
             "action_type": getattr(getattr(message, "action", None), "__class__", type(None)).__name__,
+            "is_forwarded": is_forwarded,  # Context7: Флаг пересылки для быстрой проверки
             "posted_at": posted_at,
             "created_at": created_at,
             "indicators": indicators_stub,
@@ -1574,71 +1811,187 @@ class TelegramIngestionService:
         return mentions
 
     async def _save_group_message(self, message_data: dict) -> str:
-        """Сохранение сообщения группы и связанных записей."""
+        """
+        Context7: Сохранение сообщения группы и связанных записей.
+        Сообщения сохраняются глобально (без tenant_id), изоляция происходит через user_group при запросах пользователя.
+        """
         try:
             with self.db_connection.cursor() as cursor:
-                # Context7: Устанавливаем tenant_id для RLS перед INSERT
-                tenant_id = message_data.get("tenant_id")
-                if tenant_id:
-                    cursor.execute("SET LOCAL app.tenant_id = %s", (str(tenant_id),))
+                # Context7: Получаем системный tenant_id для совместимости с существующей схемой БД
+                # TODO: В будущем миграции нужно убрать tenant_id из group_messages
+                from utils.tenant_utils import get_system_tenant_id_sync
+                import os
+                db_url = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@supabase-db:5432/postgres")
+                system_tenant_id = get_system_tenant_id_sync(db_url)
                 
-                cursor.execute(
-                    """
-                    INSERT INTO group_messages (
-                        id,
-                        group_id,
-                        tenant_id,
-                        tg_message_id,
-                        sender_tg_id,
-                        sender_username,
-                        content,
-                        media_urls,
-                        reply_to,
-                        posted_at,
-                        created_at,
-                        updated_at,
-                        has_media,
-                        is_service,
-                        action_type
-                    ) VALUES (
-                        %s, %s, %s, %s, %s, %s,
-                        %s, %s::jsonb, %s::jsonb, %s, %s,
-                        NOW(), %s, %s, %s
+                # Context7: Устанавливаем системный tenant_id для RLS перед INSERT
+                cursor.execute("SET LOCAL app.tenant_id = %s", (system_tenant_id,))
+                
+                # Context7: Обработка ON CONFLICT с fallback для случаев, когда constraint недоступен
+                # Проблема: PostgreSQL может не найти constraint из-за RLS или других причин
+                try:
+                    cursor.execute(
+                        """
+                        INSERT INTO group_messages (
+                            id,
+                            group_id,
+                            tenant_id,
+                            tg_message_id,
+                            sender_tg_id,
+                            sender_username,
+                            content,
+                            media_urls,
+                            reply_to,
+                            posted_at,
+                            created_at,
+                            updated_at,
+                            has_media,
+                            is_service,
+                            action_type
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, %s,
+                            %s, %s::jsonb, %s::jsonb, %s, %s,
+                            NOW(), %s, %s, %s
+                        )
+                        ON CONFLICT (group_id, tg_message_id)
+                        DO UPDATE SET
+                            content = EXCLUDED.content,
+                            media_urls = EXCLUDED.media_urls,
+                            reply_to = EXCLUDED.reply_to,
+                            sender_tg_id = EXCLUDED.sender_tg_id,
+                            sender_username = EXCLUDED.sender_username,
+                            has_media = EXCLUDED.has_media,
+                            is_service = EXCLUDED.is_service,
+                            action_type = EXCLUDED.action_type,
+                            posted_at = EXCLUDED.posted_at,
+                            updated_at = NOW()
+                        RETURNING id
+                        """,
+                        (
+                            message_data.get("id"),
+                            message_data["group_id"],
+                            system_tenant_id,  # Context7: Системный tenant_id для совместимости
+                            message_data["tg_message_id"],
+                            message_data["sender_tg_id"],
+                            message_data["sender_username"],
+                            message_data["content"],
+                            json.dumps(message_data.get("media_urls", [])),
+                            json.dumps(message_data.get("reply_to")),
+                            message_data.get("posted_at"),
+                            message_data.get("created_at"),
+                            message_data.get("has_media", False),
+                            message_data.get("is_service", False),
+                            message_data.get("action_type"),
+                        ),
                     )
-                    ON CONFLICT (group_id, tg_message_id)
-                    DO UPDATE SET
-                        content = EXCLUDED.content,
-                        media_urls = EXCLUDED.media_urls,
-                        reply_to = EXCLUDED.reply_to,
-                        sender_tg_id = EXCLUDED.sender_tg_id,
-                        sender_username = EXCLUDED.sender_username,
-                        has_media = EXCLUDED.has_media,
-                        is_service = EXCLUDED.is_service,
-                        action_type = EXCLUDED.action_type,
-                        posted_at = EXCLUDED.posted_at,
-                        updated_at = NOW()
-                    RETURNING id
-                    """,
-                    (
-                        message_data.get("id"),
-                        message_data["group_id"],
-                        message_data["tenant_id"],
-                        message_data["tg_message_id"],
-                        message_data["sender_tg_id"],
-                        message_data["sender_username"],
-                        message_data["content"],
-                        json.dumps(message_data.get("media_urls", [])),
-                        json.dumps(message_data.get("reply_to")),
-                        message_data.get("posted_at"),
-                        message_data.get("created_at"),
-                        message_data.get("has_media", False),
-                        message_data.get("is_service", False),
-                        message_data.get("action_type"),
-                    ),
-                )
-
-                row = cursor.fetchone()
-                group_message_id = row[0]
+                    row = cursor.fetchone()
+                    group_message_id = row[0]
+                except psycopg2_errors.InvalidColumnReference as e:
+                    # Context7: Fallback - constraint не найден, пробуем без ON CONFLICT
+                    # Сначала проверяем, существует ли запись
+                    logger.error("ON CONFLICT failed for group_messages, trying fallback",
+                               error=str(e),
+                               error_code=e.pgcode if hasattr(e, 'pgcode') else None,
+                               group_id=message_data.get("group_id"),
+                               tg_message_id=message_data.get("tg_message_id"))
+                    
+                    # Проверяем существование записи
+                    cursor.execute(
+                        "SELECT id FROM group_messages WHERE group_id = %s AND tg_message_id = %s",
+                        (message_data["group_id"], message_data["tg_message_id"])
+                    )
+                    existing = cursor.fetchone()
+                    
+                    if existing:
+                        # Обновляем существующую запись
+                        cursor.execute(
+                            """
+                            UPDATE group_messages SET
+                                content = %s,
+                                media_urls = %s::jsonb,
+                                reply_to = %s::jsonb,
+                                sender_tg_id = %s,
+                                sender_username = %s,
+                                has_media = %s,
+                                is_service = %s,
+                                action_type = %s,
+                                posted_at = %s,
+                                updated_at = NOW()
+                            WHERE group_id = %s AND tg_message_id = %s
+                            RETURNING id
+                            """,
+                            (
+                                message_data["content"],
+                                json.dumps(message_data.get("media_urls", [])),
+                                json.dumps(message_data.get("reply_to")),
+                                message_data["sender_tg_id"],
+                                message_data["sender_username"],
+                                message_data.get("has_media", False),
+                                message_data.get("is_service", False),
+                                message_data.get("action_type"),
+                                message_data.get("posted_at"),
+                                message_data["group_id"],
+                                message_data["tg_message_id"],
+                            ),
+                        )
+                        row = cursor.fetchone()
+                        group_message_id = row[0]
+                    else:
+                        # Вставляем новую запись без ON CONFLICT
+                        cursor.execute(
+                            """
+                            INSERT INTO group_messages (
+                                id,
+                                group_id,
+                                tenant_id,
+                                tg_message_id,
+                                sender_tg_id,
+                                sender_username,
+                                content,
+                                media_urls,
+                                reply_to,
+                                posted_at,
+                                created_at,
+                                updated_at,
+                                has_media,
+                                is_service,
+                                action_type
+                            ) VALUES (
+                                %s, %s, %s, %s, %s, %s,
+                                %s, %s::jsonb, %s::jsonb, %s, %s,
+                                NOW(), %s, %s, %s
+                            )
+                            RETURNING id
+                            """,
+                            (
+                                message_data.get("id"),
+                                message_data["group_id"],
+                                system_tenant_id,
+                                message_data["tg_message_id"],
+                                message_data["sender_tg_id"],
+                                message_data["sender_username"],
+                                message_data["content"],
+                                json.dumps(message_data.get("media_urls", [])),
+                                json.dumps(message_data.get("reply_to")),
+                                message_data.get("posted_at"),
+                                message_data.get("created_at"),
+                                message_data.get("has_media", False),
+                                message_data.get("is_service", False),
+                                message_data.get("action_type"),
+                            ),
+                        )
+                        row = cursor.fetchone()
+                        group_message_id = row[0]
+                except Exception as e:
+                    # Context7: Логируем все остальные ошибки для диагностики
+                    logger.error("Failed to save group message",
+                               error=str(e),
+                               error_type=type(e).__name__,
+                               error_code=getattr(e, 'pgcode', None),
+                               group_id=message_data.get("group_id"),
+                               tg_message_id=message_data.get("tg_message_id"),
+                               exc_info=True)
+                    raise
 
                 # Mentions
                 if message_data.get("mentions"):

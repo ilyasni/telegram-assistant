@@ -19,8 +19,10 @@ groups:
         for: 5m
         labels:
           severity: warning
+          component: crawl_trigger
         annotations:
           summary: "Высокий PEL backlog ({{ $value }})"
+          description: "PEL backlog для crawl trigger превышает 100 сообщений. Это может указывать на проблемы с обработкой сообщений. Проверить логи worker и состояние Redis streams."
       
       # Queue depth растёт
       - alert: CrawlTriggerQueueDepthHigh
@@ -28,8 +30,10 @@ groups:
         for: 5m
         labels:
           severity: warning
+          component: crawl_trigger
         annotations:
           summary: "Высокая глубина очереди триггера ({{ $value }})"
+          description: "Глубина очереди crawl trigger превышает 500 сообщений. Проверить производительность crawl_trigger_task и обработку сообщений из stream:posts:tagged."
       
       # Error rate > 10%
       - alert: CrawlErrorRateHigh
@@ -40,8 +44,10 @@ groups:
         for: 5m
         labels:
           severity: critical
+          component: crawl
         annotations:
           summary: "Crawl error-rate > 10%"
+          description: "Error rate для crawl requests превышает 10%. Проверить логи crawl4ai и состояние внешних ресурсов."
       
       # p95 latency > 2s
       - alert: CrawlP95LatencyHigh
@@ -49,8 +55,10 @@ groups:
         for: 10m
         labels:
           severity: warning
+          component: crawl_trigger
         annotations:
           summary: "p95 latency триггера > 2s ({{ $value }})"
+          description: "P95 latency обработки crawl trigger превышает 2 секунды. Проверить производительность обработки сообщений и состояние Redis."
       
       # TagPersistence PEL backlog
       - alert: TagPersistPELBacklogHigh
@@ -58,8 +66,10 @@ groups:
         for: 5m
         labels:
           severity: warning
+          component: tag_persistence
         annotations:
           summary: "TagPersist PEL backlog высокий ({{ $value }})"
+          description: "PEL backlog для tag persistence превышает 50 сообщений. Проверить логи worker и производительность БД операций."
 
   # Pipeline Coverage Alerts
   - name: pipeline_coverage
@@ -77,6 +87,7 @@ groups:
         for: 15m
         labels:
           severity: critical
+          component: indexing
         annotations:
           summary: "Индексация < 90% (текущее: {{ $value | humanizePercentage }})"
           description: "Целевое покрытие: 90%+. Проверить логи worker и Qdrant."
@@ -93,6 +104,7 @@ groups:
         for: 15m
         labels:
           severity: warning
+          component: tagging
         annotations:
           summary: "Тегирование < 80% (текущее: {{ $value | humanizePercentage }})"
           description: "Целевое покрытие: 80%+. Проверить AI провайдеры (GigaChat/OpenRouter)."
@@ -103,6 +115,7 @@ groups:
         for: 10m
         labels:
           severity: warning
+          component: redis_streams
         annotations:
           summary: "Redis Stream lag высокий: {{ $labels.stream }} ({{ $value }} сообщений)"
           description: "Очередь растёт. Проверить производительность worker."
@@ -113,6 +126,7 @@ groups:
         for: 2m
         labels:
           severity: critical
+          component: worker
         annotations:
           summary: "Worker не отвечает на health check"
           description: "Worker контейнер недоступен. Проверить docker logs worker."
@@ -126,6 +140,7 @@ groups:
         for: 10m
         labels:
           severity: critical
+          component: indexing
         annotations:
           summary: "Индексация не обрабатывает события (pending: {{ $value }})"
           description: "Есть события в posts.enriched, но indexing не обрабатывает. Проверить worker."
@@ -139,9 +154,173 @@ groups:
         for: 10m
         labels:
           severity: warning
+          component: tagging
         annotations:
           summary: "Тегирование не обрабатывает события (pending: {{ $value }})"
           description: "Есть события в posts.parsed, но tagging не обрабатывает. Проверить AI провайдеры."
+
+  # Parsing Pipeline Alerts (Context7 Best Practices)
+  - name: parsing_pipeline
+    interval: 30s
+    rules:
+      # Парсинг не выполняется (нет активности)
+      # Context7: Используем scheduler_heartbeat_seconds для проверки активности scheduler'а
+      # и parser_runs_total для проверки активности парсинга
+      - alert: ParsingNoActivity
+        expr: |
+          (
+            (time() - scheduler_heartbeat_seconds) > 300
+          )
+          or
+          (
+            sum(rate(parser_runs_total[10m])) == 0
+            and 
+            (time() - scheduler_last_tick_ts_seconds) > 600
+          )
+        for: 15m
+        labels:
+          severity: critical
+          component: parsing
+        annotations:
+          summary: "Парсинг не выполняется (нет активности)"
+          description: "Парсер не обрабатывает каналы. Heartbeat: {{ $value }}s назад. Проверить логи telethon-ingest и состояние TelegramClientManager."
+          runbook: "Проверить: 1) логи telethon-ingest, 2) статус TelegramClientManager, 3) scheduler_heartbeat_seconds, 4) scheduler_last_tick_ts_seconds"
+      
+      # Высокий error rate парсинга (> 20%)
+      - alert: ParsingErrorRateHigh
+        expr: |
+          (
+            sum(rate(parser_runs_total{status="failed"}[10m]))
+            /
+            (sum(rate(parser_runs_total[10m])) + 1e-6)
+          ) > 0.20
+        for: 10m
+        labels:
+          severity: warning
+          component: parsing
+        annotations:
+          summary: "Parsing error rate превышает 20% ({{ $value | humanizePercentage }})"
+          description: "Error rate парсинга = {{ $value | humanizePercentage }}. Проверить логи telethon-ingest и состояние Telegram API."
+      
+      # Высокая длительность обработки канала (p95 > 60 секунд)
+      - alert: ParsingLatencyHigh
+        expr: |
+          histogram_quantile(0.95, 
+            sum(rate(parser_channel_processing_seconds_bucket[10m])) by (le, mode)
+          ) > 60
+        for: 10m
+        labels:
+          severity: warning
+          component: parsing
+        annotations:
+          summary: "Parsing p95 latency превышает 60 секунд ({{ $value | humanize }}s)"
+          description: "P95 latency обработки канала = {{ $value | humanize }}s. Проверить производительность парсера и состояние Telegram API."
+      
+      # Нет новых постов за последний час при активном парсинге
+      - alert: ParsingNoNewPosts
+        expr: |
+          sum(rate(posts_parsed_total{status="ok"}[1h])) == 0
+          and 
+          sum(rate(parser_runs_total[1h])) > 0
+        for: 1h
+        labels:
+          severity: info
+          component: parsing
+        annotations:
+          summary: "Нет новых постов за последний час при активном парсинге"
+          description: "Парсер работает, но новых постов не обнаружено. Возможно, каналы неактивны или все посты уже обработаны."
+      
+      # Scheduler tick застрял (> 10 минут)
+      - alert: SchedulerTickStuck
+        expr: |
+          (time() - scheduler_last_tick_ts_seconds) > 600
+        for: 5m
+        labels:
+          severity: critical
+          component: scheduler
+        annotations:
+          summary: "Scheduler tick застрял ({{ $value | humanize }}s с последнего тика)"
+          description: "Последний тик scheduler был {{ $value | humanize }}s назад. Проверить логи telethon-ingest и состояние scheduler."
+      
+      # Heartbeat scheduler не обновляется (> 2 минуты)
+      - alert: SchedulerHeartbeatStale
+        expr: |
+          (time() - scheduler_heartbeat_seconds) > 120
+        for: 2m
+        labels:
+          severity: warning
+          component: scheduler
+        annotations:
+          summary: "Scheduler heartbeat не обновляется ({{ $value | humanize }}s)"
+          description: "Heartbeat scheduler не обновлялся {{ $value | humanize }}s. Проверить активность scheduler."
+
+  # Vision Analysis Alerts (Context7 Best Practices)
+  - name: vision_analysis
+    interval: 30s
+    rules:
+      # Vision анализ не обрабатывает события
+      # Context7: Используем vision_worker_processed_total (реальная метрика) и stream:posts:vision (реальный stream)
+      - alert: VisionAnalysisNoActivity
+        expr: |
+          sum(rate(vision_worker_processed_total[10m])) == 0
+          and 
+          sum(stream_pending_size{stream=~"posts\\.vision"}) > 10
+        for: 10m
+        labels:
+          severity: warning
+          component: vision_analysis
+        annotations:
+          summary: "Vision анализ не обрабатывает события (pending: {{ $value }})"
+          description: "Есть события в stream:posts:vision ({{ $value }}), но vision анализ не обрабатывает. Проверить логи worker и состояние GigaChat API."
+      
+      # Высокий error rate vision анализа (> 15%)
+      # Context7: Используем vision_worker_processed_total (реальная метрика)
+      - alert: VisionAnalysisErrorRateHigh
+        expr: |
+          (
+            sum(rate(vision_worker_processed_total{status="error"}[10m]))
+            /
+            (sum(rate(vision_worker_processed_total[10m])) + 1e-6)
+          ) > 0.15
+        for: 10m
+        labels:
+          severity: warning
+          component: vision_analysis
+        annotations:
+          summary: "Vision analysis error rate превышает 15% ({{ $value | humanizePercentage }})"
+          description: "Error rate vision анализа = {{ $value | humanizePercentage }}. Проверить логи worker и состояние GigaChat API."
+      
+      # Высокая latency vision анализа (p95 > 30 секунд)
+      # Context7: Используем vision_worker_duration_seconds (реальная метрика с label status)
+      - alert: VisionAnalysisLatencyHigh
+        expr: |
+          histogram_quantile(0.95, 
+            sum(rate(vision_worker_duration_seconds_bucket[10m])) by (le, status)
+          ) > 30
+        for: 10m
+        labels:
+          severity: warning
+          component: vision_analysis
+        annotations:
+          summary: "Vision analysis p95 latency превышает 30 секунд ({{ $value | humanize }}s)"
+          description: "P95 latency vision анализа = {{ $value | humanize }}s для status={{ $labels.status }}. Проверить производительность GigaChat API."
+      
+      # Низкое покрытие vision анализа (< 70%)
+      # Context7: Используем vision_worker_processed_total{status="success"} и stream:posts:vision
+      - alert: VisionAnalysisCoverageLow
+        expr: |
+          (
+            sum(rate(vision_worker_processed_total{status="success"}[10m]))
+            /
+            (sum(rate(stream_messages_total{stream="posts.vision", phase="new", status="ok"}[10m])) + 1e-6)
+          ) < 0.70
+        for: 15m
+        labels:
+          severity: warning
+          component: vision_analysis
+        annotations:
+          summary: "Vision analysis покрытие < 70% (текущее: {{ $value | humanizePercentage }})"
+          description: "Целевое покрытие: 70%+. Проверить логи worker и состояние GigaChat API."
 
   # Album Pipeline Alerts (Phase 4)
   - name: album_pipeline
@@ -252,3 +431,809 @@ groups:
         annotations:
           summary: "Высокая длительность агрегации vision summary (p95: {{ $value | humanize }}ms)"
           description: "Агрегация vision summary занимает слишком много времени. Проверить производительность _aggregate_vision_summary."
+
+  # Context7: System stability alerts
+  - name: system_stability
+    interval: 30s
+    rules:
+      # Scheduler не запущен
+      - alert: SchedulerNotRunning
+        expr: scheduler_running == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: scheduler
+        annotations:
+          summary: "Scheduler не запущен более 1 минуты"
+          description: "Scheduler должен автоматически запускаться при старте API"
+      
+      # Scheduler Freshness слишком высокий (парсинг каналов)
+      # Context7: Используем clamp_max для ограничения максимального значения (24 часа)
+      # и проверяем наличие метрики и что она не равна 0
+      - alert: SchedulerFreshnessHigh
+        expr: |
+          count(scheduler_last_tick_ts_seconds) > 0
+          and
+          scheduler_last_tick_ts_seconds > 0
+          and
+          clamp_max(time() - scheduler_last_tick_ts_seconds, 86400) > 600
+        for: 2m
+        labels:
+          severity: warning
+          component: scheduler
+        annotations:
+          summary: "Scheduler Freshness превысил 10 минут ({{ $value | humanizeDuration }})"
+          description: "Scheduler парсинга каналов не обновлялся {{ $value | humanizeDuration }}. Последний tick был слишком давно."
+      
+      # Scheduler Freshness критически высокий
+      # Context7: Используем clamp_max для ограничения максимального значения (24 часа)
+      # и проверяем наличие метрики и что она не равна 0
+      - alert: SchedulerFreshnessCritical
+        expr: |
+          count(scheduler_last_tick_ts_seconds) > 0
+          and
+          scheduler_last_tick_ts_seconds > 0
+          and
+          clamp_max(time() - scheduler_last_tick_ts_seconds, 86400) > 900
+        for: 3m
+        labels:
+          severity: critical
+          component: scheduler
+        annotations:
+          summary: "Scheduler Freshness критически высокий ({{ $value | humanizeDuration }})"
+          description: "Scheduler парсинга каналов не обновлялся {{ $value | humanizeDuration }}. Возможно, scheduler застрял или завис."
+      
+      # Scheduler Heartbeat отсутствует (более 60 секунд)
+      # Context7: Используем clamp_max для ограничения максимального значения (24 часа)
+      # и проверяем наличие метрики и что она не равна 0
+      - alert: SchedulerHeartbeatMissing
+        expr: |
+          count(scheduler_heartbeat_seconds) > 0
+          and
+          scheduler_heartbeat_seconds > 0
+          and
+          clamp_max(time() - scheduler_heartbeat_seconds, 86400) > 60
+        for: 1m
+        labels:
+          severity: warning
+          component: scheduler
+        annotations:
+          summary: "Scheduler Heartbeat отсутствует более 60 секунд"
+          description: "Scheduler heartbeat не обновлялся {{ $value | humanizeDuration }}. Возможно, scheduler завис или остановился."
+      
+      # Health checks падают
+      - alert: HealthCheckFailuresHigh
+        expr: rate(health_check_failures_total[5m]) > 5
+        for: 5m
+        labels:
+          severity: warning
+          component: health
+        annotations:
+          summary: "Health checks падают: {{ $value }} ошибок/сек"
+          description: "Более 5 ошибок health checks подряд"
+      
+      # Pending сообщений в streams
+      - alert: RedisStreamPendingHigh
+        expr: redis_stream_pending_messages > 100
+        for: 5m
+        labels:
+          severity: warning
+          component: redis_streams
+        annotations:
+          summary: "Высокое количество pending сообщений: {{ $value }}"
+          description: "Более 100 pending сообщений в Redis streams"
+      
+      # Контейнеры перезапускаются
+      - alert: ContainerRestartsHigh
+        expr: rate(container_restart_count_total[1h]) > 3
+        for: 1h
+        labels:
+          severity: warning
+          component: infrastructure
+        annotations:
+          summary: "Контейнер {{ $labels.service_name }} перезапускается слишком часто"
+          description: "Более 3 перезапусков в час"
+
+  # Graph Writer Alerts
+  - name: graph_writer
+    interval: 30s
+    rules:
+      - alert: GraphWriterNoActivity
+        expr: |
+          sum(rate(graph_writer_processed_total[10m])) == 0
+          and
+          sum(graph_writer_pel_size) > 10
+        for: 10m
+        labels:
+          severity: critical
+          component: graph_writer
+        annotations:
+          summary: "Graph writer не обрабатывает события"
+          description: "Есть pending сообщения ({{ $value }}), но graph writer не обрабатывает. Проверить логи worker и состояние Neo4j."
+
+      - alert: GraphWriterErrorRateHigh
+        expr: |
+          (
+            sum(rate(graph_writer_processed_total{status="error"}[5m]))
+            /
+            (sum(rate(graph_writer_processed_total[5m])) + 1e-6)
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          component: graph_writer
+        annotations:
+          summary: "Graph writer error rate превышает 5%"
+          description: "Error rate = {{ $value | humanizePercentage }}. Проверить логи worker и состояние Neo4j."
+
+      - alert: GraphWriterPELBacklogHigh
+        expr: sum(graph_writer_pel_size) > 100
+        for: 5m
+        labels:
+          severity: warning
+          component: graph_writer
+        annotations:
+          summary: "Graph writer PEL backlog высокий ({{ $value }} сообщений)"
+          description: "Требуется проверка производительности graph writer."
+
+  # Post Persistence Alerts
+  - name: post_persistence
+    interval: 30s
+    rules:
+      - alert: PostPersistenceNoActivity
+        expr: |
+          sum(rate(post_persistence_processed_total[10m])) == 0
+          and
+          sum(post_persistence_pel_size) > 10
+        for: 10m
+        labels:
+          severity: critical
+          component: post_persistence
+        annotations:
+          summary: "Post persistence не обрабатывает события"
+          description: "Есть pending сообщения ({{ $value }}), но post persistence не обрабатывает. Проверить логи worker и состояние БД."
+
+      - alert: PostPersistenceErrorRateHigh
+        expr: |
+          (
+            sum(rate(post_persistence_processed_total{status="error"}[5m]))
+            /
+            (sum(rate(post_persistence_processed_total[5m])) + 1e-6)
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          component: post_persistence
+        annotations:
+          summary: "Post persistence error rate превышает 5%"
+          description: "Error rate = {{ $value | humanizePercentage }}. Проверить логи worker и состояние БД."
+
+      - alert: PostPersistenceLatencyHigh
+        expr: |
+          histogram_quantile(0.95, rate(post_persistence_latency_seconds_bucket[5m])) > 5
+        for: 10m
+        labels:
+          severity: warning
+          component: post_persistence
+        annotations:
+          summary: "Post persistence p95 latency превышает 5 секунд"
+          description: "P95 latency = {{ $value }}s. Проверить производительность БД."
+
+  # PostgreSQL Alerts
+  - name: postgres
+    interval: 30s
+    rules:
+      - alert: PostgresUnavailable
+        # Context7: Проверяем доступность PostgreSQL
+        # Если оба сервиса (api и worker) недоступны - это критично
+        # Или если есть метрики ошибок подключения
+        expr: |
+          (
+            up{job="api"} == 0
+            and
+            up{job="worker"} == 0
+          )
+          or
+          (
+            count(postgres_operations_total) > 0
+            and
+            sum(rate(postgres_operations_total{status="error", operation=~".*connect.*|.*connection.*"}[5m])) > 0
+          )
+        for: 5m
+        labels:
+          severity: critical
+          component: postgres
+        annotations:
+          summary: "PostgreSQL недоступен"
+          description: |
+            PostgreSQL недоступен или сервисы не могут подключиться.
+            Проверить:
+            1. Состояние БД: docker ps | grep postgres
+            2. Логи: docker logs telegram-assistant-supabase-db-1
+            3. Метрики: curl http://localhost:9090/api/v1/query?query=postgres_operations_total
+
+      - alert: PostgresLatencyHigh
+        expr: |
+          histogram_quantile(0.95, sum(rate(postgres_operation_duration_seconds_bucket[5m])) by (le, operation)) > 1
+        for: 5m
+        labels:
+          severity: warning
+          component: postgres
+        annotations:
+          summary: "PostgreSQL p95 latency превышает 1 секунду"
+          description: "P95 latency = {{ $value }}s для операции {{ $labels.operation }}. Проверить производительность БД."
+
+      - alert: PostgresErrorRateHigh
+        expr: |
+          (
+            sum(rate(postgres_operations_total{status="error"}[5m])) by (operation)
+            /
+            (sum(rate(postgres_operations_total[5m])) by (operation) + 1e-6)
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          component: postgres
+        annotations:
+          summary: "PostgreSQL error rate превышает 5%"
+          description: "Error rate = {{ $value | humanizePercentage }} для операции {{ $labels.operation }}. Проверить логи и состояние БД."
+
+      - alert: PostgresConnectionsHigh
+        expr: |
+          (
+            sum(postgres_connections_active)
+            /
+            (sum(postgres_connections_max) + 1e-6)
+          ) > 0.80
+        for: 5m
+        labels:
+          severity: warning
+          component: postgres
+        annotations:
+          summary: "PostgreSQL connections превышают 80% от лимита"
+          description: "Использование соединений = {{ $value | humanizePercentage }}. Проверить connection pool."
+
+  # Qdrant Alerts
+  - name: qdrant
+    interval: 30s
+    rules:
+      - alert: QdrantUnavailable
+        # Context7: Проверяем доступность Qdrant
+        # Если worker недоступен И есть метрики ошибок - это критично
+        expr: |
+          (
+            up{job="worker"} == 0
+          )
+          or
+          (
+            count(qdrant_operations_total) > 0
+            and
+            sum(rate(qdrant_operations_total{status="error", operation=~".*connect.*|.*health.*"}[5m])) > 0
+          )
+        for: 5m
+        labels:
+          severity: critical
+          component: qdrant
+        annotations:
+          summary: "Qdrant недоступен"
+          description: |
+            Qdrant недоступен или worker не может подключиться.
+            Проверить:
+            1. Состояние Qdrant: docker ps | grep qdrant
+            2. Health check: curl http://localhost:6333/health
+            3. Метрики: curl http://localhost:9090/api/v1/query?query=qdrant_operations_total
+
+      - alert: QdrantLatencyHigh
+        expr: |
+          histogram_quantile(0.95, sum(rate(qdrant_operation_duration_seconds_bucket[5m])) by (le, operation)) > 2
+        for: 5m
+        labels:
+          severity: warning
+          component: qdrant
+        annotations:
+          summary: "Qdrant p95 latency превышает 2 секунды"
+          description: "P95 latency = {{ $value }}s для операции {{ $labels.operation }}. Проверить производительность Qdrant."
+
+      - alert: QdrantErrorRateHigh
+        expr: |
+          (
+            sum(rate(qdrant_operations_total{status="error"}[5m])) by (operation)
+            /
+            (sum(rate(qdrant_operations_total[5m])) by (operation) + 1e-6)
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          component: qdrant
+        annotations:
+          summary: "Qdrant error rate превышает 5%"
+          description: "Error rate = {{ $value | humanizePercentage }} для операции {{ $labels.operation }}. Проверить логи и состояние Qdrant."
+
+  # Neo4j Alerts
+  - name: neo4j
+    interval: 30s
+    rules:
+      - alert: Neo4jUnavailable
+        # Context7: Проверяем доступность Neo4j
+        # Если worker недоступен И есть метрики ошибок - это критично
+        expr: |
+          (
+            up{job="worker"} == 0
+          )
+          or
+          (
+            count(neo4j_operations_total) > 0
+            and
+            sum(rate(neo4j_operations_total{status="error", operation_type=~".*connect.*|.*health.*"}[5m])) > 0
+          )
+        for: 5m
+        labels:
+          severity: critical
+          component: neo4j
+        annotations:
+          summary: "Neo4j недоступен"
+          description: |
+            Neo4j недоступен или worker не может подключиться.
+            Проверить:
+            1. Состояние Neo4j: docker ps | grep neo4j
+            2. Health check: curl http://localhost:7474
+            3. Метрики: curl http://localhost:9090/api/v1/query?query=neo4j_operations_total
+
+      - alert: Neo4jLatencyHigh
+        expr: |
+          histogram_quantile(0.95, sum(rate(neo4j_operation_duration_seconds_bucket[5m])) by (le, operation_type)) > 2
+        for: 5m
+        labels:
+          severity: warning
+          component: neo4j
+        annotations:
+          summary: "Neo4j p95 latency превышает 2 секунды"
+          description: "P95 latency = {{ $value }}s для операции {{ $labels.operation_type }}. Проверить производительность Neo4j."
+
+      - alert: Neo4jErrorRateHigh
+        expr: |
+          (
+            sum(rate(neo4j_operations_total{status="error"}[5m])) by (operation_type)
+            /
+            (sum(rate(neo4j_operations_total[5m])) by (operation_type) + 1e-6)
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          component: neo4j
+        annotations:
+          summary: "Neo4j error rate превышает 5%"
+          description: "Error rate = {{ $value | humanizePercentage }} для операции {{ $labels.operation_type }}. Проверить логи и состояние Neo4j."
+
+  # Enrichment Task Alerts
+  - name: enrichment
+    interval: 30s
+    rules:
+      - alert: EnrichmentNoActivity
+        expr: |
+          sum(rate(enrichment_requests_total[10m])) == 0
+          and
+          sum(stream_pending_size{stream=~"posts\\.tagged"}) > 10
+        for: 10m
+        labels:
+          severity: warning
+          component: enrichment
+        annotations:
+          summary: "Enrichment не обрабатывает события"
+          description: "Есть pending сообщения в posts.tagged ({{ $value }}), но enrichment не обрабатывает. Проверить логи worker и состояние crawl4ai."
+
+      - alert: EnrichmentErrorRateHigh
+        expr: |
+          (
+            sum(rate(enrichment_requests_total{success="false"}[5m]))
+            /
+            (sum(rate(enrichment_requests_total[5m])) + 1e-6)
+          ) > 0.10
+        for: 5m
+        labels:
+          severity: warning
+          component: enrichment
+        annotations:
+          summary: "Enrichment error rate превышает 10%"
+          description: "Error rate = {{ $value | humanizePercentage }}. Проверить логи worker и состояние crawl4ai."
+
+      - alert: EnrichmentLatencyHigh
+        expr: |
+          histogram_quantile(0.95, rate(enrichment_latency_seconds_bucket[5m])) > 30
+        for: 10m
+        labels:
+          severity: warning
+          component: enrichment
+        annotations:
+          summary: "Enrichment p95 latency превышает 30 секунд"
+          description: "P95 latency = {{ $value }}s. Проверить производительность crawl4ai."
+
+  # Tag Persistence Task - Дополнительные алерты
+  - name: tag_persistence_additional
+    interval: 30s
+    rules:
+      - alert: TagPersistNoActivity
+        expr: |
+          sum(rate(tags_persisted_total[10m])) == 0
+          and
+          sum(tags_persist_pel_backlog_current) > 10
+        for: 10m
+        labels:
+          severity: warning
+          component: tag_persistence
+        annotations:
+          summary: "Tag persistence не обрабатывает события"
+          description: "Есть pending сообщения ({{ $value }}), но tag persistence не обрабатывает. Проверить логи worker и состояние БД."
+
+      - alert: TagPersistErrorRateHigh
+        expr: |
+          (
+            sum(rate(tags_persisted_total{status="error"}[5m]))
+            /
+            (sum(rate(tags_persisted_total[5m])) + 1e-6)
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          component: tag_persistence
+        annotations:
+          summary: "Tag persistence error rate превышает 5%"
+          description: "Error rate = {{ $value | humanizePercentage }}. Проверить логи worker и состояние БД."
+
+      - alert: TagPersistLatencyHigh
+        expr: |
+          histogram_quantile(0.95, rate(tags_persist_latency_seconds_bucket[5m])) > 5
+        for: 10m
+        labels:
+          severity: warning
+          component: tag_persistence
+        annotations:
+          summary: "Tag persistence p95 latency превышает 5 секунд"
+          description: "P95 latency = {{ $value }}s. Проверить производительность БД."
+
+  # Retagging Task Alerts
+  - name: retagging
+    interval: 30s
+    rules:
+      - alert: RetaggingNoActivity
+        expr: |
+          sum(rate(retagging_processed_total[10m])) == 0
+          and
+          sum(stream_pending_size{stream=~"posts\\.vision\\.analyzed"}) > 10
+        for: 10m
+        labels:
+          severity: warning
+          component: retagging
+        annotations:
+          summary: "Retagging не обрабатывает события"
+          description: "Есть pending сообщения в posts.vision.analyzed ({{ $value }}), но retagging не обрабатывает. Проверить логи worker и состояние AI провайдеров."
+
+      - alert: RetaggingErrorRateHigh
+        expr: |
+          (
+            sum(rate(retagging_processed_total{outcome="err"}[5m]))
+            /
+            (sum(rate(retagging_processed_total[5m])) + 1e-6)
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          component: retagging
+        annotations:
+          summary: "Retagging error rate превышает 5%"
+          description: "Error rate = {{ $value | humanizePercentage }}. Проверить логи worker и состояние AI провайдеров."
+
+      - alert: RetaggingLatencyHigh
+        expr: |
+          histogram_quantile(0.95, rate(retagging_duration_seconds_bucket[5m])) > 10
+        for: 10m
+        labels:
+          severity: warning
+          component: retagging
+        annotations:
+          summary: "Retagging p95 latency превышает 10 секунд"
+          description: "P95 latency = {{ $value }}s. Проверить производительность AI провайдеров."
+
+  # Digest Worker Alerts
+  - name: digest
+    interval: 30s
+    rules:
+      - alert: DigestGenerationFailed
+        expr: |
+          (
+            sum(rate(digest_jobs_processed_total{stage="generate", status="failed"}[10m]))
+            /
+            (sum(rate(digest_jobs_processed_total{stage="generate"}[10m])) + 1e-6)
+          ) > 0.10
+        for: 10m
+        labels:
+          severity: warning
+          component: digest
+        annotations:
+          summary: "Digest generation error rate превышает 10%"
+          description: "Error rate = {{ $value | humanizePercentage }}. Проверить логи worker и состояние AI провайдеров."
+
+      - alert: DigestSendFailed
+        expr: |
+          (
+            sum(rate(digest_jobs_processed_total{stage="send", status="failed"}[10m]))
+            /
+            (sum(rate(digest_jobs_processed_total{stage="send"}[10m])) + 1e-6)
+          ) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          component: digest
+        annotations:
+          summary: "Digest send error rate превышает 5%"
+          description: "Error rate = {{ $value | humanizePercentage }}. Проверить логи worker и состояние Telegram API."
+
+      - alert: DigestQualityLow
+        expr: |
+          histogram_quantile(0.50, rate(group_digest_quality_scores_bucket[15m])) < 0.7
+        for: 15m
+        labels:
+          severity: info
+          component: digest
+        annotations:
+          summary: "Digest quality ниже порога (median < 0.7)"
+          description: "Median quality = {{ $value }}. Проверить качество генерации дайджестов."
+
+  # Trends Alerts
+  - name: trends
+    interval: 30s
+    rules:
+      - alert: TrendDetectionFailed
+        expr: |
+          (
+            sum(rate(trend_events_processed_total{status="error"}[10m]))
+            /
+            (sum(rate(trend_events_processed_total[10m])) + 1e-6)
+          ) > 0.10
+        for: 10m
+        labels:
+          severity: warning
+          component: trends
+        annotations:
+          summary: "Trend detection error rate превышает 10%"
+          description: "Error rate = {{ $value | humanizePercentage }}. Проверить логи worker."
+
+      - alert: TrendClusteringFailed
+        expr: |
+          (
+            sum(rate(trend_clustering_rejected_total[10m]))
+            /
+            (sum(rate(trend_events_processed_total{status="processed"}[10m])) + 1e-6)
+          ) > 0.10
+        for: 10m
+        labels:
+          severity: warning
+          component: trends
+        annotations:
+          summary: "Trend clustering rejection rate превышает 10%"
+          description: "Rejection rate = {{ $value | humanizePercentage }}. Проверить логи worker и качество кластеризации."
+
+      - alert: TrendRefinementFailed
+        expr: |
+          (
+            sum(rate(trend_refinement_runs_total{status="error"}[10m]))
+            /
+            (sum(rate(trend_refinement_runs_total[10m])) + 1e-6)
+          ) > 0.10
+        for: 10m
+        labels:
+          severity: warning
+          component: trends
+        annotations:
+          summary: "Trend refinement error rate превышает 10%"
+          description: "Error rate = {{ $value | humanizePercentage }}. Проверить логи worker."
+
+  # Telethon Ingest Alerts
+  - name: telethon_ingest
+    interval: 30s
+    rules:
+      - alert: TelethonIngestCrash
+        expr: |
+          sum(rate(telethon_ingest_crash_signals_total[5m])) > 0
+        for: 1m
+        labels:
+          severity: critical
+          component: telethon_ingest
+        annotations:
+          summary: "Telethon Ingest получил crash signal"
+          description: "Получен crash signal ({{ $labels.signal_name }}). Проверить логи telethon-ingest и состояние системы."
+
+      - alert: TelethonIngestPostsLostHigh
+        expr: |
+          (
+            sum(rate(posts_lost_total[10m]))
+            /
+            (sum(rate(posts_lost_total[10m])) + sum(rate(db_users_upserted_total[10m])) + 1e-6)
+          ) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          component: telethon_ingest
+        annotations:
+          summary: "Telethon Ingest частота потерь постов превышает 5%"
+          description: "Loss rate = {{ $value | humanizePercentage }}. Проверить логи telethon-ingest и причины потерь."
+
+      - alert: TelethonIngestChannelCoverageLow
+        expr: |
+          avg(channel_coverage_percent) < 80
+        for: 30m
+        labels:
+          severity: warning
+          component: telethon_ingest
+        annotations:
+          summary: "Telethon Ingest покрытие канала ниже 80%"
+          description: "Coverage = {{ $value }}%. Проверить логи telethon-ingest и причины низкого покрытия."
+
+      - alert: TelethonIngestMediaProcessingFailed
+        expr: |
+          (
+            sum(rate(media_processing_failed_total[10m]))
+            /
+            (sum(rate(media_processing_total[10m])) + 1e-6)
+          ) > 0.10
+        for: 10m
+        labels:
+          severity: warning
+          component: telethon_ingest
+        annotations:
+          summary: "Telethon Ingest частота ошибок обработки медиа превышает 10%"
+          description: "Error rate = {{ $value | humanizePercentage }}. Проверить логи telethon-ingest и причины ошибок."
+
+  # Cleanup Task Alerts
+  - name: cleanup
+    interval: 30s
+    rules:
+      - alert: CleanupFailed
+        expr: |
+          (
+            sum(rate(cleanup_processed_total{status="error"}[10m]))
+            /
+            (sum(rate(cleanup_processed_total[10m])) + 1e-6)
+          ) > 0.10
+        for: 10m
+        labels:
+          severity: warning
+          component: cleanup
+        annotations:
+          summary: "Cleanup error rate превышает 10%"
+          description: "Error rate = {{ $value | humanizePercentage }}. Проверить логи worker и состояние Qdrant/Neo4j."
+
+      - alert: CleanupLatencyHigh
+        expr: |
+          histogram_quantile(0.95, rate(cleanup_latency_seconds_bucket[10m])) > 60
+        for: 10m
+        labels:
+          severity: warning
+          component: cleanup
+        annotations:
+          summary: "Cleanup p95 latency превышает 60 секунд"
+          description: "P95 latency = {{ $value }}s. Проверить производительность Qdrant/Neo4j."
+
+  # Context Events Task Alerts
+  - name: context_events
+    interval: 30s
+    rules:
+      # Context7: digest_context_messages - это Histogram, используем _count для подсчета событий
+      - alert: ContextEventsNoActivity
+        expr: |
+          sum(rate(digest_context_messages_count[10m])) == 0
+          and
+          sum(stream_pending_size{stream=~"digest\\.context\\.prepared"}) > 10
+        for: 10m
+        labels:
+          severity: warning
+          component: context_events
+        annotations:
+          summary: "Context events не обрабатывает события"
+          description: "Есть pending сообщения в digest.context.prepared ({{ $value }}), но context events не обрабатывает. Проверить логи worker."
+
+  # DLQ Alerts
+  - name: dlq
+    interval: 30s
+    rules:
+      - alert: DLQBacklogHigh
+        expr: |
+          sum(dlq_db_events_total{status="pending"}) > 1000
+        for: 10m
+        labels:
+          severity: warning
+          component: dlq
+        annotations:
+          summary: "DLQ backlog превышает 1000 событий"
+          description: "Backlog = {{ $value }} событий. Требуется ручная обработка или увеличение workers."
+
+      - alert: DLQAutoHealFailed
+        expr: |
+          avg(dlq_db_auto_heal_success_rate) < 0.50
+        for: 15m
+        labels:
+          severity: warning
+          component: dlq
+        annotations:
+          summary: "DLQ auto-heal success rate ниже 50%"
+          description: "Success rate = {{ $value | humanizePercentage }}. Проверить причины неудачных попыток auto-heal."
+
+  # API Endpoints Alerts
+  - name: api_endpoints
+    interval: 30s
+    rules:
+      - alert: APIEndpointLatencyHigh
+        expr: |
+          histogram_quantile(0.95, 
+            rate(api_endpoint_latency_seconds_bucket{endpoint=~"/api/(channels|sessions|digest|trends|admin).*"}[5m])
+          ) > 5
+        for: 5m
+        labels:
+          severity: warning
+          component: api
+        annotations:
+          summary: "API endpoint p95 latency превышает 5 секунд"
+          description: "P95 latency для {{ $labels.endpoint }} = {{ $value }}s. Проверить производительность endpoint."
+
+      - alert: APIEndpointErrorRateHigh
+        expr: |
+          (
+            sum(rate(api_endpoint_requests_total{status_code=~"5..", endpoint=~"/api/(channels|sessions|digest|trends|admin).*"}[5m])) by (endpoint, method)
+            /
+            (sum(rate(api_endpoint_requests_total{endpoint=~"/api/(channels|sessions|digest|trends|admin).*"}[5m])) by (endpoint, method) + 1e-6)
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          component: api
+        annotations:
+          summary: "API endpoint error rate превышает 5%"
+          description: "Error rate для {{ $labels.endpoint }} = {{ $value | humanizePercentage }}. Проверить логи API."
+
+  # Redis Alerts
+  - name: redis
+    interval: 30s
+    rules:
+      - alert: RedisUnavailable
+        # Context7: Проверяем доступность Redis
+        # Если оба сервиса (api и worker) недоступны - это критично
+        # Или если есть метрики ошибок подключения
+        expr: |
+          (
+            up{job="worker"} == 0
+            and
+            up{job="api"} == 0
+          )
+          or
+          (
+            count(redis_operations_total) > 0
+            and
+            sum(rate(redis_operations_total{status="error", operation=~".*connect.*|.*ping.*"}[5m])) > 0
+          )
+        for: 5m
+        labels:
+          severity: critical
+          component: redis
+        annotations:
+          summary: "Redis недоступен"
+          description: |
+            Redis недоступен или сервисы не могут подключиться.
+            Проверить:
+            1. Состояние Redis: docker ps | grep redis
+            2. Ping: docker exec telegram-assistant-redis-1 redis-cli ping
+            3. Метрики: curl http://localhost:9090/api/v1/query?query=redis_operations_total
+
+      - alert: RedisMemoryHigh
+        expr: |
+          (
+            sum(redis_memory_usage_bytes) by (instance)
+            /
+            (sum(redis_memory_max_bytes) by (instance) + 1e-6)
+          ) > 0.80
+        for: 5m
+        labels:
+          severity: warning
+          component: redis
+        annotations:
+          summary: "Redis использование памяти превышает 80%"
+          description: "Использование памяти = {{ $value | humanizePercentage }}. Проверить использование памяти и настройки eviction. Команда: redis-cli INFO memory"

@@ -4,7 +4,7 @@ Context7 best practice: Атомарное сохранение в БД без F
 Порядок операций:
 1. UPSERT users (ON CONFLICT telegram_id)
 2. UPSERT channels (ON CONFLICT telegram_id) 
-3. INSERT posts (ON CONFLICT DO NOTHING)
+3. INSERT posts (ON CONFLICT DO UPDATE) - обновляем существующие посты для актуализации данных
 
 HWM обновляется ТОЛЬКО после успешного commit.
 """
@@ -47,6 +47,13 @@ db_transaction_rollbacks_total = Counter(
     ['reason']
 )
 
+# Context7: Метрика для отслеживания проблем с подписками
+db_subscription_check_failures_total = Counter(
+    'db_subscription_check_failures_total',
+    'Total subscription check failures',
+    ['reason']  # 'no_subscription', 'subscription_inactive'
+)
+
 # Context7: Метрики для отслеживания проблем с парсингом
 # Context7: Импортируем метрики из channel_parser для предотвращения дублирования
 # Метрики уже определены в channel_parser.py с правильными labels
@@ -66,9 +73,41 @@ except ImportError:
             existing = REGISTRY._names_to_collectors.get(name)
             if existing:
                 return existing
-        except (AttributeError, KeyError):
+        except (AttributeError, KeyError, TypeError):
             pass
-        return Counter(name, description, labels)
+        
+        try:
+            return Counter(name, description, labels)
+        except ValueError as e:
+            if "Duplicated timeseries" in str(e):
+                try:
+                    return REGISTRY._names_to_collectors.get(name)
+                except (AttributeError, KeyError, TypeError):
+                    pass
+            logger.warning(f"Metric {name} already exists", error=str(e))
+            raise
+    
+    def _get_or_create_histogram(name, description, labels, buckets=None):
+        """Получить существующую метрику или создать новую."""
+        try:
+            existing = REGISTRY._names_to_collectors.get(name)
+            if existing:
+                return existing
+        except (AttributeError, KeyError, TypeError):
+            pass
+        
+        try:
+            if buckets:
+                return Histogram(name, description, labels, buckets=buckets)
+            return Histogram(name, description, labels)
+        except ValueError as e:
+            if "Duplicated timeseries" in str(e):
+                try:
+                    return REGISTRY._names_to_collectors.get(name)
+                except (AttributeError, KeyError, TypeError):
+                    pass
+            logger.warning(f"Metric {name} already exists", error=str(e))
+            raise
     
     channel_not_found_total = _get_or_create_counter(
         'channel_not_found_total',
@@ -88,42 +127,45 @@ except ImportError:
         ['operation']  # operation: 'before_parsing', 'before_entity', 'before_albums'
     )
 
-db_users_upserted_total = Counter(
+db_users_upserted_total = _get_or_create_counter(
     'db_users_upserted_total',
-    'Users upserted'
+    'Users upserted',
+    []
 )
 
-db_channels_upserted_total = Counter(
+db_channels_upserted_total = _get_or_create_counter(
     'db_channels_upserted_total',
-    'Channels upserted'
+    'Channels upserted',
+    []
 )
 
 # Context7: Метрики для CAS операций (media_objects + post_media_map)
-media_objects_upserted_total = Counter(
+media_objects_upserted_total = _get_or_create_counter(
     'media_objects_upserted_total',
     'Total media_objects upserted',
     ['status']  # 'new', 'existing'
 )
 
-media_objects_refs_updated_total = Counter(
+media_objects_refs_updated_total = _get_or_create_counter(
     'media_objects_refs_updated_total',
-    'Total refs_count increments'
+    'Total refs_count increments',
+    []
 )
 
-post_media_map_inserted_total = Counter(
+post_media_map_inserted_total = _get_or_create_counter(
     'post_media_map_inserted_total',
     'Total post_media_map inserts',
     ['status']  # 'new', 'duplicate'
 )
 
-cas_operations_latency_seconds = Histogram(
+cas_operations_latency_seconds = _get_or_create_histogram(
     'cas_operations_latency_seconds',
     'CAS operations latency',
     ['operation'],  # 'save_media_to_cas'
     buckets=[0.01, 0.05, 0.1, 0.5, 1, 2, 5]
 )
 
-cas_operations_errors_total = Counter(
+cas_operations_errors_total = _get_or_create_counter(
     'cas_operations_errors_total',
     'CAS operations errors',
     ['operation', 'error_type']
@@ -199,18 +241,24 @@ class AtomicDBSaver:
                                 channel_id=channel_id_uuid,
                                 telegram_id=channel_data.get('telegram_id'))
                 
-                # 2.5. Context7 best practice: Создаём user_channel связь если её нет
-                # Это необходимо для корректной работы сохранения альбомов
-                # Context7: Не прерываем транзакцию при ошибке - это дополнительная операция
-                try:
-                    await self._ensure_user_channel(db_session, user_data, channel_data, channel_id_uuid)
-                except Exception as e:
-                    # Логируем, но не прерываем транзакцию
-                    self.logger.warning("_ensure_user_channel failed but continuing transaction",
-                                      error=str(e),
-                                      error_type=type(e).__name__)
+                # Context7: Парсинг каналов - глобальный процесс, не привязан к конкретному пользователю
+                # Посты сохраняются глобально, изоляция происходит через user_channel при запросах пользователя
+                # Проверяем только активность канала, не проверяем подписку пользователя
+                channel_check = await db_session.execute(
+                    text("SELECT is_active FROM channels WHERE id = :channel_id LIMIT 1"),
+                    {"channel_id": channel_id_uuid}
+                )
+                channel_row = channel_check.fetchone()
                 
-                # 3. BULK INSERT posts (ON CONFLICT DO NOTHING)
+                if not channel_row or not channel_row.is_active:
+                    self.logger.warning("Channel is inactive, skipping post save",
+                                      channel_id=channel_id_uuid,
+                                      reason="channel_inactive",
+                                      posts_count=len(posts_data))
+                    db_subscription_check_failures_total.labels(reason="channel_inactive").inc()
+                    return False, "channel_inactive", 0
+                
+                # 3. BULK INSERT posts (ON CONFLICT DO UPDATE) - обновляем существующие посты
                 self.logger.debug("Bulk inserting posts", posts_count=len(posts_data))
                 inserted_count = await self._bulk_insert_posts(
                     db_session, 
@@ -274,6 +322,7 @@ class AtomicDBSaver:
         try:
             # Context7 P1.1: Сохранение forwards с расширенными полями MessageFwdHeader
             if forwards_data:
+                # Context7: Исправление синтаксиса SQL - используем CAST для jsonb вместо :param::jsonb
                 forwards_sql = text("""
                     INSERT INTO post_forwards (
                         post_id, from_chat_id, from_message_id,
@@ -283,8 +332,8 @@ class AtomicDBSaver:
                     ) VALUES (
                         :post_id, :from_chat_id, :from_message_id,
                         :from_chat_title, :from_chat_username, :forwarded_at,
-                        :from_id::jsonb, :from_name, :post_author_signature,
-                        :saved_from_peer::jsonb, :saved_from_msg_id, :psa_type
+                        CAST(:from_id AS jsonb), :from_name, :post_author_signature,
+                        CAST(:saved_from_peer AS jsonb), :saved_from_msg_id, :psa_type
                     )
                     ON CONFLICT DO NOTHING
                 """)
@@ -717,20 +766,36 @@ class AtomicDBSaver:
             channel_id: UUID канала (из _upsert_channel)
         """
         try:
-            # Получаем user_id по telegram_id
+            # Context7: КРИТИЧНО - проверяем tenant_id для предотвращения утечки данных
+            # В multi-tenant системе один telegram_id может быть в нескольких tenant
+            tenant_id = user_data.get('tenant_id')
+            if not tenant_id:
+                self.logger.error("tenant_id is required for user_channel creation",
+                                user_data=user_data)
+                return
+            
+            # Получаем user_id по telegram_id И tenant_id
             telegram_id = user_data.get('telegram_id')
             if isinstance(telegram_id, str):
                 telegram_id = int(telegram_id)
             
+            # Context7: КРИТИЧНО - фильтруем по tenant_id для предотвращения утечки данных
             get_user_sql = text("""
-                SELECT id FROM users WHERE telegram_id = :telegram_id LIMIT 1
+                SELECT id FROM users 
+                WHERE telegram_id = :telegram_id 
+                  AND tenant_id = :tenant_id
+                LIMIT 1
             """)
-            result = await db_session.execute(get_user_sql, {"telegram_id": telegram_id})
+            result = await db_session.execute(
+                get_user_sql, 
+                {"telegram_id": telegram_id, "tenant_id": tenant_id}
+            )
             user_row = result.fetchone()
             
             if not user_row:
                 self.logger.warning("User not found for user_channel creation",
-                                  telegram_id=telegram_id)
+                                  telegram_id=telegram_id,
+                                  tenant_id=tenant_id)
                 return
             
             user_id = str(user_row.id)
@@ -852,7 +917,7 @@ class AtomicDBSaver:
                 }
                 prepared_posts.append(prepared_post)
             
-            # Context7: Bulk insert с ON CONFLICT DO NOTHING
+            # Context7: Bulk insert с ON CONFLICT DO UPDATE - обновляем существующие посты для актуализации данных
             # Используем правильный подход: передаем список словарей в execute()
             # SQLAlchemy автоматически использует executemany для списка параметров
             # Для PostgreSQL ON CONFLICT используем text() с правильным синтаксисом

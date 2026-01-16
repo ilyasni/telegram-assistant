@@ -1,0 +1,157 @@
+groups:
+  # Performance Metrics Alerts (Performance Guardrails)
+  - name: performance_metrics
+    interval: 30s
+    rules:
+      # ============================================================================
+      # FAST PATH PERFORMANCE KPIs
+      # ============================================================================
+      
+      # P95 latency для Fast Path > 5 секунд (критично)
+      - alert: FastPathP95LatencyHigh
+        expr: |
+          histogram_quantile(0.95, 
+            sum(rate(fast_path_latency_seconds_bucket{endpoint="/rag/query"}[5m])) by (le, endpoint, tenant_id)
+          ) > 5
+        for: 5m
+        labels:
+          severity: critical
+          component: fast_path
+        annotations:
+          summary: "Fast Path P95 latency превышает 5 секунд ({{ $value | humanize }}s)"
+          description: "P95 latency для {{ $labels.endpoint }} = {{ $value | humanize }}s (target: < 5s) для tenant={{ $labels.tenant_id }}"
+          runbook: "Проверить: 1) количество LLM вызовов, 2) использование кэша, 3) производительность Qdrant/Neo4j"
+      
+      # P95 latency для Fast Path > 10 секунд (критично)
+      - alert: FastPathP95LatencyCritical
+        expr: |
+          histogram_quantile(0.95, 
+            sum(rate(fast_path_latency_seconds_bucket{endpoint="/rag/query"}[5m])) by (le, endpoint, tenant_id)
+          ) > 10
+        for: 3m
+        labels:
+          severity: critical
+          component: fast_path
+        annotations:
+          summary: "Fast Path P95 latency критично высокий ({{ $value | humanize }}s)"
+          description: "P95 latency для {{ $labels.endpoint }} = {{ $value | humanize }}s (target: < 5s). Требуется немедленное вмешательство."
+      
+      # Среднее LLM calls per request > 3 для Fast Path
+      - alert: FastPathLLMCallsHigh
+        expr: |
+          avg(llm_calls_per_request{path_type="fast_path", endpoint="/rag/query"}) by (endpoint, tenant_id) > 3
+        for: 10m
+        labels:
+          severity: warning
+          component: fast_path
+        annotations:
+          summary: "Среднее LLM calls per request > 3 для Fast Path ({{ $value | humanize }})"
+          description: "Среднее количество LLM вызовов для {{ $labels.endpoint }} = {{ $value | humanize }} (target: < 3) для tenant={{ $labels.tenant_id }}"
+          runbook: "Проверить использование Context Router кэша и эвристики. Возможно, слишком много запросов идут через LLM маршрутизацию."
+      
+      # P95 tokens per request > 8k
+      - alert: FastPathTokensHigh
+        expr: |
+          histogram_quantile(0.95, 
+            sum(rate(tokens_per_request_bucket{path_type="fast_path", endpoint="/rag/query"}[5m])) by (le, endpoint, tenant_id)
+          ) > 8000
+        for: 10m
+        labels:
+          severity: warning
+          component: fast_path
+        annotations:
+          summary: "P95 tokens per request > 8k для Fast Path ({{ $value | humanize }})"
+          description: "P95 tokens для {{ $labels.endpoint }} = {{ $value | humanize }} (target: < 8k) для tenant={{ $labels.tenant_id }}"
+          runbook: "Проверить размер контекста, отправляемого в LLM. Возможно, нужно уменьшить количество источников или использовать summarization."
+      
+      # P95 agent steps per request > 4
+      - alert: FastPathAgentStepsHigh
+        expr: |
+          histogram_quantile(0.95, 
+            sum(rate(agent_steps_per_request_bucket{path_type="fast_path", endpoint="/rag/query"}[5m])) by (le, endpoint, tenant_id)
+          ) > 4
+        for: 10m
+        labels:
+          severity: warning
+          component: fast_path
+        annotations:
+          summary: "P95 agent steps per request > 4 для Fast Path ({{ $value | humanize }})"
+          description: "P95 agent steps для {{ $labels.endpoint }} = {{ $value | humanize }} (target: ≤ 4) для tenant={{ $labels.tenant_id }}"
+          runbook: "Проверить, не используются ли сложные agentic схемы в Fast Path. Fast Path должен быть простым и быстрым."
+      
+      # ============================================================================
+      # REQUEST BUDGET EXCEEDED
+      # ============================================================================
+      
+      # Превышение бюджета LLM calls
+      - alert: RequestBudgetLLMCallsExceeded
+        expr: |
+          rate(request_budget_exceeded_total{budget_type="llm_calls", path_type="fast_path"}[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: performance_guardrails
+        annotations:
+          summary: "Превышение бюджета LLM calls для Fast Path"
+          description: "Запросы превышают бюджет LLM calls. Проверить использование Context Router кэша и оптимизацию запросов."
+      
+      # Превышение бюджета tokens
+      - alert: RequestBudgetTokensExceeded
+        expr: |
+          rate(request_budget_exceeded_total{budget_type="tokens", path_type="fast_path"}[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: performance_guardrails
+        annotations:
+          summary: "Превышение бюджета tokens для Fast Path"
+          description: "Запросы превышают бюджет tokens. Проверить размер контекста и количество источников."
+      
+      # Превышение бюджета agent steps
+      - alert: RequestBudgetAgentStepsExceeded
+        expr: |
+          rate(request_budget_exceeded_total{budget_type="agent_steps", path_type="fast_path"}[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: performance_guardrails
+        annotations:
+          summary: "Превышение бюджета agent steps для Fast Path"
+          description: "Запросы превышают бюджет agent steps. Fast Path не должен использовать сложные agentic схемы."
+      
+      # ============================================================================
+      # CACHE PERFORMANCE
+      # ============================================================================
+      
+      # Низкий cache hit rate для Context Router
+      - alert: ContextRouterCacheHitRateLow
+        expr: |
+          (
+            sum(rate(context_router_cache_hits_total[5m]))
+            /
+            (sum(rate(context_router_cache_hits_total[5m])) + sum(rate(context_router_requests_total[5m])))
+          ) < 0.5
+        for: 15m
+        labels:
+          severity: warning
+          component: context_router
+        annotations:
+          summary: "Низкий cache hit rate для Context Router ({{ $value | humanizePercentage }})"
+          description: "Cache hit rate = {{ $value | humanizePercentage }} (target: > 50%). Проверить настройки кэша и TTL."
+      
+      # Низкий cache hit rate для Performance Cache
+      - alert: PerformanceCacheHitRateLow
+        expr: |
+          (
+            sum(rate(performance_cache_hits_total[5m])) by (cache_type, path_type)
+            /
+            (sum(rate(performance_cache_hits_total[5m])) by (cache_type, path_type) + sum(rate(performance_cache_misses_total[5m])) by (cache_type, path_type))
+          ) < 0.3
+        for: 15m
+        labels:
+          severity: warning
+          component: performance_cache
+        annotations:
+          summary: "Низкий cache hit rate для Performance Cache ({{ $value | humanizePercentage }})"
+          description: "Cache hit rate для {{ $labels.cache_type }} ({{ $labels.path_type }}) = {{ $value | humanizePercentage }} (target: > 30%)"
+

@@ -20,40 +20,72 @@ from crypto_utils import encrypt_session
 
 logger = structlog.get_logger()
 
-# Context7 best practice: Prometheus метрики для QR-авторизации (с multi-tenant лейблами)
-AUTH_QR_PUBLISHED = Counter(
-    "auth_qr_published_total",
-    "QR URL published",
-    ["tenant_id"],
-    namespace="telethon"
-)
-AUTH_QR_EXPIRED = Counter(
-    "auth_qr_expired_total",
-    "QR session expired",
-    ["tenant_id"],
-    namespace="telethon"
-)
-AUTH_QR_SUCCESS = Counter(
-    "auth_qr_success_total",
-    "QR session authorized",
-    ["tenant_id"],
-    namespace="telethon"
-)
-AUTH_QR_FAIL = Counter(
-    "auth_qr_fail_total",
-    "QR session failed",
-    ["tenant_id"],
-    namespace="telethon"
-)
+# Context7: Функции для предотвращения дублирования метрик (определяем ПЕРЕД использованием)
+from prometheus_client import REGISTRY
 
-# Context7 best practice: Telethon метрики
-FLOODWAIT_TOTAL = Counter("telethon_floodwait_total", "FloodWait events", ["reason", "seconds"])
-FLOODWAIT_DURATION = Histogram("telethon_floodwait_duration_seconds", "FloodWait wait duration", ["reason"])
-SESSION_CLEANUP_TOTAL = Counter("telethon_session_cleanup_total", "Session cleanup operations", ["status"])
-SESSION_CLEANUP_DURATION = Histogram("telethon_session_cleanup_duration_seconds", "Session cleanup duration")
-QR_SESSION_TOTAL = Counter("telethon_qr_session_total", "QR sessions", ["status"])
-RATE_LIMIT_HITS = Counter("telethon_qr_rate_limit_hits_total", "Rate limit hits", ["endpoint"])
-THROTTLING_DELAY = Histogram("telethon_throttling_delay_seconds", "Request throttling delay")
+def _get_or_create_counter(name, description, labels, namespace=None):
+    """Получить существующую метрику или создать новую."""
+    try:
+        existing = REGISTRY._names_to_collectors.get(name)
+        if existing:
+            return existing
+    except (AttributeError, KeyError, TypeError):
+        pass
+    
+    try:
+        if namespace:
+            return Counter(name, description, labels, namespace=namespace)
+        return Counter(name, description, labels)
+    except ValueError as e:
+        if "Duplicated timeseries" in str(e):
+            try:
+                return REGISTRY._names_to_collectors.get(name)
+            except (AttributeError, KeyError, TypeError):
+                pass
+        logger.warning(f"Metric {name} already exists", error=str(e))
+        raise
+
+def _get_or_create_histogram(name, description, labels=None, buckets=None):
+    """Получить существующую метрику или создать новую."""
+    try:
+        existing = REGISTRY._names_to_collectors.get(name)
+        if existing:
+            return existing
+    except (AttributeError, KeyError, TypeError):
+        pass
+    
+    try:
+        # Context7: labels не может быть None для Histogram
+        if labels is None:
+            labels = []
+        if buckets:
+            return Histogram(name, description, labels, buckets=buckets)
+        return Histogram(name, description, labels)
+    except ValueError as e:
+        if "Duplicated timeseries" in str(e):
+            try:
+                return REGISTRY._names_to_collectors.get(name)
+            except (AttributeError, KeyError, TypeError):
+                pass
+        logger.warning(f"Metric {name} already exists", error=str(e))
+        raise
+
+# Context7: НЕ создаем telethon_floodwait_total и telethon_floodwait_duration_seconds здесь
+# Они уже созданы в floodwait_manager.py - используем их оттуда при необходимости
+# FLOODWAIT_TOTAL и FLOODWAIT_DURATION удалены - используем метрики из floodwait_manager
+
+SESSION_CLEANUP_TOTAL = _get_or_create_counter("telethon_session_cleanup_total", "Session cleanup operations", ["status"])
+SESSION_CLEANUP_DURATION = _get_or_create_histogram("telethon_session_cleanup_duration_seconds", "Session cleanup duration", labels=[])
+QR_SESSION_TOTAL = _get_or_create_counter("telethon_qr_session_total", "QR sessions", ["status"])
+RATE_LIMIT_HITS = _get_or_create_counter("telethon_qr_rate_limit_hits_total", "Rate limit hits", ["endpoint"])
+THROTTLING_DELAY = _get_or_create_histogram("telethon_throttling_delay_seconds", "Request throttling delay", labels=[])
+
+# Context7: Метрики QR-авторизации (namespace="telethon")
+AUTH_QR_PUBLISHED = _get_or_create_counter("telethon_auth_qr_published_total", "QR URL published", ["tenant_id"], namespace="telethon")
+AUTH_QR_SUCCESS = _get_or_create_counter("telethon_auth_qr_success_total", "QR session authorized", ["tenant_id"], namespace="telethon")
+AUTH_QR_FAIL = _get_or_create_counter("telethon_auth_qr_fail_total", "QR failures", ["tenant_id"], namespace="telethon")
+AUTH_QR_EXPIRED = _get_or_create_counter("telethon_auth_qr_expired_total", "QR session expired", ["tenant_id"], namespace="telethon")
+AUTH_QR_2FA_REQUIRED = _get_or_create_counter("telethon_auth_qr_2fa_required_total", "2FA required count", ["tenant_id"], namespace="telethon")
 
 
 class QrAuthService:
@@ -177,6 +209,11 @@ class QrAuthService:
                             logger.warning("Failed to delete expired session", key=key, error=str(e))
                         continue
                     
+                    # Context7: пропускаем password_required сессии - они ждут ввода пароля через API
+                    if status == "password_required":
+                        logger.debug("Skipping password_required session - waiting for password input", key=key, tenant_id=tenant_id)
+                        continue
+                    
                     if status not in ["pending", "failed", "authorized", "in_progress", "awaiting_scan"]:
                         logger.debug("Skipping non-processable session", key=key, status=status)
                         continue
@@ -188,36 +225,108 @@ class QrAuthService:
                                    key=key, status=status, tenant_id=tenant_id)
                         continue
                     
-                    # Context7 best practice: валидация только старых authorized сессий (старше 5 минут)
+                    # Context7 best practice: обработка authorized сессий
+                    # ВАЖНО: проверяем, сохранена ли сессия в БД, и сохраняем если нет
                     if status == "authorized":
                         # Context7: с decode_responses=True значение уже строка
-                        created_at = data.get("created_at")
-                        if created_at:
+                        session_string = data.get("session_string")
+                        telegram_user_id_raw = data.get("telegram_user_id")
+                        
+                        if session_string and telegram_user_id_raw:
                             try:
-                                created_timestamp = int(created_at)
-                                current_timestamp = int(time.time())
-                                if current_timestamp - created_timestamp > 300:  # 5 минут
-                                    logger.info("Validating old authorized session", key=key, tenant_id=tenant_id)
-                                    await self._validate_authorized_session(key, tenant_id)
+                                telegram_user_id = int(telegram_user_id_raw)
+                                
+                                # Context7: проверяем, есть ли сессия в БД
+                                if not self.session_storage.db_connection:
+                                    await self.session_storage.init_db()
+                                
+                                db_session = await self.session_storage.get_telegram_session(tenant_id, tenant_id)
+                                
+                                # Context7: если сессия не найдена в БД, сохраняем её
+                                if not db_session or not db_session.get('session_string_enc'):
+                                    logger.info(
+                                        "Authorized session not found in DB, saving now",
+                                        tenant_id=tenant_id,
+                                        telegram_user_id=telegram_user_id,
+                                        key=key
+                                    )
+                                    
+                                    # Получаем данные пользователя из Redis
+                                    first_name = data.get("first_name")
+                                    last_name = data.get("last_name")
+                                    username = data.get("username")
+                                    invite_code = data.get("invite_code")
+                                    
+                                    # Извлекаем dc_id из session_string
+                                    dc_id = 2
+                                    try:
+                                        from telethon.sessions import StringSession
+                                        session = StringSession(session_string)
+                                        dc_id = getattr(session, 'dc_id', None) or 2
+                                    except Exception:
+                                        pass
+                                    
+                                    # Сохраняем сессию в БД
+                                    success, session_id, error_code, error_details = await self.session_storage.save_telegram_session(
+                                        tenant_id=tenant_id,
+                                        user_id=tenant_id,  # Будет заменено на реальный user_id
+                                        session_string=session_string,
+                                        telegram_user_id=telegram_user_id,
+                                        first_name=first_name,
+                                        last_name=last_name,
+                                        username=username,
+                                        invite_code=invite_code,
+                                        dc_id=dc_id
+                                    )
+                                    
+                                    if success:
+                                        logger.info(
+                                            "Authorized session saved to database",
+                                            tenant_id=tenant_id,
+                                            telegram_user_id=telegram_user_id,
+                                            session_id=session_id
+                                        )
+                                    else:
+                                        logger.error(
+                                            "Failed to save authorized session to database",
+                                            tenant_id=tenant_id,
+                                            telegram_user_id=telegram_user_id,
+                                            error_code=error_code,
+                                            error_details=error_details
+                                        )
                                 else:
-                                    logger.debug("Skipping validation for recent session", key=key, tenant_id=tenant_id)
+                                    logger.debug(
+                                        "Authorized session already in database",
+                                        tenant_id=tenant_id,
+                                        telegram_user_id=telegram_user_id
+                                    )
+                                    
+                                    # Context7: валидация старых сессий (старше 5 минут)
+                                    created_at = data.get("created_at")
+                                    if created_at:
+                                        try:
+                                            created_timestamp = int(created_at)
+                                            current_timestamp = int(time.time())
+                                            if current_timestamp - created_timestamp > 300:  # 5 минут
+                                                logger.info("Validating old authorized session", key=key, tenant_id=tenant_id)
+                                                await self._validate_authorized_session(key, tenant_id)
+                                        except (ValueError, AttributeError):
+                                            logger.warning("Invalid created_at timestamp", key=key, tenant_id=tenant_id)
+                                    
                                     # Context7: ensure backfill to ingest Redis key if missing
                                     try:
-                                        # Context7: Ключ сессии для ingest с префиксом t:{tenant}:session
                                         ingest_key = self._get_session_key(tenant_id)
                                         if not self.redis_client.exists(ingest_key):
                                             ss = self.redis_client.hget(key, "session_string")
                                             if ss:
                                                 self.redis_client.set(ingest_key, ss, ex=86400)
                                                 logger.info("Backfilled telegram:session for ingest", tenant_id=tenant_id)
-                                            else:
-                                                # Пометить для повторной авторизации миниаппом
-                                                self.redis_client.hset(key, "status", "not_found")
-                                                logger.warning("Authorized session has no session_string; marked not_found", tenant_id=tenant_id)
                                     except Exception as e:
                                         logger.warning("Backfill to ingest redis failed", tenant_id=tenant_id, error=str(e))
-                            except (ValueError, AttributeError):
-                                logger.warning("Invalid created_at timestamp", key=key, tenant_id=tenant_id)
+                            except (ValueError, TypeError) as e:
+                                logger.warning("Invalid telegram_user_id in authorized session", key=key, error=str(e))
+                        else:
+                            logger.debug("Authorized session missing session_string or telegram_user_id", key=key, tenant_id=tenant_id)
                         continue
                     
                     # Context7 best practice: для failed сессий проверяем наличие session_string
@@ -377,26 +486,34 @@ class QrAuthService:
         try:
             from psycopg2.extras import RealDictCursor
             with self.session_storage.db_connection.cursor(cursor_factory=RealDictCursor) as cursor:
-                # Ищем сессию по telegram_user_id в таблице users
+                # Context7: Исправлено - используем новую схему с identity_id вместо user_id
+                # Ищем сессию по telegram_user_id через identities
                 query = """
                     SELECT 
                         ts.id,
                         ts.session_string_enc,
-                        ts.status,
+                        ts.is_active as status,
                         ts.created_at,
-                        ts.key_id,
+                        NULL as key_id,
                         ts.updated_at,
-                        u.telegram_id as telegram_user_id
+                        i.telegram_id as telegram_user_id
                     FROM telegram_sessions ts
-                    JOIN users u ON u.id::uuid = ts.user_id::uuid
-                    WHERE u.telegram_id = %s 
-                      AND ts.status = 'authorized'
+                    JOIN identities i ON i.id = ts.identity_id
+                    WHERE i.telegram_id = %s 
+                      AND ts.is_active = true
                 """
                 params = [telegram_user_id]
                 
-                # Если указан tenant_id, добавляем его в условие
+                # Context7: tenant_id больше не используется в новой схеме telegram_sessions
+                # Фильтрация по tenant происходит через users.tenant_id
                 if tenant_id:
-                    query += " AND ts.tenant_id::text = %s"
+                    query += """
+                        AND EXISTS (
+                            SELECT 1 FROM users u 
+                            WHERE u.identity_id = i.id 
+                            AND u.tenant_id::text = %s
+                        )
+                    """
                     params.append(tenant_id)
                 
                 query += " ORDER BY ts.updated_at DESC LIMIT 1"
@@ -568,7 +685,8 @@ class QrAuthService:
                     db_tenant_id = tenant_id
             
             # Сохраняем сессию в БД
-            session_id = await self.session_storage.save_telegram_session(
+            # Context7: save_telegram_session возвращает (success, session_id, error_code, error_details)
+            success, session_id, error_code, error_details = await self.session_storage.save_telegram_session(
                 tenant_id=db_tenant_id,
                 user_id=db_tenant_id,
                 session_string=session_string,
@@ -576,7 +694,7 @@ class QrAuthService:
                 invite_code=None
             )
             
-            if session_id:
+            if success and session_id:
                 logger.info("Successfully processed existing session_string", tenant_id=tenant_id, session_id=session_id)
                 self.redis_client.hset(redis_key, mapping={
                     "status": "authorized",
@@ -592,8 +710,16 @@ class QrAuthService:
                     pass
                 AUTH_QR_SUCCESS.labels(tenant_id=tenant_id or "unknown").inc()
             else:
-                logger.error("Failed to save existing session_string", tenant_id=tenant_id)
-                self.redis_client.hset(redis_key, "status", "failed")
+                logger.error("Failed to save existing session_string", 
+                           tenant_id=tenant_id, 
+                           error_code=error_code, 
+                           error_details=error_details)
+                self.redis_client.hset(redis_key, mapping={
+                    "status": "failed",
+                    "reason": f"session_store_{error_code or 'unexpected_failed'}",
+                    "error_code": error_code or "unknown",
+                    "error_details": error_details or "Unknown error"
+                })
                 AUTH_QR_FAIL.labels(tenant_id=tenant_id or "unknown").inc()
                 
         except Exception as e:
@@ -725,22 +851,52 @@ class QrAuthService:
             QR_SESSION_TOTAL.labels(status="created").inc()
             
             # Ожидание авторизации с timeout
+            # Context7: ВАЖНО! Обрабатываем SessionPasswordNeededError ПЕРВЫМ, до других исключений
+            # Это гарантирует что статус password_required сохраняется в Redis ДО отключения клиента
             try:
                 await asyncio.wait_for(qr_login.wait(), timeout=590)
+            except SessionPasswordNeededError as e:
+                # Context7: ВАЖНО! Обрабатываем ПЕРВЫМ, до других исключений
+                logger.info("SessionPasswordNeededError caught during QR login", 
+                          tenant_id=tenant_id,
+                          error_type=type(e).__name__)
+                
+                # Context7: сохраняем session_string для последующего ввода пароля
+                session_string = client.session.save()
+                
+                # Context7: сохраняем дополнительную информацию для диагностики
+                try:
+                    is_connected = client.is_connected()
+                    logger.debug("Client state before saving session", 
+                               tenant_id=tenant_id, 
+                               is_connected=is_connected,
+                               session_string_length=len(session_string))
+                except Exception as state_err:
+                    logger.warning("Error checking client state", error=str(state_err), tenant_id=tenant_id)
+                
+                # Context7: сохраняем статус password_required в Redis СРАЗУ
+                self.redis_client.hset(redis_key, mapping={
+                    "status": "password_required", 
+                    "reason": "password_required",
+                    "session_string": session_string,
+                    "password_required_at": str(int(time.time()))
+                })
+                # Продлеваем TTL для сессии, ожидающей пароль (30 минут)
+                self.redis_client.expire(redis_key, 1800)
+                
+                logger.warning("QR login requires 2FA - status saved to Redis", 
+                             tenant_id=tenant_id, 
+                             session_string_length=len(session_string),
+                             note="Session saved, waiting for password via API")
+                AUTH_QR_2FA_REQUIRED.labels(tenant_id=tenant_id or "unknown").inc()
+                QR_SESSION_TOTAL.labels(status="password_required").inc()
+                # Context7: ВАЖНО: выходим сразу, не обрабатываем дальше
+                return
             except asyncio.TimeoutError:
                 self.redis_client.hset(redis_key, "status", "expired")
                 logger.warning("QR login timeout", tenant_id=tenant_id)
                 AUTH_QR_EXPIRED.labels(tenant_id=tenant_id or "unknown").inc()
                 QR_SESSION_TOTAL.labels(status="expired").inc()
-                return
-            except SessionPasswordNeededError:
-                self.redis_client.hset(redis_key, mapping={
-                    "status": "failed", 
-                    "reason": "password_required"
-                })
-                logger.warning("QR login requires 2FA", tenant_id=tenant_id)
-                AUTH_QR_FAIL.labels(tenant_id=tenant_id or "unknown").inc()
-                QR_SESSION_TOTAL.labels(status="failed").inc()
                 return
             
             # Context7 best practice: усиленная проверка владельца
@@ -821,31 +977,31 @@ class QrAuthService:
             # Context7 best practice: сохранение StringSession в БД
             session_string = client.session.save()
             
+            # Context7: получаем dc_id из клиента
+            dc_id = getattr(client.session, 'dc_id', None) or 2
+            
             # Context7 best practice: инициализация session storage если нужно
             if not self.session_storage.db_connection:
                 await self.session_storage.init_db()
             
-            # Context7 best practice: получаем правильный tenant_id из БД
-            with self.session_storage.db_connection.cursor() as cursor:
-                cursor.execute("SELECT tenant_id FROM users WHERE telegram_id = %s", (me.id,))
-                result = cursor.fetchone()
-                if result:
-                    db_tenant_id = str(result[0])
-                else:
-                    # Если пользователь не найден, используем переданный tenant_id как fallback
-                    db_tenant_id = tenant_id
+            # Context7: получаем invite_code из Redis если есть
+            invite_code = self.redis_client.hget(redis_key, "invite_code")
+            if invite_code and isinstance(invite_code, bytes):
+                invite_code = invite_code.decode('utf-8')
             
             # Context7 best practice: сохранение сессии в БД с данными пользователя
+            # Identity и Membership будут созданы автоматически в session_storage
             # Детектор правды: детальная диагностика ошибок
             success, session_id, error_code, error_details = await self.session_storage.save_telegram_session(
-                tenant_id=db_tenant_id,
-                user_id=db_tenant_id,
+                tenant_id=tenant_id,
+                user_id=tenant_id,  # Context7: будет заменено на реальный user_id в session_storage
                 session_string=session_string,
                 telegram_user_id=me.id,
                 first_name=getattr(me, 'first_name', None),
                 last_name=getattr(me, 'last_name', None),
                 username=getattr(me, 'username', None),
-                invite_code=None  # TODO: получать invite_code из запроса
+                invite_code=invite_code,
+                dc_id=dc_id
             )
             
             if not success:
@@ -927,8 +1083,9 @@ class QrAuthService:
             delay = base_delay + jitter
             
             # Метрики FloodWait
-            FLOODWAIT_TOTAL.labels(reason="qr_login", seconds=str(e.seconds)).inc()
-            FLOODWAIT_DURATION.labels(reason="qr_login").observe(delay)
+            # Context7: Используем метрики из floodwait_manager если доступны
+            # Если floodwait_manager недоступен, просто логируем
+            logger.warning("FloodWait during QR login", seconds=e.seconds, delay=delay)
             
             logger.warning("FloodWait during QR login", 
                           seconds=e.seconds, 
@@ -945,13 +1102,26 @@ class QrAuthService:
             })
             AUTH_QR_FAIL.labels(tenant_id=tenant_id or "unknown").inc()
         except Exception as e:
-            logger.error("QR login error", error=str(e), tenant_id=tenant_id)
-            self.redis_client.hset(redis_key, "status", "failed")
+            # Context7: сохраняем детальную информацию об ошибке для диагностики
+            error_type = type(e).__name__
+            error_message = str(e)
+            logger.error("QR login error", 
+                       error=error_message, 
+                       error_type=error_type,
+                       tenant_id=tenant_id,
+                       exc_info=True)  # Context7: включаем traceback для диагностики
+            
+            # Context7: сохраняем причину ошибки в Redis
+            self.redis_client.hset(redis_key, mapping={
+                "status": "failed",
+                "reason": f"qr_login_error_{error_type.lower()}",
+                "error_message": error_message[:500]  # Ограничиваем длину сообщения
+            })
             AUTH_QR_FAIL.labels(tenant_id=tenant_id or "unknown").inc()
         finally:
             # Context7 best practice: гарантированная остановка клиента
             # [C7-ID: telethon-cleanup-003]
-            import time
+            # Context7: time уже импортирован в начале файла, не импортируем повторно
             start_time = time.time()
             
             try:

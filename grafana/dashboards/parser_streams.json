@@ -872,7 +872,7 @@
             "name": "Prometheus"
           },
           "editorMode": "code",
-          "expr": "time() - scheduler_last_tick_ts_seconds",
+          "expr": "clamp_max(time() - scheduler_last_tick_ts_seconds, 86400)",
           "legendFormat": "Scheduler Freshness",
           "refId": "A"
         }

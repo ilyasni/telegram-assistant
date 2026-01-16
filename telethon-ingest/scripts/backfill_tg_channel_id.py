@@ -46,22 +46,44 @@ channels_skipped_total = Counter(
 async def get_telegram_client() -> TelegramClient:
     """Получение авторизованного Telegram клиента."""
     import redis.asyncio as redis
-    redis_client = redis.from_url(settings.redis_url)
-    
-    # Ищем авторизованную сессию
-    keys = await redis_client.keys("tg:qr:session:*")
+    redis_client = redis.from_url(settings.redis_url, decode_responses=True)
     session_string = None
     
+    # Вариант 1: tg:qr:session:*
+    keys = await redis_client.keys("tg:qr:session:*")
     for key in keys:
         session_data = await redis_client.hgetall(key)
-        if session_data.get(b'status') == b'authorized':
-            session_string = session_data.get(b'session_string', b'').decode('utf-8')
+        if session_data.get('status') == 'authorized':
+            session_string = session_data.get('session_string', '')
             if session_string:
-                logger.info("Found authorized session", key=key.decode())
+                logger.info("Found authorized session in tg:qr:session", key=key)
+                break
+    
+    # Вариант 2: ingest:session:*
+    if not session_string:
+        keys = await redis_client.keys("ingest:session:*")
+        for key in keys:
+            session_data = await redis_client.hgetall(key)
+            if session_data.get('status') == 'authorized':
+                session_string = session_data.get('session_string', '')
+                if session_string:
+                    logger.info("Found authorized session in ingest:session", key=key)
+                    break
+    
+    # Вариант 3: telegram:session:* (простая строка)
+    if not session_string:
+        keys = await redis_client.keys("telegram:session:*")
+        for key in keys:
+            session_string = await redis_client.get(key)
+            if session_string:
+                logger.info("Found session string in telegram:session", key=key)
                 break
     
     if not session_string:
+        await redis_client.close()
         raise Exception("No authorized Telegram session found")
+    
+    await redis_client.close()
     
     from telethon.sessions import StringSession
     session = StringSession(session_string)

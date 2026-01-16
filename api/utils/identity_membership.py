@@ -256,3 +256,167 @@ async def upsert_identity_and_membership_async(
     )
     return identity_id, user_id
 
+
+def save_telegram_session_sync(
+    db: Session,
+    tenant_id: uuid.UUID,
+    session_string: str,
+    telegram_user_id: int,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    username: Optional[str] = None,
+    dc_id: int = 2
+) -> Tuple[bool, Optional[uuid.UUID], Optional[str]]:
+    """
+    Context7 best practice: сохранение Telegram сессии в БД (синхронная версия для API).
+    
+    Сохраняет сессию в telegram_sessions и обновляет telegram_auth_status в users.
+    Используется для немедленного сохранения после успешной авторизации.
+    
+    Args:
+        db: SQLAlchemy Session
+        tenant_id: UUID tenant
+        session_string: StringSession от Telethon
+        telegram_user_id: Telegram ID пользователя
+        first_name: Имя пользователя
+        last_name: Фамилия пользователя
+        username: Username пользователя
+        dc_id: DataCenter ID (по умолчанию 2)
+        
+    Returns:
+        Tuple[success, session_id, error_message]
+    """
+    from models.database import Tenant
+    from crypto_utils import encrypt_session
+    from sqlalchemy import text
+    from telethon.sessions import StringSession
+    
+    try:
+        # 1. Получаем/создаём tenant
+        tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+        if not tenant:
+            tenant = Tenant(id=tenant_id, name=f"Tenant {telegram_user_id}")
+            db.add(tenant)
+            db.flush()
+        
+        # 2. Получаем/создаём identity и membership
+        identity_id, user_id = upsert_identity_and_membership_sync(
+            db=db,
+            tenant_id=tenant_id,
+            telegram_id=telegram_user_id,
+            username=username,
+            first_name=first_name,
+            last_name=last_name,
+            tier="free"
+        )
+        
+        # 3. Извлекаем dc_id из session_string если не передан
+        if dc_id is None or dc_id == 2:
+            try:
+                session = StringSession(session_string)
+                dc_id = getattr(session, 'dc_id', None) or 2
+            except Exception:
+                dc_id = 2
+        
+        # 4. Получаем активный ключ шифрования
+        key_result = db.execute(
+            text("""
+                SELECT key_id FROM encryption_keys 
+                WHERE retired_at IS NULL 
+                ORDER BY created_at DESC 
+                LIMIT 1
+            """)
+        )
+        key_row = key_result.fetchone()
+        if not key_row:
+            return False, None, "No active encryption key found"
+        key_id = key_row[0]
+        
+        # 5. Шифруем сессию
+        encrypted_session = encrypt_session(session_string)
+        
+        # 6. Деактивируем старые сессии для этой Identity
+        db.execute(
+            text("""
+                UPDATE telegram_sessions 
+                SET is_active = false, updated_at = NOW()
+                WHERE identity_id = :identity_id AND is_active = true
+            """),
+            {"identity_id": identity_id}
+        )
+        
+        # 7. Сохраняем сессию в telegram_sessions
+        session_uuid = uuid.uuid4()
+        db.execute(
+            text("""
+                INSERT INTO telegram_sessions (
+                    id, identity_id, telegram_id, session_string_enc, dc_id, is_active, created_at, updated_at
+                ) VALUES (
+                    :session_id, :identity_id, :telegram_id, :encrypted_session, :dc_id, true, NOW(), NOW()
+                )
+                ON CONFLICT (identity_id, dc_id) 
+                DO UPDATE SET
+                    session_string_enc = EXCLUDED.session_string_enc,
+                    is_active = true,
+                    updated_at = NOW()
+            """),
+            {
+                "session_id": session_uuid,
+                "identity_id": identity_id,
+                "telegram_id": telegram_user_id,
+                "encrypted_session": encrypted_session,
+                "dc_id": dc_id
+            }
+        )
+        
+        # 8. Обновляем telegram_auth_status в users (если колонки существуют)
+        try:
+            db.execute(
+                text("""
+                    UPDATE users 
+                    SET 
+                        telegram_auth_status = 'authorized',
+                        telegram_session_enc = :encrypted_session,
+                        telegram_session_key_id = :key_id,
+                        telegram_auth_created_at = NOW(),
+                        telegram_auth_updated_at = NOW(),
+                        telegram_auth_error = NULL
+                    WHERE id = :user_id
+                """),
+                {
+                    "encrypted_session": encrypted_session,
+                    "key_id": key_id,
+                    "user_id": user_id
+                }
+            )
+        except Exception as e:
+            # Context7: legacy поля могут отсутствовать - это нормально
+            logger.debug("Legacy fields update skipped", error=str(e))
+        
+        # 9. Коммитим транзакцию
+        db.commit()
+        
+        logger.info(
+            "Telegram session saved to database",
+            session_id=str(session_uuid),
+            identity_id=str(identity_id),
+            user_id=str(user_id),
+            telegram_id=telegram_user_id,
+            tenant_id=str(tenant_id),
+            dc_id=dc_id
+        )
+        
+        return True, session_uuid, None
+        
+    except Exception as e:
+        db.rollback()
+        error_msg = str(e)
+        logger.error(
+            "Failed to save Telegram session to database",
+            error=error_msg,
+            telegram_id=telegram_user_id,
+            tenant_id=str(tenant_id),
+            exc_info=True
+        )
+        return False, None, error_msg
+

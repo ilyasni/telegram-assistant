@@ -25,32 +25,100 @@ from prometheus_client import Counter, Histogram, Gauge
 
 logger = structlog.get_logger()
 
+# Context7: Функции для предотвращения дублирования метрик
+from prometheus_client import REGISTRY
+
+def _get_or_create_counter(name, description, labels):
+    """Получить существующую метрику или создать новую."""
+    try:
+        existing = REGISTRY._names_to_collectors.get(name)
+        if existing:
+            return existing
+    except (AttributeError, KeyError, TypeError):
+        pass
+    
+    try:
+        return Counter(name, description, labels)
+    except ValueError as e:
+        if "Duplicated timeseries" in str(e):
+            try:
+                return REGISTRY._names_to_collectors.get(name)
+            except (AttributeError, KeyError, TypeError):
+                pass
+        logger.warning(f"Metric {name} already exists", error=str(e))
+        raise
+
+def _get_or_create_histogram(name, description, labels=None, buckets=None):
+    """Получить существующую метрику или создать новую."""
+    try:
+        existing = REGISTRY._names_to_collectors.get(name)
+        if existing:
+            return existing
+    except (AttributeError, KeyError, TypeError):
+        pass
+    
+    try:
+        if buckets:
+            return Histogram(name, description, labels, buckets=buckets)
+        return Histogram(name, description, labels)
+    except ValueError as e:
+        if "Duplicated timeseries" in str(e):
+            try:
+                return REGISTRY._names_to_collectors.get(name)
+            except (AttributeError, KeyError, TypeError):
+                pass
+        logger.warning(f"Metric {name} already exists", error=str(e))
+        raise
+
+def _get_or_create_gauge(name, description, labels=None):
+    """Получить существующую метрику или создать новую."""
+    try:
+        existing = REGISTRY._names_to_collectors.get(name)
+        if existing:
+            return existing
+    except (AttributeError, KeyError, TypeError):
+        pass
+    
+    try:
+        if labels:
+            return Gauge(name, description, labels)
+        return Gauge(name, description)
+    except ValueError as e:
+        if "Duplicated timeseries" in str(e):
+            try:
+                return REGISTRY._names_to_collectors.get(name)
+            except (AttributeError, KeyError, TypeError):
+                pass
+        logger.warning(f"Metric {name} already exists", error=str(e))
+        raise
+
 # Context7: Метрики без высокой кардинальности (БЕЗ telegram_id в labels)
-telethon_disconnects_total = Counter(
+telethon_disconnects_total = _get_or_create_counter(
     'telethon_disconnects_total',
     'Total disconnects',
     ['reason']  # network, auth_error, timeout
 )
 
-telethon_reconnect_attempts_total = Counter(
+telethon_reconnect_attempts_total = _get_or_create_counter(
     'telethon_reconnect_attempts_total',
     'Reconnection attempts',
     ['result']  # success, fail
 )
 
-telethon_reconnect_duration_seconds = Histogram(
+telethon_reconnect_duration_seconds = _get_or_create_histogram(
     'telethon_reconnect_duration_seconds',
     'Reconnection duration',
+    labels=[],
     buckets=[0.5, 1, 2, 5, 10, 30, 60]
 )
 
-telethon_connected_clients = Gauge(
+telethon_connected_clients = _get_or_create_gauge(
     'telethon_connected_clients',
     'Currently connected clients'
 )
 
 # Context7: отдельная метрика авторизованных клиентов
-telethon_authorized_clients = Gauge(
+telethon_authorized_clients = _get_or_create_gauge(
     'telethon_authorized_clients',
     'Currently authorized clients'
 )

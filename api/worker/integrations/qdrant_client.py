@@ -7,14 +7,79 @@ Qdrant Client с поддержкой sweeper job для очистки expired 
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional
 import structlog
 from qdrant_client import QdrantClient as QdrantSDK
 from qdrant_client.http import models
 from qdrant_client.http.exceptions import UnexpectedResponse
+from prometheus_client import Counter, Histogram, Gauge, REGISTRY
 
 logger = structlog.get_logger()
+
+# ============================================================================
+# PROMETHEUS METRICS
+# ============================================================================
+
+# Context7: Безопасное создание метрик для избежания дублирования
+def _safe_create_metric(metric_class, name, *args, **kwargs):
+    """Создание метрики с проверкой на дублирование."""
+    try:
+        return metric_class(name, *args, **kwargs)
+    except ValueError as e:
+        if 'Duplicated' in str(e) or 'already registered' in str(e).lower():
+            try:
+                if hasattr(REGISTRY, '_names_to_collectors'):
+                    existing = REGISTRY._names_to_collectors.get(name)
+                    if existing:
+                        logger.debug(f"Found existing metric {name} in REGISTRY, reusing", metric=name)
+                        return existing
+            except (AttributeError, KeyError, TypeError):
+                pass
+            logger.warning(f"Metric {name} exists but could not retrieve from REGISTRY, using mock", metric=name)
+            class MockMetric:
+                def labels(self, **kwargs):
+                    return self
+                def inc(self, value=1):
+                    pass
+                def observe(self, value):
+                    pass
+                def set(self, value):
+                    pass
+            return MockMetric()
+        raise
+
+# Метрики операций
+qdrant_operations_total = _safe_create_metric(
+    Counter,
+    'qdrant_operations_total',
+    'Total Qdrant operations',
+    ['operation', 'status']  # upsert, search, delete, success, error
+)
+
+qdrant_operation_duration_seconds = _safe_create_metric(
+    Histogram,
+    'qdrant_operation_duration_seconds',
+    'Qdrant operation duration',
+    ['operation'],
+    buckets=[0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0]
+)
+
+# Метрики коллекций
+qdrant_collection_size = _safe_create_metric(
+    Gauge,
+    'qdrant_collection_size',
+    'Number of vectors in collection',
+    ['collection']
+)
+
+qdrant_collection_indexed = _safe_create_metric(
+    Gauge,
+    'qdrant_collection_indexed',
+    'Number of indexed vectors in collection',
+    ['collection']
+)
 
 # ============================================================================
 # QDRANT CLIENT
@@ -72,6 +137,7 @@ class QdrantClient:
         Если не указана, используется значение из EMBEDDING_DIMENSION или 2560 по умолчанию
         """
         import os
+        start_time = time.time()
         if vector_size is None:
             vector_size = int(os.getenv("EMBEDDING_DIMENSION", os.getenv("EMBED_DIM", "2560")))
         try:
@@ -82,6 +148,17 @@ class QdrantClient:
             try:
                 collection_info = self.client.get_collection(collection_name)
                 self._collections_cache[collection_name] = True
+                
+                # Context7: Обновление метрик коллекции
+                if hasattr(collection_info, 'points_count'):
+                    qdrant_collection_size.labels(collection=collection_name).set(collection_info.points_count)
+                if hasattr(collection_info, 'indexed_vectors_count'):
+                    qdrant_collection_indexed.labels(collection=collection_name).set(collection_info.indexed_vectors_count)
+                
+                qdrant_operations_total.labels(operation='ensure_collection', status='success').inc()
+                duration = time.time() - start_time
+                qdrant_operation_duration_seconds.labels(operation='ensure_collection').observe(duration)
+                
                 logger.debug("Collection already exists", collection=collection_name)
                 return
             except UnexpectedResponse:
@@ -98,11 +175,23 @@ class QdrantClient:
             )
             
             self._collections_cache[collection_name] = True
+            
+            # Context7: Обновление метрик коллекции
+            qdrant_collection_size.labels(collection=collection_name).set(0)
+            qdrant_collection_indexed.labels(collection=collection_name).set(0)
+            
+            qdrant_operations_total.labels(operation='ensure_collection', status='success').inc()
+            duration = time.time() - start_time
+            qdrant_operation_duration_seconds.labels(operation='ensure_collection').observe(duration)
+            
             logger.info("Collection created", 
                        collection=collection_name,
                        vector_size=vector_size)
             
         except Exception as e:
+            qdrant_operations_total.labels(operation='ensure_collection', status='error').inc()
+            duration = time.time() - start_time
+            qdrant_operation_duration_seconds.labels(operation='ensure_collection').observe(duration)
             logger.error("Error ensuring collection", 
                         collection=collection_name,
                         error=str(e))
@@ -116,6 +205,7 @@ class QdrantClient:
         payload: Dict[str, Any]
     ) -> str:
         """Добавление/обновление вектора в коллекции."""
+        start_time = time.time()
         try:
             # Обеспечение существования коллекции
             await self.ensure_collection(collection_name, len(vector))
@@ -132,6 +222,11 @@ class QdrantClient:
                 ]
             )
             
+            # Context7: Обновление метрик
+            qdrant_operations_total.labels(operation='upsert', status='success').inc()
+            duration = time.time() - start_time
+            qdrant_operation_duration_seconds.labels(operation='upsert').observe(duration)
+            
             logger.debug("Vector upserted successfully",
                         collection=collection_name,
                         vector_id=vector_id)
@@ -139,6 +234,10 @@ class QdrantClient:
             return vector_id
             
         except Exception as e:
+            # Context7: Обновление метрик ошибок
+            qdrant_operations_total.labels(operation='upsert', status='error').inc()
+            duration = time.time() - start_time
+            qdrant_operation_duration_seconds.labels(operation='upsert').observe(duration)
             logger.error("Error upserting vector",
                         collection=collection_name,
                         vector_id=vector_id,
@@ -147,11 +246,17 @@ class QdrantClient:
     
     async def delete_vector(self, collection_name: str, vector_id: str) -> bool:
         """Удаление вектора из коллекции."""
+        start_time = time.time()
         try:
             self.client.delete(
                 collection_name=collection_name,
                 points_selector=models.PointIdsList(points=[vector_id])
             )
+            
+            # Context7: Обновление метрик
+            qdrant_operations_total.labels(operation='delete', status='success').inc()
+            duration = time.time() - start_time
+            qdrant_operation_duration_seconds.labels(operation='delete').observe(duration)
             
             logger.debug("Vector deleted successfully",
                         collection=collection_name,
@@ -160,11 +265,80 @@ class QdrantClient:
             return True
             
         except Exception as e:
+            # Context7: Обновление метрик ошибок
+            qdrant_operations_total.labels(operation='delete', status='error').inc()
+            duration = time.time() - start_time
+            qdrant_operation_duration_seconds.labels(operation='delete').observe(duration)
             logger.error("Error deleting vector",
                         collection=collection_name,
                         vector_id=vector_id,
                         error=str(e))
             return False
+    
+    async def retrieve_vectors(
+        self,
+        collection_name: str,
+        vector_ids: List[str],
+        with_vectors: bool = True,
+        with_payload: bool = True
+    ) -> List[Dict[str, Any]]:
+        """
+        Получение векторов из Qdrant по их ID.
+        
+        Context7 best practice: используем retrieve для batch получения точек по ID.
+        Это эффективнее, чем scroll с фильтром для получения конкретных точек.
+        
+        Args:
+            collection_name: Название коллекции
+            vector_ids: Список ID векторов для получения
+            with_vectors: Включать ли векторы в результат
+            with_payload: Включать ли payload в результат
+        
+        Returns:
+            Список словарей с полями:
+            - id: ID точки
+            - vector: Вектор (если with_vectors=True)
+            - payload: Payload (если with_payload=True)
+        """
+        if not vector_ids:
+            return []
+        
+        try:
+            # Context7: Используем retrieve для batch получения точек
+            # Qdrant SDK поддерживает до 100 точек за запрос
+            batch_size = 100
+            all_points = []
+            
+            for i in range(0, len(vector_ids), batch_size):
+                batch_ids = vector_ids[i:i + batch_size]
+                
+                retrieved_points = self.client.retrieve(
+                    collection_name=collection_name,
+                    ids=batch_ids,
+                    with_vectors=with_vectors,
+                    with_payload=with_payload
+                )
+                
+                for point in retrieved_points:
+                    all_points.append({
+                        'id': str(point.id),
+                        'vector': point.vector if with_vectors else None,
+                        'payload': point.payload if with_payload else None
+                    })
+            
+            logger.debug("Vectors retrieved successfully",
+                        collection=collection_name,
+                        requested_count=len(vector_ids),
+                        retrieved_count=len(all_points))
+            
+            return all_points
+            
+        except Exception as e:
+            logger.error("Error retrieving vectors",
+                        collection=collection_name,
+                        vector_ids_count=len(vector_ids),
+                        error=str(e))
+            return []
     
     async def search_vectors(
         self, 
@@ -179,6 +353,7 @@ class QdrantClient:
         
         Context7: Обязательная фильтрация по tenant_id для multi-tenant изоляции.
         """
+        start_time = time.time()
         try:
             # Подготовка фильтра
             must_conditions = []
@@ -254,6 +429,11 @@ class QdrantClient:
                     'payload': result.payload
                 })
             
+            # Context7: Обновление метрик
+            qdrant_operations_total.labels(operation='search', status='success').inc()
+            duration = time.time() - start_time
+            qdrant_operation_duration_seconds.labels(operation='search').observe(duration)
+            
             logger.debug("Search completed",
                         collection=collection_name,
                         results_count=len(results))
@@ -261,6 +441,10 @@ class QdrantClient:
             return results
             
         except Exception as e:
+            # Context7: Обновление метрик ошибок
+            qdrant_operations_total.labels(operation='search', status='error').inc()
+            duration = time.time() - start_time
+            qdrant_operation_duration_seconds.labels(operation='search').observe(duration)
             logger.error("Error searching vectors",
                         collection=collection_name,
                         error=str(e))
@@ -363,6 +547,12 @@ class QdrantClient:
         """Получение статистики коллекции."""
         try:
             collection_info = self.client.get_collection(collection_name)
+            
+            # Context7: Обновление метрик коллекции
+            if hasattr(collection_info, 'points_count'):
+                qdrant_collection_size.labels(collection=collection_name).set(collection_info.points_count)
+            if hasattr(collection_info, 'indexed_vectors_count'):
+                qdrant_collection_indexed.labels(collection=collection_name).set(collection_info.indexed_vectors_count)
             
             return {
                 'name': collection_name,

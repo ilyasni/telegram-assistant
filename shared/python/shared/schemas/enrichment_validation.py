@@ -14,10 +14,27 @@ logger = structlog.get_logger()
 
 
 class OCRData(BaseModel):
-    """OCR данные из Vision анализа."""
-    text: str = Field(..., description="Извлечённый текст")
-    engine: Optional[str] = Field(None, description="OCR engine (gigachat, tesseract)")
+    """
+    OCR данные из Vision анализа.
+    
+    Context7: Поддержка базовых полей и enhancement полей (text_enhanced, corrections, entities).
+    Enhancement поля опциональны и добавляются OCREnhancementService.
+    """
+    text: str = Field(..., description="Извлечённый текст (оригинальный)")
+    engine: Optional[str] = Field(None, description="OCR engine (gigachat, paddleocr, tesseract)")
     confidence: Optional[float] = Field(None, ge=0.0, le=1.0, description="Confidence score")
+    
+    # Context7: Enhancement поля (опционально, добавляются OCREnhancementService)
+    text_enhanced: Optional[str] = Field(None, description="Улучшенный OCR текст после spell correction")
+    corrections: Optional[List[Dict[str, Any]]] = Field(None, description="Список исправлений опечаток")
+    entities: Optional[List[Dict[str, Any]]] = Field(None, description="Извлечённые сущности (ORG, PRODUCT, PERSON, LOC)")
+    enhanced_at: Optional[str] = Field(None, description="ISO timestamp обработки enhancement")
+    enhancement_version: Optional[str] = Field(None, description="Версия enhancement пайплайна")
+    text_confidence: Optional[float] = Field(None, ge=0.0, le=1.0, description="Confidence улучшенного текста")
+    
+    class Config:
+        # Context7: Разрешаем дополнительные поля для обратной совместимости
+        extra = 'allow'
     
     @field_validator('text')
     @classmethod
@@ -29,6 +46,17 @@ class OCRData(BaseModel):
             logger.warning("OCR text too long, truncating", original_length=len(v))
             return v[:100000]
         return v.strip()
+    
+    @field_validator('text_enhanced')
+    @classmethod
+    def validate_text_enhanced(cls, v: Optional[str]) -> Optional[str]:
+        """Валидация улучшенного OCR текста."""
+        if v is None:
+            return None
+        if len(v) > 100000:  # Лимит 100KB
+            logger.warning("Enhanced OCR text too long, truncating", original_length=len(v))
+            return v[:100000]
+        return v.strip() if v.strip() else None
 
 
 class VisionEnrichmentData(BaseModel):

@@ -1,79 +1,116 @@
-# Обновление Grafana дашбордов
+# Обновление Grafana Dashboards
 
-**Дата**: 2025-11-03
+## Контекст
 
-## ✅ Выполненные работы
+Добавлены новые панели в `grafana/dashboards/system_overview.json` для визуализации новых метрик, реализованных согласно `reports/PROMETHEUS_COVERAGE_RECOMMENDATIONS.md`.
 
-### 1. Исправление всех дашбордов
-- ✅ Исправлены datasource во всех дашбордах (убраны дублирующиеся uid)
-- ✅ Добавлен uid для `album_pipeline` дашборда
-- ✅ Добавлен datasource ко всем панелям в `album_pipeline.json`
+## Добавленные панели
 
-### 2. Обновление через скрипт
-- ✅ Создан скрипт `scripts/update_all_grafana_dashboards.sh`
-- ✅ Все 9 дашбордов обновлены через provisioned механизм Grafana
+### PostgreSQL метрики
 
-### 3. Проверка дашбордов в UI
+1. **PostgreSQL Operations Rate**
+   - Метрика: `rate(postgres_operations_total[5m])`
+   - Тип: Stat
+   - Показывает: скорость операций PostgreSQL по типам (operation, status)
 
-**Проверено через браузер (grafana.produman.studio)**:
-- ✅ **Parser & Streams** - работает корректно, панели отображаются
-- ✅ **Vision & S3 Storage** - работает корректно, данные отображаются
-- ⚠️ **Album Pipeline** - дашборд обновлён, требуется проверка после перезапуска Grafana
+2. **PostgreSQL Latency (p95)**
+   - Метрика: `histogram_quantile(0.95, rate(postgres_operation_duration_seconds_bucket[5m]))`
+   - Тип: Timeseries
+   - Показывает: p95 latency операций PostgreSQL
 
-**Остальные дашборды**:
-- Crawl Pipeline
-- RAG Service
-- Session & Telethon
-- Storage Quota Management
-- System Overview
-- QR Auth Funnel
+3. **PostgreSQL Connections**
+   - Метрика: `postgres_connections_active / postgres_connections_max`
+   - Тип: Stat
+   - Показывает: использование соединений PostgreSQL (%)
 
-## Context7 Best Practices применены
+### Qdrant метрики
 
-1. **Provisioned Dashboards**: Использован механизм provisioned дашбордов для автоматического обновления
-2. **Datasource UID**: Использован uid вместо name для datasource (более надёжно)
-3. **Скрипт обновления**: Автоматизация через `update_all_grafana_dashboards.sh`
-4. **Исправление метрик**: Проверка существования метрик через `fix_dashboards.py`
+4. **Qdrant Operations Rate**
+   - Метрика: `rate(qdrant_operations_total[5m])`
+   - Тип: Stat
+   - Показывает: скорость операций Qdrant по типам (operation, status)
 
-## Проблемы и предупреждения
+5. **Qdrant Latency (p95)**
+   - Метрика: `histogram_quantile(0.95, rate(qdrant_operation_duration_seconds_bucket[5m]))`
+   - Тип: Timeseries
+   - Показывает: p95 latency операций Qdrant
 
-### Предупреждения метрик
-Скрипт `fix_dashboards.py` выдал предупреждения о метриках, которые могут не существовать:
-- `storage_bucket_usage_gb` - возможно, метрика ещё не реализована или имеет другое имя
+6. **Qdrant Collection Size**
+   - Метрика: `qdrant_collection_size`
+   - Тип: Stat
+   - Показывает: размер коллекций Qdrant
 
-**Действие**: Проверить наличие метрик в Prometheus и обновить queries в дашборде `storage_quota_dashboard.json` при необходимости.
+### Post Persistence метрики
 
-## Скрипты обновления
+7. **Post Persistence Processed**
+   - Метрика: `rate(post_persistence_processed_total[5m])`
+   - Тип: Stat
+   - Показывает: скорость обработки постов по статусам
 
-### Обновить один дашборд
-```bash
-bash scripts/update_grafana_dashboard.sh <dashboard_name> [--no-restart]
-```
+8. **Post Persistence PEL Size**
+   - Метрика: `post_persistence_pel_size`
+   - Тип: Stat
+   - Показывает: размер PEL для post persistence
 
-### Обновить все дашборды
-```bash
-bash scripts/update_all_grafana_dashboards.sh
-```
+### Graph Writer метрики
 
-### Исправить datasource/uid
-```bash
-python3 grafana/fix_dashboards.py
-```
+9. **Graph Writer Processed**
+   - Метрика: `rate(graph_writer_processed_total[5m])`
+   - Тип: Stat
+   - Показывает: скорость обработки событий GraphWriter
 
-## Проверка после обновления
+10. **Graph Writer PEL Size**
+    - Метрика: `graph_writer_pel_size`
+    - Тип: Stat
+    - Показывает: размер PEL для GraphWriter
 
-1. Открыть Grafana: https://grafana.produman.studio
-2. Проверить каждый дашборд:
-   - Панели загружаются без ошибок
-   - Datasource указан корректно
-   - Метрики отображаются (если есть данные)
+### API Endpoint метрики
 
-## Выводы
+11. **API Endpoint Requests**
+    - Метрика: `rate(api_endpoint_requests_total[5m])`
+    - Тип: Stat
+    - Показывает: скорость запросов к API endpoints
 
-✅ Все дашборды обновлены и исправлены
-✅ Datasource добавлен ко всем панелям
-✅ UID добавлен для всех дашбордов
-✅ Скрипт автоматизации создан
+12. **API Endpoint Latency (p95)**
+    - Метрика: `histogram_quantile(0.95, rate(api_endpoint_latency_seconds_bucket[5m]))`
+    - Тип: Timeseries
+    - Показывает: p95 latency запросов к API endpoints
 
-**Grafana автоматически обновит дашборды в течение 10-30 секунд после обновления файлов.**
+## Расположение панелей
 
+Все новые панели добавлены в конец dashboard `system_overview.json` с автоматическим расчетом координат.
+
+## Использование
+
+1. **Импорт dashboard в Grafana:**
+   - Откройте Grafana UI
+   - Перейдите в Dashboards → Import
+   - Загрузите `grafana/dashboards/system_overview.json`
+
+2. **Проверка метрик:**
+   - Убедитесь, что Prometheus datasource настроен
+   - Проверьте, что метрики экспортируются (после выполнения операций)
+
+3. **Настройка алертов:**
+   - Алерты уже настроены в Prometheus
+   - Уведомления будут отправляться в Telegram через AlertManager
+
+## Дополнительные рекомендации
+
+1. **Создание отдельных dashboards:**
+   - Рекомендуется создать отдельные dashboards для каждого компонента:
+     - `postgres_dashboard.json` - для PostgreSQL метрик
+     - `qdrant_dashboard.json` - для Qdrant метрик
+     - `post_persistence_dashboard.json` - для Post Persistence метрик
+     - `graph_writer_dashboard.json` - для Graph Writer метрик
+
+2. **Настройка переменных:**
+   - Добавить переменные для фильтрации по tenant_id, operation_type и т.д.
+
+3. **Добавление аннотаций:**
+   - Настроить аннотации для алертов Prometheus
+
+---
+
+**Дата обновления:** 2025-01-03  
+**Версия:** 1.0

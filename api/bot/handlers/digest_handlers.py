@@ -11,6 +11,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 import httpx
 import structlog
+import os
+import redis.asyncio as redis
 from typing import Optional
 from uuid import UUID
 from bot.states import DigestStates
@@ -222,10 +224,21 @@ async def callback_digest_edit_topics(callback: CallbackQuery, state: FSMContext
 @router.message(DigestStates.waiting_topics)
 async def process_topics(msg: Message, state: FSMContext):
     """Обработка ввода тем."""
+    # Проверка на команду отмены
+    if msg.text and msg.text.startswith("/cancel"):
+        await state.clear()
+        await msg.answer("❌ Редактирование тем отменено.")
+        return
+    
     user_id = await _get_user_id(msg.from_user.id)
     if not user_id:
         await msg.answer("❌ Пользователь не найден")
         await state.clear()
+        return
+    
+    # Context7: Проверка на None перед использованием msg.text
+    if not msg.text:
+        await msg.answer("❌ Сообщение не содержит текста. Попробуйте еще раз:")
         return
     
     # Парсим темы (разделяем по запятой, очищаем от пробелов)
@@ -281,13 +294,19 @@ async def process_schedule_time(msg: Message, state: FSMContext):
     """Обработка ввода времени."""
     # Проверка на команду отмены
     if msg.text and msg.text.startswith("/cancel"):
-        await cmd_cancel(msg, state)
+        await state.clear()
+        await msg.answer("❌ Редактирование времени отменено.")
         return
     
     user_id = await _get_user_id(msg.from_user.id)
     if not user_id:
         await msg.answer("❌ Пользователь не найден")
         await state.clear()
+        return
+    
+    # Context7: Проверка на None перед использованием msg.text
+    if not msg.text:
+        await msg.answer("❌ Сообщение не содержит текста. Попробуйте еще раз:")
         return
     
     # Валидация формата времени
@@ -430,12 +449,38 @@ async def callback_digest_generate(callback: CallbackQuery):
         await callback.answer("❌ Пользователь не найден", show_alert=True)
         return
     
-    # Показываем индикатор загрузки
-    await callback.answer("⏳ Генерирую дайджест...")
+    # Context7: Защита от двойного нажатия через Redis lock
+    redis_url = os.getenv("REDIS_URL", "redis://redis:6379")
+    redis_client = None
+    lock_key = f"digest:lock:{user_id}"
+    lock_acquired = False
+    redis_client_closed = False  # Context7: Флаг для отслеживания закрытия клиента
     
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.post(f"{API_BASE}/api/digest/generate/{user_id}")
+        # Context7: Инициализируем redis_client в начале try блока для корректной обработки ошибок
+        redis_client = await redis.from_url(redis_url, decode_responses=True)
+        
+        # Пытаемся получить lock (TTL 5 минут)
+        lock_acquired = await redis_client.set(lock_key, "1", nx=True, ex=300)
+        if not lock_acquired:
+            await callback.answer("⏳ Дайджест уже генерируется, подождите...", show_alert=True)
+            # Context7: Закрываем клиент перед ранним возвратом
+            if redis_client and not redis_client_closed:
+                try:
+                    await redis_client.close()
+                    redis_client_closed = True  # Context7: Отмечаем, что клиент закрыт
+                except Exception as e:
+                    logger.warning("Failed to close Redis client on early return", error=str(e))
+                    redis_client_closed = True  # Context7: Отмечаем как закрытый даже при ошибке
+            return
+        
+        # Context7: Код генерации дайджеста перемещен в основной try блок для корректной работы
+        # Показываем индикатор загрузки
+        await callback.answer("⏳ Генерирую дайджест...")
+        
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                r = await client.post(f"{API_BASE}/api/digest/generate/{user_id}")
             
             if r.status_code == 200:
                 result = r.json()
@@ -457,6 +502,7 @@ async def callback_digest_generate(callback: CallbackQuery):
                     queued_message += "\nМы пришлём готовый дайджест отдельным сообщением."
                     await callback.message.answer(queued_message, parse_mode="HTML")
                     await callback.answer("✅ Дайджест поставлен в очередь")
+                    # Context7: Не освобождаем lock здесь - finally блок освободит его автоматически
                     return
                 
                 from utils.telegram_formatter import markdown_to_telegram_chunks
@@ -480,20 +526,43 @@ async def callback_digest_generate(callback: CallbackQuery):
                     parse_mode="HTML"
                 )
                 await callback.answer("❌ Ошибка генерации", show_alert=True)
-    
-    except httpx.TimeoutException:
-        await callback.message.answer(
-            "⏳ <b>Генерация дайджеста занимает больше времени</b>\n\n"
-            "Попробуйте позже или проверьте настройки дайджеста.",
-            parse_mode="HTML"
-        )
-        await callback.answer("⏳ Превышено время ожидания", show_alert=True)
-    except Exception as e:
-        logger.error("Error generating digest", error=str(e))
-        await callback.message.answer(
-            "❌ <b>Ошибка генерации дайджеста</b>\n\n"
-            "Проверьте настройки дайджеста (темы должны быть указаны).",
-            parse_mode="HTML"
-        )
-        await callback.answer("❌ Ошибка генерации", show_alert=True)
+        except httpx.TimeoutException:
+            await callback.message.answer(
+                "⏳ <b>Генерация дайджеста занимает больше времени</b>\n\n"
+                "Попробуйте позже или проверьте настройки дайджеста.",
+                parse_mode="HTML"
+            )
+            await callback.answer("⏳ Превышено время ожидания", show_alert=True)
+        except Exception as e:
+            logger.error("Error generating digest", error=str(e))
+            await callback.message.answer(
+                "❌ <b>Ошибка генерации дайджеста</b>\n\n"
+                "Проверьте настройки дайджеста (темы должны быть указаны).",
+                parse_mode="HTML"
+            )
+            await callback.answer("❌ Ошибка генерации", show_alert=True)
+        finally:
+            # Освобождаем lock только если он был получен
+            if redis_client and lock_acquired:
+                try:
+                    await redis_client.delete(lock_key)
+                except Exception as e:
+                    logger.warning("Failed to release digest lock", error=str(e), lock_key=lock_key)
+    except Exception as redis_init_error:
+        # Context7: Обрабатываем ошибки инициализации Redis клиента
+        logger.error("Failed to initialize Redis client", error=str(redis_init_error))
+        await callback.answer("❌ Ошибка подключения к Redis. Попробуйте позже.", show_alert=True)
+        # Context7: redis_client может быть None, если инициализация не удалась
+        redis_client = None
+        redis_client_closed = True
+        return
+    finally:
+        # Закрываем Redis client в любом случае, если он еще не закрыт
+        if redis_client and not redis_client_closed:
+            try:
+                await redis_client.close()
+                redis_client_closed = True
+            except Exception as e:
+                logger.warning("Failed to close Redis client", error=str(e))
+                redis_client_closed = True
 

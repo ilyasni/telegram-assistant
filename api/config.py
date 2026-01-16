@@ -3,7 +3,7 @@
 import json
 import os
 from pydantic_settings import BaseSettings
-from pydantic import field_validator, SecretStr, Field, model_validator
+from pydantic import field_validator, SecretStr, Field, model_validator, computed_field
 from typing import Optional
 
 
@@ -29,12 +29,23 @@ class Settings(BaseSettings):
     
     # CORS
     # Context7 best practice: безопасные дефолты (не используем wildcard с credentials)
-    cors_origins: list = []
+    # Context7: Не используем exclude=True, чтобы Pydantic мог загружать значение из env переменных
+    cors_origins_raw: Optional[str] = Field(default=None, alias="CORS_ORIGINS")
     
-    @field_validator("cors_origins", mode="before")
-    @classmethod
-    def parse_cors_origins(cls, v):
-        """Парсинг CORS_ORIGINS: поддерживает JSON массив и строку через запятую."""
+    @computed_field
+    @property
+    def cors_origins(self) -> list[str]:
+        """Парсинг CORS_ORIGINS: поддерживает JSON массив и строку через запятую.
+        
+        Context7: Computed field вычисляется при каждом доступе, что гарантирует актуальность
+        значения даже если cors_origins_raw изменяется. В FastAPI каждый запрос обрабатывается
+        в отдельном контексте, поэтому multi-threading не является проблемой.
+        """
+        v = self.cors_origins_raw
+        if v is None:
+            return []
+        if isinstance(v, list):
+            return v
         if isinstance(v, str):
             # Попытка распарсить как JSON массив
             try:
@@ -45,7 +56,7 @@ class Settings(BaseSettings):
                 pass
             # Если не JSON, парсим как строку через запятую
             return [origin.strip() for origin in v.split(",") if origin.strip()]
-        return v
+        return []
     
     @field_validator("digest_agent_canary_tenants", mode="before")
     @classmethod

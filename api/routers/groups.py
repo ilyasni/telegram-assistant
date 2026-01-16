@@ -277,12 +277,33 @@ def _to_discovery_response(discovery: GroupDiscoveryRequest, db: Session) -> Gro
 @router.get("/", response_model=GroupListResponse)
 async def list_groups(
     tenant_id: UUID = Query(..., description="ID арендатора"),
+    user_id: Optional[UUID] = Query(default=None, description="ID пользователя для фильтрации по подпискам"),
     status: Optional[str] = Query(default=None, pattern="^(active|disabled)$"),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
 ):
-    query = db.query(Group).filter(Group.tenant_id == tenant_id)
+    """
+    Context7: Список групп.
+    Если указан user_id, возвращает только группы, на которые пользователь подписан через user_group.
+    Иначе возвращает все группы tenant (для обратной совместимости).
+    """
+    from models.database import UserGroup
+    
+    # Context7: Если указан user_id, фильтруем через user_group по подпискам пользователя
+    if user_id:
+        query = (
+            db.query(Group)
+            .join(UserGroup, Group.id == UserGroup.group_id)
+            .filter(
+                UserGroup.user_id == user_id,
+                UserGroup.is_active.is_(True),
+                Group.tenant_id == tenant_id
+            )
+        )
+    else:
+        # Context7: Для обратной совместимости - все группы tenant
+        query = db.query(Group).filter(Group.tenant_id == tenant_id)
 
     if status == "active":
         query = query.filter(Group.is_active.is_(True))
@@ -307,16 +328,30 @@ async def list_groups(
 
 @router.post("/", response_model=GroupResponse, status_code=201)
 async def create_group(request: GroupCreateRequest, db: Session = Depends(get_db)):
+    """
+    Context7: Создание группы.
+    Группы глобальные (без tenant_id), как каналы.
+    Изоляция происходит через user_group при запросах пользователя.
+    """
+    # Context7: Группы глобальные - проверяем только по tg_chat_id
     existing = (
         db.query(Group)
-        .filter(Group.tenant_id == request.tenant_id, Group.tg_chat_id == request.tg_chat_id)
+        .filter(Group.tg_chat_id == request.tg_chat_id)
         .first()
     )
     if existing:
-        raise HTTPException(status_code=409, detail="Group already registered for this tenant")
+        raise HTTPException(status_code=409, detail="Group already registered")
+    
+    # Context7: Используем утилиту для получения системного tenant_id
+    # TODO: В будущем миграции нужно убрать tenant_id из groups
+    from utils.tenant_utils import get_system_tenant_id
+    try:
+        system_tenant_id = get_system_tenant_id(db)
+    except ValueError:
+        raise HTTPException(status_code=500, detail="No tenant found in database")
 
     group = Group(
-        tenant_id=request.tenant_id,
+        tenant_id=system_tenant_id,  # Context7: Системный tenant_id для совместимости
         tg_chat_id=request.tg_chat_id,
         title=request.title,
         username=request.username,
@@ -327,6 +362,70 @@ async def create_group(request: GroupCreateRequest, db: Session = Depends(get_db
     db.add(group)
     db.commit()
     db.refresh(group)
+    
+    # Context7: Автоматически создаём подписку для пользователя, который добавил группу
+    # Используем added_by из settings, если он указан
+    settings = request.settings or {}
+    added_by = settings.get("added_by") or settings.get("discovery", {}).get("requested_by")
+    if added_by:
+        try:
+            from models.database import UserGroup
+            user_uuid = UUID(str(added_by))
+            # Проверяем, существует ли пользователь
+            from models.database import User
+            user = db.query(User).filter(User.id == user_uuid).first()
+            if user:
+                # Проверяем, нет ли уже подписки
+                existing_subscription = (
+                    db.query(UserGroup)
+                    .filter(
+                        UserGroup.user_id == user_uuid,
+                        UserGroup.group_id == group.id
+                    )
+                    .first()
+                )
+                if not existing_subscription:
+                    subscription = UserGroup(
+                        user_id=user_uuid,
+                        group_id=group.id,
+                        is_active=True,
+                        monitor_mentions=True,
+                        subscribed_at=datetime.now(timezone.utc),
+                        settings={},
+                    )
+                    db.add(subscription)
+                    db.commit()
+                    logger.info(
+                        "Auto-created user_group subscription on group creation",
+                        user_id=str(user_uuid),
+                        group_id=str(group.id),
+                        group_title=group.title,
+                    )
+                else:
+                    # Активируем существующую подписку
+                    existing_subscription.is_active = True
+                    db.commit()
+                    logger.info(
+                        "Activated existing user_group subscription on group creation",
+                        user_id=str(user_uuid),
+                        group_id=str(group.id),
+                    )
+        except (ValueError, TypeError) as e:
+            logger.warning(
+                "Failed to create user_group subscription on group creation",
+                group_id=str(group.id),
+                added_by=added_by,
+                error=str(e),
+            )
+        except Exception as e:
+            logger.error(
+                "Error creating user_group subscription on group creation",
+                group_id=str(group.id),
+                added_by=added_by,
+                error=str(e),
+                exc_info=True,
+            )
+    
     return _to_response(group)
 
 
@@ -405,7 +504,37 @@ async def trigger_group_digest(group_id: UUID, request: GroupDigestRequest, db: 
             requested_by=str(request.user_id),
         )
     except PermissionError as exc:
+        logger.warning(
+            "Permission denied for group digest",
+            group_id=str(group_id),
+            tenant_id=str(request.tenant_id),
+            user_id=str(request.user_id),
+            error=str(exc),
+        )
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        logger.warning(
+            "Validation error for group digest",
+            group_id=str(group_id),
+            tenant_id=str(request.tenant_id),
+            user_id=str(request.user_id),
+            error=str(exc),
+        )
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error(
+            "Unexpected error during group digest enqueue",
+            group_id=str(group_id),
+            tenant_id=str(request.tenant_id),
+            user_id=str(request.user_id),
+            error=str(exc),
+            error_type=type(exc).__name__,
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Internal server error while processing digest request"
+        ) from exc
 
     return GroupDigestResponse(
         history_id=UUID(result["history_id"]),

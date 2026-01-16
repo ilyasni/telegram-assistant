@@ -9,6 +9,7 @@ Context7 P3: Sideloading Service для импорта личных диалог
 """
 
 import asyncio
+import os
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Any, Set
 import structlog
@@ -456,34 +457,45 @@ class SideloadService:
         tenant_id: str,
         peer_id: Optional[int]
     ) -> Dict[str, str]:
-        """Создание/получение группы."""
+        """
+        Context7: Создание/получение группы.
+        Группы глобальные (без tenant_id), как каналы.
+        Изоляция происходит через user_group при запросах пользователя.
+        """
         if not peer_id:
             raise ValueError("peer_id required for group")
         
-        # Проверяем существование группы
+        # Context7: Группы глобальные - ищем по tg_chat_id без tenant_id
         result = await self.db_session.execute(
-            text("SELECT id FROM groups WHERE tg_chat_id = :tg_chat_id AND tenant_id = :tenant_id::uuid"),
-            {'tg_chat_id': peer_id, 'tenant_id': tenant_id}
+            text("SELECT id FROM groups WHERE tg_chat_id = :tg_chat_id"),
+            {'tg_chat_id': peer_id}
         )
         existing = result.scalar_one_or_none()
         
         if existing:
             return {'group_id': str(existing)}
         
-        # Создаём новую группу
+        # Context7: Создаём новую группу глобально (без tenant_id)
+        # Используем системный tenant_id для совместимости с существующей схемой БД
+        # TODO: В будущем миграции нужно убрать tenant_id из groups
         title = getattr(entity, 'title', None) or f"Group {peer_id}"
         username = getattr(entity, 'username', None)
         group_id = UUID()
+        
+        # Context7: Используем утилиту для получения системного tenant_id
+        # В будущем миграции нужно убрать tenant_id из groups
+        from utils.tenant_utils import get_system_tenant_id_async
+        system_tenant = await get_system_tenant_id_async(self.db_session)
         
         await self.db_session.execute(
             text("""
                 INSERT INTO groups (id, tenant_id, tg_chat_id, title, username, is_active, created_at)
                 VALUES (:id, :tenant_id, :tg_chat_id, :title, :username, :is_active, :created_at)
-                ON CONFLICT (tenant_id, tg_chat_id) DO NOTHING
+                ON CONFLICT (tg_chat_id) DO NOTHING
             """),
             {
                 'id': str(group_id),
-                'tenant_id': tenant_id,
+                'tenant_id': str(system_tenant),
                 'tg_chat_id': peer_id,
                 'title': title,
                 'username': username,
@@ -492,6 +504,15 @@ class SideloadService:
             }
         )
         await self.db_session.commit()
+        
+        # Повторно проверяем, если был конфликт
+        result = await self.db_session.execute(
+            text("SELECT id FROM groups WHERE tg_chat_id = :tg_chat_id"),
+            {'tg_chat_id': peer_id}
+        )
+        existing = result.scalar_one_or_none()
+        if existing:
+            return {'group_id': str(existing)}
         
         return {'group_id': str(group_id)}
     
@@ -542,7 +563,17 @@ class SideloadService:
                         continue
             
             elif dialog_type == 'group':
-                # Сохраняем в GroupMessage с source='group'
+                # Context7: Сохраняем в GroupMessage глобально (без tenant_id)
+                # Изоляция происходит через user_group при запросах пользователя
+                # Используем системный tenant_id для совместимости с существующей схемой БД
+                # TODO: В будущем миграции нужно убрать tenant_id из group_messages
+                from utils.tenant_utils import get_system_tenant_id_async
+                try:
+                    system_tenant = await get_system_tenant_id_async(self.db_session)
+                except ValueError:
+                    logger.error("No tenant found in database for group messages")
+                    return 0
+                
                 for msg_data in messages_data:
                     try:
                         await self.db_session.execute(
@@ -559,7 +590,7 @@ class SideloadService:
                             """),
                             {
                                 'group_id': msg_data['group_id'],
-                                'tenant_id': tenant_id,
+                                'tenant_id': str(system_tenant),  # Context7: Системный tenant_id для совместимости
                                 'tg_message_id': msg_data['telegram_message_id'],
                                 'sender_tg_id': msg_data.get('sender_tg_id'),
                                 'sender_username': msg_data.get('sender_username'),
@@ -661,7 +692,8 @@ class SideloadService:
                 
                 # Публикуем в Redis Streams
                 if hasattr(self.redis_client, 'xadd'):
-                    await self.redis_client.xadd(stream_key, event_payload, maxlen=10000)
+                    redis_stream_maxlen = int(os.getenv("REDIS_STREAM_MAXLEN", "10000"))
+                    await self.redis_client.xadd(stream_key, event_payload, maxlen=redis_stream_maxlen)
                 elif hasattr(self.redis_client, 'execute_command'):
                     await self.redis_client.execute_command('XADD', stream_key, '*', *[str(k) for k, v in event_payload.items() for _ in [1, str(v)]])
             

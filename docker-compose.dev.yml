@@ -42,5 +42,6 @@ services:
       APP_ENV: development  # [C7-ID: dev-mode-001]
     volumes:
       - ./crawl4ai:/app
+      - ./shared/python:/app/shared/python:ro  # Context7: Монтируем shared/python для доступа к CircuitBreaker и другим утилитам
   redis:
     ports: ["6379:6379"]

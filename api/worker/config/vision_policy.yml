@@ -21,16 +21,44 @@ sampling:
   prefer_with_text_overlay: true  # Приоритет мемам/скриншотам
   skip_small_images_kb: 10  # Пропускать < 10KB
 
-# Routing правила
+# Routing правила (Context7: умная стратегия для экономии токенов)
 routing:
+  # Когда использовать GigaChat Vision (полный анализ изображения)
+  # Context7: Vision API нужен там, где OCR возвращает null - для анализа сцены, объектов, описания
+  use_vision_if:
+    # Изображения БЕЗ текста - нужен анализ сцены и объектов
+    - has_text: false  # OCR не нашёл текст - используем Vision для описания
+    # Большие изображения (>500KB) - вероятно сложная сцена, нужен полный анализ
+    - min_size_kb: 500
+    # Мемы без текста - нужна классификация и описание
+    - classification_hint: "meme"
+    # Фотографии - нужен анализ сцены, объектов, описание
+    - classification_hint: "photo"
+  
+  # Когда использовать только OCR fallback (локальный OCR справляется)
+  # Context7: OCR хорошо справляется с текстом и документами
   ocr_only_if:
     - quota_exhausted  # OCR fallback при исчерпании квоты
-    - mime: ["application/pdf", "image/png", "image/jpeg"]  # Определённые типы
+    # Документы - OCR справляется лучше
+    - mime: ["application/pdf", "application/msword", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "application/vnd.ms-powerpoint", "application/vnd.openxmlformats-officedocument.presentationml.presentation"]
+    # Скриншоты - OCR извлекает текст, Vision не нужен
+    - classification_hint: "screenshot"
+    # Изображения С текстом - OCR справляется, Vision не нужен
+    - has_text: true  # Если OCR нашёл текст, используем только OCR
   
   skip_if_channel:
     - "@large_memes_dump"  # Исключения по каналам
   
   skip_if_lang_not_in: ["ru", "en"]  # Только RU/EN
+  
+  # Эвристики для определения типа контента
+  heuristics:
+    # Предварительная проверка текста (быстрый OCR для экономии токенов)
+    precheck_text: true  # Использовать быстрый OCR для определения наличия текста
+    precheck_text_min_length: 10  # Минимальная длина текста для использования Vision
+    # Размеры для классификации
+    large_image_threshold_kb: 500  # Изображения >500KB считаются большими
+    small_image_threshold_kb: 100  # Изображения <100KB считаются маленькими
 
 # Fallback стратегии
 fallback:

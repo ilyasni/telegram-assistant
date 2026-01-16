@@ -180,6 +180,7 @@ class User(Base):
     identity = relationship("Identity", back_populates="memberships")
     channel_subscriptions = relationship("UserChannel", back_populates="user")
     group_subscriptions = relationship("UserGroup", back_populates="user")
+    theme_subscriptions = relationship("UserTheme", back_populates="user")
     # Context7: Явно указываем foreign_keys для избежания AmbiguousForeignKeysError
     # (UserAuditLog имеет два FK на users: user_id и changed_by)
     # Используем строковое имя колонки через lambda, так как класс UserAuditLog определен ниже
@@ -271,6 +272,30 @@ class Channel(Base):
     # Relationships
     posts = relationship("Post", back_populates="channel")
     user_subscriptions = relationship("UserChannel", back_populates="channel")
+
+
+class IngestAccount(Base):
+    """Сервисный аккаунт для ingestion публичных каналов."""
+    __tablename__ = "ingest_accounts"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    telegram_id = Column(BigInteger, unique=True, nullable=False)
+    is_active = Column(Boolean, server_default=text("true"), nullable=False)
+    priority = Column(Integer, server_default=text("100"), nullable=False)  # меньше = выше приоритет
+    role = Column(String(20), server_default=text("'both'"), nullable=False)  # 'read', 'resolver', 'both'
+    max_concurrent_channels = Column(Integer, nullable=True)
+    blocked_until = Column(DateTime(timezone=True), nullable=True)  # защита от FloodWait
+    last_error_code = Column(Text, nullable=True)
+    last_error_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+    last_used_at = Column(DateTime(timezone=True), nullable=True)  # медленный аудит (debounce)
+    notes = Column(Text, nullable=True)
+    
+    __table_args__ = (
+        Index("idx_ingest_accounts_telegram_id", "telegram_id"),
+        Index("idx_ingest_accounts_active_blocked_priority", "is_active", "blocked_until", "priority"),
+    )
 
 
 class TelegramEntity(Base):
@@ -527,7 +552,12 @@ class TelegramAuthLog(Base):
 # ============================================================================
 
 class UserChannel(Base):
-    """Many-to-many связь пользователей и каналов."""
+    """Many-to-many связь пользователей и каналов.
+    
+    Context7: Поддержка разделения на ручные каналы и каналы из подборок.
+    source='manual' - подключен пользователем вручную
+    source='theme' - подключен через подборку (theme_id указывает на подборку)
+    """
     __tablename__ = "user_channel"
     
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), primary_key=True)
@@ -535,10 +565,48 @@ class UserChannel(Base):
     subscribed_at = Column(DateTime, default=datetime.utcnow)
     is_active = Column(Boolean, default=True)
     settings = Column(JSON, default={})
+    # Context7: Источник подписки - 'manual' (вручную) или 'theme' (через подборку)
+    source = Column(String(20), nullable=False, server_default='manual')
+    # Context7: ID подборки, если source='theme' (nullable для source='manual')
+    theme_id = Column(UUID(as_uuid=True), ForeignKey("themes.id", ondelete="SET NULL"), nullable=True)
+    # Context7: Автоматическое обновление timestamp при изменении записи
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
     
     # Relationships
     user = relationship("User", back_populates="channel_subscriptions")
     channel = relationship("Channel", back_populates="user_subscriptions")
+    
+    __table_args__ = (
+        CheckConstraint("source IN ('manual', 'theme')", name='chk_user_channel_source'),
+        CheckConstraint(
+            "(source = 'theme' AND theme_id IS NOT NULL) OR (source = 'manual' AND theme_id IS NULL)",
+            name='chk_user_channel_source_theme_id'
+        ),
+    )
+
+
+class UserTheme(Base):
+    """Связь пользователей с подборками (themes).
+    
+    Context7: Отслеживает, какие подборки подключены у пользователя.
+    Позволяет администратору управлять составом подборок без влияния на пользователей.
+    """
+    __tablename__ = "user_theme"
+    
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    theme_id = Column(UUID(as_uuid=True), ForeignKey("themes.id", ondelete="CASCADE"), primary_key=True)
+    subscribed_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+    
+    # Relationships
+    user = relationship("User", back_populates="theme_subscriptions")
+    # Примечание: theme relationship будет работать, если таблица themes доступна в этой БД
+    # Если themes в другой БД, relationship не нужен
+    
+    __table_args__ = (
+        Index("ix_user_theme_user_active", "user_id", "is_active"),
+        Index("ix_user_theme_theme_active", "theme_id", "is_active"),
+    )
 
 
 class PostEnrichment(Base):
@@ -1207,6 +1275,10 @@ class TrendCluster(Base):
     editor_notes = Column(Text, nullable=True)
     taxonomy_categories = Column(JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb"))
     last_edited_at = Column(DateTime(timezone=True), nullable=True)
+    is_generic = Column(Boolean, nullable=False, server_default=text("false"))
+    # Context7: Поля для иерархической кластеризации (двухуровневая структура)
+    parent_cluster_id = Column(UUID(as_uuid=True), ForeignKey("trend_clusters.id", ondelete="SET NULL"), nullable=True)  # Родительский кластер (NULL для level 1)
+    cluster_level = Column(Integer, nullable=False, server_default=text("1"))  # Уровень иерархии: 1 = основной топик, 2 = подтема
 
     resolved_trend = relationship("TrendDetection", backref="clusters")
 
@@ -1215,6 +1287,10 @@ class TrendCluster(Base):
         Index('idx_trend_clusters_last_activity', 'last_activity_at', postgresql_ops={'last_activity_at': 'DESC'}),
         Index('idx_trend_clusters_novelty', 'novelty_score', postgresql_ops={'novelty_score': 'DESC NULLS LAST'}),
         Index('idx_trend_clusters_quality_score', 'quality_score', postgresql_ops={'quality_score': 'DESC NULLS LAST'}),
+        # Context7: Индексы для иерархической кластеризации
+        Index('idx_trend_clusters_parent', 'parent_cluster_id'),
+        Index('idx_trend_clusters_level', 'cluster_level'),
+        Index('idx_trend_clusters_parent_level', 'parent_cluster_id', 'cluster_level'),
     )
 
 
@@ -1347,15 +1423,111 @@ class TrendThresholdSuggestion(Base):
     threshold_name = Column(String(64), nullable=False)  # 'TREND_FREQ_RATIO_THRESHOLD'
     current_value = Column(REAL, nullable=False)
     suggested_value = Column(REAL, nullable=False)
-    reasoning = Column(Text, nullable=True)
-    confidence = Column(REAL, nullable=True)
-    analysis_period_start = Column(DateTime(timezone=True), nullable=False)
-    analysis_period_end = Column(DateTime(timezone=True), nullable=False)
-    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
-    status = Column(String(32), nullable=False, server_default="'pending'")  # 'pending', 'accepted', 'rejected'
+    reasoning = Column(Text, nullable=True)  # Объяснение предложения
+    confidence = Column(REAL, nullable=True)  # Уверенность в предложении (0.0-1.0)
+    analysis_period_start = Column(DateTime(timezone=True), nullable=False)  # Начало периода анализа
+    analysis_period_end = Column(DateTime(timezone=True), nullable=False)  # Конец периода анализа
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())  # Время создания предложения
+    status = Column(String(32), nullable=False, server_default=text("'pending'"))  # Context7: 'pending', 'accepted', 'rejected'
     
     __table_args__ = (
         Index('idx_trend_threshold_suggestions_status', 'status'),
         Index('idx_trend_threshold_suggestions_created_at', 'created_at', postgresql_ops={'created_at': 'DESC'}),
         Index('idx_trend_threshold_suggestions_threshold_name', 'threshold_name'),
+    )
+
+
+class EpisodicMemory(Base):
+    """Episodic Memory Layer - история действий, ошибок и попыток для self-tuning.
+    
+    Performance guardrails:
+    - Логируем только высокоуровневые события: run_started/run_completed/error/retry
+    - Retention: 30-90 дней (настраивается через TTL/partitioning)
+    - Индексы только по полям для чтения: tenant_id, entity_type, created_at
+    """
+    __tablename__ = "episodic_memory"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
+    entity_type = Column(String(50), nullable=False)  # 'digest', 'trend', 'enrichment', 'indexing', 'rag'
+    entity_id = Column(UUID(as_uuid=True), nullable=True)  # ID сущности (digest_id, trend_id и т.д.)
+    event_type = Column(String(50), nullable=False)  # 'run_started', 'run_completed', 'error', 'retry', 'quality_low'
+    event_metadata = Column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))  # Детали события (metadata - зарезервированное слово в SQLAlchemy)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), index=True)
+    
+    # Relationships
+    tenant = relationship("Tenant", backref="episodic_memories")
+    
+    __table_args__ = (
+        Index('idx_episodic_memory_tenant_entity', 'tenant_id', 'entity_type', 'created_at', postgresql_ops={'created_at': 'DESC'}),
+        Index('idx_episodic_memory_entity', 'entity_type', 'entity_id', 'created_at', postgresql_ops={'created_at': 'DESC'}),
+        Index('idx_episodic_memory_event_type', 'event_type', 'created_at', postgresql_ops={'created_at': 'DESC'}),
+        # Partitioning hint: можно добавить partition by tenant_id и created_at для больших объемов
+    )
+
+
+class DLQEvent(Base):
+    """Dead Letter Queue - события, которые не удалось обработать после всех попыток.
+    
+    Performance guardrails:
+    - max_attempts per event (например 3)
+    - Поле next_retry_at и exponential backoff
+    - Если превышено - помечаем event как permanent_failure, только ручной разбор
+    """
+    __tablename__ = "dlq_events"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
+    entity_type = Column(String(50), nullable=False)  # 'digest', 'trend', 'enrichment', 'indexing', 'rag'
+    entity_id = Column(UUID(as_uuid=True), nullable=True)
+    event_type = Column(String(100), nullable=False)  # Тип исходного события
+    payload = Column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
+    error_code = Column(String(100), nullable=True)
+    error_message = Column(Text, nullable=True)
+    stack_trace = Column(Text, nullable=True)
+    retry_count = Column(Integer, nullable=False, server_default=text('0'))
+    max_attempts = Column(Integer, nullable=False, server_default=text('3'))
+    next_retry_at = Column(DateTime(timezone=True), nullable=True)
+    first_seen_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    last_attempt_at = Column(DateTime(timezone=True), nullable=True)
+    status = Column(String(32), nullable=False, server_default=text("'pending'"))  # 'pending', 'reprocessed', 'permanent_failure'
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    
+    # Relationships
+    tenant = relationship("Tenant", backref="dlq_events")
+    
+    __table_args__ = (
+        Index('idx_dlq_events_tenant_status', 'tenant_id', 'status', 'next_retry_at'),
+        Index('idx_dlq_events_entity', 'entity_type', 'entity_id'),
+        Index('idx_dlq_events_status', 'status', 'next_retry_at'),
+        Index('idx_dlq_events_retry_count', 'retry_count', 'max_attempts'),
+    )
+
+
+class OCRDictionary(Base):
+    """Автоматические словари OCR для spell correction.
+    
+    Context7: Реализует автоматическое извлечение терминов из OCR текстов
+    по аналогии с trend_clusters.keywords. Термины извлекаются, категоризируются
+    и обновляются автоматически на основе статистики использования.
+    """
+    __tablename__ = "ocr_dictionaries"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    term = Column(Text, nullable=False)
+    category = Column(Text, nullable=True)  # politics, geography, media, organizations, etc.
+    frequency = Column(Integer, nullable=False, server_default=text("1"))
+    confidence = Column(REAL, nullable=False, server_default=text("0.5"))
+    first_seen_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    last_seen_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    correction_examples = Column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+    
+    __table_args__ = (
+        UniqueConstraint("term", "category", name="uq_ocr_dictionaries_term_category"),
+        Index("idx_ocr_dictionaries_term", "term"),
+        Index("idx_ocr_dictionaries_category", "category"),
+        Index("idx_ocr_dictionaries_frequency", "frequency", postgresql_ops={"frequency": "DESC"}),
+        Index("idx_ocr_dictionaries_last_seen", "last_seen_at", postgresql_ops={"last_seen_at": "DESC"}),
     )

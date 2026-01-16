@@ -5,6 +5,7 @@ Endpoints:
 - GET /api/admin/users/{user_id} - детали пользователя
 - PUT /api/admin/users/{user_id}/tier - изменение tier пользователя
 - PUT /api/admin/users/{user_id}/role - изменение роли пользователя
+- DELETE /api/admin/users/{user_id} - удаление пользователя
 - GET /api/admin/users/{user_id}/subscriptions - подписки пользователя
 - PUT /api/admin/users/{user_id}/subscriptions/{subscription_id} - редактирование подписки
 """
@@ -13,15 +14,17 @@ from fastapi import APIRouter, HTTPException, Depends, Query, Request
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from uuid import UUID
+from datetime import datetime, timezone
 import uuid
 import structlog
 import time
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_, text
 from prometheus_client import Counter, Histogram
-from models.database import get_db, User, Identity, UserChannel, UserGroup, Channel, Group, UserAuditLog
+from models.database import get_db, User, Identity, UserChannel, UserGroup, UserTheme, Channel, Group, UserAuditLog
 from dependencies.auth import get_admin_user, get_current_tenant_id
 from middleware.tracing import get_trace_id
+from api.services.channel_garbage_collector import get_channel_garbage_collector
 
 logger = structlog.get_logger()
 router = APIRouter(prefix="/api/admin", tags=["admin"])
@@ -809,6 +812,216 @@ async def update_user_role(
         raise HTTPException(status_code=500, detail="Failed to update user role")
 
 
+@router.delete("/users/{user_id}")
+async def delete_user(
+    user_id: str,
+    admin_request: Request,
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_db)
+):
+    """Удаление пользователя администратором.
+    
+    Context7: Удаляет пользователя и все связанные данные (UserChannel, UserGroup, UserTheme, UserAuditLog, UserFeedback).
+    Нельзя удалить самого себя.
+    """
+    start_time = time.time()
+    trace_id = get_trace_id(admin_request)
+    tenant_id = str(admin_user.tenant_id)
+    actor_id = str(admin_user.id)
+    
+    # Context7: Детальное логирование входа в эндпоинт
+    logger.info(
+        "delete_user: request started",
+        actor_id=actor_id,
+        target_user_id=user_id,
+        tenant_id=tenant_id,
+        trace_id=trace_id,
+        auth_mode="jwt_admin"
+    )
+    
+    try:
+        user_uuid = uuid.UUID(user_id)
+        
+        # Context7: Проверка - нельзя удалить самого себя
+        if user_uuid == admin_user.id:
+            ADMIN_OPERATIONS_TOTAL.labels(operation="delete_user", status="forbidden", tenant_id=tenant_id).inc()
+            logger.warning(
+                "delete_user: attempt to delete self",
+                actor_id=actor_id,
+                target_user_id=user_id,
+                tenant_id=tenant_id,
+                trace_id=trace_id
+            )
+            raise HTTPException(status_code=403, detail="Cannot delete yourself")
+        
+        # Context7: Получаем пользователя для удаления
+        user = db.query(User).filter(User.id == user_uuid).first()
+        if not user:
+            ADMIN_OPERATIONS_TOTAL.labels(operation="delete_user", status="not_found", tenant_id=tenant_id).inc()
+            logger.warning(
+                "delete_user: user not found",
+                actor_id=actor_id,
+                target_user_id=user_id,
+                tenant_id=tenant_id,
+                trace_id=trace_id
+            )
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        # Context7: Сохраняем информацию для логирования
+        target_telegram_id = user.telegram_id
+        user_tenant_id = str(user.tenant_id) if user.tenant_id else None
+        username = user.username or "N/A"
+        
+        logger.info(
+            "delete_user: user found, deleting",
+            actor_id=actor_id,
+            target_user_id=user_id,
+            target_telegram_id=target_telegram_id,
+            target_username=username,
+            user_tenant_id=user_tenant_id,
+            tenant_id=tenant_id,
+            trace_id=trace_id
+        )
+        
+        # Context7: Подсчитываем связанные записи для статистики
+        channel_subs_count = db.query(UserChannel).filter(UserChannel.user_id == user_uuid).count()
+        group_subs_count = db.query(UserGroup).filter(UserGroup.user_id == user_uuid).count()
+        theme_subs_count = db.query(UserTheme).filter(UserTheme.user_id == user_uuid).count()
+        audit_logs_count = db.query(UserAuditLog).filter(UserAuditLog.user_id == user_uuid).count()
+        
+        logger.info(
+            "delete_user: related records count",
+            actor_id=actor_id,
+            target_user_id=user_id,
+            channel_subs_count=channel_subs_count,
+            group_subs_count=group_subs_count,
+            theme_subs_count=theme_subs_count,
+            audit_logs_count=audit_logs_count,
+            tenant_id=tenant_id,
+            trace_id=trace_id
+        )
+        
+        # Context7: Удаляем пользователя (каскадное удаление через SQLAlchemy relationships)
+        # UserAuditLog и UserFeedback удалятся автоматически через CASCADE в БД
+        # UserTheme удалится автоматически через CASCADE в БД
+        # UserChannel и UserGroup нужно удалить явно, так как нет CASCADE в БД
+        db.query(UserChannel).filter(UserChannel.user_id == user_uuid).delete()
+        db.query(UserGroup).filter(UserGroup.user_id == user_uuid).delete()
+        db.query(UserTheme).filter(UserTheme.user_id == user_uuid).delete()
+        
+        # Context7: Удаляем пользователя
+        db.delete(user)
+        
+        # Context7: Явный flush перед commit для проверки ошибок целостности
+        try:
+            db.flush()
+            logger.debug(
+                "delete_user: flush successful",
+                actor_id=actor_id,
+                target_user_id=user_id,
+                trace_id=trace_id
+            )
+        except Exception as flush_error:
+            logger.error(
+                "delete_user: flush failed",
+                actor_id=actor_id,
+                target_user_id=user_id,
+                error=str(flush_error),
+                error_type=type(flush_error).__name__,
+                tenant_id=tenant_id,
+                trace_id=trace_id
+            )
+            db.rollback()
+            raise HTTPException(status_code=500, detail=f"Database flush failed: {str(flush_error)}")
+        
+        # Context7: Коммит транзакции
+        try:
+            db.commit()
+            logger.debug(
+                "delete_user: commit successful",
+                actor_id=actor_id,
+                target_user_id=user_id,
+                trace_id=trace_id
+            )
+        except Exception as commit_error:
+            logger.error(
+                "delete_user: commit failed",
+                actor_id=actor_id,
+                target_user_id=user_id,
+                error=str(commit_error),
+                error_type=type(commit_error).__name__,
+                tenant_id=tenant_id,
+                trace_id=trace_id
+            )
+            db.rollback()
+            raise HTTPException(status_code=500, detail=f"Database commit failed: {str(commit_error)}")
+        
+        duration = time.time() - start_time
+        ADMIN_OPERATION_DURATION.labels(operation="delete_user", tenant_id=tenant_id).observe(duration)
+        ADMIN_OPERATIONS_TOTAL.labels(operation="delete_user", status="success", tenant_id=tenant_id).inc()
+        
+        # Context7: Детальное логирование успешного удаления
+        logger.info(
+            "delete_user: success",
+            actor_id=actor_id,
+            target_user_id=user_id,
+            target_telegram_id=target_telegram_id,
+            target_username=username,
+            channel_subs_deleted=channel_subs_count,
+            group_subs_deleted=group_subs_count,
+            theme_subs_deleted=theme_subs_count,
+            audit_logs_deleted=audit_logs_count,
+            tenant_id=tenant_id,
+            trace_id=trace_id,
+            duration_ms=duration * 1000
+        )
+        
+        return {
+            "message": "User deleted successfully",
+            "user_id": user_id,
+            "telegram_id": target_telegram_id,
+            "username": username,
+            "deleted_at": datetime.now(timezone.utc).isoformat()
+        }
+        
+    except HTTPException:
+        db.rollback()
+        raise
+    except ValueError as e:
+        # Ошибка парсинга UUID
+        db.rollback()
+        duration = time.time() - start_time
+        ADMIN_OPERATION_DURATION.labels(operation="delete_user", tenant_id=tenant_id).observe(duration)
+        ADMIN_OPERATIONS_TOTAL.labels(operation="delete_user", status="error", tenant_id=tenant_id).inc()
+        
+        logger.error(
+            "delete_user: invalid user_id format",
+            error=str(e),
+            actor_id=actor_id,
+            target_user_id=user_id,
+            tenant_id=tenant_id,
+            trace_id=trace_id
+        )
+        raise HTTPException(status_code=400, detail="Invalid user_id format")
+    except Exception as e:
+        db.rollback()
+        duration = time.time() - start_time
+        ADMIN_OPERATION_DURATION.labels(operation="delete_user", tenant_id=tenant_id).observe(duration)
+        ADMIN_OPERATIONS_TOTAL.labels(operation="delete_user", status="error", tenant_id=tenant_id).inc()
+        
+        logger.error(
+            "Failed to delete user",
+            error=str(e),
+            error_type=type(e).__name__,
+            actor_id=actor_id,
+            target_user_id=user_id,
+            tenant_id=tenant_id,
+            trace_id=trace_id,
+            exc_info=True
+        )
+        raise HTTPException(status_code=500, detail="Failed to delete user")
+
+
 @router.get("/users/{user_id}/subscriptions", response_model=UserSubscriptionsResponse)
 async def get_user_subscriptions(
     user_id: str,
@@ -822,48 +1035,127 @@ async def get_user_subscriptions(
     tenant_id = str(admin_user.tenant_id)
     
     try:
-        user_uuid = uuid.UUID(user_id)
-        user = db.query(User).filter(User.id == user_uuid).first()
+        # Context7: Устанавливаем tenant_id для RLS политик
+        from middleware.rls_middleware import set_tenant_id_in_session
+        set_tenant_id_in_session(db, tenant_id)
+        
+        # Context7: Поддержка поиска по telegram_id или UUID
+        # Определяем, является ли user_id UUID или telegram_id
+        user = None
+        user_uuid = None
+        
+        try:
+            # Пытаемся преобразовать в int - если получилось, это telegram_id
+            telegram_id = int(user_id)
+            user = db.query(User).filter(User.telegram_id == telegram_id).first()
+            if user:
+                user_uuid = user.id
+        except ValueError:
+            # Если не получилось преобразовать в int, считаем что это UUID
+            try:
+                user_uuid = uuid.UUID(user_id)
+                user = db.query(User).filter(User.id == user_uuid).first()
+            except ValueError:
+                # Невалидный формат
+                ADMIN_OPERATIONS_TOTAL.labels(operation="get_user_subscriptions", status="error", tenant_id=tenant_id).inc()
+                raise HTTPException(status_code=400, detail="Invalid user_id format. Expected UUID or telegram_id")
         
         if not user:
             ADMIN_OPERATIONS_TOTAL.labels(operation="get_user_subscriptions", status="not_found", tenant_id=tenant_id).inc()
             raise HTTPException(status_code=404, detail="User not found")
         
+        # Context7: Админ может видеть подписки всех пользователей, независимо от tenant
+        # Устанавливаем tenant_id пользователя для RLS политик, чтобы получить доступ к его данным
+        user_tenant_id = str(user.tenant_id)
+        if user_tenant_id != tenant_id:
+            logger.info(
+                "Admin accessing user from different tenant",
+                admin_id=str(admin_user.id),
+                admin_tenant_id=tenant_id,
+                user_id=user_id,
+                user_tenant_id=user_tenant_id,
+                trace_id=trace_id
+            )
+            # Устанавливаем tenant_id пользователя для RLS
+            set_tenant_id_in_session(db, user_tenant_id)
+        
         # Подписки на каналы
-        channel_subs = db.query(UserChannel, Channel).join(
+        # Context7: Используем outerjoin для обработки случаев, когда канал может быть удален
+        channel_subs = db.query(UserChannel, Channel).outerjoin(
             Channel, UserChannel.channel_id == Channel.id
         ).filter(UserChannel.user_id == user_uuid).all()
         
+        logger.debug(
+            "Found channel subscriptions",
+            user_id=user_id,
+            user_uuid=str(user_uuid),
+            channel_subs_count=len(channel_subs),
+            tenant_id=tenant_id,
+            trace_id=trace_id
+        )
+        
         # Подписки на группы
-        group_subs = db.query(UserGroup, Group).join(
+        # Context7: Используем outerjoin для обработки случаев, когда группа может быть удалена
+        group_subs = db.query(UserGroup, Group).outerjoin(
             Group, UserGroup.group_id == Group.id
         ).filter(UserGroup.user_id == user_uuid).all()
+        
+        logger.debug(
+            "Found group subscriptions",
+            user_id=user_id,
+            user_uuid=str(user_uuid),
+            group_subs_count=len(group_subs),
+            tenant_id=tenant_id,
+            trace_id=trace_id
+        )
         
         subscriptions = []
         
         # Обработка подписок на каналы
         for user_channel, channel in channel_subs:
+            # Context7: Обрабатываем случаи, когда канал может быть None (удален)
+            if channel is None:
+                logger.warning(
+                    "Channel not found for subscription",
+                    user_id=user_id,
+                    channel_id=str(user_channel.channel_id),
+                    tenant_id=tenant_id,
+                    trace_id=trace_id
+                )
+                continue
+            
             subscriptions.append(SubscriptionResponse(
                 id=f"channel_{user_channel.channel_id}",
                 channel_id=str(channel.id),
                 group_id=None,
-                channel_title=channel.title,
+                channel_title=channel.title or "Без названия",
                 group_title=None,
-                subscribed_at=user_channel.subscribed_at.isoformat(),
-                is_active=user_channel.is_active,
+                subscribed_at=user_channel.subscribed_at.isoformat() if user_channel.subscribed_at else datetime.now(timezone.utc).isoformat(),
+                is_active=user_channel.is_active if user_channel.is_active is not None else True,
                 type="channel"
             ))
         
         # Обработка подписок на группы
         for user_group, group in group_subs:
+            # Context7: Обрабатываем случаи, когда группа может быть None (удалена)
+            if group is None:
+                logger.warning(
+                    "Group not found for subscription",
+                    user_id=user_id,
+                    group_id=str(user_group.group_id),
+                    tenant_id=tenant_id,
+                    trace_id=trace_id
+                )
+                continue
+            
             subscriptions.append(SubscriptionResponse(
                 id=f"group_{user_group.group_id}",
                 channel_id=None,
                 group_id=str(group.id),
                 channel_title=None,
-                group_title=group.title,
-                subscribed_at=user_group.subscribed_at.isoformat(),
-                is_active=user_group.is_active,
+                group_title=group.title or "Без названия",
+                subscribed_at=user_group.subscribed_at.isoformat() if user_group.subscribed_at else datetime.now(timezone.utc).isoformat(),
+                is_active=user_group.is_active if user_group.is_active is not None else True,
                 type="group"
             ))
         
@@ -888,6 +1180,21 @@ async def get_user_subscriptions(
         
     except HTTPException:
         raise
+    except ValueError as e:
+        # Ошибка парсинга UUID
+        duration = time.time() - start_time
+        ADMIN_OPERATION_DURATION.labels(operation="get_user_subscriptions", tenant_id=tenant_id).observe(duration)
+        ADMIN_OPERATIONS_TOTAL.labels(operation="get_user_subscriptions", status="error", tenant_id=tenant_id).inc()
+        
+        logger.error(
+            "Invalid user_id format",
+            error=str(e),
+            admin_id=str(admin_user.id),
+            user_id=user_id,
+            tenant_id=tenant_id,
+            trace_id=trace_id
+        )
+        raise HTTPException(status_code=400, detail="Invalid user_id format")
     except Exception as e:
         duration = time.time() - start_time
         ADMIN_OPERATION_DURATION.labels(operation="get_user_subscriptions", tenant_id=tenant_id).observe(duration)
@@ -896,10 +1203,12 @@ async def get_user_subscriptions(
         logger.error(
             "Failed to get user subscriptions",
             error=str(e),
+            error_type=type(e).__name__,
             admin_id=str(admin_user.id),
             user_id=user_id,
             tenant_id=tenant_id,
-            trace_id=trace_id
+            trace_id=trace_id,
+            exc_info=True
         )
         raise HTTPException(status_code=500, detail="Failed to get user subscriptions")
 
@@ -1033,4 +1342,79 @@ async def update_subscription(
             trace_id=trace_id
         )
         raise HTTPException(status_code=500, detail="Failed to update subscription")
+
+
+@router.post("/channels/garbage-collect")
+async def garbage_collect_channels(
+    dry_run: bool = Query(False, description="Dry run mode - only count, don't deactivate"),
+    batch_size: int = Query(1000, ge=1, le=10000, description="Batch size for processing"),
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(get_admin_user),
+    trace_id: str = Depends(get_trace_id)
+):
+    """
+    Garbage collection для неиспользуемых каналов.
+    
+    Context7: Находит каналы без активных подписок и помечает их как is_active=false.
+    Только для администраторов.
+    
+    Args:
+        dry_run: Если True, только подсчитывает каналы без изменений
+        batch_size: Размер батча для обработки
+        db: SQLAlchemy сессия
+        admin_user: Текущий администратор
+        trace_id: ID трейса для логирования
+    
+    Returns:
+        Статистика очистки
+    """
+    start_time = time.time()
+    tenant_id = str(admin_user.tenant_id) if admin_user.tenant_id else "unknown"
+    
+    logger.info(
+        "Starting channel garbage collection",
+        admin_id=str(admin_user.id),
+        tenant_id=tenant_id,
+        dry_run=dry_run,
+        batch_size=batch_size,
+        trace_id=trace_id
+    )
+    
+    try:
+        collector = get_channel_garbage_collector()
+        result = collector.collect_unused_channels(
+            db=db,
+            batch_size=batch_size,
+            dry_run=dry_run
+        )
+        
+        duration = time.time() - start_time
+        ADMIN_OPERATION_DURATION.labels(operation="garbage_collect_channels", tenant_id=tenant_id).observe(duration)
+        ADMIN_OPERATIONS_TOTAL.labels(operation="garbage_collect_channels", status="success", tenant_id=tenant_id).inc()
+        
+        logger.info(
+            "Channel garbage collection completed",
+            admin_id=str(admin_user.id),
+            tenant_id=tenant_id,
+            result=result,
+            duration=duration,
+            trace_id=trace_id
+        )
+        
+        return result
+        
+    except Exception as e:
+        duration = time.time() - start_time
+        ADMIN_OPERATION_DURATION.labels(operation="garbage_collect_channels", tenant_id=tenant_id).observe(duration)
+        ADMIN_OPERATIONS_TOTAL.labels(operation="garbage_collect_channels", status="error", tenant_id=tenant_id).inc()
+        
+        logger.error(
+            "Failed to garbage collect channels",
+            error=str(e),
+            admin_id=str(admin_user.id),
+            tenant_id=tenant_id,
+            trace_id=trace_id,
+            exc_info=True
+        )
+        raise HTTPException(status_code=500, detail="Failed to garbage collect channels")
 

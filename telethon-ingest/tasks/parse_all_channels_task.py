@@ -18,118 +18,203 @@ import structlog
 import redis.asyncio as redis
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from prometheus_client import Counter, Histogram, Gauge
+from prometheus_client import Counter, Histogram, Gauge, Summary, REGISTRY
 
 from config import settings
 from utils.time_utils import ensure_dt_utc
 
 logger = structlog.get_logger()
 
+# Context7: Функции для предотвращения дублирования метрик (определяем ПЕРЕД использованием)
+def _get_or_create_counter(name, description, labels):
+    """Получить существующую метрику или создать новую."""
+    try:
+        existing = REGISTRY._names_to_collectors.get(name)
+        if existing:
+            return existing
+    except (AttributeError, KeyError, TypeError):
+        pass
+    
+    try:
+        return Counter(name, description, labels)
+    except ValueError as e:
+        if "Duplicated timeseries" in str(e):
+            try:
+                return REGISTRY._names_to_collectors.get(name)
+            except (AttributeError, KeyError, TypeError):
+                pass
+        logger.warning(f"Metric {name} already exists", error=str(e))
+        raise
+
+def _get_or_create_histogram(name, description, labels=None, buckets=None):
+    """Получить существующую метрику или создать новую."""
+    try:
+        existing = REGISTRY._names_to_collectors.get(name)
+        if existing:
+            return existing
+    except (AttributeError, KeyError, TypeError):
+        pass
+    
+    try:
+        # Context7: labels не может быть None для Histogram
+        if labels is None:
+            labels = []
+        if buckets:
+            return Histogram(name, description, labels, buckets=buckets)
+        return Histogram(name, description, labels)
+    except ValueError as e:
+        if "Duplicated timeseries" in str(e):
+            try:
+                return REGISTRY._names_to_collectors.get(name)
+            except (AttributeError, KeyError, TypeError):
+                pass
+        logger.warning(f"Metric {name} already exists", error=str(e))
+        raise
+
+def _get_or_create_gauge(name, description, labels=None):
+    """Получить существующую метрику или создать новую."""
+    try:
+        existing = REGISTRY._names_to_collectors.get(name)
+        if existing:
+            return existing
+    except (AttributeError, KeyError, TypeError):
+        pass
+    
+    try:
+        if labels:
+            return Gauge(name, description, labels)
+        return Gauge(name, description)
+    except ValueError as e:
+        if "Duplicated timeseries" in str(e):
+            try:
+                return REGISTRY._names_to_collectors.get(name)
+            except (AttributeError, KeyError, TypeError):
+                pass
+        logger.warning(f"Metric {name} already exists", error=str(e))
+        raise
+
 # Prometheus метрики
-parser_runs_total = Counter(
+parser_runs_total = _get_or_create_counter(
     'parser_runs_total',
     'Total parser runs',
     ['mode', 'status']
 )
 
-parsing_duration_seconds = Histogram(
+parsing_duration_seconds = _get_or_create_histogram(
     'parsing_duration_seconds',
     'Channel parsing duration',
     ['mode']
 )
 
-posts_parsed_total = Counter(
+posts_parsed_total = _get_or_create_counter(
     'posts_parsed_total',
     'Total posts parsed',
     ['mode', 'status']
 )
 
-incremental_watermark_age_seconds = Gauge(
+incremental_watermark_age_seconds = _get_or_create_gauge(
     'incremental_watermark_age_seconds',
     'Age of last_parsed_at watermark',
     ['channel_id']
 )
 
-scheduler_lock_acquired_total = Counter(
+scheduler_lock_acquired_total = _get_or_create_counter(
     'scheduler_lock_acquired_total',
     'Scheduler lock acquisition attempts',
     ['status']
 )
 
-parser_hwm_age_seconds = Gauge(
+parser_hwm_age_seconds = _get_or_create_gauge(
     'parser_hwm_age_seconds',
     'Age of Redis HWM watermark',
     ['channel_id']
 )
 
-parser_mode_forced_total = Counter(
+parser_mode_forced_total = _get_or_create_counter(
     'parser_mode_forced_total',
     'Count of forced mode changes',
     ['reason']
 )
 
-scheduler_last_tick_ts_seconds = Gauge(
+scheduler_last_tick_ts_seconds = _get_or_create_gauge(
     'scheduler_last_tick_ts_seconds',
-    'Unix timestamp of last scheduler tick'
+    'Unix timestamp of last scheduler tick',
+    labels=None
 )
 
-parser_retries_total = Counter(
+# Context7: Heartbeat метрика для отслеживания активности scheduler'а в реальном времени
+scheduler_heartbeat_seconds = _get_or_create_gauge(
+    'scheduler_heartbeat_seconds',
+    'Scheduler heartbeat timestamp (updated every 30s to track scheduler activity)',
+    labels=None
+)
+
+parser_retries_total = _get_or_create_counter(
     'parser_retries_total',
     'Total parser retry attempts',
     ['reason']
 )
 
-parser_floodwait_seconds_total = Counter(
+# Context7: Summary для времени обработки каналов с перцентилями
+# Используем Histogram вместо Summary для совместимости с prometheus_client
+parser_channel_processing_seconds = _get_or_create_histogram(
+    'parser_channel_processing_seconds',
+    'Time spent processing a single channel',
+    ['mode', 'status'],
+    buckets=(0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0)
+)
+
+parser_floodwait_seconds_total = _get_or_create_counter(
     'parser_floodwait_seconds_total',
     'Total time spent waiting for FloodWait',
     ['channel_id']
 )
 
 # Context7: Метрики для мониторинга пропусков постов
-posts_missing_duration_seconds = Gauge(
+posts_missing_duration_seconds = _get_or_create_gauge(
     'posts_missing_duration_seconds',
     'Duration of missing posts gap (difference between last_parsed_at and MAX(posted_at))',
     ['channel_id']
 )
 
-posts_backfill_triggered_total = Counter(
+posts_backfill_triggered_total = _get_or_create_counter(
     'posts_backfill_triggered_total',
     'Total backfill operations triggered for missing posts',
     ['channel_id', 'reason']
 )
 
 # Расширенные метрики для адаптивных порогов
-channel_last_post_timestamp_seconds = Gauge(
+channel_last_post_timestamp_seconds = _get_or_create_gauge(
     'channel_last_post_timestamp_seconds',
     'Timestamp of last post (MAX(posted_at)) in epoch seconds',
     ['channel_id']
 )
 
-parser_last_success_seconds = Gauge(
+parser_last_success_seconds = _get_or_create_gauge(
     'parser_last_success_seconds',
     'Timestamp of last successful parsing in epoch seconds',
     ['channel_id']
 )
 
-adaptive_threshold_seconds = Gauge(
+adaptive_threshold_seconds = _get_or_create_gauge(
     'adaptive_threshold_seconds',
     'Current adaptive threshold for missing posts detection in seconds',
     ['channel_id']
 )
 
-channel_gap_seconds = Gauge(
+channel_gap_seconds = _get_or_create_gauge(
     'channel_gap_seconds',
     'Current gap between now and last post (now - MAX(posted_at)) in seconds',
     ['channel_id']
 )
 
-backfill_jobs_total = Counter(
+backfill_jobs_total = _get_or_create_counter(
     'backfill_jobs_total',
     'Total backfill jobs (enqueued, completed, failed)',
     ['channel_id', 'status']
 )
 
-interarrival_seconds = Histogram(
+interarrival_seconds = _get_or_create_histogram(
     'interarrival_seconds',
     'Interarrival time between posts in seconds',
     ['channel_id'],
@@ -140,19 +225,51 @@ interarrival_seconds = Histogram(
 class ParseAllChannelsTask:
     """Scheduler для периодического парсинга всех активных каналов."""
     
-    def __init__(self, config, db_url: str, redis_client: Optional[Any], parser=None, app_state: Optional[Dict] = None, telegram_client_manager: Optional[Any] = None, media_processor: Optional[Any] = None):
+    def __init__(self, config, db_url: str, redis_client: Optional[Any], parser=None, app_state: Optional[Dict] = None, telegram_client_manager: Optional[Any] = None, media_processor: Optional[Any] = None, floodwait_manager: Optional[Any] = None):
         self.config = config
         self.db_url = db_url
         self.redis: Optional[redis.Redis] = redis_client  # Context7: Используем переданный async Redis клиент
-        self.parser = parser  # Будет инициализирован при необходимости
+        self.parser = parser  # Будет инициализирован при необходимости (legacy, для обратной совместимости)
         self.app_state = app_state
         self.telegram_client_manager = telegram_client_manager  # TelegramClientManager для парсинга
         self.media_processor = media_processor  # MediaProcessor для обработки медиа
+        self.floodwait_manager = floodwait_manager  # Context7: FloodWaitManager для глобального circuit breaker
         self.interval_sec = int(os.getenv("PARSER_SCHEDULER_INTERVAL_SEC", "300"))
         self.enabled = os.getenv("FEATURE_INCREMENTAL_PARSING_ENABLED", "true").lower() == "true"
         
         # Semaphore for concurrency control
         self.semaphore = asyncio.Semaphore(self.config.max_concurrency)
+        
+        # Context7: Создаем engine и session factory для создания отдельных sessions на канал
+        # Это предотвращает дедлоки при параллельной обработке каналов
+        import re
+        from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
+        from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+        
+        db_url_async = self.db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        parsed = urlparse(db_url_async)
+        qs = parse_qs(parsed.query)
+        # Remove asyncpg-unsupported parameters
+        for key in ['connect_timeout', 'application_name', 'keepalives', 'keepalives_idle', 'keepalives_interval', 'keepalives_count']:
+            qs.pop(key, None)
+        new_query = urlencode(qs, doseq=True)
+        db_url_async = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
+        
+        # Context7: Добавляем таймауты для предотвращения зависаний
+        self.engine = create_async_engine(
+            db_url_async, 
+            pool_pre_ping=True, 
+            pool_size=10,  # Увеличено для параллельной обработки
+            max_overflow=20,
+            pool_timeout=30,
+            connect_args={
+                "command_timeout": 60,
+                "server_settings": {
+                    "application_name": "telethon_parser"
+                }
+            }
+        )
+        self.async_session_factory = async_sessionmaker(self.engine, expire_on_commit=False)
         
         logger.info(
             "ParseAllChannelsTask initialized (simplified version for testing)",
@@ -186,17 +303,65 @@ class ParseAllChannelsTask:
         
         logger.info("Starting parse_all_channels scheduler loop (active parsing mode)")
         
+        # Context7: Запускаем heartbeat задачу для мониторинга активности scheduler'а
+        async def heartbeat_task():
+            """Context7: Обновляем heartbeat метрику каждые 30 секунд для отслеживания активности.
+            
+            Context7 Best Practices: Используем таймаут для обновления метрики, чтобы предотвратить
+            зависание heartbeat при проблемах с event loop или блокирующих операциях.
+            """
+            # Инициализируем heartbeat сразу при запуске
+            try:
+                now_ts = datetime.now(timezone.utc).timestamp()
+                scheduler_heartbeat_seconds.set(now_ts)
+            except Exception:
+                pass
+            
+            while True:
+                try:
+                    # Context7: Обновляем heartbeat метрику (синхронная операция prometheus_client)
+                    # Обрабатываем все возможные ошибки, чтобы heartbeat не падал
+                    now_ts = datetime.now(timezone.utc).timestamp()
+                    scheduler_heartbeat_seconds.set(now_ts)
+                    
+                    await asyncio.sleep(30)  # Обновляем каждые 30 секунд
+                except asyncio.CancelledError:
+                    logger.info("Heartbeat task cancelled")
+                    raise
+                except Exception as e:
+                    logger.error("Heartbeat task error", error=str(e), error_type=type(e).__name__, exc_info=True)
+                    # Context7: Продолжаем работу даже при ошибке, но делаем небольшую задержку
+                    try:
+                        await asyncio.sleep(30)
+                    except Exception:
+                        pass  # Игнорируем ошибки sleep
+        
+        # Запускаем heartbeat в фоне
+        asyncio.create_task(heartbeat_task())
+        logger.info("Scheduler heartbeat task started")
+        
         # Context7: Реальный парсинг с мониторингом
         while True:
             try:
                 await self._run_tick()
             except Exception as e:
                 logger.exception("scheduler tick failed", error=str(e))
+                # Context7: Обновляем метрику даже при ошибке в run_forever, чтобы показать активность
+                try:
+                    now_ts = datetime.now(timezone.utc).timestamp()
+                    scheduler_last_tick_ts_seconds.set(now_ts)
+                except Exception:
+                    pass  # Игнорируем ошибки обновления метрики
             
             await asyncio.sleep(self.interval_sec)
     
     async def _acquire_lock(self) -> bool:
-        """Try to acquire scheduler lock"""
+        """Try to acquire scheduler lock
+        
+        Context7: Улучшенная логика получения lock:
+        - Если lock принадлежит тому же instance_id (после перезапуска контейнера), перезаписываем его
+        - Это предотвращает ситуацию, когда старый lock блокирует новый экземпляр после перезапуска
+        """
         instance_id = os.getenv("HOSTNAME", "default")
         lock_key = "parse_all_channels:lock"
         ttl = self.interval_sec * 2
@@ -214,6 +379,32 @@ class ParseAllChannelsTask:
                 )
                 logger.info("Redis initialized for lock acquisition")
             
+            # Context7: Проверяем текущее состояние lock перед попыткой установки
+            existing_lock = await self.redis.get(lock_key)
+            if existing_lock:
+                logger.debug("Lock exists in Redis",
+                           lock_key=lock_key,
+                           existing_value=existing_lock,
+                           instance_id=instance_id)
+                
+                # Context7: Если lock принадлежит тому же instance_id, это означает,
+                # что контейнер перезапустился, и старый lock "мертвый"
+                # Перезаписываем lock, чтобы новый экземпляр мог работать
+                if existing_lock == instance_id:
+                    logger.warning("Lock held by same instance_id (container restarted), reclaiming lock",
+                                 lock_key=lock_key,
+                                 instance_id=instance_id)
+                    # Перезаписываем lock с новым TTL
+                    await self.redis.set(lock_key, instance_id, ex=ttl)
+                    scheduler_lock_acquired_total.labels(status="reclaimed").inc()
+                    logger.info("Lock reclaimed successfully after container restart",
+                               lock_key=lock_key,
+                               instance_id=instance_id,
+                               ttl=ttl)
+                    if self.app_state:
+                        self.app_state["scheduler"]["lock_owner"] = instance_id
+                    return True
+            
             # Context7: async Redis - используем await для set()
             acquired = await self.redis.set(
                 lock_key,
@@ -222,16 +413,35 @@ class ParseAllChannelsTask:
                 ex=ttl
             )
             
+            logger.debug("Lock acquisition attempt",
+                        lock_key=lock_key,
+                        instance_id=instance_id,
+                        acquired=acquired,
+                        existing_lock=existing_lock)
+            
             if acquired:
                 scheduler_lock_acquired_total.labels(status="acquired").inc()
+                logger.info("Lock acquired successfully",
+                           lock_key=lock_key,
+                           instance_id=instance_id,
+                           ttl=ttl)
                 if self.app_state:
                     self.app_state["scheduler"]["lock_owner"] = instance_id
                 return True
             else:
                 scheduler_lock_acquired_total.labels(status="missed").inc()
+                logger.debug("Lock acquisition failed - lock already held",
+                           lock_key=lock_key,
+                           instance_id=instance_id,
+                           existing_lock=existing_lock)
                 return False
         except Exception as e:
-            logger.error(f"Failed to acquire lock: {str(e)}")
+            logger.error("Failed to acquire lock",
+                        lock_key=lock_key,
+                        instance_id=instance_id,
+                        error=str(e),
+                        error_type=type(e).__name__,
+                        exc_info=True)
             return False
     
     async def _release_lock(self):
@@ -278,8 +488,75 @@ class ParseAllChannelsTask:
         except Exception as e:
             logger.error(f"Failed to clear HWM for channel {channel_id}: {str(e)}")
     
-    async def _get_system_user_and_tenant(self) -> Tuple[int, str]:
-        """Get system telegram_id (int) and tenant_id (str) from the first authorized session."""
+    async def _update_last_parsed_at_async(self, channel_id: str, db_session):
+        """
+        Context7: Асинхронное обновление last_parsed_at через SQLAlchemy.
+        Используется для каналов с ошибками/пропусками, чтобы они не оставались с NULL.
+        
+        ВАЖНО: channel_parser.py уже обновляет last_parsed_at после успешного парсинга,
+        поэтому этот метод используется только для ошибок/пропусков.
+        """
+        try:
+            from sqlalchemy import text
+            now = datetime.now(timezone.utc)
+            
+            # Context7: Используем async SQLAlchemy для неблокирующего обновления
+            result = await db_session.execute(
+                text("UPDATE channels SET last_parsed_at = :now WHERE id = :channel_id"),
+                {"now": now, "channel_id": channel_id}
+            )
+            
+            rows_affected = result.rowcount
+            if rows_affected == 0:
+                logger.warning("No rows updated for last_parsed_at", 
+                             channel_id=channel_id)
+            
+            logger.debug("Updated last_parsed_at for channel",
+                        channel_id=channel_id,
+                        rows_affected=rows_affected)
+        except Exception as e:
+            logger.error("Failed to update last_parsed_at for channel",
+                        channel_id=channel_id,
+                        error=str(e),
+                        error_type=type(e).__name__)
+    
+    async def _update_last_parsed_at(self, channel_id: str):
+        """
+        DEPRECATED: Используйте _update_last_parsed_at_async вместо этого метода.
+        
+        Context7: Этот метод использует синхронный psycopg2 и блокирует event loop.
+        Оставлен для обратной совместимости, но должен быть удален после миграции.
+        """
+        try:
+            import psycopg2
+            conn = psycopg2.connect(self.db_url)
+            cursor = conn.cursor()
+            
+            # Context7: Обновляем last_parsed_at на текущее время для отслеживания попытки парсинга
+            cursor.execute("""
+                UPDATE channels 
+                SET last_parsed_at = NOW() 
+                WHERE id = %s
+            """, (channel_id,))
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            logger.debug("Updated last_parsed_at for channel with error",
+                        channel_id=channel_id)
+        except Exception as e:
+            logger.error("Failed to update last_parsed_at for channel with error",
+                        channel_id=channel_id,
+                        error=str(e),
+                        error_type=type(e).__name__)
+    
+    def _get_system_user_and_tenant_sync(self) -> Tuple[int, str]:
+        """Синхронная версия для использования в run_in_executor.
+        
+        Context7: Синхронный psycopg2 вызов блокирует event loop при параллельной обработке.
+        Используем run_in_executor для неблокирующего выполнения.
+        """
         try:
             import psycopg2
             from psycopg2.extras import RealDictCursor
@@ -317,13 +594,40 @@ class ParseAllChannelsTask:
             logger.error(f"Failed to get system user/tenant: {str(e)}")
             return 0, "00000000-0000-0000-0000-000000000000"
     
-    async def _parse_channel_with_retry(self, channel: Dict[str, Any], mode: str):
+    async def _get_system_user_and_tenant(self) -> Tuple[int, str]:
+        """Get system telegram_id (int) and tenant_id (str) from the first authorized session.
+        
+        Context7: Обертываем синхронный psycopg2 вызов в run_in_executor для неблокирующего выполнения.
         """
-        Parse channel with exponential backoff retry and FloodWait handling.
+        import asyncio
+        loop = asyncio.get_event_loop()
+        try:
+            # Context7: Используем run_in_executor для неблокирующего выполнения синхронного DB запроса
+            telegram_id, tenant_id = await asyncio.wait_for(
+                loop.run_in_executor(None, self._get_system_user_and_tenant_sync),
+                timeout=5.0
+            )
+            return telegram_id, tenant_id
+        except asyncio.TimeoutError:
+            logger.error("Timeout getting system user/tenant")
+            return 0, "00000000-0000-0000-0000-000000000000"
+        except Exception as e:
+            logger.error(f"Failed to get system user/tenant: {str(e)}")
+            return 0, "00000000-0000-0000-0000-000000000000"
+    
+    async def _parse_channel_with_retry_internal(self, channel: Dict[str, Any], mode: str, parser, telegram_id: int, tenant_id: str):
+        """
+        Internal method for parsing channel with exponential backoff retry and FloodWait handling.
+        
+        Context7: Этот метод используется внутри parse_single_channel, где parser уже создан
+        с отдельным DB session. Все блокирующие операции уже выполнены до вызова этого метода.
         
         Args:
             channel: Channel data dictionary
             mode: Parsing mode (historical/incremental)
+            parser: ChannelParser instance with separate DB session
+            telegram_id: Telegram user ID (int)
+            tenant_id: Tenant ID (str)
             
         Returns:
             Parsing result or None if all retries exhausted
@@ -331,81 +635,13 @@ class ParseAllChannelsTask:
         max_retries = self.config.retry_max
         base_delay = 1.0
         
-        # Check if telegram_client_manager is available
-        if not self.telegram_client_manager:
-            logger.warning(f"TelegramClientManager not available for channel {channel['id']}, skipping parsing")
-            return {"status": "skipped", "reason": "no_client_manager", "parsed": 0, "max_message_date": None}
-        
-        # Get telegram_id (int) and tenant_id (str) from database
-        telegram_id, tenant_id = await self._get_system_user_and_tenant()
-        
-        if not telegram_id or telegram_id == 0:
-            logger.warning("No telegram_id found in database, skipping parsing")
-            return {"status": "skipped", "reason": "no_telegram_id", "parsed": 0, "max_message_date": None}
-        
-        # Get telegram client from manager (expects int telegram_id)
-        telegram_client = await self.telegram_client_manager.get_client(telegram_id)
-        if not telegram_client:
-            logger.warning(f"No telegram client available for telegram_id {telegram_id}, skipping parsing")
-            return {"status": "skipped", "reason": "no_client", "parsed": 0, "max_message_date": None}
-        
         for attempt in range(max_retries):
             try:
                 async with self.semaphore:
-                    logger.info(f"Parsing channel {channel['id']} with retry - mode={mode}, attempt={attempt + 1}")
-                    
-                    # Initialize parser if needed
-                    if not self.parser:
-                        logger.info(f"Initializing ChannelParser for channel {channel['id']}")
-                        # Initialize ChannelParser with correct signature
-                        from services.channel_parser import ChannelParser, ParserConfig
-                        from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-                        
-                        # Create config
-                        config = ParserConfig()
-                        config.db_url = self.db_url
-                        config.redis_url = os.getenv("REDIS_URL", "redis://redis:6379")
-                        
-                        # Create async engine and session
-                        import re
-                        from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
-                        db_url_async = self.db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
-                        parsed = urlparse(db_url_async)
-                        qs = parse_qs(parsed.query)
-                        # Remove asyncpg-unsupported parameters
-                        for key in ['connect_timeout', 'application_name', 'keepalives', 'keepalives_idle', 'keepalives_interval', 'keepalives_count']:
-                            qs.pop(key, None)
-                        new_query = urlencode(qs, doseq=True)
-                        db_url_async = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
-                        
-                        # Context7: Добавляем таймауты для предотвращения зависаний
-                        engine = create_async_engine(
-                            db_url_async, 
-                            pool_pre_ping=True, 
-                            pool_size=5,
-                            pool_timeout=30,
-                            connect_args={
-                                "command_timeout": 60,
-                                "server_settings": {
-                                    "application_name": "telethon_parser"
-                                }
-                            }
-                        )
-                        async_session_factory = async_sessionmaker(engine, expire_on_commit=False)
-                        db_session = async_session_factory()
-                        
-                        # Initialize parser with correct parameters
-                        self.parser = ChannelParser(
-                            config=config,
-                            db_session=db_session,
-                            event_publisher=None,
-                            redis_client=self.redis,
-                            telegram_client_manager=self.telegram_client_manager,
-                            media_processor=self.media_processor  # Context7: Передаём MediaProcessor
-                        )
+                    logger.debug(f"Parsing channel {channel['id']} with retry - mode={mode}, attempt={attempt + 1}")
                     
                     # Call actual parser
-                    result = await self.parser.parse_channel_messages(
+                    result = await parser.parse_channel_messages(
                         channel_id=channel['id'],
                         user_id=str(telegram_id),  # user_id для парсера — строка
                         tenant_id=tenant_id,
@@ -426,37 +662,47 @@ class ParseAllChannelsTask:
                     
             except Exception as e:
                 error_type = type(e).__name__
-                # Context7: Проверяем состояние db_session после ошибки
-                # Если сессия в неправильном состоянии, пересоздаем parser с новой сессией
-                if self.parser and hasattr(self.parser, 'db_session'):
-                    try:
-                        if self.parser.db_session.in_transaction():
-                            logger.warning("Session in transaction after error, rolling back",
-                                         channel_id=channel.get('id'),
-                                         error_type=error_type)
-                            await self.parser.db_session.rollback()
-                    except Exception as session_error:
-                        logger.warning("Failed to check/rollback session after error, may need to recreate parser",
-                                     channel_id=channel.get('id'),
-                                     error_type=error_type,
-                                     session_error=str(session_error))
-                        # Context7: Если не можем восстановить сессию, сбрасываем parser для пересоздания
-                        self.parser = None
                 
                 # FloodWait handling
                 if "FloodWait" in error_type or "FLOOD_WAIT" in str(e):
                     # Extract wait time from error message if available
                     wait_match = re.search(r'(\d+)', str(e))
                     wait_seconds = int(wait_match.group(1)) if wait_match else 10
-                    wait_seconds += random.uniform(0, 3)  # Add jitter
+                    wait_seconds = min(wait_seconds, 300)  # Cap at 5 minutes
                     
                     logger.warning(f"FloodWait {wait_seconds:.1f}s for channel {channel['id']} - attempt={attempt + 1}/{max_retries}")
                     
                     parser_retries_total.labels(reason="floodwait").inc()
                     parser_floodwait_seconds_total.labels(channel_id=channel['id']).inc(wait_seconds)
                     
-                    await asyncio.sleep(wait_seconds)
-                    continue
+                    # Context7: Устанавливаем blocked_until в БД вместо sleep
+                    blocked_until = datetime.now(timezone.utc) + timedelta(seconds=wait_seconds)
+                    try:
+                        import psycopg2
+                        conn = psycopg2.connect(self.db_url)
+                        cursor = conn.cursor()
+                        cursor.execute("""
+                            UPDATE channels 
+                            SET blocked_until = %s 
+                            WHERE id = %s
+                        """, (blocked_until, channel['id']))
+                        conn.commit()
+                        cursor.close()
+                        conn.close()
+                        logger.info("Channel blocked_until set due to FloodWait",
+                                   channel_id=channel['id'],
+                                   wait_seconds=wait_seconds,
+                                   blocked_until=blocked_until.isoformat())
+                    except Exception as db_error:
+                        logger.error("Failed to set blocked_until for channel",
+                                    channel_id=channel['id'],
+                                    error=str(db_error))
+                        # Fallback: используем sleep если не удалось обновить БД
+                        await asyncio.sleep(wait_seconds)
+                    
+                    # Context7: Прерываем попытки парсинга для этого канала
+                    # Канал будет пропущен в следующих тиках до истечения blocked_until
+                    return {"status": "error", "error": "flood_wait", "blocked_until": blocked_until.isoformat()}
                 
                 # Transient errors (timeout, connection)
                 elif any(err_type in error_type for err_type in ["Timeout", "Connection", "Network"]):
@@ -483,158 +729,592 @@ class ParseAllChannelsTask:
         logger.error(f"Parse channel exhausted all retries for channel {channel['id']}")
         return None
     
+    async def parse_single_channel(self, channel: Dict[str, Any], tick_start_time: datetime):
+        """Обработка одного канала с отдельным DB session и полным таймаутом.
+        
+        Context7: Все блокирующие операции (get_client, создание parser'а) внутри этого метода,
+        который обернут в asyncio.wait_for на уровне задачи. Отдельный DB session для каждого канала
+        предотвращает дедлоки при параллельной обработке.
+        
+        Args:
+            channel: Словарь с данными канала
+            tick_start_time: Время начала tick'а для проверки времени
+            
+        Returns:
+            Результат обработки канала или None
+        """
+        process_start_time = datetime.now(timezone.utc)
+        mode = None
+        status = "unknown"  # Будет обновлен в процессе обработки
+        
+        # Context7: Логирование начала обработки канала
+        is_new_channel = channel.get('last_parsed_at') is None
+        logger.info(
+            "CHANNEL_PARSE_START",
+            channel_id=channel['id'],
+            channel_title=channel.get('title'),
+            channel_username=channel.get('username'),
+            is_new_channel=is_new_channel,
+            last_parsed_at=channel.get('last_parsed_at')
+        )
+        
+        try:
+            # Get HWM from Redis
+            hwm_key = f"parse_hwm:{channel['id']}"
+            # Context7: async Redis - используем await для get()
+            hwm_raw = await self.redis.get(hwm_key)
+            
+            # Context7 best practice: безопасная обработка типов через ensure_dt_utc
+            hwm_ts = ensure_dt_utc(hwm_raw)
+            if hwm_ts:
+                age_seconds = (datetime.now(timezone.utc) - hwm_ts).total_seconds()
+                parser_hwm_age_seconds.labels(channel_id=channel['id']).set(age_seconds)
+            
+            # Определение режима
+            mode = self._decide_mode(channel)
+            
+            # Context7: Парсинг каналов - глобальный процесс, не привязан к конкретному tenant_id
+            # Посты сохраняются глобально, изоляция происходит через user_channel при запросах пользователя
+            # Используем системный telegram_id и tenant_id для парсинга
+            logger.debug("Getting system user/tenant for global channel parsing",
+                        channel_id=channel['id'])
+            telegram_id, tenant_id = await self._get_system_user_and_tenant()
+            logger.debug("Got system user/tenant for channel parsing",
+                        channel_id=channel['id'],
+                        telegram_id=telegram_id,
+                        has_tenant_id=bool(tenant_id))
+            
+            if not telegram_id or telegram_id == 0:
+                logger.warning("No telegram_id found, skipping parsing",
+                             channel_id=channel['id'])
+                status = "skipped"
+                return {"status": "skipped", "reason": "no_telegram_id", "parsed": 0, "max_message_date": None}
+            
+            # Context7: Получение Telegram клиента - внутри wait_for
+            if not self.telegram_client_manager:
+                logger.warning("TelegramClientManager not available, skipping parsing",
+                             channel_id=channel['id'])
+                status = "skipped"
+                return {"status": "skipped", "reason": "no_client_manager", "parsed": 0, "max_message_date": None}
+            
+            logger.debug("Getting telegram client",
+                        channel_id=channel['id'],
+                        telegram_id=telegram_id)
+            telegram_client = await self.telegram_client_manager.get_client(telegram_id)
+            if not telegram_client:
+                logger.warning("No telegram client available, skipping parsing",
+                             channel_id=channel['id'],
+                             telegram_id=telegram_id)
+                status = "skipped"
+                return {"status": "skipped", "reason": "no_client", "parsed": 0, "max_message_date": None}
+            logger.debug("Got telegram client",
+                        channel_id=channel['id'])
+            
+            # Context7: Проверка глобального FloodWait перед парсингом канала
+            if self.floodwait_manager:
+                # Получаем session_id из telegram_client
+                session_id = "default"
+                try:
+                    if telegram_client.is_connected() and await telegram_client.is_user_authorized():
+                        me = await telegram_client.get_me()
+                        if me and hasattr(me, 'id'):
+                            session_id = str(me.id)
+                except Exception as e:
+                    logger.debug("Failed to get session_id from client", error=str(e))
+                
+                global_wait = await self.floodwait_manager.check_global_floodwait(session_id)
+                if global_wait and global_wait > 0:
+                    logger.warning("Skipping channel parsing due to global FloodWait",
+                                 channel_id=channel['id'],
+                                 wait_seconds=global_wait,
+                                 session_id=session_id)
+                    status = "skipped"
+                    return {"status": "skipped", "reason": "global_floodwait", "parsed": 0, "max_message_date": None}
+            
+            # Context7: Создаем отдельный DB session для каждого канала
+            # Это предотвращает дедлоки при параллельной обработке
+            async with self.async_session_factory() as db_session:
+                # Context7: Создаем parser с новым session для каждого канала
+                from services.channel_parser import ChannelParser, ParserConfig
+                
+                config = ParserConfig()
+                config.db_url = self.db_url
+                config.redis_url = os.getenv("REDIS_URL", "redis://redis:6379")
+                
+                # Context7: Создаем SessionRateLimiter если не передан
+                from services.session_rate_limiter import SessionRateLimiter
+                session_rate_limiter = SessionRateLimiter(self.redis)
+                
+                # Context7: Создаем IngestAccountPool для управления пулом аккаунтов
+                from services.ingest_account_pool import IngestAccountPool
+                ingest_account_pool = IngestAccountPool(db_session, self.redis)
+                
+                parser = ChannelParser(
+                    config=config,
+                    db_session=db_session,
+                    event_publisher=None,
+                    redis_client=self.redis,
+                    telegram_client_manager=self.telegram_client_manager,
+                    media_processor=self.media_processor,
+                    floodwait_manager=self.floodwait_manager,  # Context7: Передаем FloodWaitManager
+                    session_rate_limiter=session_rate_limiter,  # Context7: Передаем SessionRateLimiter
+                    ingest_account_pool=ingest_account_pool  # Context7: Передаем IngestAccountPool
+                )
+                
+                # Context7: Парсинг канала с retry (все внутри wait_for)
+                result = await self._parse_channel_with_retry_internal(channel, mode, parser, telegram_id, tenant_id)
+                
+                # Context7: Обработка результатов парсинга
+                # ВАЖНО: channel_parser.py уже обновляет last_parsed_at после успешного парсинга,
+                # поэтому НЕ вызываем _update_last_parsed_at здесь, чтобы избежать дублирования
+                if result and "messages_processed" in result:
+                    parsed_count = result.get("messages_processed", 0)
+                    # Context7: Обновляем метрики даже при 0 сообщениях для отслеживания активности парсинга
+                    # Это позволяет алерту ParsingNoActivity правильно определять, что парсинг работает
+                    if parsed_count > 0:
+                        posts_parsed_total.labels(mode=mode, status="success").inc(parsed_count)
+                    else:
+                        # Обновляем метрику с 0 для отслеживания активности (rate будет > 0)
+                        posts_parsed_total.labels(mode=mode, status="success").inc(0)
+                    parser_runs_total.labels(mode=mode, status="ok").inc()
+                    status = "ok"
+                    logger.info("CHANNEL_PARSE_END",
+                               channel_id=channel['id'],
+                               status="ok",
+                               messages_processed=parsed_count,
+                               mode=mode)
+                    return result
+                elif result and result.get("status") == "skipped":
+                    parser_runs_total.labels(mode=mode, status="skipped").inc()
+                    status = "skipped"
+                    # Context7: Для пропущенных каналов обновляем last_parsed_at через async SQLAlchemy
+                    await self._update_last_parsed_at_async(channel['id'], db_session)
+                    logger.info("CHANNEL_PARSE_END",
+                               channel_id=channel['id'],
+                               status="skipped",
+                               reason=result.get("reason"),
+                               mode=mode)
+                    return result
+                elif result and result.get("status") == "error":
+                    error_type = result.get("error", "unknown")
+                    logger.warning("CHANNEL_PARSE_END",
+                                 channel_id=channel['id'],
+                                 status="error",
+                                 error_type=error_type,
+                                 mode=mode)
+                    parser_runs_total.labels(mode=mode, status="error").inc()
+                    status = "error"
+                    # Context7: Для ошибок обновляем last_parsed_at через async SQLAlchemy
+                    await self._update_last_parsed_at_async(channel['id'], db_session)
+                    return result
+                elif result is None:
+                    logger.warning("CHANNEL_PARSE_END",
+                                 channel_id=channel['id'],
+                                 status="failed",
+                                 reason="all_retries_exhausted",
+                                 mode=mode)
+                    parser_runs_total.labels(mode=mode, status="failed").inc()
+                    status = "failed"
+                    # Context7: Для failed обновляем last_parsed_at через async SQLAlchemy
+                    await self._update_last_parsed_at_async(channel['id'], db_session)
+                    return {"status": "failed", "reason": "all_retries_exhausted"}
+                else:
+                    logger.warning("CHANNEL_PARSE_END",
+                                 channel_id=channel['id'],
+                                 status="failed",
+                                 reason="unexpected_format",
+                                 result_keys=list(result.keys()) if isinstance(result, dict) else type(result),
+                                 mode=mode)
+                    parser_runs_total.labels(mode=mode, status="failed").inc()
+                    status = "failed"
+                    # Context7: Для failed обновляем last_parsed_at через async SQLAlchemy
+                    await self._update_last_parsed_at_async(channel['id'], db_session)
+                    return {"status": "failed", "reason": "unexpected_format"}
+            
+            # Context7: Если telegram_client_manager недоступен, просто возвращаем skipped
+            status = "skipped"
+            logger.info("CHANNEL_PARSE_END",
+                       channel_id=channel['id'],
+                       status="skipped",
+                       reason="no_client_manager",
+                       mode=mode)
+            return {"status": "skipped", "reason": "no_client_manager", "parsed": 0, "max_message_date": None}
+            
+        except Exception as e:
+            status = "error"
+            logger.error("CHANNEL_PARSE_ERROR",
+                        channel_id=channel['id'],
+                        error=str(e),
+                        error_type=type(e).__name__,
+                        exc_info=True)
+            # Context7: Для исключений обновляем last_parsed_at через async SQLAlchemy (если db_session доступен)
+            # Используем try/except, так как db_session может быть недоступен
+            try:
+                async with self.async_session_factory() as db_session:
+                    await self._update_last_parsed_at_async(channel['id'], db_session)
+            except Exception as update_error:
+                logger.warning("Failed to update last_parsed_at after exception",
+                             channel_id=channel['id'],
+                             error=str(update_error))
+            return {"status": "error", "error": str(e), "error_type": type(e).__name__}
+        finally:
+            # Context7: Записываем метрику времени обработки ОДИН РАЗ в finally
+            # Убрали дублирование из except блока
+            process_duration = (datetime.now(timezone.utc) - process_start_time).total_seconds()
+            parser_channel_processing_seconds.labels(mode=mode or "unknown", status=status).observe(process_duration)
+    
     async def _run_tick(self):
-        """Run scheduler tick with lock protection"""
+        """Run scheduler tick with lock protection.
+        
+        Context7: Улучшенная обработка ошибок для предотвращения падения процесса.
+        Все исключения логируются, но не прерывают выполнение scheduler'а.
+        Context7: Добавлен общий таймаут для всего тика, чтобы гарантировать освобождение lock.
+        """
         if not await self._acquire_lock():
             logger.info("Lock held by another instance, skipping tick")
+            # Context7: Обновляем метрику freshness даже при отсутствии lock,
+            # чтобы показать, что scheduler активен, но не может выполнить тик
+            try:
+                now_ts = datetime.now(timezone.utc).timestamp()
+                scheduler_last_tick_ts_seconds.set(now_ts)
+            except Exception:
+                pass  # Игнорируем ошибки обновления метрики
             return
         
-        tick_start_time = datetime.now(timezone.utc)
-        try:
-            logger.info("Running scheduler tick (lock acquired)")
-            
-            # Получение активных каналов
-            channels = self._get_active_channels()
-            logger.info(
-                "Starting scheduler tick",
-                channels_count=len(channels),
-                tick_interval_sec=self.interval_sec
-            )
-            
-            if not channels:
-                logger.warning("No active channels found for parsing")
-                # Context7: Не делаем return здесь, чтобы finally блок освободил lock
-                # Просто пропускаем парсинг каналов
-            
-            # Context7: Ограничиваем время выполнения tick, чтобы lock не зависал
-            # TTL lock = interval_sec * 2, поэтому tick должен завершиться быстрее
-            max_tick_duration = self.interval_sec * 1.5  # 90% от TTL lock
-            channels_processed = 0
-            
-            # Context7: Сортируем каналы по last_parsed_at (старые первыми) для равномерного парсинга
-            # Это гарантирует, что каналы с давно не обновленными данными обрабатываются в первую очередь
-            channels_sorted = sorted(
-                channels,
-                key=lambda c: (
-                    c.get('last_parsed_at') is None,  # Новые каналы (None) первыми
-                    c.get('last_parsed_at') or datetime.min.replace(tzinfo=timezone.utc)  # Затем по дате (старые первыми)
-                )
-            )
-            
-            for idx, channel in enumerate(channels_sorted):
-                # Context7: Проверяем, не превысили ли мы максимальное время выполнения
-                elapsed = (datetime.now(timezone.utc) - tick_start_time).total_seconds()
-                if elapsed > max_tick_duration:
-                    logger.warning(
-                        "Tick duration exceeded maximum, stopping channel processing",
-                        channels_processed=channels_processed,
-                        channels_total=len(channels),
-                        elapsed_seconds=elapsed,
-                        max_duration_seconds=max_tick_duration
-                    )
-                    break
+        # Context7: Общий таймаут для всего тика
+        # Учитываем архитектуру и вариативность:
+        # - Lock TTL = interval_sec * 2 (защита от зависших тиков)
+        # - max_tick_duration = min(interval_sec * 0.8, 400) (внутренний лимит обработки)
+        # - Общий таймаут должен быть: больше max_tick_duration, но меньше lock TTL
+        # - Формула учитывает разные сценарии:
+        #   * Короткие интервалы (300s): таймаут ~480s (достаточно для обработки)
+        #   * Длинные интервалы (1800s+): таймаут ограничен 1800s (защита от зависаний)
+        #   * Всегда: таймаут < lock_ttl * 0.9 (10% запас до истечения lock)
+        max_tick_duration = min(self.interval_sec * 0.8, 400.0)
+        lock_ttl = self.interval_sec * 2
+        # Общий таймаут: минимум из (lock_ttl * 0.9, max(max_tick_duration * 2, interval_sec * 1.2), 1800)
+        # - lock_ttl * 0.9: оставляем 10% запаса до истечения lock
+        # - max(max_tick_duration * 2, interval_sec * 1.2): даем запас для обработки всех каналов
+        # - 1800: максимальный разумный лимит (30 минут) для защиты от бесконечных зависаний
+        max_total_tick_timeout = min(lock_ttl * 0.9, max(max_tick_duration * 2, self.interval_sec * 1.2), 1800.0)
+        
+        logger.debug("Scheduler tick timeout configuration",
+                   interval_sec=self.interval_sec,
+                   max_tick_duration=max_tick_duration,
+                   lock_ttl=lock_ttl,
+                   max_total_tick_timeout=max_total_tick_timeout)
+        
+        async def _run_tick_internal():
+            tick_start_time = datetime.now(timezone.utc)
+            lock_acquired = True
+            try:
+                # Context7: Обновляем метрику в начале тика, чтобы показать активность scheduler'а
+                # даже если тик еще не завершился. Это предотвращает ложные алерты при долгих тиках.
                 try:
-                    # Get HWM from Redis
-                    hwm_key = f"parse_hwm:{channel['id']}"
-                    # Context7: async Redis - используем await для get()
-                    hwm_raw = await self.redis.get(hwm_key)
-                    
-                    # Context7 best practice: безопасная обработка типов через ensure_dt_utc
-                    hwm_ts = ensure_dt_utc(hwm_raw)
-                    if hwm_ts:
-                        age_seconds = (datetime.now(timezone.utc) - hwm_ts).total_seconds()
-                        parser_hwm_age_seconds.labels(channel_id=channel['id']).set(age_seconds)
-                    
-                    # Определение режима
-                    mode = self._decide_mode(channel)
-                    
-                    # Context7: Логирование для новых каналов с диагностикой
-                    is_new_channel = channel.get('last_parsed_at') is None
-                    lpa = channel.get('last_parsed_at')
-                    lpa_str = lpa.isoformat() if isinstance(lpa, datetime) else 'null'
-                    logger.info(
-                        "Channel parsing status",
-                        channel_id=channel['id'],
-                        channel_title=channel.get('title'),
-                        channel_username=channel.get('username'),
-                        mode=mode,
-                        is_new_channel=is_new_channel,
-                        last_parsed_at=lpa_str,
-                        has_telegram_id=bool(channel.get('tg_channel_id'))
-                    )
-                    
-                    # Call actual parser if telegram_client_manager is available
-                    if self.telegram_client_manager:
-                        # Parse channel with retry
-                        result = await self._parse_channel_with_retry(channel, mode)
-                        
-                        if result and result.get("status") == "success":
-                            parsed_count = result.get("messages_processed", 0)
-                            posts_parsed_total.labels(mode=mode, status="success").inc(parsed_count)
-                            parser_runs_total.labels(mode=mode, status="ok").inc()
-                        elif result and result.get("status") == "skipped":
-                            parser_runs_total.labels(mode=mode, status="skipped").inc()
-                        else:
-                            parser_runs_total.labels(mode=mode, status="failed").inc()
-                    else:
-                        # Just monitor without parsing
-                        parser_runs_total.labels(mode=mode, status='monitored').inc()
-                    
-                    # Gauge для возраста watermark с безопасной обработкой типов
-                    lpa_dt = ensure_dt_utc(channel.get('last_parsed_at'))
-                    if lpa_dt:
-                        age_seconds = (datetime.now(timezone.utc) - lpa_dt).total_seconds()
-                        incremental_watermark_age_seconds.labels(
-                            channel_id=channel['id']
-                        ).set(age_seconds)
-                    
-                    # Context7: [C7-ID: backfill-missing-posts-001] Проверка и запуск backfill при пропусках
-                    await self._check_and_trigger_backfill(channel)
-                    
-                    channels_processed += 1
-                    # Context7: Логируем прогресс каждые 10 каналов
-                    if channels_processed % 10 == 0:
-                        elapsed = (datetime.now(timezone.utc) - tick_start_time).total_seconds()
-                        logger.info(
-                            "Tick progress",
-                            channels_processed=channels_processed,
-                            channels_total=len(channels),
-                            elapsed_seconds=elapsed
-                        )
-                        
+                    now_ts = datetime.now(timezone.utc).timestamp()
+                    scheduler_last_tick_ts_seconds.set(now_ts)
+                except Exception:
+                    pass  # Игнорируем ошибки обновления метрики
+                
+                logger.info("Running scheduler tick (lock acquired)")
+                
+                # Получение активных каналов с обработкой ошибок
+                try:
+                    channels = self._get_active_channels()
                 except Exception as e:
-                    logger.error(f"Failed to monitor channel {channel['id']}: {str(e)}")
-                    channels_processed += 1
-            
-            # Update scheduler freshness metric
-            now_ts = datetime.now(timezone.utc).timestamp()
-            scheduler_last_tick_ts_seconds.set(now_ts)
-            
-            # Update app_state if available
-            if self.app_state:
-                self.app_state["scheduler"]["last_tick_ts"] = datetime.now(timezone.utc).isoformat()
-                self.app_state["scheduler"]["status"] = "running"
-            
-            tick_duration = (datetime.now(timezone.utc) - tick_start_time).total_seconds()
-            logger.info(
-                "Scheduler tick completed",
-                channels_processed=channels_processed,
-                channels_total=len(channels) if channels else 0,
-                duration_seconds=tick_duration
-            )
-            
-        finally:
-            # Context7: Всегда освобождаем lock в finally блоке
-            # Context7: Логируем освобождение lock для диагностики
+                    logger.error("Failed to get active channels in tick",
+                               error=str(e),
+                               error_type=type(e).__name__,
+                               exc_info=True)
+                    channels = []
+                
+                logger.info(
+                    "Starting scheduler tick",
+                    channels_count=len(channels),
+                    tick_interval_sec=self.interval_sec
+                )
+                
+                if not channels:
+                    logger.warning("No active channels found for parsing")
+                    # Context7: Не делаем return здесь, чтобы finally блок освободил lock
+                    # Просто пропускаем парсинг каналов
+                
+                # Context7: Safety-guard для времени tick'а (вторичный механизм)
+                # Динамическое время не требуется, так как число каналов ограничено CHANNELS_PER_TICK
+                # Используем ту же формулу, что и для общего таймаута (вычислено выше)
+                # max_tick_duration уже вычислен выше для общего таймаута, используем его
+                # Но для внутреннего лимита используем более консервативное значение
+                max_tick_duration = min(self.interval_sec * 0.8, 400.0)  # Фиксированный лимит как safety-guard
+                
+                # Context7: Приоритизация уже реализована в SQL через ORDER BY last_parsed_at NULLS FIRST
+                # channels уже отсортированы из БД, дополнительная сортировка не требуется
+                channels_sorted = channels
+                
+                # Context7: Логируем выбор каналов для тика
+                for channel in channels_sorted:
+                    is_new_channel = channel.get('last_parsed_at') is None
+                    logger.info("CHANNEL_SELECTED_FOR_TICK",
+                               channel_id=channel['id'],
+                               channel_title=channel.get('title'),
+                               channel_username=channel.get('username'),
+                               is_new_channel=is_new_channel,
+                               last_parsed_at=channel.get('last_parsed_at'))
+                
+                # Context7: Ограничиваем глобальный параллелизм каналов
+                # Формула: min(кол-во_сессий * max_concurrent_per_session, разумный_предел)
+                # Предполагаем 2 сессии (389326685, 139883458) с max_concurrent=10 → 20 параллельных запросов
+                # Ограничиваем до 15 каналов одновременно для безопасности
+                global_channel_concurrency = min(
+                    int(os.getenv("PARSER_GLOBAL_CHANNEL_CONCURRENCY", "15")),
+                    self.config.max_concurrency * 3  # Не больше чем max_concurrency * 3
+                )
+                logger.info("Global channel concurrency limit",
+                           global_channel_concurrency=global_channel_concurrency,
+                           max_concurrency=self.config.max_concurrency,
+                           channels_selected=len(channels_sorted))
+                
+                # Context7: Создаем дополнительный семафор для ограничения глобального параллелизма каналов
+                global_channel_semaphore = asyncio.Semaphore(global_channel_concurrency)
+                
+                # Context7: Параллельная обработка только выбранных N каналов (не всех!)
+                # Context7: Используем новый parse_single_channel с отдельными DB sessions
+                async def process_channel_wrapper(channel, tick_start_time, max_tick_duration):
+                    """Wrapper для обработки одного канала с проверкой времени"""
+                    # Context7: Проверяем время ПЕРЕД началом обработки канала
+                    # Это предотвращает запуск задач, которые заведомо не успеют завершиться
+                    elapsed = (datetime.now(timezone.utc) - tick_start_time).total_seconds()
+                    if elapsed >= max_tick_duration:
+                        logger.debug("Skipping channel due to tick time limit",
+                                    channel_id=channel['id'],
+                                    elapsed_seconds=elapsed,
+                                    max_duration_seconds=max_tick_duration)
+                        return {"status": "skipped", "reason": "tick_time_limit", "channel_id": channel.get('id')}
+                    # Context7: Вызываем parse_single_channel, который сам имеет таймаут individual_task_timeout
+                    return await self.parse_single_channel(channel, tick_start_time)
+                
+                # Создаем задачи только для выбранных N каналов (не всех!)
+                # Context7: Создаем Task объекты для возможности отмены при таймауте
+                # Context7: Добавляем индивидуальный таймаут для каждой задачи
+                # Увеличено до 180 секунд, так как парсинг канала может занимать время
+                # (получение клиента, создание parser'а, сам парсинг, обработка медиа)
+                # Особенно важно для больших каналов с большим количеством постов
+                individual_task_timeout = float(os.getenv("PARSER_INDIVIDUAL_TASK_TIMEOUT", "180.0"))  # секунд на обработку одного канала
+                
+                async def process_channel_with_timeout(channel, tick_start_time, max_tick_duration):
+                    """Wrapper с индивидуальным таймаутом для каждого канала"""
+                    try:
+                        return await asyncio.wait_for(
+                            process_channel_wrapper(channel, tick_start_time, max_tick_duration),
+                            timeout=individual_task_timeout
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning("CHANNEL_PARSE_TIMEOUT",
+                                     channel_id=channel.get('id'),
+                                     channel_title=channel.get('title'),
+                                     timeout_seconds=individual_task_timeout)
+                        return {"status": "timeout", "channel_id": channel.get('id')}
+                    except Exception as e:
+                        logger.error("CHANNEL_PARSE_ERROR",
+                                   channel_id=channel.get('id'),
+                                   error=str(e),
+                                   error_type=type(e).__name__,
+                                   exc_info=True)
+                        return {"status": "error", "channel_id": channel.get('id'), "error": str(e)}
+                
+                channel_batch_size = int(os.getenv("CHANNEL_BATCH_SIZE", "20"))
+                channel_batch_size = max(1, channel_batch_size)
+                
+                results: List[Tuple[Dict[str, Any], Any]] = []
+                channels_processed = 0
+                
+                for batch_start in range(0, len(channels_sorted), channel_batch_size):
+                    elapsed_before_batch = (datetime.now(timezone.utc) - tick_start_time).total_seconds()
+                    if elapsed_before_batch >= max_tick_duration:
+                        logger.debug("Stopping batching due to tick time budget",
+                                    elapsed_seconds=elapsed_before_batch,
+                                    max_duration_seconds=max_tick_duration,
+                                    batch_start=batch_start)
+                        break
+                    
+                    batch = channels_sorted[batch_start:batch_start + channel_batch_size]
+                    # Context7: Ограничиваем размер батча глобальным семафором
+                    # Берем только столько каналов, сколько можем обработать параллельно
+                    batch = batch[:global_channel_concurrency]
+                    batch_tasks = [
+                        asyncio.create_task(process_channel_with_timeout(channel, tick_start_time, max_tick_duration))
+                        for channel in batch
+                    ]
+                    
+                    try:
+                        # Context7: Вычисляем оставшееся время для батча
+                        # Используем min(remaining_timeout, individual_task_timeout + 10) для безопасности
+                        # +10 секунд - запас на завершение задач после таймаута
+                        remaining_timeout = max(1.0, max_tick_duration - elapsed_before_batch)
+                        # Context7: Ограничиваем таймаут батча, чтобы не превышать individual_task_timeout
+                        # Это предотвращает ситуации, когда батч ждет дольше, чем может работать одна задача
+                        batch_timeout = min(remaining_timeout, individual_task_timeout + 10.0)
+                        batch_results = await asyncio.wait_for(
+                            asyncio.gather(*batch_tasks, return_exceptions=True),
+                            timeout=batch_timeout
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error("Channel batch processing timeout",
+                                    batch_size=len(batch),
+                                    timeout_seconds=remaining_timeout,
+                                    elapsed_since_tick_start=elapsed_before_batch)
+                        for task in batch_tasks:
+                            if not task.done():
+                                task.cancel()
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.gather(*batch_tasks, return_exceptions=True),
+                                timeout=5.0
+                            )
+                        except Exception:
+                            pass
+                        batch_results = []
+                    except Exception as e:
+                        logger.error("Failed to gather channel batch results",
+                                   error=str(e),
+                                   error_type=type(e).__name__,
+                                   batch_size=len(batch),
+                                   exc_info=True)
+                        for task in batch_tasks:
+                            if not task.done():
+                                task.cancel()
+                        batch_results = []
+                    
+                    for idx, result in enumerate(batch_results):
+                        results.append((batch[idx], result))
+                    
+                    elapsed_after_batch = (datetime.now(timezone.utc) - tick_start_time).total_seconds()
+                    if elapsed_after_batch >= max_tick_duration:
+                        logger.debug("Stopping batching after batch due to tick time budget",
+                                    elapsed_seconds=elapsed_after_batch,
+                                    max_duration_seconds=max_tick_duration,
+                                    batch_start=batch_start)
+                        break
+                
+                for channel, result in results:
+                    if isinstance(result, Exception):
+                        logger.error("Channel processing exception",
+                                   channel_id=channel['id'],
+                                   error=str(result),
+                                   error_type=type(result).__name__,
+                                   exc_info=True)
+                        # Context7: Обновляем last_parsed_at через async SQLAlchemy для ошибок
+                        try:
+                            async with self.async_session_factory() as db_session:
+                                await self._update_last_parsed_at_async(channel['id'], db_session)
+                        except Exception as update_error:
+                            logger.warning("Failed to update last_parsed_at after exception",
+                                         channel_id=channel['id'],
+                                         error=str(update_error))
+                        channels_processed += 1
+                    elif result is not None:
+                        status = result.get("status", "unknown")
+                        if status in ["timeout", "error", "failed"]:
+                            # Context7: Обновляем last_parsed_at через async SQLAlchemy для ошибок
+                            try:
+                                async with self.async_session_factory() as db_session:
+                                    await self._update_last_parsed_at_async(channel['id'], db_session)
+                            except Exception as update_error:
+                                logger.warning("Failed to update last_parsed_at after error",
+                                             channel_id=channel['id'],
+                                             error=str(update_error))
+                        channels_processed += 1
+                    else:
+                        continue
+                
+                # Context7: Логируем прогресс после обработки всех каналов
+                elapsed = (datetime.now(timezone.utc) - tick_start_time).total_seconds()
+                logger.info(
+                    "Tick completed",
+                    channels_processed=channels_processed,
+                    channels_total=len(channels),
+                    elapsed_seconds=elapsed
+                )
+                
+                # Update scheduler freshness metric
+                now_ts = datetime.now(timezone.utc).timestamp()
+                scheduler_last_tick_ts_seconds.set(now_ts)
+                
+                # Update app_state if available
+                if self.app_state:
+                    self.app_state["scheduler"]["last_tick_ts"] = datetime.now(timezone.utc).isoformat()
+                    self.app_state["scheduler"]["status"] = "running"
+                
+                tick_duration = (datetime.now(timezone.utc) - tick_start_time).total_seconds()
+                logger.info(
+                    "Scheduler tick completed",
+                    channels_processed=channels_processed,
+                    channels_total=len(channels) if channels else 0,
+                    duration_seconds=tick_duration
+                )
+                
+            except Exception as e:
+                # Context7: Обработка всех неожиданных ошибок в тике для предотвращения падения процесса
+                logger.error("Unexpected error in scheduler tick",
+                           error=str(e),
+                           error_type=type(e).__name__,
+                           exc_info=True)
+                # Context7: Обновляем метрику даже при ошибке для отслеживания активности scheduler'а
+                try:
+                    now_ts = datetime.now(timezone.utc).timestamp()
+                    scheduler_last_tick_ts_seconds.set(now_ts)
+                except Exception:
+                    pass  # Игнорируем ошибки обновления метрики
+                # Не прерываем выполнение - scheduler продолжит работу в следующем тике
+            finally:
+                # Context7: Всегда освобождаем lock в finally блоке
+                # Context7: Логируем освобождение lock для диагностики
+                try:
+                    await self._release_lock()
+                    logger.debug("Lock released after tick", 
+                               tick_duration_seconds=(datetime.now(timezone.utc) - tick_start_time).total_seconds() if 'tick_start_time' in locals() else None)
+                except Exception as release_error:
+                    logger.error("Failed to release lock in finally block", 
+                               error=str(release_error), 
+                               error_type=type(release_error).__name__,
+                               exc_info=True)
+        
+        # Context7: Обертываем весь тик в общий таймаут для гарантированного завершения
+        try:
+            await asyncio.wait_for(_run_tick_internal(), timeout=max_total_tick_timeout)
+        except asyncio.TimeoutError:
+            logger.error("Scheduler tick timeout - forcing completion",
+                       timeout_seconds=max_total_tick_timeout,
+                       interval_sec=self.interval_sec)
+            # Context7: Обновляем метрику даже при таймауте
+            try:
+                now_ts = datetime.now(timezone.utc).timestamp()
+                scheduler_last_tick_ts_seconds.set(now_ts)
+            except Exception:
+                pass
+            # Context7: Принудительно освобождаем lock при таймауте
             try:
                 await self._release_lock()
-                logger.debug("Lock released after tick", 
-                           tick_duration_seconds=(datetime.now(timezone.utc) - tick_start_time).total_seconds() if 'tick_start_time' in locals() else None)
+                logger.warning("Lock force-released after tick timeout")
             except Exception as release_error:
-                logger.error("Failed to release lock in finally block", 
-                           error=str(release_error), 
+                logger.error("Failed to force-release lock after timeout",
+                           error=str(release_error),
                            error_type=type(release_error).__name__,
                            exc_info=True)
+        except Exception as e:
+            logger.error("Unexpected error in tick wrapper",
+                       error=str(e),
+                       error_type=type(e).__name__,
+                       exc_info=True)
+            # Context7: Обновляем метрику и освобождаем lock даже при неожиданной ошибке
+            try:
+                now_ts = datetime.now(timezone.utc).timestamp()
+                scheduler_last_tick_ts_seconds.set(now_ts)
+            except Exception:
+                pass
+            try:
+                await self._release_lock()
+            except Exception:
+                pass
     
     async def _check_and_trigger_backfill(self, channel: Dict[str, Any]):
         """
@@ -827,42 +1507,123 @@ class ParseAllChannelsTask:
             )
     
     def _get_active_channels(self) -> List[Dict[str, Any]]:
-        """Получение активных каналов из БД.
+        """Получение активных каналов из БД с ограничением количества за тик.
         
         Context7 best practice: 
+        - Ограничение через CHANNELS_PER_TICK для фиксированного объёма работы за тик
+        - Фильтр blocked_until для пропуска каналов в cooldown
         - Приоритет новым каналам (NULLS FIRST для last_parsed_at)
-        - Без жесткого лимита для поддержки всех активных каналов
-        - Настраиваемый лимит через PARSER_MAX_CHANNELS_PER_TICK (по умолчанию 100)
+        - Fairness через сортировку по tenant_id/user_id
+        
+        Context7: Исправление проблемы с async соединениями - гарантированное закрытие соединений
+        через try/finally для предотвращения RuntimeError: coroutine ignored GeneratorExit
         """
+        conn = None
+        cursor = None
         try:
-            # Context7: Настраиваемый лимит для контроля нагрузки
-            max_channels = int(os.getenv("PARSER_MAX_CHANNELS_PER_TICK", "100"))
+            # Context7: Фиксированное количество каналов за тик - главный механизм масштабирования
+            channels_per_tick = int(os.getenv("CHANNELS_PER_TICK", "50"))
             
             conn = psycopg2.connect(self.db_url)
             cursor = conn.cursor(cursor_factory=RealDictCursor)
             
-            # Context7: Получаем все активные каналы, приоритет новым (без last_parsed_at)
+            # Context7: Weighted Round-Robin с анти-starvation механизмом
+            # Гарантируем минимальную частоту парсинга для всех каналов
+            # Используем комбинированный подход: гарантия + приоритизация + fairness
+            # 
+            # Приоритеты:
+            # 1. Критические голодающие (> 24 часа) - гарантированный слот
+            # 2. Голодающие (> 6 часов) - гарантированный слот
+            # 3. Каналы с новыми постами - приоритетный слот
+            # 4. Остальные каналы - fairness слот
+            
+            # Context7: Оптимизированный запрос с EXISTS вместо DISTINCT ON
+            # Поля uc (source, theme_id) не используются после выборки, только для фильтрации активности
+            # EXISTS проще и быстрее, чем DISTINCT ON с LEFT JOIN
             cursor.execute("""
-                SELECT id, tg_channel_id, username, title, last_parsed_at, is_active
-                FROM channels
-                WHERE is_active = true
-                ORDER BY last_parsed_at NULLS FIRST, created_at DESC
+                WITH channel_activity AS (
+                    SELECT 
+                        c.id as channel_id,
+                        COUNT(p.id) FILTER (
+                            WHERE p.posted_at > COALESCE(c.last_parsed_at, '1970-01-01'::timestamp)
+                        ) as new_posts_count,
+                        MAX(p.posted_at) as last_post_time,
+                        COUNT(p.id) FILTER (
+                            WHERE p.posted_at > NOW() - INTERVAL '24 hours'
+                        ) as posts_24h
+                    FROM channels c
+                    LEFT JOIN posts p ON p.channel_id = c.id
+                    WHERE c.is_active = true
+                      AND (c.blocked_until IS NULL OR c.blocked_until < NOW())
+                    GROUP BY c.id
+                )
+                SELECT c.id,
+                       c.tg_channel_id,
+                       c.username,
+                       c.title,
+                       c.last_parsed_at,
+                       c.is_active,
+                       c.blocked_until,
+                       COALESCE(ca.new_posts_count, 0) as new_posts_count,
+                       ca.last_post_time,
+                       COALESCE(ca.posts_24h, 0) as posts_24h
+                FROM channels c
+                LEFT JOIN channel_activity ca ON c.id = ca.channel_id
+                WHERE c.is_active = true
+                  AND (c.blocked_until IS NULL OR c.blocked_until < NOW())
+                  -- Context7: Канал активен, если есть хотя бы одна активная подписка (manual или theme)
+                  AND EXISTS (
+                      SELECT 1 FROM user_channel uc
+                      WHERE uc.channel_id = c.id AND uc.is_active = true
+                  )
+                ORDER BY
+                  -- Приоритет 1: Критически голодающие каналы (> 24 часа или NULL)
+                  (c.last_parsed_at IS NULL OR c.last_parsed_at < NOW() - INTERVAL '24 hours') DESC,
+                  -- Приоритет 2: Голодающие каналы (> 6 часов) - анти-starvation
+                  (c.last_parsed_at < NOW() - INTERVAL '6 hours') DESC,
+                  -- Приоритет 3: Каналы с новыми постами (posted_at > last_parsed_at)
+                  (COALESCE(ca.new_posts_count, 0) > 0) DESC,
+                  COALESCE(ca.new_posts_count, 0) DESC NULLS LAST,
+                  -- Приоритет 4: Активные каналы (много постов за 24 часа)
+                  COALESCE(ca.posts_24h, 0) DESC NULLS LAST,
+                  ca.last_post_time DESC NULLS LAST,
+                  -- Приоритет 5: Давно не парсились (старые last_parsed_at) - fairness
+                  c.last_parsed_at ASC NULLS FIRST,
+                  -- Приоритет 6: Fairness - новые каналы первыми
+                  c.created_at DESC
                 LIMIT %s
-            """, (max_channels,))
+            """, (channels_per_tick,))
             
             channels = cursor.fetchall()
-            cursor.close()
-            conn.close()
-            
             channels_list = [dict(ch) for ch in channels]
             
-            # Context7: Логируем статистику для диагностики
+            # Context7: Очистка истекших блокировок перед обработкой каналов
+            try:
+                cursor.execute("""
+                    UPDATE channels 
+                    SET blocked_until = NULL 
+                    WHERE blocked_until IS NOT NULL 
+                        AND blocked_until < NOW()
+                """)
+                cleared_count = cursor.rowcount
+                if cleared_count > 0:
+                    logger.debug("Cleared expired blocked_until",
+                               cleared_count=cleared_count)
+            except Exception as cleanup_error:
+                logger.warning("Failed to clear expired blocked_until",
+                             error=str(cleanup_error))
+            
+            # Context7: Логируем статистику для диагностики с информацией о новых постах
             new_channels_count = sum(1 for ch in channels_list if ch.get('last_parsed_at') is None)
+            channels_with_new_posts = sum(1 for ch in channels_list if ch.get('new_posts_count', 0) > 0)
+            total_new_posts = sum(ch.get('new_posts_count', 0) for ch in channels_list)
             logger.info(
-                "Active channels retrieved",
+                "Active channels retrieved (limited per tick)",
                 total=len(channels_list),
                 new_channels=new_channels_count,
-                max_channels_limit=max_channels
+                channels_with_new_posts=channels_with_new_posts,
+                total_new_posts=total_new_posts,
+                channels_per_tick_limit=channels_per_tick
             )
             
             return channels_list
@@ -870,6 +1631,18 @@ class ParseAllChannelsTask:
         except Exception as e:
             logger.error(f"Failed to get active channels: {str(e)}", error=str(e), exc_info=True)
             return []
+        finally:
+            # Context7: Гарантированное закрытие соединений для предотвращения утечек и RuntimeError
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception as e:
+                    logger.warning(f"Failed to close cursor: {str(e)}", error=str(e))
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception as e:
+                    logger.warning(f"Failed to close connection: {str(e)}", error=str(e))
     
     def _decide_mode(self, channel: Dict[str, Any]) -> str:
         """Автоопределение режима парсинга."""

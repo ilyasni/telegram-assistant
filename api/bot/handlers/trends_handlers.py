@@ -136,16 +136,18 @@ async def _update_trend_subscription(chat_id: int, frequency: str, topics: List[
 async def _load_emerging_digest(client: httpx.AsyncClient, window: str = "3h", limit: int = 5, user_id: Optional[UUID] = None) -> Tuple[str, List[Dict[str, Any]]]:
     """Загрузить emerging тренды с обработкой ошибок."""
     try:
+        # Context7: Ослабляем фильтры для показа трендов - снижаем пороги для лучшего UX
+        params = {
+            "min_sources": 0,  # Убираем минимальное требование по источникам
+            "min_burst": 0.0,  # Убираем минимальное требование по burst score
+            "page": 1,
+            "page_size": max(limit * 2, 10),  # Запрашиваем больше, чтобы после фильтрации осталось достаточно
+            "window": window,
+            **({"user_id": str(user_id)} if user_id else {}),
+        }
         response = await client.get(
             f"{API_BASE}/api/trends/emerging",
-            params={
-                "min_sources": 1,
-                "min_burst": 0.8,
-                "page": 1,
-                "page_size": max(limit, 1),
-                "window": window,
-                **({"user_id": str(user_id)} if user_id else {}),
-            },
+            params=params,
         )
         if response.status_code != 200:
             logger.warning(
@@ -209,7 +211,45 @@ async def _load_emerging_digest(client: httpx.AsyncClient, window: str = "3h", l
             )
             return window, []
         
-        return payload.get("window") or window, payload.get("clusters", [])
+        clusters = payload.get("clusters", [])
+        total = payload.get("total", 0)
+        logger.info(
+            "Loaded emerging trends",
+            clusters_count=len(clusters),
+            total=total,
+            user_id=str(user_id) if user_id else None,
+            window=window,
+            params=params
+        )
+        
+        # Context7: Fallback - если с персонализацией ничего не найдено, пробуем без персонализации
+        if user_id and not clusters:
+            logger.info("No personalized trends found, trying without personalization", user_id=str(user_id))
+            fallback_params = {**params}
+            fallback_params.pop("user_id", None)
+            try:
+                fallback_response = await client.get(
+                    f"{API_BASE}/api/trends/emerging",
+                    params=fallback_params,
+                )
+                if fallback_response.status_code == 200:
+                    fallback_text = fallback_response.text
+                    if fallback_text and fallback_text.strip():
+                        fallback_payload = json.loads(fallback_text)
+                        clusters = fallback_payload.get("clusters", [])
+                        logger.info(
+                            "Loaded emerging trends without personalization",
+                            clusters_count=len(clusters),
+                            user_id=str(user_id)
+                        )
+            except Exception as e:
+                logger.warning(
+                    "Error loading trends without personalization",
+                    error=str(e),
+                    user_id=str(user_id)
+                )
+        
+        return payload.get("window") or window, clusters[:limit]  # Ограничиваем до limit
     except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout, 
             httpx.RemoteProtocolError, httpx.LocalProtocolError) as e:
         logger.error(
@@ -237,14 +277,15 @@ async def _load_emerging_digest(client: httpx.AsyncClient, window: str = "3h", l
         return window, []
 
 
-async def _load_stable_digest(client: httpx.AsyncClient, min_frequency: int = 10, limit: int = 5, user_id: Optional[UUID] = None) -> List[Dict[str, Any]]:
+async def _load_stable_digest(client: httpx.AsyncClient, min_frequency: int = 0, limit: int = 5, user_id: Optional[UUID] = None) -> List[Dict[str, Any]]:
     """Загрузить stable тренды с обработкой ошибок."""
     try:
+        # Context7: Ослабляем фильтры для показа трендов - убираем min_frequency для digest
         params = {
-            "min_frequency": min_frequency,
+            "min_frequency": min_frequency,  # По умолчанию 0 - показываем все тренды
             "status": "stable",
             "page": 1,
-            "page_size": max(limit, 1),
+            "page_size": max(limit * 2, 10),  # Запрашиваем больше, чтобы после фильтрации осталось достаточно
             **({"user_id": str(user_id)} if user_id else {}),
         }
         response = await client.get(f"{API_BASE}/api/trends/clusters", params=params)
@@ -311,8 +352,41 @@ async def _load_stable_digest(client: httpx.AsyncClient, min_frequency: int = 10
             return []
         
         clusters = payload.get("clusters", [])
+        total = payload.get("total", 0)
+        logger.info(
+            "Loaded stable trends",
+            clusters_count=len(clusters),
+            total=total,
+            user_id=str(user_id) if user_id else None,
+            params=params
+        )
+        
+        # Context7: Fallback - если с персонализацией ничего не найдено, пробуем без персонализации
+        if user_id and not clusters:
+            logger.info("No personalized stable trends found, trying without personalization", user_id=str(user_id))
+            fallback_params = {**params}
+            fallback_params.pop("user_id", None)
+            try:
+                fallback_response = await client.get(f"{API_BASE}/api/trends/clusters", params=fallback_params)
+                if fallback_response.status_code == 200:
+                    fallback_text = fallback_response.text
+                    if fallback_text and fallback_text.strip():
+                        fallback_payload = json.loads(fallback_text)
+                        clusters = fallback_payload.get("clusters", [])
+                        logger.info(
+                            "Loaded stable trends without personalization",
+                            clusters_count=len(clusters),
+                            user_id=str(user_id)
+                        )
+            except Exception as e:
+                logger.warning(
+                    "Error loading stable trends without personalization",
+                    error=str(e),
+                    user_id=str(user_id)
+                )
+        
         if clusters:
-            return clusters
+            return clusters[:limit]  # Ограничиваем до limit
         
         # Fallback to emerging if no stable trends
         params["status"] = "emerging"
@@ -379,7 +453,13 @@ async def _load_stable_digest(client: httpx.AsyncClient, min_frequency: int = 10
                 )
                 return []
             
-            return fallback_payload.get("clusters", [])
+            fallback_clusters = fallback_payload.get("clusters", [])
+            logger.info(
+                "Loaded emerging trends as fallback for stable",
+                clusters_count=len(fallback_clusters),
+                user_id=str(user_id) if user_id else None
+            )
+            return fallback_clusters[:limit]  # Ограничиваем до limit
         except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout,
                 httpx.RemoteProtocolError, httpx.LocalProtocolError) as e:
             logger.error(
@@ -418,7 +498,7 @@ async def _load_stable_digest(client: httpx.AsyncClient, min_frequency: int = 10
 
 def _format_emerging_digest(window_label: str, clusters: List[Dict[str, Any]]) -> str:
     if not clusters:
-        return f"🔥 <b>Горячие тренды за {window_label}</b>\n— пока пусто, запусти обнаружение позже."
+        return f"🔥 <b>Горячие тренды за {window_label}</b>\n\nЗа последние {window_label} не было всплесков по вашим каналам. Это нормально, иногда новостное поле спокойное."
     lines = [f"🔥 <b>Горячие тренды за {window_label}</b>"]
     for idx, cluster in enumerate(clusters[:5], 1):
         card = cluster.get("card") or {}
@@ -449,7 +529,7 @@ def _format_emerging_digest(window_label: str, clusters: List[Dict[str, Any]]) -
 
 def _format_stable_digest(trends: List[Dict[str, Any]]) -> str:
     if not trends:
-        return "🧊 <b>Устойчивые тренды за 7 дней</b>\n— пока ничего интересного."
+        return "🧊 <b>Устойчивые тренды за 7 дней</b>\n\nСейчас за 7 дней не нашлось трендов, которые проходят качество. Можно подключить больше каналов или уменьшить пороги."
     lines = ["🧊 <b>Устойчивые тренды за 7 дней</b>"]
     for idx, cluster in enumerate(trends[:5], 1):
         card = cluster.get("card") or {}
@@ -701,16 +781,22 @@ async def callback_trends_list(callback: CallbackQuery):
             cluster_id = cluster.get("id")
             if cluster_id:
                 builder.button(text=f"ℹ️ {label[:26]}", callback_data=f"trend:cluster:{cluster_id}")
-            builder.button(text="🔍 Обнаружить", callback_data="trends:detect")
-            builder.button(text="🔙 Назад", callback_data="trends:menu")
-            builder.adjust(1)
-            
-            await callback.message.edit_text(
-                text,
-                reply_markup=builder.as_markup(),
-                parse_mode="HTML"
-            )
-            await callback.answer()
+        
+        # Context7: Применяем adjust(1) один раз после цикла для всех кнопок кластеров
+        # Это гарантирует, что каждая кнопка кластера отображается на отдельной строке
+        builder.adjust(1)
+        
+        # Context7: Кнопки навигации добавляем один раз после цикла
+        builder.button(text="🔍 Обнаружить", callback_data="trends:detect")
+        builder.button(text="🔙 Назад", callback_data="trends:menu")
+        builder.adjust(1)
+        
+        await callback.message.edit_text(
+            text,
+            reply_markup=builder.as_markup(),
+            parse_mode="HTML"
+        )
+        await callback.answer()
     
     except Exception as e:
         logger.error("Error showing trends list", error=str(e))
@@ -1155,8 +1241,17 @@ async def callback_trends_detect(callback: CallbackQuery):
                 trends_count = result.get("trends_count", 0)
                 
                 # Загружаем emerging и stable тренды (с обработкой ошибок внутри функций)
-                window_label, emerging_clusters = await _load_emerging_digest(client, user_id=user_uuid)
-                stable_trends = await _load_stable_digest(client, user_id=user_uuid)
+                # Context7: Используем ослабленные параметры для лучшего UX
+                window_label, emerging_clusters = await _load_emerging_digest(client, user_id=user_uuid, limit=5)
+                stable_trends = await _load_stable_digest(client, min_frequency=0, user_id=user_uuid, limit=5)
+                
+                logger.info(
+                    "Trends loaded for digest",
+                    emerging_count=len(emerging_clusters),
+                    stable_count=len(stable_trends),
+                    trends_count=trends_count,
+                    user_id=str(user_uuid) if user_uuid else None
+                )
 
                 emerging_text = _format_emerging_digest(window_label, emerging_clusters)
                 stable_text = _format_stable_digest(stable_trends)

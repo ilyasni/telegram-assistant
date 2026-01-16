@@ -25,10 +25,35 @@ from prometheus_client import Histogram, Gauge
 
 logger = structlog.get_logger()
 
+# Context7: Функции для предотвращения дублирования метрик
+from prometheus_client import REGISTRY
+
+def _get_or_create_gauge(name, description, labels=None):
+    """Получить существующую метрику или создать новую."""
+    try:
+        existing = REGISTRY._names_to_collectors.get(name)
+        if existing:
+            return existing
+    except (AttributeError, KeyError, TypeError):
+        pass
+    
+    try:
+        if labels:
+            return Gauge(name, description, labels)
+        return Gauge(name, description)
+    except ValueError as e:
+        if "Duplicated timeseries" in str(e):
+            try:
+                return REGISTRY._names_to_collectors.get(name)
+            except (AttributeError, KeyError, TypeError):
+                pass
+        logger.warning(f"Metric {name} already exists", error=str(e))
+        raise
+
 # Context7: Метрики без высокой кардинальности (импортируем из main.py)
 # telegram_floodwait_seconds определен в main.py
 
-cooldown_channels_total = Gauge(
+cooldown_channels_total = _get_or_create_gauge(
     'cooldown_channels_total',
     'Channels in cooldown'
 )
@@ -56,7 +81,7 @@ NON_RETRIABLE_ERRORS = (
 )
 
 # Константы
-MAX_FLOOD_WAIT = 60  # Максимальный FloodWait для cooldown
+MAX_FLOOD_WAIT = 300  # Context7: Увеличено до 5 минут для обработки больших FloodWait (было 60)
 MAX_RETRIES = 5
 
 
@@ -67,6 +92,7 @@ async def fetch_messages_with_retry(
     max_retries: int = MAX_RETRIES,
     redis_client: Optional[redis.Redis] = None,
     offset_date: Optional[datetime] = None,  # Context7: Для получения сообщений после определенной даты
+    offset_id: Optional[int] = None,  # Context7: Для получения сообщений после определенного message_id
     reverse: bool = False,  # Context7 P1.3: Reverse итерация (от старых к новым)
     floodwait_manager: Optional[Any] = None,  # Context7 P0.2: FloodWaitManager для централизованного управления
     account_id: Optional[str] = None  # Context7 P0.2: Идентификатор аккаунта для FloodWaitManager
@@ -94,7 +120,16 @@ async def fetch_messages_with_retry(
         try:
             # Проверяем cooldown перед запросом
             # Context7: Безопасная проверка типа channel.id
-            channel_id = getattr(channel, 'id', None)
+            # Для InputPeerChannel используем channel_id из объекта
+            from telethon.tl.types import InputPeerChannel
+            if isinstance(channel, InputPeerChannel):
+                channel_id = channel.channel_id
+                logger.debug("Using InputPeerChannel for fetch",
+                           channel_id=channel_id,
+                           has_access_hash=bool(channel.access_hash))
+            else:
+                channel_id = getattr(channel, 'id', None)
+            
             if redis_client and channel_id and await is_channel_in_cooldown(redis_client, channel_id):
                 logger.info("Channel in cooldown, skipping", 
                           channel_id=channel_id)
@@ -116,28 +151,80 @@ async def fetch_messages_with_retry(
                 # offset_date с reverse=False возвращает сообщения ПРЕДШЕСТВУЮЩИЕ дате (для historical)
                 iter_params["offset_date"] = offset_date
             
+            if offset_id:
+                # Context7: offset_id возвращает сообщения ПОСЛЕ указанного message_id (новее)
+                # КРИТИЧНО для incremental режима - гарантирует получение новых сообщений
+                iter_params["offset_id"] = offset_id
+            
+            # Context7: Диагностика - логируем тип channel для понимания проблемы
+            from telethon.tl.types import InputPeerChannel
+            channel_type = "InputPeerChannel" if isinstance(channel, InputPeerChannel) else type(channel).__name__
             logger.debug("Fetching messages with iter_messages",
                         channel_id=channel_id,
+                        channel_type=channel_type,
                         limit=limit,
                         offset_date=offset_date.isoformat() if offset_date else None,
+                        offset_id=offset_id,
                         reverse=reverse,
                         attempt=attempt + 1)
             
+            # Context7: Диагностика - логируем параметры перед вызовом iter_messages
+            logger.debug("Calling iter_messages",
+                        channel_id=channel_id,
+                        channel_type=channel_type,
+                        limit=limit,
+                        offset_date=offset_date.isoformat() if offset_date else None,
+                        offset_id=offset_id,
+                        reverse=reverse,
+                        attempt=attempt + 1)
+            
+            message_count_before = len(messages)
+            # Context7: Итерация по сообщениям с диагностикой
+            iter_count = 0
             async for msg in client.iter_messages(channel, **iter_params):
                 messages.append(msg)
+                iter_count += 1
                 # Context7: Защита от получения слишком большого количества сообщений
                 if len(messages) >= limit:
                     break
             
+            message_count_after = len(messages)
+            messages_fetched = message_count_after - message_count_before
+            
+            # Context7: Диагностика - логируем количество итераций
+            if iter_count == 0 and messages_fetched == 0:
+                logger.debug("iter_messages returned no messages (empty iterator)",
+                           channel_id=channel_id,
+                           channel_type=channel_type,
+                           limit=limit,
+                           offset_date=offset_date.isoformat() if offset_date else None)
+            
             # Сброс backoff после успешного запроса
             backoff = 0.5
             
-            logger.info("Messages fetched successfully", 
-                        channel_id=channel_id,
-                        count=len(messages),
-                        offset_date=offset_date.isoformat() if offset_date else None,
-                        reverse=reverse,
-                        attempt=attempt + 1)
+            # Context7: Диагностика - логируем результат вызова iter_messages
+            if messages_fetched > 0:
+                logger.info("Messages fetched successfully", 
+                            channel_id=channel_id,
+                            channel_type=channel_type,
+                            count=messages_fetched,
+                            total_count=len(messages),
+                            offset_date=offset_date.isoformat() if offset_date else None,
+                            reverse=reverse,
+                            attempt=attempt + 1)
+            else:
+                # Context7: КРИТИЧНО - если iter_messages не вернул сообщения, логируем это как WARNING
+                logger.warning("iter_messages returned no messages",
+                             channel_id=channel_id,
+                             channel_type=channel_type,
+                             limit=limit,
+                             offset_date=offset_date.isoformat() if offset_date else None,
+                             reverse=reverse,
+                             attempt=attempt + 1,
+                             message_count_before=message_count_before,
+                             message_count_after=message_count_after,
+                             iter_count=iter_count)
+            
             return messages
             
         except errors.FloodWaitError as e:
@@ -163,12 +250,21 @@ async def fetch_messages_with_retry(
                               attempt=attempt)
                 
                 if e.seconds > MAX_FLOOD_WAIT:
+                    # Context7: Для больших FloodWait устанавливаем cooldown на MAX_FLOOD_WAIT
+                    # Но логируем реальное время ожидания для диагностики
+                    logger.warning(
+                        "Large FloodWait detected, using cooldown",
+                        channel_id=channel_id,
+                        actual_seconds=e.seconds,
+                        cooldown_seconds=MAX_FLOOD_WAIT
+                    )
                     # Перевести канал в cooldown
                     if redis_client:
-                        await set_channel_cooldown(redis_client, channel_id, e.seconds)
+                        await set_channel_cooldown(redis_client, channel_id, MAX_FLOOD_WAIT)
                     logger.warning("Channel moved to cooldown", 
                                   channel_id=channel_id,
-                                  seconds=e.seconds)
+                                  actual_seconds=e.seconds,
+                                  cooldown_seconds=MAX_FLOOD_WAIT)
                     return []
                     
                 # Ждем FloodWait + 1 секунда

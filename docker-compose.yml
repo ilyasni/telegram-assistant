@@ -169,7 +169,8 @@ services:
   grafana:
     image: grafana/grafana:latest
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: ${GF_SECURITY_ADMIN_PASSWORD}
+      # Используем GRAFANA_PASSWORD как основной источник, с fallback на GF_SECURITY_ADMIN_PASSWORD
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-${GF_SECURITY_ADMIN_PASSWORD:-admin}}
       GF_SERVER_ROOT_URL: https://grafana.${DOMAIN}/
       GF_SERVER_DOMAIN: grafana.${DOMAIN}
       GF_SERVER_ENFORCE_DOMAIN: "true"
@@ -208,6 +209,25 @@ services:
       - "9090:9090"
     networks:
       - telegram-network
+    profiles:
+      - monitoring
+
+  # AlertManager для отправки уведомлений
+  alertmanager:
+    image: prom/alertmanager:latest
+    volumes:
+      - ./prometheus/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+      - '--storage.path=/alertmanager'
+      - '--web.external-url=http://localhost:9093'
+    ports:
+      - "9093:9093"
+    networks:
+      - telegram-network
+    depends_on:
+      - prometheus
     profiles:
       - monitoring
 
@@ -425,6 +445,8 @@ services:
       BOT_WEBHOOK_SECRET: ${BOT_WEBHOOK_SECRET}
       BOT_PUBLIC_URL: ${BOT_PUBLIC_URL}
       DEFAULT_TENANT_ID: ${DEFAULT_TENANT_ID}
+      # Context7: AlertManager Telegram Notifications
+      ALERT_TELEGRAM_CHAT_ID: ${ALERT_TELEGRAM_CHAT_ID:-}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       ENVIRONMENT: ${ENVIRONMENT:-production}
       PYTHONPATH: /app:/opt/project
@@ -436,6 +458,9 @@ services:
       NEO4J_PASSWORD: ${NEO4J_PASSWORD}
       # Context7 best practice: timezone для корректной работы с временем
       TZ: Europe/Moscow
+      # Context7: Telegram API credentials для проверки 2FA пароля в QR-авторизации
+      MASTER_API_ID: ${MASTER_API_ID}
+      MASTER_API_HASH: ${MASTER_API_HASH}
       # S3 Storage Configuration (Cloud.ru) - Context7: для Vision + S3 Integration
       S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-https://s3.cloud.ru}
       S3_BUCKET_NAME: ${S3_BUCKET_NAME}
@@ -461,6 +486,11 @@ services:
       TREND_QA_MIN_SCORE: ${TREND_QA_MIN_SCORE:-0.6}
       TREND_QA_LLM_MODEL: ${TREND_QA_LLM_MODEL:-GigaChat}
       TREND_PERSONALIZER_ENABLED: ${TREND_PERSONALIZER_ENABLED:-true}
+      # Context7: GigaChat API Credentials (для Self-Improvement, Context Router и других LLM вызовов)
+      GIGACHAT_CREDENTIALS: ${GIGACHAT_CREDENTIALS}
+      GIGACHAT_SCOPE: ${GIGACHAT_SCOPE:-GIGACHAT_API_PERS}
+      GIGACHAT_BASE_URL: ${GIGACHAT_BASE_URL:-}
+      GIGACHAT_PROXY_URL: ${GIGACHAT_PROXY_URL:-http://gpt2giga-proxy:8090}
     volumes:
       - ./webapp:/app/webapp:ro
       - ./api:/app:ro  # Context7: монтируем код для разработки (read-only для безопасности)
@@ -514,8 +544,10 @@ services:
       # Убираем GIGACHAT_ACCESS_TOKEN - используем только прокси
       # GIGACHAT_ACCESS_TOKEN: ${GIGACHAT_ACCESS_TOKEN}
       # Context7: GigaChat Vision API Credentials (для VisionAnalysisTask)
+      # Context7: GigaChat API Credentials (для Self-Improvement, Context Router и других LLM вызовов)
       GIGACHAT_CREDENTIALS: ${GIGACHAT_CREDENTIALS}
       GIGACHAT_SCOPE: ${GIGACHAT_SCOPE:-GIGACHAT_API_PERS}
+      GIGACHAT_BASE_URL: ${GIGACHAT_BASE_URL:-}
       # Context7: Модель для embeddings (EmbeddingsGigaR возвращает 2560 измерений)
       GIGACHAT_EMBEDDINGS_MODEL: ${GIGACHAT_EMBEDDINGS_MODEL:-EmbeddingsGigaR}
       # Fallback: OpenRouter
@@ -695,6 +727,9 @@ services:
         condition: service_healthy
     networks:
       - telegram-network
+    # Context7 best practice: проброс порта для health check и метрик
+    ports:
+      - "8011:8011"
     restart: unless-stopped  # автоматический рестарт
     # Context7 best practice: health check для telethon-ingest на порту 8011
     healthcheck:
@@ -725,7 +760,7 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       ENRICHMENT_CONFIG_PATH: /app/config/enrichment_policy.yml
       FEATURE_CRAWL4AI_ENABLED: ${FEATURE_CRAWL4AI_ENABLED:-true}
-      MAX_CONCURRENT_CRAWLS: 3
+      MAX_CONCURRENT_CRAWLS: 5
       TMPDIR: /tmp/playwright
       # Crawl4AI specific settings
       CRAWL_USER_AGENT: "TelegramAssistant/1.0 (Crawl4AI Bot)"
@@ -739,6 +774,7 @@ services:
       CRAWL_GROUP: crawl4ai_workers
     volumes:
       - ./worker/config:/app/config:ro
+      - ./shared/python:/app/shared/python:ro  # Context7: Монтируем shared/python для доступа к CircuitBreaker и другим утилитам
       - /tmp/playwright:/tmp/playwright
     shm_size: "1gb"
     ulimits:
@@ -760,11 +796,65 @@ services:
     profiles:
       - core
 
+  # TGStat Parser Service
+  tgstat-parser:
+    build:
+      context: .
+      dockerfile: tgstat-parser/Dockerfile
+    # Context7: Увеличенные лимиты памяти для Selenium Chrome
+    deploy:
+      resources:
+        limits:
+          memory: 3G
+          cpus: '2.0'
+        reservations:
+          memory: 2G
+          cpus: '1.0'
+    # Context7: Увеличение shared memory для предотвращения tab crashes
+    # Context7: Chrome использует /dev/shm для IPC, по умолчанию в Docker это 64MB
+    shm_size: 2gb
+    environment:
+      TGSTAT_DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@supabase-db:5432/${POSTGRES_DB}
+      TGSTAT_BASE_URL: ${TGSTAT_BASE_URL:-https://tgstat.ru}
+      TGSTAT_LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      TGSTAT_RATE_LIMIT_PER_SECOND: ${TGSTAT_RATE_LIMIT_PER_SECOND:-1.0}
+      TGSTAT_RATE_LIMIT_MAX_REQUESTS: ${TGSTAT_RATE_LIMIT_MAX_REQUESTS:-200}
+      TGSTAT_HTTP_TIMEOUT: ${TGSTAT_HTTP_TIMEOUT:-30}
+      TGSTAT_HTTP_MAX_RETRIES: ${TGSTAT_HTTP_MAX_RETRIES:-3}
+      TGSTAT_SCHEDULER_TIMEZONE: ${TGSTAT_SCHEDULER_TIMEZONE:-UTC}
+      TGSTAT_SCHEDULER_MONTHLY_HOUR: ${TGSTAT_SCHEDULER_MONTHLY_HOUR:-3}
+      TGSTAT_SCHEDULER_MONTHLY_MINUTE: ${TGSTAT_SCHEDULER_MONTHLY_MINUTE:-0}
+      TGSTAT_API_HOST: ${TGSTAT_API_HOST:-0.0.0.0}
+      TGSTAT_API_PORT: ${TGSTAT_API_PORT:-8020}
+      # Context7 best practice: timezone для корректной работы с временем
+      TZ: Europe/Moscow
+    volumes:
+      # Context7 best practice: монтируем timezone данные хоста
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    depends_on:
+      supabase-db:
+        condition: service_healthy
+    networks:
+      - telegram-network
+    ports:
+      - "8020:8020"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8020/health', timeout=5)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    profiles:
+      - core
+
 volumes:
   supabase_data:
   redis_data:
   grafana_data:
   prometheus_data:
+  alertmanager_data:
   caddy_data:
   caddy_config:
   qdrant_data:

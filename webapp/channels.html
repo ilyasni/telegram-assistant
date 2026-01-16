@@ -247,6 +247,98 @@
             margin: 0;
             font-size: 14px;
         }
+        
+        /* Переключатель вида */
+        .view-switcher {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 16px;
+            background: var(--tg-theme-secondary-bg-color, #f8f8f8);
+            padding: 4px;
+            border-radius: 12px;
+        }
+        
+        .view-btn {
+            flex: 1;
+            padding: 10px 16px;
+            border: none;
+            border-radius: 8px;
+            background: transparent;
+            color: var(--tg-theme-text-color, #000000);
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        
+        .view-btn.active {
+            background: var(--tg-theme-button-color, #007aff);
+            color: var(--tg-theme-button-text-color, #ffffff);
+        }
+        
+        .view-btn:hover:not(.active) {
+            background: var(--tg-theme-hint-color, #cccccc);
+            opacity: 0.7;
+        }
+        
+        /* Секции каналов */
+        .channels-section {
+            margin-bottom: 24px;
+        }
+        
+        .section-title {
+            font-size: 16px;
+            font-weight: 600;
+            margin: 0 0 12px 0;
+            color: var(--tg-theme-text-color, #000000);
+            padding: 8px 0;
+            border-bottom: 1px solid var(--tg-theme-hint-color, #cccccc);
+        }
+        
+        /* Бейджи источников */
+        .channel-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 8px;
+            margin-bottom: 4px;
+        }
+        
+        .channel-header h3 {
+            flex: 1;
+            margin: 0;
+        }
+        
+        .channel-badges {
+            display: flex;
+            gap: 4px;
+            flex-wrap: wrap;
+        }
+        
+        .badge {
+            padding: 4px 8px;
+            border-radius: 6px;
+            font-size: 11px;
+            font-weight: 500;
+            white-space: nowrap;
+        }
+        
+        .badge-manual {
+            background: #34c759;
+            color: white;
+        }
+        
+        .badge-theme {
+            background: #007aff;
+            color: white;
+        }
+        
+        .channel-hint {
+            margin: 8px 0 0 0;
+            font-size: 12px;
+            color: var(--tg-theme-hint-color, #666666);
+            font-style: italic;
+        }
     </style>
 </head>
 <body>
@@ -256,6 +348,19 @@
             <div class="quota">
                 <span id="quota-text">Загрузка...</span>
             </div>
+        </div>
+        
+        <!-- Переключатель вида -->
+        <div class="view-switcher">
+            <button class="view-btn active" data-view="all" onclick="switchView('all')">
+                Все
+            </button>
+            <button class="view-btn" data-view="manual" onclick="switchView('manual')">
+                📝 Вручную
+            </button>
+            <button class="view-btn" data-view="theme" onclick="switchView('theme')">
+                📚 Подборки
+            </button>
         </div>
         
         <div class="search-bar">

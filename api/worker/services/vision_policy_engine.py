@@ -220,38 +220,123 @@ class VisionPolicyEngine:
         
         return channel_username in skip_list
     
+    def should_use_vision_api(
+        self,
+        mime_type: str,
+        size_bytes: int,
+        has_text: Optional[bool] = None,
+        classification_hint: Optional[str] = None
+    ) -> bool:
+        """
+        Context7: Определение, нужен ли полный Vision анализ через GigaChat API.
+        Экономия токенов: Vision API нужен там, где OCR возвращает null - для анализа сцены, объектов, описания.
+        
+        Логика:
+        - OCR хорошо справляется с текстом и документами → используем OCR
+        - Vision API нужен для изображений БЕЗ текста → анализ сцены, объектов, описание
+        
+        Args:
+            mime_type: MIME тип файла
+            size_bytes: Размер файла в байтах
+            has_text: Наличие текста (определяется предварительным OCR, опционально)
+            classification_hint: Подсказка о типе контента (screenshot, meme, photo, document)
+            
+        Returns:
+            True если нужен полный Vision анализ
+        """
+        routing = self.config.get("routing", {})
+        use_vision_conditions = routing.get("use_vision_if", [])
+        heuristics = routing.get("heuristics", {})
+        
+        # Проверка 1: Изображения БЕЗ текста - нужен Vision для анализа сцены
+        if has_text is False:
+            for condition in use_vision_conditions:
+                if isinstance(condition, dict) and condition.get("has_text") is False:
+                    vision_policy_decisions_total.labels(decision="vision", reason="no_text").inc()
+                    return True
+        
+        # Проверка 2: Классификация (meme, photo) - нужен Vision для описания
+        if classification_hint in ["meme", "photo"]:
+            for condition in use_vision_conditions:
+                if isinstance(condition, dict) and condition.get("classification_hint") == classification_hint:
+                    vision_policy_decisions_total.labels(decision="vision", reason=f"classification_{classification_hint}").inc()
+                    return True
+        
+        # Проверка 3: Большие изображения (>500KB) - вероятно сложная сцена, нужен Vision
+        min_size_kb = None
+        for condition in use_vision_conditions:
+            if isinstance(condition, dict) and "min_size_kb" in condition:
+                min_size_kb = condition["min_size_kb"]
+                break
+        
+        if min_size_kb and size_bytes >= min_size_kb * 1024:
+            vision_policy_decisions_total.labels(decision="vision", reason="large_image").inc()
+            return True
+        
+        # По умолчанию: если OCR нашёл текст или это документ/скриншот - используем OCR fallback
+        # Vision API не нужен, если OCR справляется
+        return False
+    
     def should_use_ocr_fallback(
         self,
         quota_exhausted: bool,
-        mime_type: str
+        mime_type: str,
+        size_bytes: int = 0,
+        has_text: Optional[bool] = None,
+        classification_hint: Optional[str] = None
     ) -> bool:
         """
-        Определение, использовать ли OCR fallback.
+        Context7: Определение, использовать ли OCR fallback вместо Vision API.
+        Экономия токенов: OCR хорошо справляется с текстом и документами, Vision нужен только для изображений без текста.
+        
+        Логика:
+        - OCR для: документов, скриншотов, изображений с текстом
+        - Vision для: изображений без текста (фотографии, мемы, сложные сцены)
         
         Args:
             quota_exhausted: Исчерпана ли квота Vision API
             mime_type: MIME тип файла
+            size_bytes: Размер файла в байтах
+            has_text: Наличие текста (определяется предварительным OCR, опционально)
+            classification_hint: Подсказка о типе контента
             
         Returns:
             True если нужен OCR fallback
         """
         routing = self.config.get("routing", {})
         ocr_conditions = routing.get("ocr_only_if", [])
+        heuristics = routing.get("heuristics", {})
         
-        # Проверка quota_exhausted
+        # Проверка 1: quota_exhausted - всегда OCR fallback
         if quota_exhausted and "quota_exhausted" in ocr_conditions:
             vision_policy_decisions_total.labels(decision="fallback", reason="quota_exhausted").inc()
             return True
         
-        # Проверка MIME типа
-        ocr_mime_list = None
+        # Проверка 2: Документы - OCR справляется лучше
         for condition in ocr_conditions:
             if isinstance(condition, dict) and "mime" in condition:
                 ocr_mime_list = condition["mime"]
-                break
+                if mime_type in ocr_mime_list:
+                    vision_policy_decisions_total.labels(decision="fallback", reason="document_mime").inc()
+                    return True
         
-        if ocr_mime_list and mime_type in ocr_mime_list:
-            vision_policy_decisions_total.labels(decision="fallback", reason="mime_type").inc()
+        # Проверка 3: Скриншоты - OCR извлекает текст, Vision не нужен
+        if classification_hint == "screenshot":
+            for condition in ocr_conditions:
+                if isinstance(condition, dict) and condition.get("classification_hint") == "screenshot":
+                    vision_policy_decisions_total.labels(decision="fallback", reason="screenshot").inc()
+                    return True
+        
+        # Проверка 4: Изображения С текстом - OCR справляется, Vision не нужен
+        if has_text is True:
+            for condition in ocr_conditions:
+                if isinstance(condition, dict) and condition.get("has_text") is True:
+                    vision_policy_decisions_total.labels(decision="fallback", reason="has_text").inc()
+                    return True
+        
+        # Проверка 5: Если Vision API не нужен (нет явных признаков), используем OCR fallback
+        if not self.should_use_vision_api(mime_type, size_bytes, has_text, classification_hint):
+            vision_policy_decisions_total.labels(decision="fallback", reason="vision_not_needed").inc()
             return True
         
         return False
@@ -303,10 +388,24 @@ class VisionPolicyEngine:
             vision_policy_decisions_total.labels(decision="skip", reason="channel").inc()
             return result
         
-        # Проверка 4: OCR fallback
-        if self.should_use_ocr_fallback(quota_exhausted, mime_type):
+        # Проверка 4: Умная стратегия выбора между Vision API и OCR fallback
+        # Context7: Экономия токенов
+        # - OCR для: документов, скриншотов, изображений с текстом
+        # - Vision для: изображений без текста (фотографии, мемы, сложные сцены)
+        has_text = media_file.get("has_text")  # Предварительная проверка текста (опционально)
+        classification_hint = media_file.get("classification_hint")  # Подсказка о типе контента
+        
+        if self.should_use_ocr_fallback(quota_exhausted, mime_type, size_bytes, has_text, classification_hint):
             result["use_ocr"] = True
             result["allowed"] = True  # Разрешено, но через OCR
+            result["reason"] = "ocr_fallback_optimal"  # Уточняем причину
+            return result
+        
+        # Проверка 5: Vision API нужен (изображения без текста)
+        if self.should_use_vision_api(mime_type, size_bytes, has_text, classification_hint):
+            result["use_ocr"] = False
+            result["allowed"] = True
+            result["reason"] = "vision_api_needed"
             return result
         
         # Все проверки пройдены

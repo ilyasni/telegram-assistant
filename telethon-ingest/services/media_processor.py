@@ -67,20 +67,85 @@ except ImportError:
 logger = structlog.get_logger()
 
 # Context7: Метрики Prometheus для обработки медиа
+# Context7: Функции для предотвращения дублирования метрик
+from prometheus_client import REGISTRY
+
+def _get_or_create_counter(name, description, labels):
+    """Получить существующую метрику или создать новую."""
+    try:
+        existing = REGISTRY._names_to_collectors.get(name)
+        if existing:
+            return existing
+    except (AttributeError, KeyError, TypeError):
+        pass
+    
+    try:
+        return Counter(name, description, labels)
+    except ValueError as e:
+        if "Duplicated timeseries" in str(e):
+            try:
+                return REGISTRY._names_to_collectors.get(name)
+            except (AttributeError, KeyError, TypeError):
+                pass
+        logger.warning(f"Metric {name} already exists", error=str(e))
+        raise
+
+def _get_or_create_histogram(name, description, labels, buckets=None):
+    """Получить существующую метрику или создать новую."""
+    try:
+        existing = REGISTRY._names_to_collectors.get(name)
+        if existing:
+            return existing
+    except (AttributeError, KeyError, TypeError):
+        pass
+    
+    try:
+        if buckets:
+            return Histogram(name, description, labels, buckets=buckets)
+        return Histogram(name, description, labels)
+    except ValueError as e:
+        if "Duplicated timeseries" in str(e):
+            try:
+                return REGISTRY._names_to_collectors.get(name)
+            except (AttributeError, KeyError, TypeError):
+                pass
+        logger.warning(f"Metric {name} already exists", error=str(e))
+        raise
+
+def _get_or_create_gauge(name, description, labels):
+    """Получить существующую метрику или создать новую."""
+    try:
+        existing = REGISTRY._names_to_collectors.get(name)
+        if existing:
+            return existing
+    except (AttributeError, KeyError, TypeError):
+        pass
+    
+    try:
+        return Gauge(name, description, labels)
+    except ValueError as e:
+        if "Duplicated timeseries" in str(e):
+            try:
+                return REGISTRY._names_to_collectors.get(name)
+            except (AttributeError, KeyError, TypeError):
+                pass
+        logger.warning(f"Metric {name} already exists", error=str(e))
+        raise
+
 # Best practice: контроль кардинальности labels, нормализация значений
 if PROMETHEUS_AVAILABLE:
     # Основные метрики обработки медиа
     # stage: parse (парсинг), vision (vision анализ), retag (ретеггинг)
     # media: нормализованные значения - photo, video, album, doc
     # outcome: ok (успех), err (ошибка)
-    media_processing_total = Counter(
+    media_processing_total = _get_or_create_counter(
         'media_processing_total',
         'Total media files processed',
         ['stage', 'media', 'outcome']
     )
     
     # Суммарный объем обработанных медиа в байтах
-    media_bytes_total = Counter(
+    media_bytes_total = _get_or_create_counter(
         'media_bytes_total',
         'Total bytes processed',
         ['media']  # photo, video, album, doc
@@ -88,7 +153,7 @@ if PROMETHEUS_AVAILABLE:
     
     # Гистограмма размеров медиа с предопределенными buckets для SLO
     # Buckets: 50KB, 100KB, 500KB, 1MB, 5MB, 20MB
-    media_size_bytes = Histogram(
+    media_size_bytes = _get_or_create_histogram(
         'media_size_bytes',
         'Media file size in bytes',
         ['media'],
@@ -96,28 +161,28 @@ if PROMETHEUS_AVAILABLE:
     )
     
     # Latency обработки медиа
-    media_processing_duration_seconds = Histogram(
+    media_processing_duration_seconds = _get_or_create_histogram(
         'media_processing_duration_seconds',
         'Duration of media processing in seconds',
         ['stage', 'media', 'outcome']
     )
     
     # Альбомы обработаны
-    media_albums_processed_total = Counter(
+    media_albums_processed_total = _get_or_create_counter(
         'media_albums_processed_total',
         'Total media albums processed',
         ['status']  # success, failed, error
     )
     
     # Ошибки обработки медиа
-    media_processing_failed_total = Counter(
+    media_processing_failed_total = _get_or_create_counter(
         'media_processing_failed_total',
         'Total failed media processing attempts',
         ['reason']  # timeout, quota_exceeded, unsupported_format, download_error, album_item_error
     )
     
     # Здоровье экспорта метрик
-    metrics_backend_up = Gauge(
+    metrics_backend_up = _get_or_create_gauge(
         'metrics_backend_up',
         'Metrics backend availability',
         ['target']  # prometheus
@@ -170,7 +235,11 @@ class MediaProcessor:
         self.s3_service = s3_service
         self.storage_quota = storage_quota
         self.redis_client = redis_client
-        self.tenant_id = tenant_id or os.getenv("S3_DEFAULT_TENANT_ID", "877193ef-be80-4977-aaeb-8009c3d772ee")
+        # Context7: Убираем хардкод UUID - используем только env переменную
+        s3_default_tenant_id = os.getenv("S3_DEFAULT_TENANT_ID")
+        if not s3_default_tenant_id:
+            raise ValueError("S3_DEFAULT_TENANT_ID must be set in environment variables")
+        self.tenant_id = tenant_id or s3_default_tenant_id
         
         logger.info(
             "MediaProcessor initialized",
@@ -621,8 +690,30 @@ class MediaProcessor:
             logger.error("Photo download timeout after 120s", trace_id=trace_id)
             return None
         except Exception as e:
+            error_message = str(e)
+            error_type = type(e).__name__
+            
+            # Context7: Обработка ошибок expired file reference - это нормальная ситуация для старых медиа
+            # Пропускаем медиа с предупреждением, но не блокируем обработку поста
+            if "file reference has expired" in error_message.lower() or "self-destructing media" in error_message.lower():
+                media_processing_failed_total.labels(reason="expired_file_reference").inc()
+                logger.warning(
+                    "Photo file reference expired - skipping media",
+                    error=error_message,
+                    error_type=error_type,
+                    trace_id=trace_id,
+                    note="This is normal for old media or self-destructing content"
+                )
+                return None
+            
             media_processing_failed_total.labels(reason="download_error").inc()
-            logger.error("Failed to process photo", error=str(e), trace_id=trace_id)
+            logger.error(
+                "Failed to process photo",
+                error=error_message,
+                error_type=error_type,
+                trace_id=trace_id,
+                exc_info=True
+            )
             return None
     
     async def _process_document(
@@ -682,8 +773,31 @@ class MediaProcessor:
             logger.error("Document download timeout after 300s", trace_id=trace_id)
             return None
         except Exception as e:
+            error_message = str(e)
+            error_type = type(e).__name__
+            
+            # Context7: Обработка ошибок expired file reference - это нормальная ситуация для старых медиа
+            # Пропускаем медиа с предупреждением, но не блокируем обработку поста
+            if "file reference has expired" in error_message.lower() or "self-destructing media" in error_message.lower():
+                media_processing_failed_total.labels(reason="expired_file_reference").inc()
+                logger.warning(
+                    "Document file reference expired - skipping media",
+                    error=error_message,
+                    error_type=error_type,
+                    trace_id=trace_id,
+                    note="This is normal for old media or self-destructing content"
+                )
+                return None
+            
             media_processing_failed_total.labels(reason="download_error").inc()
-            logger.error("Failed to process document", error=str(e), trace_id=trace_id)
+            logger.error(
+                "Failed to process document",
+                error=error_message,
+                error_type=error_type,
+                trace_id=trace_id,
+                exc_info=True
+            )
+            return None
             return None
     
     async def _upload_to_s3(
@@ -721,45 +835,79 @@ class MediaProcessor:
                 )
                 return None
             
-            # Context7: Загрузка в S3 (идемпотентная - возвращает существующий SHA256 если есть)
-            sha256, s3_key, size_bytes = await self.s3_service.put_media(
-                content=content,
-                mime_type=mime_type,
-                tenant_id=tenant_id
-            )
+            # Context7: Загрузка в S3 с retry логикой для ошибок InvalidDigest
+            # InvalidDigest может возникать из-за проблем с вычислением MD5 на стороне S3
+            max_retries = 3
+            last_error = None
             
-            logger.debug(
-                "Media uploaded to S3 successfully",
-                sha256=sha256[:16] + "...",
-                s3_key=s3_key,
-                size_bytes=size_bytes,
-                mime_type=mime_type,
-                trace_id=trace_id
-            )
+            for attempt in range(max_retries):
+                try:
+                    sha256, s3_key, size_bytes = await self.s3_service.put_media(
+                        content=content,
+                        mime_type=mime_type,
+                        tenant_id=tenant_id
+                    )
+                    
+                    logger.debug(
+                        "Media uploaded to S3 successfully",
+                        sha256=sha256[:16] + "...",
+                        s3_key=s3_key,
+                        size_bytes=size_bytes,
+                        mime_type=mime_type,
+                        trace_id=trace_id,
+                        attempt=attempt + 1 if attempt > 0 else None
+                    )
+                    
+                    # Создание MediaFile объекта
+                    return MediaFile(
+                        sha256=sha256,
+                        s3_key=s3_key,
+                        mime_type=mime_type,
+                        size_bytes=size_bytes
+                    )
+                except Exception as e:
+                    last_error = e
+                    error_type = type(e).__name__
+                    error_message = str(e)
+                    
+                    # Извлекаем дополнительные детали из исключения если доступны
+                    error_code = None
+                    if hasattr(e, 'response'):
+                        # Boto3 ClientError
+                        error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+                    
+                    # Context7: Retry для ошибок InvalidDigest
+                    if error_code == "InvalidDigest" and attempt < max_retries - 1:
+                        logger.warning(
+                            "S3 InvalidDigest error, retrying",
+                            attempt=attempt + 1,
+                            max_retries=max_retries,
+                            error=error_message,
+                            mime_type=mime_type,
+                            size_bytes=len(content),
+                            trace_id=trace_id
+                        )
+                        # Небольшая задержка перед retry
+                        await asyncio.sleep(1.0 * (attempt + 1))
+                        continue
+                    else:
+                        # Не retry-able ошибка или последняя попытка
+                        break
             
-            # Создание MediaFile объекта
-            return MediaFile(
-                sha256=sha256,
-                s3_key=s3_key,
-                mime_type=mime_type,
-                size_bytes=size_bytes
-            )
-            
-        except Exception as e:
             # Context7: Детальное логирование ошибок S3 с полным контекстом
-            error_type = type(e).__name__
-            error_message = str(e)
+            error_type = type(last_error).__name__ if last_error else "Unknown"
+            error_message = str(last_error) if last_error else "Unknown error"
             
             # Извлекаем дополнительные детали из исключения если доступны
             error_details = {}
-            if hasattr(e, 'response'):
+            if last_error and hasattr(last_error, 'response'):
                 # Boto3 ClientError
-                error_details['error_code'] = e.response.get('Error', {}).get('Code', 'Unknown')
-                error_details['request_id'] = e.response.get('ResponseMetadata', {}).get('RequestId', '')
+                error_details['error_code'] = last_error.response.get('Error', {}).get('Code', 'Unknown')
+                error_details['request_id'] = last_error.response.get('ResponseMetadata', {}).get('RequestId', '')
             
             media_processing_failed_total.labels(reason="s3_upload_error").inc()
             logger.error(
-                "Failed to upload media to S3",
+                "Failed to upload media to S3 after retries",
                 error=error_message,
                 error_type=error_type,
                 mime_type=mime_type,
@@ -767,10 +915,24 @@ class MediaProcessor:
                 size_mb=len(content) / (1024 ** 2),
                 tenant_id=tenant_id,
                 trace_id=trace_id,
+                attempts=max_retries,
                 **error_details
             )
             # Context7: Не блокируем создание события - медиа может быть загружено позже через retry
             # Возвращаем None чтобы вызывающий код мог обработать это gracefully
+            return None
+        except Exception as e:
+            # Context7: Обработка неожиданных ошибок при проверке квоты или других операциях
+            logger.error(
+                "Unexpected error in _upload_to_s3",
+                error=str(e),
+                error_type=type(e).__name__,
+                mime_type=mime_type,
+                size_bytes=len(content),
+                trace_id=trace_id,
+                exc_info=True
+            )
+            media_processing_failed_total.labels(reason="unexpected_error").inc()
             return None
     
     async def emit_vision_uploaded_event(

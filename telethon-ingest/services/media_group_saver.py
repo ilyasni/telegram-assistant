@@ -5,6 +5,7 @@ Context7 best practice: Сохранение медиа-альбомов в БД
 
 import hashlib
 import json
+import os
 import uuid as uuid_lib
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
@@ -81,7 +82,8 @@ async def _emit_album_parsed_event(
             else:
                 event_payload[key] = str(value)
         
-        await redis_client.xadd(stream_key, event_payload, maxlen=10000)
+        redis_stream_maxlen = int(os.getenv("REDIS_STREAM_MAXLEN", "10000"))
+        await redis_client.xadd(stream_key, event_payload, maxlen=redis_stream_maxlen)
         logger.debug(
             "albums.parsed event published to Redis Streams",
             group_id=group_id,

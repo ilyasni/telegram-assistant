@@ -106,7 +106,8 @@ class GraphService:
         topic: Optional[str] = None,
         tenant_id: Optional[str] = None,
         limit: int = 10,
-        max_depth: int = 2
+        max_depth: int = 2,
+        time_filter: Optional[tuple] = None
     ) -> List[Dict[str, Any]]:
         """
         Поиск связанных постов через граф.
@@ -119,6 +120,7 @@ class GraphService:
             tenant_id: Ограничение по арендатору (обязательно для изоляции данных)
             limit: Максимальное количество результатов
             max_depth: Максимальная глубина обхода графа (2-3 для производительности)
+            time_filter: Временной фильтр (start_time, end_time) или None
         
         Returns:
             Список связанных постов с метаданными
@@ -135,17 +137,37 @@ class GraphService:
                 # Используем фиксированную глубину *1..max_depth
                 tenant_clause = ""
                 related_clause = ""
+                time_clause = ""
                 params: Dict[str, Any] = {"limit": limit, "content_property": "content"}
                 if tenant_id:
                     tenant_clause = "WHERE p.tenant_id = $tenant_id"
                     related_clause = "WHERE related_p IS NULL OR related_p.tenant_id = $tenant_id"
                     params["tenant_id"] = str(tenant_id)
+                
+                # Добавляем временной фильтр
+                if time_filter:
+                    start_time, end_time = time_filter
+                    time_conditions = []
+                    if start_time:
+                        time_conditions.append("p.posted_at >= $start_time")
+                        params["start_time"] = start_time
+                    if end_time:
+                        time_conditions.append("p.posted_at <= $end_time")
+                        params["end_time"] = end_time
+                    
+                    if time_conditions:
+                        # Context7: Если tenant_clause пустой, начинаем с WHERE, иначе с AND
+                        if tenant_clause:
+                            time_clause = " AND " + " AND ".join(time_conditions)
+                        else:
+                            time_clause = "WHERE " + " AND ".join(time_conditions)
+                
                 if topic:
                     params["topic"] = topic
                     cypher_query = """
                     MATCH (t:Topic {{name: $topic}})
                     MATCH (t)<-[:HAS_TOPIC]-(p:Post)
-                    {tenant_clause}
+                    {tenant_clause}{time_clause}
                     OPTIONAL MATCH path = (t)-[:RELATED_TO*1..{max_depth}]-(related_t:Topic)
                     WHERE related_t IS NOT NULL
                     OPTIONAL MATCH (related_t)<-[:HAS_TOPIC]-(related_p:Post)
@@ -158,11 +180,13 @@ class GraphService:
                                ''
                            ) AS content,
                            topic_name,
+                           coalesce(p.channel_title, '') AS channel_title,
                            'direct' AS relation_type
                     ORDER BY post_posted_at DESC
                     LIMIT $limit
                     """.format(
                         tenant_clause=tenant_clause,
+                        time_clause=time_clause,
                         related_clause=related_clause,
                         max_depth=max_depth
                     )
@@ -176,7 +200,7 @@ class GraphService:
                     MATCH (t:Topic)
                     WHERE toLower(t.name) CONTAINS toLower($query)
                     MATCH (t)<-[:HAS_TOPIC]-(p:Post)
-                    {tenant_clause}
+                    {tenant_clause}{time_clause}
                     RETURN p.post_id AS post_id,
                            coalesce(p[$content_property], '') AS content,
                            collect(DISTINCT t.name) AS topics,
@@ -184,7 +208,10 @@ class GraphService:
                            p.posted_at AS post_posted_at
                     ORDER BY post_posted_at DESC
                     LIMIT $limit
-                    """.format(tenant_clause=tenant_clause)
+                    """.format(
+                        tenant_clause=tenant_clause,
+                        time_clause=time_clause
+                    )
                     if not tenant_id:
                         logger.warning("Graph query search executed without tenant filter", query=query[:50])
                     result = await session.run(cypher_query, parameters=params)
@@ -196,7 +223,7 @@ class GraphService:
                         'content': record.get('content', ''),
                         'topic': record.get('topic_name') or (record.get('topics', [])[0] if record.get('topics') else None),
                         'topics': record.get('topics', []),
-                        'channel_title': record.get('channel_title'),
+                        'channel_title': record.get('channel_title', ''),
                         'relation_type': record.get('relation_type', 'direct')
                     })
                 

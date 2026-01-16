@@ -64,11 +64,14 @@ async def test_full_album_pipeline_e2e(db_session, redis_client):
     tenant_id = "test_tenant"
     grouped_id = 123456789
     
-    # Создаём канал
+    # Context7: Создаём канал с правильным ON CONFLICT по tg_channel_id
     await db_session.execute(text("""
         INSERT INTO channels (id, tg_channel_id, username, title, created_at)
         VALUES (:channel_id, -1001234567890, 'test_e2e_channel', 'Test E2E Channel', NOW())
-        ON CONFLICT (id) DO NOTHING
+        ON CONFLICT (tg_channel_id) DO UPDATE SET
+            title = EXCLUDED.title,
+            username = EXCLUDED.username
+        RETURNING id
     """), {"channel_id": channel_id})
     
     # Создаём посты для альбома

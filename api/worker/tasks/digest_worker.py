@@ -142,7 +142,7 @@ from shared.utils.circuit_breaker import (  # type: ignore # noqa: E402
     CircuitBreakerOpenError,
 )
 from api.middleware.rls_middleware import set_tenant_id_in_session  # type: ignore # noqa: E402
-from api.models.database import SessionLocal, DigestHistory, GroupDigest, User  # type: ignore # noqa: E402
+from api.models.database import SessionLocal, DigestHistory, GroupDigest, GroupConversationWindow, User  # type: ignore # noqa: E402
 from api.services.digest_service import get_digest_service  # type: ignore # noqa: E402
 from api.services.group_digest_service import (  # type: ignore # noqa: E402
     get_group_digest_service,
@@ -246,36 +246,74 @@ class DigestWorker:
 
     async def start(self):
         """Запуск воркера и бесконечное потребление очереди."""
-        self.redis_client = RedisStreamsClient(self.redis_url)
-        await self.redis_client.connect()
-        self.publisher = EventPublisher(self.redis_client)
+        logger.info("DigestWorker.start() called", redis_url=self.redis_url)
+        
+        try:
+            self.redis_client = RedisStreamsClient(self.redis_url)
+            await self.redis_client.connect()
+            logger.info("DigestWorker: Redis client connected")
+            
+            self.publisher = EventPublisher(self.redis_client)
+            logger.info("DigestWorker: EventPublisher created")
 
-        consumer_name = f"digest-worker-{os.getpid()}"
-        config = ConsumerConfig(
-            group_name="digest-workers",
-            consumer_name=consumer_name,
-            batch_size=5,
-            block_time=1000,
-            max_retries=3,
-            retry_delay=5,
-        )
-        self.consumer = EventConsumer(self.redis_client, config)
+            consumer_name = f"digest-worker-{os.getpid()}"
+            config = ConsumerConfig(
+                group_name="digest-workers",
+                consumer_name=consumer_name,
+                batch_size=5,
+                block_time=1000,
+                max_retries=3,
+                retry_delay=5,
+            )
+            self.consumer = EventConsumer(self.redis_client, config)
+            logger.info("DigestWorker: EventConsumer created", consumer_name=consumer_name)
 
-        logger.info(
-            "DigestWorker started",
-            redis_url=self.redis_url,
-            consumer_name=consumer_name,
-        )
+            logger.info(
+                "DigestWorker started successfully",
+                redis_url=self.redis_url,
+                consumer_name=consumer_name,
+                stream_name="digests.generate"
+            )
 
-        await self.consumer.consume_forever("digests.generate", self._handle_event)
+            # Context7: Логируем начало потребления для диагностики
+            logger.info("DigestWorker: Starting consume_forever", stream_name="digests.generate")
+            await self.consumer.consume_forever("digests.generate", self._handle_event)
+        except Exception as e:
+            logger.error(
+                "DigestWorker.start() failed",
+                error=str(e),
+                error_type=type(e).__name__,
+                exc_info=True
+            )
+            raise
 
     async def _handle_event(self, event_data: Dict[str, Any]) -> None:
         """Основной обработчик события digests.generate."""
+        # Context7: Логируем получение события для диагностики
+        logger.info(
+            "DigestWorker: Event received",
+            event_keys=list(event_data.keys()) if isinstance(event_data, dict) else type(event_data),
+            has_payload="payload" in event_data if isinstance(event_data, dict) else False
+        )
+        
         payload = event_data.get("payload") or event_data
         try:
             digest_event = DigestGenerateEvent(**payload)
+            logger.info(
+                "DigestWorker: Event parsed successfully",
+                user_id=digest_event.user_id,
+                tenant_id=digest_event.tenant_id,
+                history_id=digest_event.history_id,
+                trigger=digest_event.trigger
+            )
         except Exception as e:
-            logger.error("Failed to parse digest event payload", error=str(e), payload=payload)
+            logger.error(
+                "Failed to parse digest event payload",
+                error=str(e),
+                error_type=type(e).__name__,
+                payload=payload,
+                exc_info=True
+            )
             raise
 
         session = SessionLocal()
@@ -466,6 +504,10 @@ class DigestWorker:
         digest_service = self._get_digest_service()
         group_digest_service = self._get_group_digest_service() if is_group_context else None
 
+        # Context7: Для групповых дайджестов существующий дайджест будет использован как baseline
+        # для сравнения при генерации нового. Это позволяет создать секцию "По сравнению с прошлым окном"
+        # Вся логика загрузки baseline перенесена в group_digest_service.generate()
+
         @self._generation_retry
         async def _run_generation():
             if is_group_context:
@@ -576,7 +618,15 @@ class DigestWorker:
         if not bot:
             raise NonRetryableDigestError("Telegram bot is not initialized")
 
-        digest_chunks = markdown_to_telegram_chunks(content)
+        # Context7: Для групповых дайджестов content уже содержит HTML (summary_html),
+        # не нужно конвертировать из Markdown. Используем split_for_telegram напрямую.
+        if group_digest_id:
+            # Групповой дайджест: content уже HTML, используем split_for_telegram
+            from utils.telegram_formatter import split_for_telegram
+            digest_chunks = split_for_telegram(content, limit=4096)
+        else:
+            # Обычный дайджест: content в Markdown, конвертируем в HTML
+            digest_chunks = markdown_to_telegram_chunks(content)
 
         async def _do_send():
             for idx, chunk in enumerate(digest_chunks):

@@ -5,13 +5,14 @@ Context7: Используем APScheduler для планирования за�
 
 import asyncio
 import os
+import time as time_module
 from datetime import datetime, date, time, timezone, timedelta
 from typing import List, Optional, Dict, Any
 import json
 import structlog
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from prometheus_client import Counter, REGISTRY
+from prometheus_client import Counter, Histogram, Gauge, REGISTRY
 from sqlalchemy.orm import Session
 
 from models.database import (
@@ -26,6 +27,8 @@ from models.database import (
     Group,
     GroupConversationWindow,
     GroupMessage,
+    GroupDigest,  # Context7: Для проверки готовых дайджестов при переиспользовании окон
+    UserGroup,  # Context7: Для проверки подписки пользователя на группу
     ChatTrendSubscription,
     UserTrendProfile,
     Tenant,
@@ -43,6 +46,84 @@ from worker.event_bus import EventPublisher, RedisStreamsClient, DigestGenerateE
 from uuid import UUID
 
 logger = structlog.get_logger()
+
+# ============================================================================
+# PROMETHEUS METRICS для scheduled tasks
+# ============================================================================
+
+# Context7: Метрики для trends_stable_task - проверяем, что не дублируются с trends_worker
+# Используем префикс "trends_stable_" чтобы избежать конфликтов
+# Проверяем существование метрик перед созданием, чтобы избежать дублирования при повторном импорте
+def _get_or_create_metric(metric_type, name, *args, **kwargs):
+    """Context7: Создает метрику только если она еще не существует в REGISTRY."""
+    try:
+        # Пытаемся получить существующую метрику
+        existing = REGISTRY._names_to_collectors.get(name)
+        if existing:
+            return existing
+    except (AttributeError, KeyError):
+        pass
+    
+    # Создаем новую метрику с обработкой дублирования
+    try:
+        return metric_type(name, *args, **kwargs)
+    except ValueError as e:
+        if 'Duplicated timeseries' in str(e) or 'already registered' in str(e).lower():
+            # Метрика уже зарегистрирована, пытаемся найти её в registry
+            try:
+                existing = REGISTRY._names_to_collectors.get(name)
+                if existing:
+                    logger.debug(f"Metric {name} already registered, reusing existing", metric=name)
+                    return existing
+            except (AttributeError, KeyError, TypeError):
+                pass
+            # Если не нашли, логируем предупреждение и возвращаем заглушку
+            logger.warning(f"Metric {name} exists but could not retrieve from REGISTRY", metric=name)
+            # Создаём заглушку для избежания падения
+            class MockMetric:
+                def labels(self, **kwargs):
+                    return self
+                def inc(self, value=1):
+                    pass
+                def observe(self, value):
+                    pass
+                def set(self, value):
+                    pass
+            return MockMetric()
+        raise
+
+trends_stable_task_runs_total = _get_or_create_metric(
+    Counter,
+    "trends_stable_task_runs_total",
+    "Total number of trends_stable_task executions",
+    ["outcome"],  # outcome: success|error
+)
+
+trends_stable_clusters_checked_total = _get_or_create_metric(
+    Counter,
+    "trends_stable_clusters_checked_total",
+    "Total number of clusters checked by trends_stable_task",
+)
+
+trends_stable_clusters_promoted_total = _get_or_create_metric(
+    Counter,
+    "trends_stable_clusters_promoted_total",
+    "Total number of clusters promoted to stable status",
+)
+
+trends_stable_clusters_skipped_total = _get_or_create_metric(
+    Counter,
+    "trends_stable_clusters_skipped_total",
+    "Total number of clusters skipped by trends_stable_task",
+    ["reason"],  # reason: no_metrics|freq_too_low|sources_too_low|burst_too_low|is_generic
+)
+
+trends_stable_task_duration_seconds = _get_or_create_metric(
+    Histogram,
+    "trends_stable_task_duration_seconds",
+    "Duration of trends_stable_task execution",
+    buckets=(1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0),
+)
 
 # Добавляем api/worker в путь для импорта
 worker_dir = Path(__file__).resolve().parent.parent / "worker"
@@ -99,10 +180,15 @@ def _is_group_digest_enabled_for_tenant(tenant_id: str) -> bool:
     return normalized in allow_list
 
 def _register_digest_retry_counter() -> Counter:
+    """Context7: Регистрация метрики digest_retry_total с защитой от дублирования."""
     metric_name = 'api_digest_retry_total'
-    existing = REGISTRY._names_to_collectors.get(metric_name)
-    if existing is not None:
-        return existing  # type: ignore[return-value]
+    try:
+        existing = REGISTRY._names_to_collectors.get(metric_name)
+        if existing is not None:
+            return existing  # type: ignore[return-value]
+    except (AttributeError, KeyError):
+        pass
+    
     try:
         return Counter(
             'digest_retry_total',
@@ -119,6 +205,26 @@ def _register_digest_retry_counter() -> Counter:
 
 
 digest_retry_counter = _register_digest_retry_counter()
+
+# Context7: Метрики для scheduler
+scheduler_running = _get_or_create_metric(
+    Gauge,
+    "scheduler_running",
+    "Scheduler running status (1=running, 0=stopped)",
+)
+
+scheduler_startup_duration_seconds = _get_or_create_metric(
+    Histogram,
+    "scheduler_startup_duration_seconds",
+    "Duration of scheduler startup in seconds",
+    buckets=(0.1, 0.5, 1.0, 2.0, 5.0, 10.0),
+)
+
+scheduler_jobs_total = _get_or_create_metric(
+    Gauge,
+    "scheduler_jobs_total",
+    "Total number of scheduled jobs",
+)
 
 # Глобальный scheduler
 scheduler: AsyncIOScheduler = None
@@ -197,6 +303,19 @@ async def generate_digest_for_user(
         if existing:
             if existing.status in {"scheduled", "pending", "processing"}:
                 if force_new:
+                    # Context7: При manual trigger перезаписываем только если прошло достаточно времени
+                    # Предотвращаем дубликаты при быстром двойном нажатии
+                    from datetime import timezone
+                    age_seconds = (datetime.now(timezone.utc) - existing.created_at).total_seconds()
+                    if age_seconds < 30:  # Меньше 30 секунд - игнорируем второй запрос
+                        logger.warning(
+                            "Duplicate digest request ignored (too recent)",
+                            user_id=user_id,
+                            digest_id=str(existing.id),
+                            age_seconds=age_seconds
+                        )
+                        return existing
+                    
                     logger.warning(
                         "Manual trigger overriding in-flight digest",
                         user_id=user_id,
@@ -330,45 +449,260 @@ async def enqueue_group_digest(
         user_uuid = UUID(user_id)
         requested_by_uuid = UUID(requested_by) if requested_by else user_uuid
 
+        # Context7: Группы глобальные (без tenant_id), проверяем только существование группы
+        # Изоляция происходит через user_group - проверяем, что пользователь подписан на группу
         group: Optional[Group] = (
             db.query(Group)
-            .filter(Group.id == group_uuid, Group.tenant_id == tenant_uuid)
+            .filter(Group.id == group_uuid)
             .first()
         )
         if not group:
-            raise ValueError("Группа не найдена или принадлежит другому арендатору")
+            logger.warning(
+                "Group not found in enqueue_group_digest",
+                group_id=group_id,
+                tenant_id=tenant_id,
+                user_id=user_id,
+            )
+            raise ValueError("Группа не найдена")
+        
+        # Context7: КРИТИЧНО - проверяем, что пользователь подписан на группу через user_group
+        # Context7: Используем .is_(True) вместо == True для правильной работы с NULL значениями
+        logger.debug(
+            "Checking user subscription to group",
+            group_id=group_id,
+            group_title=group.title,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            user_uuid=str(user_uuid),
+            group_uuid=str(group_uuid),
+        )
+        
+        user_group_subscription = (
+            db.query(UserGroup)
+            .filter(
+                UserGroup.user_id == user_uuid,
+                UserGroup.group_id == group_uuid,
+                UserGroup.is_active.is_(True)
+            )
+            .first()
+        )
+        
+        # Context7: Детальная диагностика - проверяем все подписки пользователя на эту группу
+        if not user_group_subscription:
+            # Проверяем, есть ли вообще подписка (даже неактивная)
+            any_subscription = (
+                db.query(UserGroup)
+                .filter(
+                    UserGroup.user_id == user_uuid,
+                    UserGroup.group_id == group_uuid
+                )
+                .first()
+            )
+            
+            if any_subscription:
+                logger.warning(
+                    "User subscription exists but is not active in enqueue_group_digest",
+                    group_id=group_id,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    subscription_is_active=any_subscription.is_active,
+                    subscription_subscribed_at=any_subscription.subscribed_at.isoformat() if any_subscription.subscribed_at else None,
+                )
+                raise ValueError("Подписка пользователя на группу неактивна")
+            else:
+                logger.warning(
+                    "User not subscribed to group in enqueue_group_digest",
+                    group_id=group_id,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    group_title=group.title if group else None,
+                )
+                raise ValueError("Пользователь не подписан на эту группу")
 
         now_utc = datetime.now(timezone.utc)
         window_start = now_utc - timedelta(hours=window_size_hours)
         window_end = now_utc
 
+        # Context7: Конвертируем timezone-aware datetime в naive UTC для сравнения
+        # с naive datetime в БД (posted_at хранится как naive datetime в UTC)
+        window_start_naive = window_start.replace(tzinfo=None)
+        window_end_naive = window_end.replace(tzinfo=None)
+
+        # Context7: Диагностический запрос - проверяем общее количество сообщений в группе
+        total_messages_in_group = (
+            db.query(GroupMessage)
+            .filter(GroupMessage.group_id == group_uuid)
+            .count()
+        )
+
+        # Context7: Проверяем сообщения в окне с правильной фильтрацией по времени
         messages_query = (
             db.query(GroupMessage)
             .filter(
                 GroupMessage.group_id == group_uuid,
-                GroupMessage.posted_at >= window_start,
-                GroupMessage.posted_at <= window_end,
+                GroupMessage.posted_at >= window_start_naive,
+                GroupMessage.posted_at <= window_end_naive,
             )
         )
         message_count = messages_query.count()
+        
+        # Context7: Дополнительная диагностика - проверяем сообщения без верхней границы
+        messages_after_start = (
+            db.query(GroupMessage)
+            .filter(
+                GroupMessage.group_id == group_uuid,
+                GroupMessage.posted_at >= window_start_naive,
+            )
+            .count()
+        )
+
         participant_count = (
             messages_query.distinct(GroupMessage.sender_tg_id)
             .count()
         )
 
-        window = GroupConversationWindow(
-            group_id=group_uuid,
-            tenant_id=tenant_uuid,
+        # Context7: Детальное логирование для диагностики проблемы с подсчетом
+        logger.info(
+            "Group digest message count calculation",
+            tenant_id=tenant_id,
+            group_id=group_id,
             window_size_hours=window_size_hours,
-            window_start=window_start,
-            window_end=window_end,
-            message_count=message_count,
+            window_start=window_start_naive.isoformat(),
+            window_end=window_end_naive.isoformat(),
+            total_messages_in_group=total_messages_in_group,
+            messages_after_start=messages_after_start,
+            message_count_in_window=message_count,
             participant_count=participant_count,
-            status="queued",
         )
-        db.add(window)
-        db.commit()
-        db.refresh(window)
+
+        # Context7: Предупреждение, если сообщения есть в группе, но не попадают в окно
+        if total_messages_in_group > 0 and message_count == 0:
+            # Проверяем последнее сообщение в группе для диагностики
+            last_message = (
+                db.query(GroupMessage)
+                .filter(GroupMessage.group_id == group_uuid)
+                .order_by(GroupMessage.posted_at.desc())
+                .first()
+            )
+            if last_message:
+                last_message_age_hours = (window_end_naive - last_message.posted_at).total_seconds() / 3600.0
+                logger.warning(
+                    "Messages exist in group but none in window - last message is too old",
+                    tenant_id=tenant_id,
+                    group_id=group_id,
+                    window_size_hours=window_size_hours,
+                    window_start=window_start_naive.isoformat(),
+                    window_end=window_end_naive.isoformat(),
+                    last_message_posted_at=last_message.posted_at.isoformat() if last_message.posted_at else None,
+                    last_message_age_hours=round(last_message_age_hours, 2),
+                    total_messages_in_group=total_messages_in_group,
+                    suggestion=f"Last message is {round(last_message_age_hours, 1)} hours old. Try increasing window_size_hours or check if new messages are being ingested.",
+                )
+
+        # Context7: Дедупликация окон - проверяем существующие окна с перекрывающимся временным диапазоном
+        # Перекрытие определяется как: (window1_start <= window2_end) AND (window1_end >= window2_start)
+        # Для одинакового размера окна допустимый порог перекрытия - 30 минут
+        window_overlap_threshold_minutes = int(os.getenv("GROUP_DIGEST_WINDOW_OVERLAP_THRESHOLD_MINUTES", "30"))
+        window_overlap_threshold = timedelta(minutes=window_overlap_threshold_minutes)
+        
+        existing_window = (
+            db.query(GroupConversationWindow)
+            .filter(
+                GroupConversationWindow.group_id == group_uuid,
+                GroupConversationWindow.tenant_id == tenant_uuid,
+                GroupConversationWindow.window_size_hours == window_size_hours,
+                # Проверка перекрытия временных диапазонов:
+                # существующее окно перекрывается с новым, если:
+                # (existing_start <= new_end) AND (existing_end >= new_start)
+                GroupConversationWindow.window_start <= window_end,
+                GroupConversationWindow.window_end >= window_start,
+            )
+            .order_by(GroupConversationWindow.window_end.desc())
+            .first()
+        )
+        
+        if existing_window:
+            # Проверяем, насколько близко временные окна (для одинакового размера окна)
+            time_diff_start = abs((existing_window.window_start - window_start).total_seconds() / 60)
+            time_diff_end = abs((existing_window.window_end - window_end).total_seconds() / 60)
+            
+            if time_diff_start <= window_overlap_threshold_minutes and time_diff_end <= window_overlap_threshold_minutes:
+                # Переиспользуем существующее окно
+                window = existing_window
+                
+                # Context7: Проверяем, есть ли уже готовый дайджест для этого окна
+                # Если есть - он будет использован как baseline для сравнения при генерации нового дайджеста
+                existing_digest = (
+                    db.query(GroupDigest)
+                    .filter(
+                        GroupDigest.window_id == window.id,
+                        GroupDigest.delivery_status == "sent",
+                    )
+                    .order_by(GroupDigest.generated_at.desc())
+                    .first()
+                )
+                
+                logger.info(
+                    "Reusing existing conversation window for group digest",
+                    tenant_id=tenant_id,
+                    group_id=group_id,
+                    window_id=str(window.id),
+                    existing_window_start=window.window_start.isoformat(),
+                    existing_window_end=window.window_end.isoformat(),
+                    requested_window_start=window_start.isoformat(),
+                    requested_window_end=window_end.isoformat(),
+                    time_diff_start_minutes=round(time_diff_start, 1),
+                    time_diff_end_minutes=round(time_diff_end, 1),
+                    window_status=window.status,
+                    has_existing_digest=existing_digest is not None,
+                    will_use_as_baseline=existing_digest is not None,
+                )
+                
+                # Окно существует, но дайджест еще не готов или не завершен
+                # Используем существующее окно, но создадим новую запись DigestHistory
+            else:
+                # Окна перекрываются, но различаются слишком сильно - создаем новое
+                logger.info(
+                    "Overlapping windows found but time difference too large, creating new window",
+                    tenant_id=tenant_id,
+                    group_id=group_id,
+                    existing_window_id=str(existing_window.id),
+                    existing_window_start=existing_window.window_start.isoformat(),
+                    existing_window_end=existing_window.window_end.isoformat(),
+                    requested_window_start=window_start.isoformat(),
+                    requested_window_end=window_end.isoformat(),
+                    time_diff_start_minutes=round(time_diff_start, 1),
+                    time_diff_end_minutes=round(time_diff_end, 1),
+                    threshold_minutes=window_overlap_threshold_minutes,
+                )
+                window = GroupConversationWindow(
+                    group_id=group_uuid,
+                    tenant_id=tenant_uuid,
+                    window_size_hours=window_size_hours,
+                    window_start=window_start,
+                    window_end=window_end,
+                    message_count=message_count,
+                    participant_count=participant_count,
+                    status="queued",
+                )
+                db.add(window)
+                db.commit()
+                db.refresh(window)
+        else:
+            # Окно не найдено - создаем новое
+            window = GroupConversationWindow(
+                group_id=group_uuid,
+                tenant_id=tenant_uuid,
+                window_size_hours=window_size_hours,
+                window_start=window_start,
+                window_end=window_end,
+                message_count=message_count,
+                participant_count=participant_count,
+                status="queued",
+            )
+            db.add(window)
+            db.commit()
+            db.refresh(window)
 
         digest_history = DigestHistory(
             user_id=user_uuid,
@@ -419,8 +753,36 @@ async def enqueue_group_digest(
             "participant_count": participant_count,
         }
 
+    except Exception as exc:
+        # Context7: Rollback при ошибках для предотвращения утечек транзакций
+        try:
+            db.rollback()
+            logger.warning(
+                "Rolled back transaction due to error in enqueue_group_digest",
+                group_id=group_id,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+        except Exception as rollback_exc:
+            logger.error(
+                "Failed to rollback transaction",
+                group_id=group_id,
+                tenant_id=tenant_id,
+                error=str(rollback_exc),
+            )
+        # Пробрасываем исключение дальше для обработки в эндпоинте
+        raise
     finally:
-        db.close()
+        # Context7: Всегда закрываем сессию БД
+        try:
+            db.close()
+        except Exception as close_exc:
+            logger.error(
+                "Error closing database session",
+                error=str(close_exc),
+            )
 
 
 async def process_digests_task():
@@ -430,6 +792,9 @@ async def process_digests_task():
     Context7: Проверяет всех пользователей с включенными дайджестами и topics,
     вычисляет локальное время по schedule_tz и генерирует дайджесты.
     """
+    task_start_time = datetime.now(timezone.utc)
+    logger.info("process_digests_task started", timestamp=task_start_time.isoformat())
+    
     try:
         from pytz import timezone as pytz_timezone
         
@@ -439,6 +804,11 @@ async def process_digests_task():
         digest_settings = db.query(DigestSettings).filter(
             DigestSettings.enabled == True
         ).all()
+        
+        logger.info(
+            "process_digests_task: checking users",
+            enabled_settings_count=len(digest_settings)
+        )
         
         current_utc = datetime.now(timezone.utc)
         
@@ -482,7 +852,24 @@ async def process_digests_task():
                     (schedule_time.hour * 60 + schedule_time.minute)
                 )
                 
+                # Context7: Логируем проверку расписания для диагностики
+                logger.debug(
+                    "Checking digest schedule",
+                    user_id=str(setting.user_id),
+                    schedule_time=schedule_time.isoformat() if isinstance(schedule_time, time) else str(schedule_time),
+                    local_time=local_time.isoformat(),
+                    schedule_tz=setting.schedule_tz,
+                    time_diff_minutes=time_diff
+                )
+                
                 if time_diff <= 5:  # В пределах 5 минут от расписания
+                    logger.info(
+                        "Digest schedule matched",
+                        user_id=str(setting.user_id),
+                        schedule_time=schedule_time.isoformat() if isinstance(schedule_time, time) else str(schedule_time),
+                        local_time=local_time.isoformat(),
+                        time_diff_minutes=time_diff
+                    )
                     # Проверяем, не был ли уже сгенерирован дайджест сегодня
                     from datetime import date
                     today = date.today()
@@ -554,10 +941,22 @@ async def process_digests_task():
                 continue
         
         db.close()
-        logger.info("Digest processing task completed")
+        task_duration = (datetime.now(timezone.utc) - task_start_time).total_seconds()
+        logger.info(
+            "Digest processing task completed",
+            duration_seconds=round(task_duration, 2),
+            settings_checked=len(digest_settings) if 'digest_settings' in locals() else 0
+        )
     
     except Exception as e:
-        logger.error("Error in digest processing task", error=str(e))
+        task_duration = (datetime.now(timezone.utc) - task_start_time).total_seconds()
+        logger.error(
+            "Error in digest processing task",
+            error=str(e),
+            error_type=type(e).__name__,
+            duration_seconds=round(task_duration, 2),
+            exc_info=True
+        )
 
 
 async def detect_trends_task():
@@ -584,9 +983,15 @@ async def detect_trends_task():
             trends_count=len(trends)
         )
         
-        # Отправка уведомлений о трендах пользователям
-        if trends:
+        # Context7: Отправка уведомлений о трендах пользователям (управляется через TREND_ALERTS_ENABLED)
+        alerts_enabled = os.getenv("TREND_ALERTS_ENABLED", "false").lower() == "true"
+        if trends and alerts_enabled:
             await send_trend_alerts_to_users(trends, db)
+        elif trends and not alerts_enabled:
+            logger.debug(
+                "Trend alerts disabled via TREND_ALERTS_ENABLED",
+                trends_count=len(trends)
+            )
         
         db.close()
     
@@ -601,6 +1006,8 @@ async def trends_stable_task():
     Context7: Использует trend_metrics для вычисления baseline и переносит
     emerging кластеры в таблицу TrendDetection.
     """
+    import time
+    task_start = time_module.time()
     db = None
     try:
         db = next(get_db())
@@ -609,13 +1016,21 @@ async def trends_stable_task():
         min_burst = getattr(settings, "trend_stable_min_burst", 1.5)
 
         clusters = db.query(TrendCluster).filter(
-            TrendCluster.status.in_(["emerging", "stable"])
+            TrendCluster.status.in_(["emerging", "stable"]),
+            TrendCluster.is_generic == False
         ).all()
 
         promoted = 0
         updated = 0
+        skipped_no_metrics = 0
+        skipped_freq = 0
+        skipped_sources = 0
+        skipped_burst = 0
+        skipped_generic = 0
 
         for cluster in clusters:
+            trends_stable_clusters_checked_total.inc()
+            
             metrics = (
                 db.query(TrendMetrics)
                 .filter(TrendMetrics.cluster_id == cluster.id)
@@ -623,13 +1038,63 @@ async def trends_stable_task():
                 .first()
             )
             if not metrics:
+                skipped_no_metrics += 1
+                trends_stable_clusters_skipped_total.labels(reason="no_metrics").inc()
+                # Context7: Логируем причину пропуска для диагностики
+                logger.debug(
+                    "trends_stable_task_skipped",
+                    cluster_id=str(cluster.id),
+                    reason="no_metrics",
+                    label=cluster.label,
+                )
                 continue
 
+            # Context7: Проверяем пороги и логируем причины пропуска
             if (metrics.freq_long or 0) < min_freq:
+                skipped_freq += 1
+                trends_stable_clusters_skipped_total.labels(reason="freq_too_low").inc()
+                logger.debug(
+                    "trends_stable_task_skipped",
+                    cluster_id=str(cluster.id),
+                    reason="freq_too_low",
+                    freq_long=metrics.freq_long,
+                    min_freq=min_freq,
+                    label=cluster.label,
+                )
                 continue
             if (metrics.source_diversity or 0) < min_sources:
+                skipped_sources += 1
+                trends_stable_clusters_skipped_total.labels(reason="sources_too_low").inc()
+                logger.debug(
+                    "trends_stable_task_skipped",
+                    cluster_id=str(cluster.id),
+                    reason="sources_too_low",
+                    source_diversity=metrics.source_diversity,
+                    min_sources=min_sources,
+                    label=cluster.label,
+                )
                 continue
             if (metrics.burst_score or 0) < min_burst:
+                skipped_burst += 1
+                trends_stable_clusters_skipped_total.labels(reason="burst_too_low").inc()
+                logger.debug(
+                    "trends_stable_task_skipped",
+                    cluster_id=str(cluster.id),
+                    reason="burst_too_low",
+                    burst_score=metrics.burst_score,
+                    min_burst=min_burst,
+                    label=cluster.label,
+                )
+                continue
+            if cluster.is_generic:
+                skipped_generic += 1
+                trends_stable_clusters_skipped_total.labels(reason="is_generic").inc()
+                logger.debug(
+                    "trends_stable_task_skipped",
+                    cluster_id=str(cluster.id),
+                    reason="is_generic",
+                    label=cluster.label,
+                )
                 continue
 
             if cluster.status != "stable":
@@ -653,24 +1118,40 @@ async def trends_stable_task():
                 db.flush()
                 cluster.resolved_trend_id = trend.id
                 promoted += 1
+                trends_stable_clusters_promoted_total.inc()
 
         if promoted or updated:
             db.commit()
         else:
             db.rollback()
 
+        task_duration = time_module.time() - task_start
+        trends_stable_task_duration_seconds.observe(task_duration)
+        trends_stable_task_runs_total.labels(outcome="success").inc()
+
         logger.info(
             "Trends stable task completed",
             clusters_checked=len(clusters),
             clusters_promoted=promoted,
             clusters_updated=updated,
+            skipped={
+                "no_metrics": skipped_no_metrics,
+                "freq_too_low": skipped_freq,
+                "sources_too_low": skipped_sources,
+                "burst_too_low": skipped_burst,
+                "is_generic": skipped_generic,
+            },
             thresholds={
                 "min_freq": min_freq,
                 "min_sources": min_sources,
                 "min_burst": min_burst,
             },
+            duration_seconds=round(task_duration, 2),
         )
     except Exception as e:
+        trends_stable_task_runs_total.labels(outcome="error").inc()
+        task_duration = time_module.time() - task_start
+        trends_stable_task_duration_seconds.observe(task_duration)
         if db:
             db.rollback()
         logger.error("Error in trends_stable_task", error=str(e), exc_info=True)
@@ -1220,7 +1701,11 @@ async def calculate_tenant_storage_usage_task():
     """
     try:
         import os
-        import asyncpg
+        try:
+            import asyncpg
+        except ImportError:
+            logger.warning("asyncpg not available, skipping tenant storage usage calculation")
+            return
         
         # Context7: Импорт worker версии StorageQuotaService для async методов
         # Добавляем путь к worker для импорта
@@ -1411,12 +1896,15 @@ def setup_scheduled_tasks():
         scheduler = init_scheduler()
     
     # Дайджесты: каждые 15 минут
+    # Context7: Добавляем misfire_grace_time для обработки пропущенных задач
+    # Если задача пропущена (missed), она все равно выполнится в течение 5 минут
     scheduler.add_job(
         process_digests_task,
         trigger=CronTrigger(minute="*/15"),  # Каждые 15 минут
         id="process_digests",
         name="Process user digests",
-        replace_existing=True
+        replace_existing=True,
+        misfire_grace_time=300  # 5 минут - выполнить даже если пропущено
     )
     
     # Тренды: ежедневно в 00:00 UTC
@@ -1495,27 +1983,108 @@ def setup_scheduled_tasks():
 
 
 async def start_scheduler():
-    """Запуск scheduler (async для работы с AsyncIOScheduler)."""
+    """
+    Запуск scheduler (async для работы с AsyncIOScheduler).
+    
+    Context7: Добавлено подробное логирование и метрики для observability.
+    """
     global scheduler
     
-    if scheduler is None:
-        scheduler = init_scheduler()
+    start_time = time_module.time()
+    logger.info("Starting scheduler initialization...")
     
-    if not scheduler.running:
-        # Context7: AsyncIOScheduler требует запущенного event loop
-        # Запускаем scheduler в фоне через asyncio.create_task
-        scheduler.start()
-        setup_scheduled_tasks()
-        logger.info("Scheduler started")
-    else:
-        logger.warning("Scheduler already running")
+    try:
+        if scheduler is None:
+            logger.info("Initializing scheduler instance...")
+            scheduler = init_scheduler()
+            logger.info("Scheduler instance created", scheduler_id=id(scheduler))
+        else:
+            logger.info("Using existing scheduler instance", scheduler_id=id(scheduler))
+        
+        if not scheduler.running:
+            # Context7: AsyncIOScheduler требует запущенного event loop
+            # Запускаем scheduler в фоне через asyncio.create_task
+            logger.info("Starting scheduler...")
+            scheduler.start()
+            logger.info("Scheduler started, setting up scheduled tasks...")
+            
+            setup_scheduled_tasks()
+            
+            # Context7: Обновляем метрики
+            scheduler_running.set(1)
+            jobs = scheduler.get_jobs()
+            scheduler_jobs_total.set(len(jobs))
+            
+            duration = time_module.time() - start_time
+            scheduler_startup_duration_seconds.observe(duration)
+            
+            logger.info(
+                "Scheduler started successfully",
+                jobs_count=len(jobs),
+                startup_duration_seconds=round(duration, 3),
+                job_ids=[job.id for job in jobs]
+            )
+        else:
+            logger.warning("Scheduler already running, skipping startup")
+            scheduler_running.set(1)
+            jobs = scheduler.get_jobs()
+            scheduler_jobs_total.set(len(jobs))
+            
+    except Exception as e:
+        scheduler_running.set(0)
+        duration = time.time() - start_time
+        scheduler_startup_duration_seconds.observe(duration)
+        logger.error(
+            "Failed to start scheduler",
+            error=str(e),
+            error_type=type(e).__name__,
+            startup_duration_seconds=round(duration, 3),
+            exc_info=True
+        )
+        raise
 
 
 def stop_scheduler():
-    """Остановка scheduler."""
+    """
+    Остановка scheduler.
+    
+    Context7: Graceful shutdown с таймаутом и обновлением метрик.
+    """
     global scheduler
     
-    if scheduler and scheduler.running:
-        scheduler.shutdown()
-        logger.info("Scheduler stopped")
+    if scheduler is None:
+        logger.warning("Scheduler is None, nothing to stop")
+        scheduler_running.set(0)
+        return
+    
+    if not scheduler.running:
+        logger.info("Scheduler is not running, nothing to stop")
+        scheduler_running.set(0)
+        return
+    
+    try:
+        logger.info("Stopping scheduler...")
+        
+        # Context7: Graceful shutdown - сохраняем список jobs перед остановкой
+        jobs_before = scheduler.get_jobs()
+        logger.info("Jobs before shutdown", jobs_count=len(jobs_before), job_ids=[job.id for job in jobs_before])
+        
+        # Останавливаем scheduler
+        scheduler.shutdown(wait=False)  # Не ждем завершения задач
+        
+        # Context7: Обновляем метрики
+        scheduler_running.set(0)
+        scheduler_jobs_total.set(0)
+        
+        logger.info("Scheduler stopped successfully")
+        
+    except Exception as e:
+        scheduler_running.set(0)
+        logger.error(
+            "Error stopping scheduler",
+            error=str(e),
+            error_type=type(e).__name__,
+            exc_info=True
+        )
+        # Не пробрасываем исключение, чтобы не блокировать shutdown
 

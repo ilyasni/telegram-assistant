@@ -138,6 +138,23 @@ async def _analyze_single_row(row) -> Dict[str, Any]:
     has_ocr_legacy = bool(ocr_text_legacy)
     has_ocr_data = bool(ocr_data)
     
+    # Context7: Проверка enhancement полей
+    enhancement_info = {}
+    if isinstance(ocr_data, dict):
+        enhancement_info = {
+            "has_text_enhanced": bool(ocr_data.get('text_enhanced')),
+            "has_corrections": bool(ocr_data.get('corrections')),
+            "has_entities": bool(ocr_data.get('entities')),
+            "has_enhanced_at": bool(ocr_data.get('enhanced_at')),
+            "has_enhancement_version": bool(ocr_data.get('enhancement_version')),
+            "text_enhanced": ocr_data.get('text_enhanced')[:200] if ocr_data.get('text_enhanced') else None,
+            "corrections_count": len(ocr_data.get('corrections', [])) if ocr_data.get('corrections') else 0,
+            "entities_count": len(ocr_data.get('entities', [])) if ocr_data.get('entities') else 0,
+            "enhanced_at": ocr_data.get('enhanced_at'),
+            "enhancement_version": ocr_data.get('enhancement_version'),
+            "text_confidence": ocr_data.get('text_confidence')
+        }
+    
     return {
         "status": "found",
         "post_id": str(row['post_id']),
@@ -154,7 +171,8 @@ async def _analyze_single_row(row) -> Dict[str, Any]:
             "confidence": ocr_confidence,
             "match": ocr_match,
             "length_new": len(ocr_text_new) if ocr_text_new else 0,
-            "length_legacy": len(ocr_text_legacy) if ocr_text_legacy else 0
+            "length_legacy": len(ocr_text_legacy) if ocr_text_legacy else 0,
+            "enhancement": enhancement_info
         },
         "data_keys": list(data.keys()) if data and isinstance(data, dict) else [],
         "full_data": data
@@ -302,7 +320,25 @@ def main(db_url: str, post_id: Optional[str], limit: int):
         table.add_row("OCR Text Length (legacy)", str(ocr_info.get('length_legacy', 0)))
         table.add_row("Formats Match", "✓" if ocr_info.get('match') else "✗")
         
+        # Enhancement поля
+        enhancement = ocr_info.get('enhancement', {})
+        if enhancement:
+            table.add_row("", "")
+            table.add_row("[bold]Enhancement Fields[/bold]", "")
+            table.add_row("Has text_enhanced", "✓" if enhancement.get('has_text_enhanced') else "✗")
+            table.add_row("Has corrections", "✓" if enhancement.get('has_corrections') else "✗")
+            table.add_row("Has entities", "✓" if enhancement.get('has_entities') else "✗")
+            table.add_row("Corrections Count", str(enhancement.get('corrections_count', 0)))
+            table.add_row("Entities Count", str(enhancement.get('entities_count', 0)))
+            table.add_row("Enhanced At", enhancement.get('enhanced_at') or 'N/A')
+            table.add_row("Enhancement Version", enhancement.get('enhancement_version') or 'N/A')
+        
         console.print(table)
+        
+        # Показываем улучшенный текст если есть
+        if enhancement and enhancement.get('text_enhanced'):
+            console.print(f"\n[bold]OCR Text (enhanced):[/bold]")
+            console.print(Panel(enhancement['text_enhanced'][:500], title="Enhanced OCR Text"))
         
         if ocr_info.get('text_new'):
             console.print(f"\n[bold]OCR Text (new format):[/bold]")

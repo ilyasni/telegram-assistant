@@ -13,7 +13,7 @@ from typing import Dict, Any, Optional, List, Tuple
 
 import redis.asyncio as redis
 import structlog
-from prometheus_client import Counter, Histogram
+from prometheus_client import Counter, Histogram, CollectorRegistry, REGISTRY
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy import select, update, text
@@ -23,6 +23,7 @@ from ai_adapters.gigachat_vision import GigaChatVisionAdapter
 from services.vision_policy_engine import VisionPolicyEngine
 from services.budget_gate import BudgetGateService
 from services.ocr_fallback import OCRFallbackService
+from services.ocr_enhancement_service import OCREnhancementService
 from services.storage_quota import StorageQuotaService
 from services.retry_policy import create_retry_decorator, DEFAULT_RETRY_CONFIG, DLQService, should_retry, classify_error
 from services.experiment_manager import VisionExperimentManager
@@ -48,111 +49,156 @@ logger = structlog.get_logger()
 # METRICS
 # ============================================================================
 
-vision_worker_processed_total = Counter(
+# Context7: Безопасное создание метрик для избежания дублирования в CollectorRegistry
+def _safe_create_metric(metric_class, name, *args, **kwargs):
+    """Создание метрики с проверкой на дублирование."""
+    try:
+        return metric_class(name, *args, **kwargs)
+    except ValueError as e:
+        # Если метрика уже существует, пытаемся получить существующую
+        if 'Duplicated' in str(e) or 'already registered' in str(e).lower():
+            try:
+                if hasattr(REGISTRY, '_names_to_collectors'):
+                    existing = REGISTRY._names_to_collectors.get(name)
+                    if existing:
+                        logger.debug(f"Found existing metric {name} in REGISTRY, reusing", metric=name)
+                        return existing
+            except (AttributeError, KeyError, TypeError):
+                pass
+            # Если не нашли - создаём заглушку (метрика уже существует в Prometheus)
+            logger.warning(f"Metric {name} exists but could not retrieve from REGISTRY, using mock", metric=name)
+            class MockMetric:
+                def labels(self, **kwargs):
+                    return self
+                def inc(self, value=1):
+                    pass
+                def observe(self, value):
+                    pass
+                def set(self, value):
+                    pass
+            return MockMetric()
+        raise
+
+vision_worker_processed_total = _safe_create_metric(
+    Counter,
     'vision_worker_processed_total',
     'Total vision events processed',
     ['status', 'reason']
 )
 
-vision_worker_duration_seconds = Histogram(
+vision_worker_duration_seconds = _safe_create_metric(
+    Histogram,
     'vision_worker_duration_seconds',
     'Vision worker processing duration',
     ['status']
 )
 
-vision_worker_idempotency_hits = Counter(
+vision_worker_idempotency_hits = _safe_create_metric(
+    Counter,
     'vision_worker_idempotency_hits',
     'Idempotency cache hits'
 )
 
 # Context7: Расширенные метрики для observability
-vision_events_total = Counter(
+vision_events_total = _safe_create_metric(
+    Counter,
     'vision_events_total',
     'Total vision events processed',
     ['status', 'reason']  # status: processed, skipped, failed; reason: policy, budget, idempotency, etc.
 )
 
-vision_media_total = Counter(
+vision_media_total = _safe_create_metric(
+    Counter,
     'vision_media_total',
     'Total media files processed',
     ['result', 'reason']  # result: ok, skipped, failed; reason: policy, budget, idempotency, s3_missing, etc.
 )
 
-vision_retries_total = Counter(
+vision_retries_total = _safe_create_metric(
+    Counter,
     'vision_retries_total',
     'Total retries by stage',
     ['stage']  # stage: s3, vision_api, db
 )
 
-vision_event_duration_seconds = Histogram(
+vision_event_duration_seconds = _safe_create_metric(
+    Histogram,
     'vision_event_duration_seconds',
     'End-to-end vision event processing duration',
     buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0]
 )
 
-vision_media_duration_seconds = Histogram(
+vision_media_duration_seconds = _safe_create_metric(
+    Histogram,
     'vision_media_duration_seconds',
     'Single media file processing duration',
     buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0]
+    # ПРИМЕЧАНИЕ: Метрика БЕЗ labels - используем .observe() напрямую
 )
 
-vision_experiment_assignments_total = Counter(
+vision_experiment_assignments_total = _safe_create_metric(
+    Counter,
     'vision_experiment_assignments_total',
     'Vision experiment assignments per tenant',
     ['experiment', 'variant']
 )
 
-vision_low_priority_enqueued_total = Counter(
+vision_low_priority_enqueued_total = _safe_create_metric(
+    Counter,
     'vision_low_priority_enqueued_total',
     'Vision media enqueued to low priority queue',
     ['reason']
 )
 
-vision_low_priority_processed_total = Counter(
+vision_low_priority_processed_total = _safe_create_metric(
+    Counter,
     'vision_low_priority_processed_total',
     'Low priority vision processing outcomes',
     ['status']  # processed | pending | error | budget_exhausted
 )
 
 from prometheus_client import Gauge
-vision_pel_size = Gauge(
+vision_pel_size = _safe_create_metric(
+    Gauge,
     'vision_pel_size',
     'Pending Entry List size for vision workers',
     ['consumer_group']
 )
 
-vision_pending_older_than_seconds = Gauge(
+vision_pending_older_than_seconds = _safe_create_metric(
+    Gauge,
     'vision_pending_older_than_seconds',
     'Age of oldest pending message in seconds',
     ['percentile', 'consumer_group']  # percentile: 95, 99
 )
 
-ocr_local_latency_seconds = Histogram(
+ocr_local_latency_seconds = _safe_create_metric(
+    Histogram,
     'ocr_local_latency_seconds',
     'Latency of local OCR processing before/after Vision',
     ['engine', 'mode']  # mode: primary | fallback
 )
 
 # Context7: Дополнительные метрики для мониторинга Vision анализа
-vision_analysis_duration_seconds = Histogram(
-    'vision_analysis_duration_seconds',
-    'Vision analysis duration (API call time)',
-    buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0]
-)
+# ПРИМЕЧАНИЕ: vision_analysis_duration_seconds определена в gigachat_vision.py с labels ['provider', 'has_ocr']
+# Не дублируем здесь, чтобы избежать конфликта определений
 
-vision_analysis_tokens_total = Counter(
+vision_analysis_tokens_total = _safe_create_metric(
+    Counter,
     'vision_analysis_tokens_total',
     'Total tokens used for Vision analysis',
     ['provider', 'model']
 )
 
-vision_analysis_errors_total = Counter(
+vision_analysis_errors_total = _safe_create_metric(
+    Counter,
     'vision_analysis_errors_total',
     'Total Vision analysis errors',
     ['error_type']  # error_type: parse_error, api_error, timeout, quota_exceeded, etc.
 )
 
-vision_albums_processed_total = Counter(
+vision_albums_processed_total = _safe_create_metric(
+    Counter,
     'vision_albums_processed_total',
     'Total albums processed by Vision',
     ['status']  # status: success, failed, skipped
@@ -181,6 +227,7 @@ class VisionAnalysisTask:
         vision_adapter: GigaChatVisionAdapter,
         policy_engine: VisionPolicyEngine,
         ocr_fallback: Optional[OCRFallbackService] = None,
+        ocr_enhancement_service: Optional[OCREnhancementService] = None,
         dlq_service: Optional[DLQService] = None,
         neo4j_client: Optional = None,  # Neo4jClient для синхронизации графа
         stream_name: str = "stream:posts:vision",
@@ -197,6 +244,7 @@ class VisionAnalysisTask:
         self.vision_adapter = vision_adapter
         self.policy_engine = policy_engine
         self.ocr_fallback = ocr_fallback
+        self.ocr_enhancement_service = ocr_enhancement_service
         self.dlq_service = dlq_service
         self.neo4j_client = neo4j_client
         self.local_ocr_primary_enabled = local_ocr_primary_enabled
@@ -321,6 +369,7 @@ class VisionAnalysisTask:
         # Context7: Флаг для обработки backlog при первом запуске
         backlog_processed = False
         last_pending_check = time.time()
+        last_pel_metrics_update = time.time()
         
         while self.running:
             try:
@@ -430,6 +479,21 @@ class VisionAnalysisTask:
                                     "error_type": type(e).__name__
                                 },
                                 exc_info=True
+                            )
+                    
+                    # Context7: Регулярное обновление метрик PEL (даже если нет pending сообщений)
+                    # Это нужно для корректной работы алерта VisionWorkerNotProcessing
+                    if current_time - last_pel_metrics_update >= 30:  # Обновляем каждые 30 секунд
+                        try:
+                            await self._update_pel_metrics()
+                            last_pel_metrics_update = current_time
+                        except Exception as e:
+                            logger.debug(
+                                "Error updating PEL metrics",
+                                extra={
+                                    "error": str(e),
+                                    "error_type": type(e).__name__
+                                }
                             )
                 
                 except asyncio.CancelledError:
@@ -668,10 +732,44 @@ class VisionAnalysisTask:
                         )
                         quota_exhausted = not budget_check.allowed
                     
+                    # Context7: Опциональная предварительная проверка текста для экономии токенов
+                    # Быстрый OCR для определения, есть ли текст на изображении
+                    has_text = None
+                    routing = self.policy_engine.config.get("routing", {})
+                    heuristics = routing.get("heuristics", {})
+                    precheck_text = heuristics.get("precheck_text", False)
+                    
+                    if precheck_text and self.ocr_fallback and not quota_exhausted:
+                        # Быстрая проверка наличия текста через OCR fallback
+                        try:
+                            file_content = await self.s3_service.get_object(media_file.s3_key)
+                            if file_content:
+                                # Быстрый OCR только для проверки наличия текста
+                                ocr_text = await self.ocr_fallback.extract_text(file_content)
+                                min_text_length = heuristics.get("precheck_text_min_length", 10)
+                                has_text = bool(ocr_text and len(ocr_text.strip()) >= min_text_length)
+                                logger.debug(
+                                    "Text precheck completed",
+                                    post_id=post_id,
+                                    sha256=media_id[:16] + "...",
+                                    has_text=has_text,
+                                    text_length=len(ocr_text) if ocr_text else 0,
+                                    trace_id=trace_id
+                                )
+                        except Exception as precheck_error:
+                            # Ошибка предварительной проверки не критична - продолжаем без неё
+                            logger.debug(
+                                "Text precheck failed, continuing without it",
+                                post_id=post_id,
+                                error=str(precheck_error),
+                                trace_id=trace_id
+                            )
+                    
                     policy_result = self.policy_engine.evaluate_media_for_vision(
                         media_file={
                             "mime_type": media_file.mime_type,
-                            "size_bytes": media_file.size_bytes
+                            "size_bytes": media_file.size_bytes,
+                            "has_text": has_text  # Context7: Результат предварительной проверки текста
                         },
                         channel_username=channel_username,  # Context7: получено из БД выше
                         quota_exhausted=quota_exhausted
@@ -872,8 +970,21 @@ class VisionAnalysisTask:
                     )
                     media_duration = time.time() - media_start_time
                     analysis_duration = time.time() - analysis_start_time
-                    vision_media_duration_seconds.observe(media_duration)
-                    vision_analysis_duration_seconds.observe(analysis_duration)
+                    # Context7: Безопасная запись метрик с обработкой ошибок
+                    try:
+                        vision_media_duration_seconds.observe(media_duration)
+                    except Exception as metric_error:
+                        logger.warning(
+                            "Failed to record vision_media_duration_seconds metric",
+                            extra={
+                                "error": str(metric_error),
+                                "post_id": post_id,
+                                "sha256": media_id[:16] + "...",
+                                "trace_id": trace_id
+                            }
+                        )
+                    # vision_analysis_duration_seconds записывается в gigachat_vision.py с labels
+                    # Не дублируем здесь, чтобы избежать конфликта определений
                     
                     if result:
                         result = self._attach_experiment_context(result, experiment_variants)
@@ -929,8 +1040,21 @@ class VisionAnalysisTask:
                         "reason": "exception",
                         "details": {"error": str(e)[:200]}
                     })
-                    vision_media_total.labels(result="failed", reason="exception").inc()
-                    vision_analysis_errors_total.labels(error_type="exception").inc()
+                    # Context7: Безопасная запись метрик с обработкой ошибок
+                    try:
+                        vision_media_total.labels(result="failed", reason="exception").inc()
+                        vision_analysis_errors_total.labels(error_type="exception").inc()
+                    except Exception as metric_error:
+                        logger.warning(
+                            "Failed to record error metrics",
+                            extra={
+                                "metric_error": str(metric_error),
+                                "original_error": str(e),
+                                "post_id": post_id,
+                                "sha256": media_id[:16] + "...",
+                                "trace_id": trace_id
+                            }
+                        )
                     continue
             
             # Context7: Всегда эмитить событие (analyzed или skipped)
@@ -995,11 +1119,24 @@ class VisionAnalysisTask:
                     )
             
             duration = time.time() - start_time
-            vision_event_duration_seconds.observe(duration)
+            # Context7: Безопасная запись метрики с обработкой ошибок
+            try:
+                vision_event_duration_seconds.observe(duration)
+            except Exception as metric_error:
+                logger.warning(
+                    "Failed to record vision_event_duration_seconds metric",
+                    extra={
+                        "error": str(metric_error),
+                        "post_id": post_id,
+                        "trace_id": trace_id
+                    }
+                )
             
             if event_emitted:
                 vision_worker_duration_seconds.labels(status="success").observe(duration)
                 vision_worker_processed_total.labels(status="success", reason="completed").inc()
+                # Context7: Инкремент vision_events_total для алерта VisionWorkerNotProcessing
+                vision_events_total.labels(status="processed", reason="completed").inc()
                 self.processed_count += 1
                 
                 # Context7: Учет альбомов в метриках
@@ -1020,6 +1157,8 @@ class VisionAnalysisTask:
             else:
                 vision_worker_duration_seconds.labels(status="error").observe(duration)
                 vision_worker_processed_total.labels(status="error", reason="emit_failed").inc()
+                # Context7: Инкремент vision_events_total для алерта VisionWorkerNotProcessing
+                vision_events_total.labels(status="failed", reason="emit_failed").inc()
                 vision_analysis_errors_total.labels(error_type="emit_failed").inc()
                 if is_album:
                     vision_albums_processed_total.labels(status="failed").inc()
@@ -1035,9 +1174,21 @@ class VisionAnalysisTask:
             
         except Exception as e:
             duration = time.time() - start_time
-            vision_worker_duration_seconds.labels(status="error").observe(duration)
-            vision_worker_processed_total.labels(status="error", reason="exception").inc()
-            vision_analysis_errors_total.labels(error_type="exception").inc()
+            # Context7: Безопасная запись метрик с обработкой ошибок
+            try:
+                vision_worker_duration_seconds.labels(status="error").observe(duration)
+                vision_worker_processed_total.labels(status="error", reason="exception").inc()
+                vision_events_total.labels(status="failed", reason="exception").inc()
+                vision_analysis_errors_total.labels(error_type="exception").inc()
+            except Exception as metric_error:
+                logger.warning(
+                    "Failed to record error metrics",
+                    extra={
+                        "metric_error": str(metric_error),
+                        "original_error": str(e),
+                        "message_id": message_id
+                    }
+                )
             self.error_count += 1
             logger.error(
                 "Failed to process vision event",
@@ -2017,13 +2168,48 @@ class VisionAnalysisTask:
             if ocr_extracted and ocr_extracted.get("text"):
                 ocr_text = ocr_extracted.get("text", "").strip()
                 if ocr_text and len(ocr_text) > 0:
-                    ocr_value = ocr_extracted
+                    # Context7: Применяем OCR Enhancement Service для улучшения текста
+                    if self.ocr_enhancement_service:
+                        try:
+                            enhanced_ocr = await self.ocr_enhancement_service.enhance_ocr_data(
+                                ocr_extracted,
+                                post_id=post_id,
+                                trace_id=trace_id
+                            )
+                            # Сохраняем улучшенный OCR с оригинальным текстом
+                            ocr_value = enhanced_ocr
+                            logger.debug(
+                                "OCR enhanced before saving",
+                                post_id=post_id,
+                                original_length=len(ocr_text),
+                                enhanced_length=len(enhanced_ocr.get("text_enhanced", ocr_text)),
+                                corrections_count=len(enhanced_ocr.get("corrections", [])),
+                                entities_count=len(enhanced_ocr.get("entities", [])),
+                                ocr_engine=ocr_extracted.get("engine"),
+                                provider=first_result.get("provider"),
+                                trace_id=trace_id
+                            )
+                        except Exception as enhancement_error:
+                            # Context7: Если enhancement не удался, сохраняем оригинальный OCR
+                            logger.warning(
+                                "OCR enhancement failed, using original OCR",
+                                post_id=post_id,
+                                error=str(enhancement_error),
+                                error_type=type(enhancement_error).__name__,
+                                trace_id=trace_id
+                            )
+                            ocr_value = ocr_extracted
+                    else:
+                        # Если enhancement service не доступен, сохраняем оригинальный OCR
+                        ocr_value = ocr_extracted
+                    
                     logger.debug(
                         "OCR value set for vision_data",
                         post_id=post_id,
                         ocr_text_length=len(ocr_text),
                         ocr_engine=ocr_extracted.get("engine"),
                         provider=first_result.get("provider"),
+                        has_enhancement=bool(self.ocr_enhancement_service),
                         trace_id=trace_id
                     )
                 else:
@@ -3353,6 +3539,36 @@ async def create_vision_analysis_task(
     )
     experiment_manager = VisionExperimentManager(experiment_config_path)
     
+    # Context7: Инициализация OCR Enhancement Service для улучшения OCR текста
+    ocr_enhancement_enabled = vision_config.get("ocr_enhancement_enabled", True)
+    ocr_enhancement_service = None
+    if ocr_enhancement_enabled:
+        try:
+            # Context7: OCREnhancementService создаст свой GigaChat адаптер если не передан
+            # Используем redis_client для кэширования LLM запросов
+            # Context7: Передаем db_pool для автоматических словарей (по аналогии с trends)
+            ocr_enhancement_service = OCREnhancementService(
+                redis_client=redis_client,
+                gigachat_adapter=None,  # Создаст свой адаптер
+                db_pool=db_pool,  # Для автоматических словарей
+                enabled=True,
+                llm_fallback_enabled=vision_config.get("ocr_enhancement_llm_fallback", True),
+                entity_extraction_enabled=vision_config.get("ocr_enhancement_entities", True),
+                auto_dictionaries_enabled=vision_config.get("ocr_auto_dictionaries_enabled", True)
+            )
+            logger.info(
+                "OCR Enhancement Service initialized",
+                llm_fallback_enabled=vision_config.get("ocr_enhancement_llm_fallback", True),
+                entity_extraction_enabled=vision_config.get("ocr_enhancement_entities", True)
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to initialize OCR Enhancement Service, OCR will be saved without enhancement",
+                error=str(e),
+                error_type=type(e).__name__
+            )
+            ocr_enhancement_service = None
+    
     # Vision Task
     task = VisionAnalysisTask(
         redis_client=redis_client,
@@ -3363,6 +3579,7 @@ async def create_vision_analysis_task(
         vision_adapter=vision_adapter,
         policy_engine=policy_engine,
         ocr_fallback=ocr_fallback,
+        ocr_enhancement_service=ocr_enhancement_service,
         dlq_service=dlq_service,
         local_ocr_primary_enabled=vision_config.get("local_ocr_primary_enabled", False),
         experiment_manager=experiment_manager

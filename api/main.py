@@ -15,6 +15,31 @@ from fastapi.staticfiles import StaticFiles
 from bot.webhook import router as bot_router, init_bot, ensure_webhook
 from bot.handlers.base import router as bot_handlers
 
+# Импорт Performance Metrics для регистрации метрик в Prometheus
+try:
+    from api.worker.common.performance_metrics import (
+        fast_path_latency_seconds,
+        llm_calls_per_request,
+        tokens_per_request,
+        agent_steps_per_request,
+    )
+except Exception as e:
+    # logger еще не определен на этом этапе, используем print
+    print(f"Warning: Failed to import performance metrics: {e}")
+    # Context7: Fallback NoOpMetric для избежания NameError при использовании метрик
+    class NoOpMetric:
+        def labels(self, **kwargs):
+            return self
+        def observe(self, value):
+            pass
+        def inc(self, value=1):
+            pass
+    
+    fast_path_latency_seconds = NoOpMetric()
+    llm_calls_per_request = NoOpMetric()
+    tokens_per_request = NoOpMetric()
+    agent_steps_per_request = NoOpMetric()
+
 # Middleware imports
 from middleware.tracing import TracingMiddleware
 from middleware.rate_limiter import RateLimiterMiddleware, init_rate_limiter
@@ -74,6 +99,8 @@ neo4j_connections_active = Gauge(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
+    # Context7: Явное логирование для диагностики
+    print("INFO: Application startup - lifespan started", flush=True)
     logger.info("Application startup - lifespan started")
     # [C7-ID: dev-mode-002] Логируем окружение при старте
     logger.info(
@@ -83,12 +110,92 @@ async def lifespan(app: FastAPI):
     )
     
     # Инициализация scheduler для периодических задач
+    # Context7: Подробное логирование всех этапов запуска scheduler
+    scheduler_start_time = time.time()
     try:
-        from tasks.scheduler_tasks import start_scheduler
+        logger.info(
+            "Scheduler initialization started",
+            timestamp=time.time(),
+            step="import"
+        )
+        # Context7: Явный вывод для диагностики
+        print("INFO: Scheduler initialization started", flush=True)
+        from tasks.scheduler_tasks import start_scheduler, scheduler as scheduler_module
+        print(f"INFO: Scheduler module imported, scheduler_module={scheduler_module}", flush=True)
+        
+        logger.info(
+            "Scheduler module imported successfully",
+            timestamp=time.time(),
+            step="import_complete",
+            scheduler_exists=scheduler_module is not None
+        )
+        
+        logger.info(
+            "Calling start_scheduler()",
+            timestamp=time.time(),
+            step="start_call"
+        )
+        print("INFO: Calling start_scheduler()", flush=True)
         await start_scheduler()  # Context7: AsyncIOScheduler требует async контекст
-        logger.info("Scheduler started for digest and trend tasks")
+        
+        scheduler_duration = time.time() - scheduler_start_time
+        logger.info(
+            "Scheduler started successfully",
+            timestamp=time.time(),
+            step="start_complete",
+            duration_seconds=round(scheduler_duration, 3)
+        )
+        print(f"INFO: Scheduler started successfully in {round(scheduler_duration, 3)}s", flush=True)
+        
+        # Context7: Проверяем статус scheduler после запуска
+        from tasks.scheduler_tasks import scheduler
+        if scheduler:
+            jobs = scheduler.get_jobs() if scheduler.running else []
+            logger.info(
+                "Scheduler status verified",
+                timestamp=time.time(),
+                step="status_check",
+                running=scheduler.running,
+                jobs_count=len(jobs),
+                job_ids=[job.id for job in jobs] if jobs else [],
+                state=scheduler.state if hasattr(scheduler, 'state') else 'N/A'
+            )
+        else:
+            logger.warning(
+                "Scheduler is None after start_scheduler()",
+                timestamp=time.time(),
+                step="status_check_failed"
+            )
+    except ImportError as e:
+        scheduler_duration = time.time() - scheduler_start_time
+        logger.error(
+            "Failed to import scheduler module",
+            timestamp=time.time(),
+            step="import_error",
+            error=str(e),
+            error_type=type(e).__name__,
+            duration_seconds=round(scheduler_duration, 3),
+            exc_info=True
+        )
+        # Context7: Выводим ошибку также в stdout для видимости
+        import sys
+        print(f"ERROR: Failed to import scheduler module: {e}", file=sys.stderr)
+        # Продолжаем без scheduler
     except Exception as e:
-        logger.error("Failed to start scheduler", error=str(e), exc_info=True)
+        scheduler_duration = time.time() - scheduler_start_time
+        logger.error(
+            "Failed to start scheduler",
+            timestamp=time.time(),
+            step="start_error",
+            error=str(e),
+            error_type=type(e).__name__,
+            duration_seconds=round(scheduler_duration, 3),
+            exc_info=True
+        )
+        # Context7: Выводим ошибку также в stdout для видимости
+        print(f"ERROR: Failed to start scheduler: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
         # Продолжаем без scheduler
     
     # Инициализация Redis для rate limiter
@@ -135,12 +242,47 @@ async def lifespan(app: FastAPI):
     logger.info("Lifespan shutdown started")
     
     # Остановка scheduler
+    # Context7: Graceful shutdown с таймаутом и подробным логированием
+    shutdown_start_time = time.time()
     try:
-        from tasks.scheduler_tasks import stop_scheduler
+        logger.info(
+            "Scheduler shutdown started",
+            timestamp=time.time(),
+            step="shutdown_start"
+        )
+        from tasks.scheduler_tasks import stop_scheduler, scheduler as scheduler_module
+        
+        if scheduler_module:
+            jobs_before = scheduler_module.get_jobs() if scheduler_module.running else []
+            logger.info(
+                "Scheduler state before shutdown",
+                timestamp=time.time(),
+                step="shutdown_precheck",
+                running=scheduler_module.running if scheduler_module else False,
+                jobs_count=len(jobs_before),
+                job_ids=[job.id for job in jobs_before] if jobs_before else []
+            )
+        
         stop_scheduler()
-        logger.info("Scheduler stopped")
+        
+        shutdown_duration = time.time() - shutdown_start_time
+        logger.info(
+            "Scheduler stopped successfully",
+            timestamp=time.time(),
+            step="shutdown_complete",
+            duration_seconds=round(shutdown_duration, 3)
+        )
     except Exception as e:
-        logger.error("Error stopping scheduler", error=str(e))
+        shutdown_duration = time.time() - shutdown_start_time
+        logger.error(
+            "Error stopping scheduler",
+            timestamp=time.time(),
+            step="shutdown_error",
+            error=str(e),
+            error_type=type(e).__name__,
+            duration_seconds=round(shutdown_duration, 3),
+            exc_info=True
+        )
     
     # Shutdown (временно отключено)
     # try:
@@ -176,6 +318,10 @@ app.add_middleware(TracingMiddleware)  # Первым - генерирует tra
 if settings.feature_rls_enabled:
     app.add_middleware(RLSMiddleware)
 app.add_middleware(RateLimiterMiddleware, redis_url=settings.redis_url)  # Проверяет лимиты (использует tenant_id)
+
+# Context7: API Metrics Middleware для детального мониторинга endpoints
+from middleware.metrics_middleware import metrics_middleware
+app.middleware("http")(metrics_middleware)
 
 # Context7 best practice: CORS whitelist из ENV
 # [C7-ID: fastapi-cors-001]
@@ -422,6 +568,10 @@ from routers import rag  # RAG API endpoints
 from routers import digest  # Digest API endpoints
 from routers import trends  # Trends API endpoints
 from routers import feedback  # Feedback API endpoints
+from routers import themes  # Context7: TGStat themes and channels API
+from routers import monitoring  # Context7: System monitoring endpoints
+from routers import pipeline_health  # Context7: Pipeline health endpoints
+from routers import metrics as metrics_router  # Context7: Metrics summary endpoints
 app.include_router(health.router, prefix="/api")
 app.include_router(channels.router, prefix="/api")
 app.include_router(tg_auth.router)  # QR auth endpoints
@@ -438,6 +588,10 @@ app.include_router(digest.router, prefix="/api")  # Digest API endpoints
 app.include_router(groups.router, prefix="/api")  # Groups & group digests
 app.include_router(trends.router, prefix="/api")  # Trends API endpoints
 app.include_router(feedback.router)  # Feedback API endpoints (prefix уже в роутере)
+app.include_router(themes.router, prefix="/api")  # Context7: TGStat themes and channels API
+app.include_router(monitoring.router, prefix="/api/monitoring")  # Context7: System monitoring
+app.include_router(pipeline_health.router, prefix="/api/pipeline")  # Context7: Pipeline health
+app.include_router(metrics_router.router, prefix="/api/metrics")  # Context7: Metrics summary
 app.include_router(bot_router, prefix="/tg")
 
 # Диагностический код временно убран
@@ -490,6 +644,13 @@ async def serve_admin_app():
 
 @app.get("/app/qr")
 async def serve_qr_app_compat():
+    from fastapi.responses import FileResponse
+    return FileResponse("webapp/qr.html")
+
+
+@app.get("/qr.html")
+async def serve_qr_html():
+    """Context7: Прямой доступ к qr.html для совместимости."""
     from fastapi.responses import FileResponse
     return FileResponse("webapp/qr.html")
 
